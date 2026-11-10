@@ -1047,6 +1047,54 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) { retur
 
 int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
+struct PlatFileSwap {
+    int fd;
+    void *view;
+    size_t n;
+    char tmp[PATH_MAX + 48], path[PATH_MAX];
+};
+
+// posix_fallocate allocates the n bytes on the disk: a full disk fails here and not at a page of the mapping, where
+// it would be a bus error.
+void *plat_file_swap_begin(const char *path, size_t n, PlatFileSwap **swap) {
+    if (!n || (access(path, W_OK) && errno != ENOENT)) return NULL;   // a read-only file stays, as in write_swap
+    PlatFileSwap *s = calloc(1, sizeof *s);
+    int len = s ? snprintf(s->tmp, sizeof s->tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id()) : -1;
+    if (len < 0 || len >= (int)sizeof s->tmp || strlen(path) >= sizeof s->path) {
+        free(s);
+        return NULL;
+    }
+    strcpy(s->path, path);
+    s->n = n;
+    s->fd = open(s->tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (s->fd < 0) {
+        free(s);
+        return NULL;
+    }
+    void *v = posix_fallocate(s->fd, 0, (off_t)n) ? MAP_FAILED : mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
+    if (v == MAP_FAILED) {
+        close(s->fd);
+        unlink(s->tmp);
+        free(s);
+        return NULL;
+    }
+    s->view = v;
+    *swap = s;
+    return v;
+}
+
+int plat_file_swap_end(PlatFileSwap *s, size_t used, int ok) {
+    ok = ok && used && used <= s->n && msync(s->view, used, MS_SYNC) == 0;
+    munmap(s->view, s->n);
+    ok = ok && (used == s->n || ftruncate(s->fd, (off_t)used) == 0) && fsync(s->fd) == 0;
+    ok = close(s->fd) == 0 && ok;
+    ok = ok && rename(s->tmp, s->path) == 0;
+    if (ok) sync_dir_of(s->path);
+    else unlink(s->tmp);
+    free(s);
+    return ok;
+}
+
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return 0;

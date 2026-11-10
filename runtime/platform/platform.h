@@ -342,6 +342,14 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n);
 // cut can leave a torn or zero-filled one. For files whose readers check them and that can be made again (the shader
 // cache). Each flush costs 1-5 ms on an NVMe drive and much more on a SATA SSD or a hard drive. 1 on success.
 int plat_file_write_cached(const char *path, const void *data, size_t n);
+// The same swap for data something else writes into memory of ours (a driver's pipeline cache): plat_file_swap_begin
+// makes path.<pid>.<tid>.tmp with n bytes and maps it read-write, NULL on failure. The mapped pages belong to the file,
+// so they take none of the system's commit, which a malloc'd buffer of n bytes holds until it is freed.
+// plat_file_swap_end unmaps the file and, with ok, cuts it to used bytes, flushes it to the disk and renames it over
+// path; without ok, or when one of those fails, it deletes it. 1 when path holds the new file.
+typedef struct PlatFileSwap PlatFileSwap;
+void *plat_file_swap_begin(const char *path, size_t n, PlatFileSwap **swap);
+int plat_file_swap_end(PlatFileSwap *swap, size_t used, int ok);
 // Takes the file at path (made when missing) as a lock no other process can take, held until this process ends:
 // 1 held (again, when this process holds it already), 0 another process holds it, -1 the file cannot be made.
 int plat_lock_file(const char *path);

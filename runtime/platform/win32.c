@@ -721,6 +721,56 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) { retur
 
 int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
+struct PlatFileSwap {
+    HANDLE file, map;
+    void *view;
+    size_t n;
+    wchar_t tmp[WPATH + 48], path[WPATH];
+};
+
+// The mapping object extends the new file to n bytes, which allocates them on the disk: a full disk fails here and
+// not at a page of the view.
+void *plat_file_swap_begin(const char *path, size_t n, PlatFileSwap **swap) {
+    char tmp[WPATH + 48];
+    PlatFileSwap *s = n ? calloc(1, sizeof *s) : NULL;
+    int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, (unsigned)GetCurrentProcessId(), (unsigned)GetCurrentThreadId());
+    if (!s || len < 0 || len >= (int)sizeof tmp || !widen(tmp, s->tmp, WPATH + 48) || !widen(path, s->path, WPATH)) {
+        free(s);
+        return NULL;
+    }
+    s->n = n;
+    s->file = CreateFileW(s->tmp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (s->file == INVALID_HANDLE_VALUE) {
+        free(s);
+        return NULL;
+    }
+    s->map = CreateFileMappingW(s->file, NULL, PAGE_READWRITE, (DWORD)((uint64_t)n >> 32), (DWORD)n, NULL);
+    s->view = s->map ? MapViewOfFile(s->map, FILE_MAP_WRITE, 0, 0, n) : NULL;
+    if (!s->view) {
+        if (s->map) CloseHandle(s->map);
+        CloseHandle(s->file);
+        DeleteFileW(s->tmp);
+        free(s);
+        return NULL;
+    }
+    *swap = s;
+    return s->view;
+}
+
+int plat_file_swap_end(PlatFileSwap *s, size_t used, int ok) {
+    ok = ok && used && used <= s->n && FlushViewOfFile(s->view, used);
+    UnmapViewOfFile(s->view);
+    CloseHandle(s->map);   // the file's size can change only once no mapping of it is left
+    LARGE_INTEGER at = {.QuadPart = (LONGLONG)used};
+    ok = ok && (used == s->n || (SetFilePointerEx(s->file, at, NULL, FILE_BEGIN) && SetEndOfFile(s->file))) &&
+         FlushFileBuffers(s->file);
+    CloseHandle(s->file);
+    ok = ok && MoveFileExW(s->tmp, s->path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) DeleteFileW(s->tmp);
+    free(s);
+    return ok;
+}
+
 int plat_file_flush(const char *path) {
     wchar_t w[WPATH];
     if (!widen(path, w, WPATH)) return 0;
