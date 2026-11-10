@@ -4,6 +4,15 @@
     python -I tools/make_game.py --exefs "C:\\path\\exefs" --romfs "C:\\path\\romfs" --out "C:\\Games\\Ocarina"
     python -I tools/make_game.py --nup "C:\\path\\game.nup" --check          # only checks the game's version
     python -I tools/make_game.py --rebuild --out "C:\\Games\\Ocarina"         # a newer kit, the files of the last build
+    python -I tools/make_game.py --rebuild --out "C:\\Games\\Ocarina" --debug # a debug build with symbols beside it
+
+--debug builds <out>/ocarina-debug.exe (ocarina-debug on Linux) beside the release one, which it leaves alone: the
+runtime at -O0 with full debug info, the lifted code still at -O1 (at -O0 it is far too slow to play and its huge
+functions overflow the stack) with line tables only, frame pointers kept in both. On Windows with lld the debug info
+is CodeView in <out>/ocarina-debug.pdb (Visual Studio, WinDbg, RemedyBG, RAD Debugger); without lld it is DWARF
+inside the exe (gdb, lldb). On Linux it is DWARF inside the binary. Its objects go to build-cache/obj-debug, the
+prebuilt runtime library is not used (it carries no debug info), and its compile and shaders steps are recorded
+apart from the release build's, so switching between the two rebuilds neither from scratch.
 
 Steps, each skipped when a run before finished it for the same inputs (state in <out>/build-cache/state.json):
   1. check    the title (0400486024DEC000) and main's build id (game 1.1.1)
@@ -131,6 +140,10 @@ RUN_SCRIPT = ('import os, runpy, sys; s = sys.argv[1]; sys.argv = sys.argv[1:]; 
               'sys.path.insert(0, os.path.dirname(os.path.abspath(s))); runpy.run_path(s, run_name="__main__")')
 
 EVENTS = False
+DEBUG = False   # --debug
+# The steps whose output differs in a --debug build: recorded under '<step>-debug' in state.json, so the release and
+# the debug build each keep their own and switching between them rebuilds neither.
+DEBUG_STEPS = ('compile', 'shaders')
 OUT_LOCK = threading.Lock()   # the RomFS step prints from its own thread (main)
 
 
@@ -920,8 +933,17 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None):
-    """fast: fast_clang's compiler for the lifted code, with msys as its sysroot."""
+def debug_flags(guest, codeview):
+    """--debug's compile flags: line tables for the lifted code (full info for millions of generated lines makes
+    the compile and the PDB enormous for little gain), full info for the runtime; CodeView for a PDB when lld links
+    on Windows, else DWARF."""
+    return (['-gline-tables-only' if guest else '-g', '-fno-omit-frame-pointer']
+            + (['-gcodeview'] if codeview else []))
+
+
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, debug=False, codeview=False):
+    """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. debug: --debug's flags (the
+    runtime at -O0 with debug info, the lifted code at -O1 with line tables); codeview: CodeView rather than DWARF."""
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
@@ -933,7 +955,9 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None):
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
+        opt = '-O1' if guest else ('-O0' if debug else '-O2')
+        dbg = debug_flags(guest, codeview) if debug else []
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', opt, *dbg,
                 *march, '-fno-strict-aliasing', '-w', *declspec, *inc, '-o', str(dst), str(src)]
     return cmd_for
 
@@ -1093,13 +1117,22 @@ def toolchain(msys):
     return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma_include()
 
 
-def xlate_source():
-    """The folder of the shader translator to copy beside the game: the kit's bin/, else a source checkout's
-    build/xlate/ (tools/build_xlate.py)."""
+def xlate_dir():
+    """The folder of the shader translator: the kit's bin/, else a source checkout's build/xlate/
+    (tools/build_xlate.py); None when neither has it. The compile and shaders steps and the shaders step's key all
+    look it up here, so they agree on which translator a build uses."""
     for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
         if (d / XLATE_NAME).is_file():
             return d
-    fail(f'{XLATE_NAME} is missing: build it with tools/build_xlate.py')
+    return None
+
+
+def xlate_source():
+    """xlate_dir(), or stop the build when there is no translator."""
+    d = xlate_dir()
+    if d is None:
+        fail(f'{XLATE_NAME} is missing: build it with tools/build_xlate.py')
+    return d
 
 
 # The x86-64 level the lifted code was compiled for, beside the objects (lifted_level).
@@ -1127,19 +1160,25 @@ def lifted_level(obj, now, update):
     return 0 if old else now
 
 
-def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
+def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False, debug=False):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
-    update: a rebuild after a kit update (lifted_level)."""
-    lift, gen, obj = cache_dir / 'lift', cache_dir / 'gen', cache_dir / 'obj'
+    update: a rebuild after a kit update (lifted_level). debug: --debug, into build-cache/obj-debug and
+    <out>/ocarina-debug.exe with its symbols (see the docstring)."""
+    lift, gen, obj = cache_dir / 'lift', cache_dir / 'gen', cache_dir / ('obj-debug' if debug else 'obj')
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
     clang, clangxx, env, vma = toolchain(msys)
+    lld = (msys / 'bin' / 'ld.lld.exe').is_file() if WIN else bool(shutil.which('ld.lld'))
+    codeview = debug and WIN and lld   # a PDB needs lld; GNU ld keeps DWARF in the exe
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
-    prebuilt = prebuilt_runtime(clang, env)
+    prebuilt = None if debug else prebuilt_runtime(clang, env)   # the prebuilt runtime has no debug info
+    if debug:
+        say('  debug build: the runtime at -O0 with full debug info, the lifted code at -O1 with line tables; '
+            + ('CodeView symbols into a PDB' if codeview else 'DWARF symbols in the executable'))
     runtime = [(p, obj / name) for p, name in runtime_sources()]
     if prebuilt:
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
@@ -1161,10 +1200,10 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     fast = fast_clang(msys, clang, env)
     if fast:
         say(f'  the lifted code compiles with {fast}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys)
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, debug, codeview)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths.
-    plain = runtime_cmd(clang, clangxx, inc, level, None, msys)
+    plain = runtime_cmd(clang, clangxx, inc, level, None, msys, debug, codeview)
     fast_old = (cid_old + compiler_ids(fast, env)[1]) if fast else None
     kits = earlier_kits()
 
@@ -1212,26 +1251,32 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         fail(f'{len(bad)} files did not compile')
     (obj / LIFTED_BUILD).write_text(json.dumps({'level': level}), encoding='utf-8')   # lifted_level reads it next update
 
-    objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=(msys / 'bin' / 'ld.lld.exe').is_file())]
-                                   if WIN else [])
+    objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=lld)] if WIN else [])
     exe = out / EXE_NAME
-    rsp = cache_dir / 'link.rsp'
+    tag = '-debug' if debug else ''
+    rsp = cache_dir / f'link{tag}.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for o in objs), encoding='utf-8')
     # lld links several times faster than GNU ld; the stack matches tools/build_game.py's build
     # 16 MiB for the main thread with either linker (GNU ld takes the same flag): the default 2 MiB is too little
     if WIN:
-        ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
+        ld = (['-fuse-ld=lld'] if lld else []) + ['-Wl,--stack,16777216']
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
+        ld = (['-fuse-ld=lld'] if lld else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one
-    ld.append('-Wl,--Map=' + (cache_dir / 'ocarina.map').as_posix())
+    ld.append('-Wl,--Map=' + (cache_dir / f'ocarina{tag}.map').as_posix())
+    pdb = out / 'ocarina-debug.pdb' if codeview else None
+    if debug:   # keep the symbols: -g at the link, and with CodeView the PDB beside the exe (its path is in the exe)
+        ld.append('-g')
+        if pdb:
+            ld.append('-Wl,--pdb=' + str(pdb))
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
         stamp.append([prebuilt[0].name, prebuilt[0].stat().st_size, sha256_file(prebuilt[0])])
     link_key = sha256_bytes(json.dumps([LINK_LIBS, ld, cid] + stamp).encode())
-    state_link = cache_dir / 'link.key'
-    if exe.is_file() and state_link.is_file() and state_link.read_text(encoding='utf-8') == link_key:
+    state_link = cache_dir / f'link{tag}.key'
+    if (exe.is_file() and state_link.is_file() and state_link.read_text(encoding='utf-8') == link_key
+            and (pdb is None or pdb.is_file())):
         say(f'  {EXE_NAME} is current, not linked again')
     else:
         emit('phase', step='compile', phase='link')
@@ -1243,7 +1288,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         if p.returncode:
             print(p.stderr[-4000:], file=sys.stderr)
             tmp.unlink(missing_ok=True)
-            fail('the link failed')
+            fail('the link failed' + (f' (if {pdb.name} is open in a debugger, close it and try again)' if pdb else ''))
         try:
             os.replace(tmp, exe)
         except PermissionError:
@@ -1264,6 +1309,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         say('  DLSS Frame Generation: nx2navi_dlssg.dll, Streamline and nvngx_dlssg.dll beside the game')
     beside = copy_dlls(exe, msys / 'bin', out) if WIN else []
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB' + (f'; beside it: {", ".join(beside)}' if beside else ''))
+    if pdb and pdb.is_file():
+        say(f'  symbols: {pdb} {pdb.stat().st_size / 1e6:.0f} MB')
     (out / 'profile').mkdir(exist_ok=True)
 
 
@@ -1355,12 +1402,11 @@ def step_shaders(out, update=False):
     # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
     # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
     # has one: the compile step, which always runs first, stops a build without it.
-    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
-        if (d / XLATE_NAME).is_file():
-            note_cache_translator(out)
-            for name in (XLATE_NAME, 'nx2navi_xlate.id'):
-                copy_if_changed(d / name, out / name)
-            break
+    d = xlate_dir()
+    if d is not None:
+        note_cache_translator(out)
+        for name in (XLATE_NAME, 'nx2navi_xlate.id'):
+            copy_if_changed(d / name, out / name)
     if update and shader_carry(out):
         say('  the shaders prepared before this update stay in use; the game translates them again in the background')
         return
@@ -1502,6 +1548,11 @@ def cpu_tag():
         return 'any'
 
 
+def slot(step):
+    """The name a step is recorded under in state.json: its own, or '<step>-debug' for DEBUG_STEPS of --debug."""
+    return f'{step}-debug' if DEBUG and step in DEBUG_STEPS else step
+
+
 def step_key(step, identity, out=None):
     """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS and the
     lifter; compile: the lift, the runtime sources, this script and the processor (cpu_tag); prompts: the game files,
@@ -1519,15 +1570,18 @@ def step_key(step, identity, out=None):
     if step == 'lift':
         return lift
     compile_key = (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
-                   f'|cpu {cpu_tag()}')
+                   f'|cpu {cpu_tag()}' + ('|debug' if DEBUG else ''))
     if step == 'compile':
         return compile_key
     # shaders: the built game and the translator that prepared them
-    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
+    # the translator's id from where the compile step takes it (xlate_dir): a kit's bin/ or a checkout's build/xlate/
+    xd = xlate_dir()
+    xid = sha256_file(xd / 'nx2navi_xlate.id') if xd and (xd / 'nx2navi_xlate.id').is_file() else 'none'
+    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{xid}'
 
 
 def main():
-    global EVENTS
+    global EVENTS, DEBUG, EXE_NAME
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--nup', help='the game as one .nup file')
     ap.add_argument('--exefs', help='the game\'s exefs folder (with --romfs, instead of --nup)')
@@ -1539,15 +1593,20 @@ def main():
                          'kept from before an update were compiled for another (Rebuild the Game)')
     ap.add_argument('--out', help='the folder for the finished game')
     ap.add_argument('--check', action='store_true', help='only check the game\'s version; builds nothing')
-    ap.add_argument('--msys', default=r'C:\msys64\ucrt64',
+    ap.add_argument('--msys', default=r'D:\msys64\ucrt64',
                     help='MSYS2 UCRT64 folder (default C:\\msys64\\ucrt64; Windows only: Linux takes clang and lld from PATH)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4, help='parallel compiles')
     ap.add_argument('--events', action='store_true', help='machine-readable progress lines on stdout ("@@" + JSON)')
+    ap.add_argument('--debug', action='store_true',
+                    help='build ocarina-debug.exe with debug symbols (a PDB on Windows) beside the release build')
     ap.add_argument('--make-runtime-lib', metavar='DIR', help='build the prebuilt runtime library of a release into DIR')
     ap.add_argument('--obj', help='with --make-runtime-lib: the folder for its objects')
     ap.add_argument('--until', choices=STEPS, help=argparse.SUPPRESS)   # tests: stop after this step
     a = ap.parse_args()
     EVENTS = a.events
+    DEBUG = a.debug
+    if DEBUG:
+        EXE_NAME = 'ocarina-debug.exe' if WIN else 'ocarina-debug'
     if a.make_runtime_lib:
         make_runtime_lib(a.make_runtime_lib, Path(a.msys), a.jobs, a.obj)
         return
@@ -1599,7 +1658,7 @@ def main():
     romfs_job = None
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache),
-            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune),
+            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune, DEBUG),
             'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
@@ -1620,7 +1679,7 @@ def main():
         t = time.time()
         runs[name]()
         with state_lock:
-            state['steps'][name] = step_key(name, src.identity, out)
+            state['steps'][slot(name)] = step_key(name, src.identity, out)
         save()
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
@@ -1630,7 +1689,7 @@ def main():
             if name == 'prompts' and not prompt_art_dir():
                 say('prompts: none to draw, the kit has no button art')
                 emit('step', step=name, state='skip')
-            elif state['steps'].get(name) == step_key(name, src.identity, out):
+            elif state['steps'].get(slot(name)) == step_key(name, src.identity, out):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:
@@ -1639,7 +1698,10 @@ def main():
                 with state_lock:
                     for later in STEPS[STEPS.index(name):]:
                         if later == name or not {name, later} & set(OWN_KEY_STEPS):
-                            state['steps'].pop(later, None)
+                            state['steps'].pop(slot(later), None)
+                            if later != name and later in DEBUG_STEPS:   # both builds hang off an earlier step
+                                state['steps'].pop(f'{later}-debug', None)
+                                state['steps'].pop(later, None)
                 say(f'{name}:')
                 emit('step', step=name, state='start')
                 if name in ('shaders', 'prompts') and romfs_job:   # they read the RomFS image
