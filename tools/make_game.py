@@ -159,7 +159,9 @@ RUNTIME_LIB = 'libnx2navirt.a'
 FFX4_DLLS = ('amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll')   # AMD's FSR SDK 2.4, for FSR 4
 FFX4_FG_DLL = 'amd_fidelityfx_framegeneration_vk.dll'   # ... and its frame generation, with the two above
 RUNTIME_PATTERNS = ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp',
-                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c')
+                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c',
+                    'third_party/fsr_vulkan/src/*.c',
+                    'third_party/fsr_vulkan/src/*.cpp', 'third_party/fsr_vulkan/sdk/src/**/*.cpp')
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
 
 # Runs a script the way `python script.py` does, with the script's folder first on sys.path. The launcher's
@@ -1169,7 +1171,7 @@ def preflight(msys, jobs, sources=None):
     say(f'check: the compiler is {version}')
     rt = KIT / 'runtime'
     runtime_headers(rt)
-    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
+    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma), *fsr_inc(rt)]
     vulkan = vulkan_headers(clang, env)
     cmd_for = runtime_cmd(clang, clangxx, inc, first=vulkan)
     if sources is None:
@@ -1337,6 +1339,19 @@ def runtime_sources():
     return out
 
 
+def fsr_inc(rt):
+    """The include dirs and defines the vendored portable FSR 3 sources need (runtime/third_party/fsr_vulkan, MIT).
+    Every place that compiles a runtime source takes them, so the three stay in step."""
+    return ['-I', str(rt / 'third_party' / 'fsr_vulkan' / 'include'), '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'src'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'include'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'shared'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'components'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'backends' / 'shared'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'backends' / 'shared' / 'blob_accessors'),
+            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'generated' / 'ffx-1.1.4' / 'vk' / 'fsr3upscaler'),
+            '-DFFX_VK_PORTABLE_HAS_FSR3_UPSCALER=1', '-DFFX_FSR3UPSCALER', '-DFFX_OF']
+
+
 def per_install_names(generated=GENERATED_HEADERS):
     """The basenames of the generated headers and of every runtime header that includes one, at any depth."""
     rt = KIT / 'runtime'
@@ -1457,7 +1472,7 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     rt = KIT / 'runtime'
     tainted = per_install_names()
     srcs = [(p, obj / name) for p, name in runtime_sources() if not per_install(p, tainted)]
-    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
+    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma), *fsr_inc(rt)]
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
     t0 = time.time()
     compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc, first=vulkan_headers(clang, env)),
@@ -1703,7 +1718,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     srcs.append((modules_c(lift, out, gen), obj / 'modules.o'))
     if WIN:
         srcs.append((gen / 'shim.c', obj / 'shim.o'))
-    inc = ['-I', str(rt), '-I', str(lift), '-I', str(gen), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
+    inc = ['-I', str(rt), '-I', str(lift), '-I', str(gen), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma),
+           *fsr_inc(rt)]
     cid, cid_old = compiler_ids(clang, env)   # fast_clang's compiler writes the same objects: not part of the key
     now = cpu_level(clang, env)
     level = lifted_level(obj, now, update)
