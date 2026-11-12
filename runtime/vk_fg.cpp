@@ -28,6 +28,7 @@ extern "C" {
 #include "vk_dlssg.h"
 #include "vk_ffx.h"
 #include "vk_fg.h"
+#include "vk_fg_reset.h"
 #include "ui/menu.h"
 }
 
@@ -45,6 +46,9 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg_generating)
+    FgrRing cuts;   // each frame id's camera cut, for the generation callback (vk_fg_reset.h)
+    uint64_t cut_frames = 0;   // frames handed to the callback as cuts
+    int prepared = 0;          // the last frame was prepared (generation on with its inputs)
 } F;
 
 VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
@@ -56,6 +60,8 @@ VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
 
 ffxReturnCode_t generate(ffxDispatchDescFrameGeneration *d, void *user) {
     F.generated++;
+    // the swapchain's own reset (a frame id that did not follow the last) stays; a cut vk_fg_frame noted is added
+    if (fgr_cut(&F.cuts, d->frameID)) d->reset = true;
     return vk_ffx_dispatch((ffxContext *)user, &d->header);
 }
 
@@ -267,6 +273,11 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     else if (!hudless) F.no_hudless++;
     else if (!on) F.paused++;
     F.frame++;
+    // A cut: DLSS started a new history (vk_dlaa_fg_inputs), or the frame before was not prepared (generation off for
+    // the menu, no inputs), so the frame between the two would be made from a stale depth and motion
+    fgr_note(&F.cuts, F.frame, reset || !F.prepared);
+    if ((reset || !F.prepared) && on) F.cut_frames++;
+    F.prepared = on;
     ffxConfigureDescFrameGeneration cfg = {};
     cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
     cfg.swapChain = (void *)sc;
@@ -312,9 +323,9 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     if (r != FFX_API_RETURN_OK) return fail("frame generation preparation", r);
     if (F.frame == 2 || F.frame % 3600 == 0)
         rt_log("fg: %llu frames presented, %llu generated (%llu with the HUD kept out); paused %llu (menu), %llu without depth "
-               "and motion, %llu without the HUD-less picture", (unsigned long long)F.frame, (unsigned long long)F.generated,
+               "and motion, %llu without the HUD-less picture; %llu after a camera cut", (unsigned long long)F.frame, (unsigned long long)F.generated,
                (unsigned long long)F.hudless, (unsigned long long)F.paused, (unsigned long long)F.no_inputs,
-               (unsigned long long)F.no_hudless);
+               (unsigned long long)F.no_hudless, (unsigned long long)F.cut_frames);
 }
 
 extern "C" void vk_fg_release(void) {
@@ -322,4 +333,5 @@ extern "C" void vk_fg_release(void) {
     if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+    F.prepared = 0;
 }

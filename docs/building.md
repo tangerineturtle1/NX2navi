@@ -473,6 +473,11 @@ builds the header alone and replays an area change after a loading screen from a
 half-resolution passes are per-frame again at once, a lookup table, a volume's slices and an icon capture still wait,
 and an image taken over by another texture starts without the history of the one before. No GPU, no game files.
 
+A change to which frames FSR 3.1 frame generation is told are camera cuts (`runtime/vk_fg_reset.h`, `runtime/vk_fg.cpp`
+`generate` and `vk_fg_frame`) passes `python tests\fg_reset_check.py`, which builds the header alone and checks that each
+frame id gets its own frame's cut, that an id never noted or no longer held counts as a cut, and that a slot rewritten
+on another thread never answers an old id with a newer frame's value. No GPU, no game files.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 
