@@ -133,6 +133,22 @@ static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT r
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
 static int32_t n_imports, n_import_failures;
+// What the driver's host-pointer imports cost, since the last "mem: imports" line (import_log): the calls that make one
+// (vkAllocateMemory and vkBindBufferMemory in import_pool) and the vkFreeMemory that ends one (destroy_rec), their
+// time and their slowest call. The game makes and finalizes pools on its own threads while an area streams in, up to
+// 1,500 a second, so time spent here is no wait the frame-time summary records: a slow frame shows it as
+// "unattributed". A driver that pins the pages at each import pays for it here, and a log has to tell that from a
+// slow GPU.
+typedef struct { uint64_t n, ns, max_ns; } ImpAcc;
+static ImpAcc imp_made, imp_freed;
+static uint64_t imp_refused;
+
+static void imp_note(ImpAcc *a, uint64_t t0) {
+    uint64_t dt = plat_now_ns() - t0, m = __atomic_load_n(&a->max_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&a->n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&a->ns, dt, __ATOMIC_RELAXED);
+    while (dt > m && !__atomic_compare_exchange_n(&a->max_ns, &m, dt, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
@@ -201,8 +217,10 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                     .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = vk_gpa_wanted() ? (void *)&fi : (void *)&im,
                                .allocationSize = n, .memoryTypeIndex = (uint32_t)type};
+    uint64_t t0 = plat_now_ns();
     if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
         (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+        __atomic_add_fetch(&imp_refused, 1, __ATOMIC_RELAXED);
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -210,6 +228,7 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         r->mem = VK_NULL_HANDLE;
         return 0;
     }
+    imp_note(&imp_made, t0);
     plat_inc32(&n_imports);
     return 1;
 }
@@ -283,13 +302,19 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
-    if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->mem) {
+        uint64_t t0 = plat_now_ns();
+        vkFreeMemory(c->device, r->mem, NULL);
+        imp_note(&imp_freed, t0);
+    }
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
     free(r->pt);
     free(r);
 }
+
+static int vram_query(uint64_t *used, uint64_t *budget, int *exact);
 
 static int pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
@@ -327,6 +352,14 @@ static int pool_init(pool_t *p) {
             long n = plat_inc32(&n_import_failures);
             if (n <= 8) rt_log("vk: pool %p (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (void *)p->mem,
                                p->flags, (unsigned long long)p->size, n);
+            // Whether the driver refused for want of memory or for a reason of its own: what its device-local heaps
+            // hold at that moment, and how many imports are live.
+            uint64_t used, budget;
+            int exact;
+            if (n <= 8 && vram_query(&used, &budget, &exact))
+                rt_log("vk:   device-local heaps at the refusal: %.0f of %.0f MiB%s; %d pools given storage so far",
+                       used / 1048576.0, budget / 1048576.0, exact ? " (the driver's budget)" : " (our blocks, heap size)",
+                       (int)n_imports);
             r->buf = VK_NULL_HANDLE;
             ok = 1;
         }
@@ -656,8 +689,24 @@ void vk_mem_snapshot(uint64_t frame) {
     if (rt_trace & RT_TRACE_PERF) vram_log(frame);
 }
 
+// Every 3,600 frames in which a pool was imported, freed or refused: what those driver calls cost (imp_made).
+static void import_log(uint64_t frame) {
+    uint64_t mn = __atomic_exchange_n(&imp_made.n, 0, __ATOMIC_RELAXED), mt = __atomic_exchange_n(&imp_made.ns, 0, __ATOMIC_RELAXED);
+    uint64_t mx = __atomic_exchange_n(&imp_made.max_ns, 0, __ATOMIC_RELAXED);
+    uint64_t fn = __atomic_exchange_n(&imp_freed.n, 0, __ATOMIC_RELAXED), ft = __atomic_exchange_n(&imp_freed.ns, 0, __ATOMIC_RELAXED);
+    uint64_t fx = __atomic_exchange_n(&imp_freed.max_ns, 0, __ATOMIC_RELAXED);
+    uint64_t ref = __atomic_exchange_n(&imp_refused, 0, __ATOMIC_RELAXED);
+    if (!mn && !fn && !ref) return;
+    rt_log("mem: imports up to frame %llu: %llu made in %.1f ms (avg %.3f, max %.2f), %llu freed in %.1f ms (avg %.3f, "
+           "max %.2f), %llu refused; %.2f ms a frame over the last 3600",
+           (unsigned long long)frame, (unsigned long long)mn, mt / 1e6, mn ? mt / 1e6 / mn : 0.0, mx / 1e6,
+           (unsigned long long)fn, ft / 1e6, fn ? ft / 1e6 / fn : 0.0, fx / 1e6, (unsigned long long)ref,
+           (mt + ft) / 1e6 / 3600);
+}
+
 void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
+    if (frame && frame % 3600 == 0) import_log(frame);
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame);

@@ -244,6 +244,13 @@
 # title screen, bound: gpu, every line of the perf window waiting on a fence). The log names the mode in use: "mem:
 # mode import" or "mem: mode mirror".
 # memory = auto
+# 1: the game's CPU-visible memory pools are not imported into Vulkan at all (no VK_EXT_external_memory_host imports):
+# each gets a buffer of the driver's own, the pages the game wrote are copied in before every submission and what the
+# GPU wrote is copied back when it is done. 0: imports. Unset: imports on Windows; copies under Wine and on Linux, but
+# for NVIDIA's own driver. The copies take as much memory again as the pools hold (about 5 GB) and their copying costs
+# frame rate, so set 1 only where a driver's imports fail or stall: the log's "mem: imports" lines give what the
+# imports cost, and "host memory import failed" names one the driver refused.
+# shadow = 0
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
 # A new depth image is cleared at the place in the frame where the game makes it (1, default), not ahead of the
