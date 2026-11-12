@@ -866,6 +866,11 @@ int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
     return 0;
 }
 
+// Guest memory as dma-bufs is Linux's (platform.h).
+int plat_mem_dmabuf_ok(uint64_t *limit, uint64_t *any, const char **why) { *limit = *any = 0, *why = ""; return 0; }
+int plat_mem_dmabuf(uint64_t addr, uint64_t n) { (void)addr; (void)n; return -1; }
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n) { (void)addr; (void)n; }
+
 // Contains code Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 // GetWriteWatch with the reset flag.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {

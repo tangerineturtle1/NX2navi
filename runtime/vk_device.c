@@ -14,6 +14,7 @@
 #include "vk.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_gpa.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
 
@@ -311,6 +312,15 @@ retry:
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
     vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
+    {   // and by whether the device imports dma-bufs (vk_memory.c "dma-buf imports")
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
+        vk_mem_dmabuf_caps(has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+                           has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME));
+        free(ep);
+    }
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -492,6 +502,11 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // Guest memory imported as dma-bufs (vk_memory.c "dma-buf imports"; pick_device checked the extensions)
+    if (vk_mem_dmabuf_on() && n_ext + 4 <= sizeof ext / sizeof *ext) {
+        ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -644,6 +659,7 @@ static int create_device(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     vk_caps_init(&g_vk);
+    vk_mem_dmabuf_probe(g_vk.device, &g_vk.mem_props, vk_gpa_wanted_ctx(&g_vk));   // may turn shadow storage on
     vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
     rt_fatal_note_add(fatal_note);
 

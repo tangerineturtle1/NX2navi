@@ -407,6 +407,14 @@ int vk_mem_flush_add_probe(void);        // --probe-vkexec: the flush range list
 uint64_t vk_mem_mirror_uploaded(void);   // --probe-vkexec: bytes copied into mirrors since the last summary line
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
+// Guest memory as dma-bufs (vk_memory.c "dma-buf imports"): pick_device tells whether the device has
+// VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf (before vk_mem_class_log); create_device enables them
+// when the pools are imported that way.
+void vk_mem_dmabuf_caps(int exts);
+int vk_mem_dmabuf_on(void);
+// After vkCreateDevice, before vk_mem_lazy_decide: a page of guest memory imported as the pools will be; any refusal
+// turns the dma-buf imports off for the run (shadow storage then). bda: buffers get device addresses.
+void vk_mem_dmabuf_probe(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int bda);
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,

@@ -8,6 +8,7 @@
 // users. Virtual pools are a GPU-side page table
 // over device-local memory and dirty pages come from GetWriteWatch (mem_written_pages), so neither host VM aliasing
 // nor page protection (a fault handler) is needed.
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,7 @@ typedef struct PoolRec {
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
+    struct Span *span;                 // POOL_IMPORT as a dma-buf: the span whose memory buf is bound to ("dma-buf imports")
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
@@ -158,9 +160,310 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     return -1;
 }
 
-// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+// ---------------------------------------------------------------- dma-buf imports
+// Where guest memory is a memfd's (Linux, NX2NAVI_DMABUF, on by default: platform/linux.c "Guest memory as a memfd's"), a
+// CPU-visible pool is imported as a dma-buf of its own pages, not as a host pointer and not as a shadow copy. It keeps
+// what an import is to the rest of this file (the GPU's writes are in guest memory once the GPU has made them, the
+// device address table's twin is guest memory, mirrors sync from it and write back into it), without amdgpu's costs
+// for host pointers: those are userptr objects, which the kernel looks up page by page at every submission and
+// invalidates whenever the write watch or a freeze re-protects their pages (about 0.2 frames a second in Kokiri
+// Forest), which is why Linux had shadow storage. A dma-buf's pages are pinned once and the process's page tables
+// never matter to it again: the write watch, the freezes and the lazy write-back's armed pages leave the GPU alone.
+// RADV puts every imported memory object in every submission, at about 0.6 us each (RX 6800 XT, Linux 7.3, Mesa 26.2:
+// 2.6 ms a vkQueueSubmit with 4096 of them, 0.04 ms with 64), and the game keeps over 4,000 pools, so a pool does not
+// get a dma-buf of its own: guest addresses are cut into aligned spans of NX2NAVI_DMABUF_MB (64 by default), the first
+// pool made in a span imports the span's dma-buf, and every pool is a buffer bound into the memory of a span that holds
+// it, at its offset. A pool that no span holds gets a new one over the aligned range around it, cut back at the spans
+// already there (span_get): spans overlap only where such a pool itself lies in an older span, because every span's
+// pages count in amdgpu's GTT use (an overlap twice) and stay pinned. A span whose
+// last pool is gone stays SPAN_KEEP frames for the pools the game makes again at the same addresses, then is freed
+// (span_gc); its dma-buf goes with the memory.
+// A new span pins its pages: about 13 us per MiB the game had touched and 260 us per MiB it had not, which are
+// allocated then (the same RX 6800 XT machine), so a 64 MiB span costs 1-17 ms once. A span over udmabuf's size limit
+// (/sys/module/udmabuf/parameters/size_limit_mb) is not made; such a pool, or one outside the memfd, falls back to a
+// host-pointer import, which a shared mapping's pages refuse on RADV: it gets no GPU buffer (logged).
+typedef struct Span { uint64_t lo, hi; VkDeviceMemory mem; int32_t refs; uint64_t idle_frame; } Span;
+#define SPAN_KEEP 600
+static int dmabuf_on;                  // mirror_mode
+static int dmabuf_exts;                // vk_mem_dmabuf_caps: the device has VK_KHR_external_memory_fd and _dma_buf
+static uint64_t dmabuf_limit;          // udmabuf's size limit, bytes
+static uint64_t span_size = 64ull << 20;
+static PlatMutex span_lock = PLAT_MUTEX_INIT;   // after pool_lock
+static Span **spans;                   // span_lock
+static int nspans, cspans;
+static uint32_t dmabuf_type = UINT32_MAX;   // span_lock: the memory type of the imports, asked at the first one
+static PFN_vkGetMemoryFdPropertiesKHR p_fd_props;
+static int64_t sp_live_bytes;          // span_lock
+static uint64_t sp_made, sp_made_bytes, sp_ns, sp_max_ns, sp_freed, sp_freed_bytes, sp_fail, sp_fallback;   // span_lock, since the log
+static uint64_t sp_fail_all;           // span_lock
+static volatile uint64_t span_frame;   // the frame vk_mem_census last saw
+#ifdef _WIN32
+static void dmabuf_close(int fd) { (void)fd; }
+#else
+#include <unistd.h>
+static void dmabuf_close(int fd) { close(fd); }
+#endif
+
+void vk_mem_dmabuf_caps(int exts) { dmabuf_exts = exts; }
+int vk_mem_dmabuf_on(void) { return dmabuf_on; }
+
+// The memory type of the imports, from the types the driver offers for the dma-buf fd: cached where offered, as guest
+// memory is to the CPU (RADV: the GPU snoops it); not one of AMD's device-coherent or device-uncached types, which the
+// third pass takes only when nothing else is offered. Sets dmabuf_type (UINT32_MAX: none fits); returns the offer.
+static uint32_t dmabuf_pick_type(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int fd) {
+    if (!p_fd_props) p_fd_props = (PFN_vkGetMemoryFdPropertiesKHR)vk_dpa(dev, "vkGetMemoryFdPropertiesKHR");
+    VkMemoryFdPropertiesKHR fp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    uint32_t bits = p_fd_props && p_fd_props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS
+                        ? fp.memoryTypeBits : 0;
+    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    dmabuf_type = UINT32_MAX;
+    for (int w = 0; w < 3 && dmabuf_type == UINT32_MAX; w++)
+        for (uint32_t i = 0; i < mp->memoryTypeCount && dmabuf_type == UINT32_MAX; i++) {
+            VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+            if ((bits >> i & 1) && (w == 0 ? f == (hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : w == 1 ? f == hv : (f & hv) == hv))
+                dmabuf_type = i;
+        }
+    rt_log("mem: dma-bufs of guest memory may have memory types %#x; type %d taken", bits,
+           dmabuf_type == UINT32_MAX ? -1 : (int)dmabuf_type);
+    return bits;
+}
+
+static uint64_t dmabuf_any;            // a page of guest memory a dma-buf can be made of (vk_mem_dmabuf_probe)
+
+// After device creation, before the first pool and before anything asks for the storage mode (vk_mem_lazy_decide): one
+// page of guest memory is made a dma-buf, imported and bound to a buffer, as every pool will be. Any step refused turns
+// the dma-buf imports off for the run: the pools are shadow copies, as with NX2NAVI_DMABUF=0. A refusal later, for
+// one span, leaves its pools without a GPU buffer (span_log counts them), so the probe asks once for what all need.
+static int s_learn, s_check;
+void vk_mem_dmabuf_probe(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int bda) {
+    if (!dmabuf_on) return;
+    const char *no = NULL;
+    long err = 0;
+    uint32_t bits = 0;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    int fd = plat_mem_dmabuf(dmabuf_any, 4096);
+    if (fd < 0) {
+        no = "udmabuf refused a dma-buf of guest memory", err = errno;
+    } else if (bits = dmabuf_pick_type(dev, mp, fd), dmabuf_type == UINT32_MAX) {
+        no = "the device offers no host-visible coherent memory type for it";
+        dmabuf_close(fd);
+    } else {
+        VkImportMemoryFdInfoKHR im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+        VkMemoryAllocateFlagsInfo fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = bda ? (void *)&fi : (void *)&im,
+                                   .allocationSize = 4096, .memoryTypeIndex = dmabuf_type};
+        VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = 4096,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                          (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+                                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkMemoryRequirements req;
+        VkResult r = vkAllocateMemory(dev, &ai, NULL, &mem);
+        if (r != VK_SUCCESS) {
+            mem = VK_NULL_HANDLE;
+            dmabuf_close(fd);   // a failed import leaves the descriptor with us
+            no = "the device refused to import it", err = r;
+        } else if ((r = vkCreateBuffer(dev, &bi, NULL, &buf)) != VK_SUCCESS) {
+            buf = VK_NULL_HANDLE;
+            no = "no buffer for it", err = r;
+        } else if (vkGetBufferMemoryRequirements(dev, buf, &req), !(req.memoryTypeBits >> dmabuf_type & 1)) {
+            no = "a buffer cannot be bound to its memory type", err = (long)req.memoryTypeBits;
+        } else if ((r = vkBindBufferMemory(dev, buf, mem, 0)) != VK_SUCCESS) {
+            no = "binding a buffer to it failed", err = r;
+        }
+    }
+    if (buf) vkDestroyBuffer(dev, buf, NULL);
+    if (mem) vkFreeMemory(dev, mem, NULL);
+    if (fd >= 0) plat_mem_dmabuf_done(dmabuf_any, 4096);
+    if (!no) return;
+    dmabuf_on = 0, shadow_on = 1;
+    s_learn = rt_knob("SHADOW_TABLE_STORES", "0") == 1;
+    s_check = cfg_bool("NX2NAVI_SHADOW_CHECK");
+    rt_log("mem: dma-buf imports off: %s (%ld; memory types %#x): CPU-visible pools are host-visible copies of guest "
+           "memory (shadow storage), as with NX2NAVI_DMABUF=0", no, err, bits);
+}
+
+static void span_fail(const char *what, uint64_t lo, uint64_t hi, long err) {   // span_lock held
+    sp_fail++;
+    if (++sp_fail_all <= 8)
+        rt_log("mem: dma-buf of %#llx+%#llx: %s (%ld)%s", (unsigned long long)lo, (unsigned long long)(hi - lo), what, err,
+               sp_fail_all == 8 ? "; no more of these lines" : "");
+}
+
+// span_lock held: a new span over [lo, hi), NULL when udmabuf or the import refuses it.
+static Span *span_create(VkCtx *c, uint64_t lo, uint64_t hi) {
+    uint64_t t0 = qpc();
+    int fd = plat_mem_dmabuf(lo, hi - lo);
+    if (fd < 0) {
+        span_fail("udmabuf refused it", lo, hi, errno);
+        return NULL;
+    }
+    if (dmabuf_type == UINT32_MAX) {   // every dma-buf of guest memory has the same types: asked once
+        dmabuf_pick_type(c->device, &c->mem_props, fd);
+        if (dmabuf_type == UINT32_MAX) {
+            dmabuf_close(fd);
+            plat_mem_dmabuf_done(lo, hi - lo);
+            span_fail("no host-visible coherent memory type", lo, hi, 0);
+            dmabuf_type = UINT32_MAX - 1;   // not asked again: every span fails
+            return NULL;
+        }
+    }
+    if (dmabuf_type >= c->mem_props.memoryTypeCount) {
+        dmabuf_close(fd);
+        plat_mem_dmabuf_done(lo, hi - lo);
+        return NULL;
+    }
+    VkImportMemoryFdInfoKHR im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                  .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+    // A buffer with device address usage needs memory allocated for device addresses (vk_gpa.c).
+    VkMemoryAllocateFlagsInfo fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = vk_gpa_wanted() ? (void *)&fi : (void *)&im, .allocationSize = hi - lo,
+                               .memoryTypeIndex = dmabuf_type};
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult res = vkAllocateMemory(c->device, &ai, NULL, &mem);
+    Span *s = res == VK_SUCCESS ? calloc(1, sizeof *s) : NULL;
+    if (!s) {
+        if (res == VK_SUCCESS) vkFreeMemory(c->device, mem, NULL);
+        else dmabuf_close(fd);   // a failed import leaves the descriptor with us; a successful one took it
+        plat_mem_dmabuf_done(lo, hi - lo);
+        span_fail("the import failed", lo, hi, res);
+        return NULL;
+    }
+    s->lo = lo, s->hi = hi, s->mem = mem;
+    if (nspans == cspans) grow((void **)&spans, &cspans, sizeof *spans);
+    spans[nspans++] = s;
+    uint64_t ns = qpc() - t0;
+    sp_made++, sp_made_bytes += hi - lo, sp_ns += ns, sp_live_bytes += (int64_t)(hi - lo);
+    if (ns > sp_max_ns) sp_max_ns = ns;
+    return s;
+}
+
+// span_lock held: the span a pool's [lo, hi) is bound into, with a reference for it; NULL when none can be made. al is
+// the alignment the pool's buffer needs inside the span's memory.
+// A new span covers the span_size-aligned range around the pool, less what other spans hold below and above the pool:
+// a pool across an edge of an older span then pins only its own pages twice, not the older span's whole range. With
+// the whole aligned range, Hyrule Field's area loads left 11.5-11.7 GiB of spans counted in amdgpu's GTT use; cut back,
+// 9.5-9.6 GiB, over the same 9.3 GiB of distinct pages, at the same frame rate (RX 6800 XT, 2 pairs).
+static Span *span_get(VkCtx *c, uint64_t lo, uint64_t hi, uint64_t al) {
+    Span *best = NULL;
+    for (int i = 0; i < nspans; i++)
+        if (spans[i]->lo <= lo && hi <= spans[i]->hi && (!best || spans[i]->hi - spans[i]->lo > best->hi - best->lo))
+            best = spans[i];
+    if (!best) {
+        uint64_t a = lo / span_size * span_size, b = (hi + span_size - 1) / span_size * span_size;
+        for (int i = 0; i < nspans; i++) {   // no span holds [lo, hi): none reaches below lo and above hi at once
+            const Span *s = spans[i];
+            if (s->lo < lo && s->hi > a) a = s->hi < lo ? s->hi : lo;
+            if (s->hi > hi && s->lo < b) b = s->lo > hi ? s->lo : hi;
+        }
+        if (al > 1) a = lo - (lo - a) / al * al;   // the pool's offset in the span a multiple of al
+        if (b - a <= dmabuf_limit) best = span_create(c, a, b);
+        // the aligned range may leave the memfd's reservation: the pool's own pages then
+        if (!best && (a != lo || b != hi) && hi - lo <= dmabuf_limit) best = span_create(c, lo, hi);
+    }
+    if (best) best->refs++;
+    return best;
+}
+
+static void span_put(Span *s) {
+    plat_mutex_lock(&span_lock);
+    if (!--s->refs) s->idle_frame = __atomic_load_n(&span_frame, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&span_lock);
+}
+
+// Frees the spans no pool has used for SPAN_KEEP frames (all: every span without a pool). A span without a reference
+// is out of the GPU's work: a pool's reference goes when its record is destroyed, after the GPU is done with it.
+static void span_gc(uint64_t frame, int all) {
+    VkCtx *c = vk_ctx();
+    if (!c || !dmabuf_on) return;
+    Span *gone[64];
+    int ng;
+    do {
+        ng = 0;
+        plat_mutex_lock(&span_lock);
+        for (int i = 0; i < nspans && ng < 64;)
+            if (!spans[i]->refs && (all || frame - spans[i]->idle_frame >= SPAN_KEEP)) {
+                gone[ng++] = spans[i];
+                sp_freed++, sp_freed_bytes += spans[i]->hi - spans[i]->lo;
+                sp_live_bytes -= (int64_t)(spans[i]->hi - spans[i]->lo);
+                spans[i] = spans[--nspans];
+            } else {
+                i++;
+            }
+        plat_mutex_unlock(&span_lock);
+        for (int i = 0; i < ng; i++) {   // the dma-buf goes with the memory; then its pages are let go
+            vkFreeMemory(c->device, gone[i]->mem, NULL);
+            plat_mem_dmabuf_done(gone[i]->lo, gone[i]->hi - gone[i]->lo);
+            free(gone[i]);
+        }
+    } while (ng == 64);
+}
+
+static void span_log(uint64_t frame) {
+    if (!dmabuf_on) return;
+    plat_mutex_lock(&span_lock);
+    int64_t refs = 0;
+    for (int i = 0; i < nspans; i++) refs += spans[i]->refs;
+    rt_log("mem: dma-buf spans at frame %llu: %d live, %.0f MiB, %lld pools in them; since the last line %llu made "
+           "(%.0f MiB, %.1f ms, the longest %.1f ms), %llu freed (%.0f MiB), %llu refused, %llu pools left out",
+           (unsigned long long)frame, nspans, sp_live_bytes / 1048576.0, (long long)refs, (unsigned long long)sp_made,
+           sp_made_bytes / 1048576.0, qpc_ms(sp_ns), qpc_ms(sp_max_ns), (unsigned long long)sp_freed,
+           sp_freed_bytes / 1048576.0, (unsigned long long)sp_fail, (unsigned long long)sp_fallback);
+    sp_made = sp_made_bytes = sp_ns = sp_max_ns = sp_freed = sp_freed_bytes = sp_fail = sp_fallback = 0;
+    plat_mutex_unlock(&span_lock);
+}
+
+// A pool's buffer bound into a span's memory; 0 when no span can be made for it.
+static int import_dmabuf(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    r->import_lo = addr & ~0xfffull;
+    r->import_hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t n = r->import_hi - r->import_lo;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = n,
+                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkResult res = vkCreateBuffer(c->device, &bi, NULL, &r->buf);
+    if (res != VK_SUCCESS) {
+        r->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(c->device, r->buf, &req);
+    uint64_t need = ((req.size > n ? req.size : n) + 0xfff) & ~0xfffull;
+    plat_mutex_lock(&span_lock);
+    Span *s = span_get(c, r->import_lo, r->import_lo + need, req.alignment);
+    int ok = s && (r->import_lo - s->lo) % (req.alignment ? req.alignment : 1) == 0 && (req.memoryTypeBits >> dmabuf_type & 1);
+    if (!s) sp_fallback++;
+    plat_mutex_unlock(&span_lock);
+    if (ok && (res = vkBindBufferMemory(c->device, r->buf, s->mem, r->import_lo - s->lo)) != VK_SUCCESS) ok = 0;
+    if (!ok) {
+        if (s) {
+            rt_log("vk: pool %#llx+%#llx: binding into its dma-buf span failed (alignment %llu, types %#x, %d)",
+                   (unsigned long long)addr, (unsigned long long)size, (unsigned long long)req.alignment,
+                   req.memoryTypeBits, (int)res);
+            span_put(s);
+        }
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        r->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    r->span = s;
+    plat_inc32(&n_imports);
+    return 1;
+}
+
+// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host, or a
+// dma-buf of them: "dma-buf imports" above).
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
+    if (dmabuf_on && import_dmabuf(c, r, addr, size)) return 1;
     if (!p_host_props)
         p_host_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vk_dpa(c->device, "vkGetMemoryHostPointerPropertiesEXT");
     uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
@@ -295,6 +598,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->span) span_put(r->span);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
@@ -357,7 +661,7 @@ static int pool_init(pool_t *p) {
     // The imported pages, or the shadow that stands for them, go into the device address table: shaders that read a
     // pointer from memory reach them there. A shadow in the table is kept up to date for the table's readers whether
     // or not the replay resolves it (vk_mem_shadow_sync).
-    if (r->kind == POOL_IMPORT && (r->mem || r->smap) && r->buf && r->import_hi > r->import_lo) {
+    if (r->kind == POOL_IMPORT && (r->mem || r->span || r->smap) && r->buf && r->import_hi > r->import_lo) {
         r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
         if (r->smap && r->gpa_rec) shadow_table_add(r);
     }
@@ -670,12 +974,14 @@ void vk_mem_snapshot(uint64_t frame) {
 
 void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
+    __atomic_store_n(&span_frame, frame, __ATOMIC_RELAXED);
+    if (dmabuf_on && frame % 60 == 0) span_gc(frame, 0);
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame), up_ts_log(frame), vk_gtl_log(frame, 60);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
-        mirror_log(frame), shadow_log(frame);   // mirror_log also logs the write-watch line
+        mirror_log(frame), shadow_log(frame), span_log(frame);   // mirror_log also logs the write-watch line
     else if (shadow_check_on() && frame % 60 == 0)
         shadow_log(frame);   // NX2NAVI_SHADOW_CHECK: the shadow lines at that rate without the perf trace
     if (frame == 1200) {   // loading is over: the first window starts here
@@ -1305,8 +1611,8 @@ static uint64_t s_wb_seen, s_wb_ticks;            // shadow_lock: bytes the fenc
 static uint64_t s_q_ticks;                        // shadow_lock: the copy-ins' write-watch queries
 static int wb_no_reup(void);
 // Pages a shader stores into through the device address table. The two switches are read in mirror_mode.
-static int s_learn;                               // NX2NAVI_SHADOW_TABLE_STORES: such pages get a base copy and a write-back
-static int s_check;                               // NX2NAVI_SHADOW_CHECK: the counts below marked "check"
+// s_learn (NX2NAVI_SHADOW_TABLE_STORES: such pages get a base copy and a write-back) and s_check (NX2NAVI_SHADOW_CHECK:
+// the counts below marked "check") are defined with vk_mem_dmabuf_probe, which may turn shadow storage on late.
 static PoolRec **tpools;                          // shadow_lock: the pools that have such pages
 static int ntpools, ctpools;
 static uint64_t s_tab_pages;                      // shadow_lock: such pages, all pools
@@ -2200,6 +2506,40 @@ static void mirror_mode(int discrete, int nvidia_own) {
     // memory (vk_gpa.c). The pools stay imports unless NX2NAVI_SHADOW asks for the copies. The open driver for the same
     // cards keeps the copies: it is not measured. The AppImage's play.sh has set the same for this driver since 0.6.0.
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !nvidia_own;
+    // Guest memory a memfd's (NX2NAVI_DMABUF, platform/linux.c): the pools are dma-buf imports ("dma-buf imports"),
+    // whatever the driver, unless NX2NAVI_SHADOW=1 asks for the copies. A device that cannot import dma-bufs keeps the
+    // copies: a shared mapping's pages are no host-pointer import on RADV.
+    uint64_t lim = 0;
+    const char *dmwhy = "";
+    static char small[200];
+    if (plat_mem_dmabuf_ok(&lim, &dmabuf_any, &dmwhy)) {
+        int forced = sh && *sh && strcmp(sh, "0");
+        // The game's largest pools take about 300 MiB, each in one dma-buf: below 1 GiB (the module's default is 64 MB)
+        // some would get none, so the copies stay.
+        if (lim < (1ull << 30))
+            snprintf(small, sizeof small, "udmabuf's size_limit_mb is %llu, below the 1024 a pool of the game may need "
+                     "(/sys/module/udmabuf/parameters/size_limit_mb)", (unsigned long long)(lim >> 20));
+        dmabuf_on = dmabuf_exts && !forced && lim >= (1ull << 30);
+        shadow_on = !dmabuf_on;
+        dmabuf_limit = lim;
+        const char *mbs = cfg_get("NX2NAVI_DMABUF_MB");
+        int mb = mbs && *mbs ? atoi(mbs) : 64;
+        span_size = (uint64_t)(mb > 0 ? mb : 64) << 20;
+        if (span_size > dmabuf_limit) span_size = dmabuf_limit & ~0xfffull;
+        if (span_size < (2ull << 20)) span_size = 2ull << 20;
+        if (dmabuf_on)
+            rt_log("mem: guest memory is a memfd's: CPU-visible pools are imported as dma-bufs of it, in spans of %llu MiB "
+                   "(NX2NAVI_DMABUF_MB; udmabuf's limit %llu MiB)", (unsigned long long)(span_size >> 20),
+                   (unsigned long long)(dmabuf_limit >> 20));
+        else
+            rt_log("mem: guest memory is a memfd's, but its pools get shadow copies: %s",
+                   forced ? "NX2NAVI_SHADOW asks for them"
+                   : !dmabuf_exts ? "the device cannot import dma-bufs (VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf)"
+                                  : small);
+    } else if (*dmwhy) {
+        rt_log("mem: guest memory is not a memfd's (NX2NAVI_DMABUF): %s: CPU-visible pools are %s, as with NX2NAVI_DMABUF=0", dmwhy,
+               shadow_on ? "host-visible copies of guest memory (shadow storage)" : "host-pointer imports");
+    }
 #endif
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
                           sh && *sh ? " (NX2NAVI_SHADOW)" : "");
@@ -5070,6 +5410,7 @@ void vk_mem_shutdown(void) {
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;
     plat_mutex_unlock(&pool_lock);
+    span_gc(0, 1);   // every pool is gone: so are the spans' references
     plat_mutex_lock(&gen_lock);
     for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL, free(cgen_chunk[i]), cgen_chunk[i] = NULL;
     plat_mutex_unlock(&gen_lock);
