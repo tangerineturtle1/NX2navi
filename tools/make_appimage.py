@@ -53,6 +53,7 @@ NX2navi $(cat "$KIT/VERSION") - build Ocarina of Time (Switch 2, game 1.1.1) nat
   $(basename "${APPIMAGE:-$0}")                                     a window to install, update and play (on a desktop)
   $(basename "${APPIMAGE:-$0}") <your game.nup> [game folder]       build (default folder: ~/Games/Ocarina)
   $(basename "${APPIMAGE:-$0}") --check <your game.nup>             only check the dump's version
+  $(basename "${APPIMAGE:-$0}") --progress <game.nup> <game folder> build, printing "progress 0.4 text" lines
   $(basename "${APPIMAGE:-$0}") --make-game <make_game.py options>  run tools/make_game.py directly
 
 The game folder then holds 'ocarina' and 'play.sh', which starts it. Nothing of the game is in this file:
@@ -65,6 +66,14 @@ if [ $# -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     exec "$PY" -I "$KIT/tools/appimage_gui.py" --apprun "$HERE/AppRun" --icon "$HERE/nx2navi.png"
 fi
 case "$1" in ""|-h|--help) usage; exit 0 ;; esac
+
+# --progress: the same build, with a "progress <0 to 1> <text>" line as it goes instead of the "@@" events, for a
+# program that runs it without a window (tools/progress_lines.py). The exit code is the build's.
+if [ "$1" = --progress ]; then
+    shift
+    "$HERE/AppRun" --events "$@" | "$PY" -I "$KIT/tools/progress_lines.py"
+    exit "${PIPESTATUS[0]}"
+fi
 
 # --events: the window's mode. make_game.py prints its "@@" progress lines (--events), and the steps around it print
 # theirs (deps, dlss) in the same form.
@@ -251,6 +260,7 @@ def main():
     (app / 'AppRun').write_text(apprun, encoding='utf-8')
     (app / 'AppRun').chmod(0o755)
     (app / 'nx2navi.desktop').write_text(DESKTOP, encoding='utf-8')
+    shutil.copy2(ROOT / 'recomplauncher.json', app / 'recomplauncher.json')   # at the AppDir root, where launchers read it
     from PIL import Image   # the window icon of runtime/nx2navi.ico, as PNG
     with Image.open(ROOT / 'runtime' / 'nx2navi.ico') as ico:
         ico.size = max(ico.ico.sizes())

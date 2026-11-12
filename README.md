@@ -2,6 +2,8 @@
 
 # NX2navi
 
+<a href="https://recomplauncher.com/game/nx2navi"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 **Join the official NX2navi update discord server: https://discord.com/invite/uf6gSrsPpq** 
 
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game

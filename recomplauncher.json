@@ -1,0 +1,85 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "NX2navi",
+  "repo": "tangerineturtle1/NX2navi",
+  "game": {
+    "kind": "iso",
+    "label": "Your own .nup dump of The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, game version 1.1.1.",
+    "check": { "nup_build_id": "e0f3ccfaf50065ae4ea01eb5aeb13b1a" }
+  },
+  "start": {
+    "program": ["game/play.sh"]
+  },
+  "prepare": {
+    "program": ["NX2navi-Linux-x86_64.AppImage"],
+    "args": ["--progress", "{game}", "{install}/game"],
+    "label": "Building the game from your dump",
+    "timeout": 7200
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/game/nx2navi.ini" }]
+    }
+  ],
+  "folders": {
+    "saves": [{ "path": "{install}/game/profile" }],
+    "logs": [{ "path": "{install}/game/logs" }]
+  },
+  "saves": [
+    "{install}/game/profile/save",
+    "{install}/game/profile/account.uid",
+    "{install}/game/nx2navi.ini"
+  ],
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window",
+      "help": "Fullscreen covers the monitor the game opens on. F11 switches in the game.",
+      "choices": [
+        { "label": "Windowed", "set": { "fullscreen": "0" } },
+        { "label": "Fullscreen", "set": { "fullscreen": "1" } }
+      ],
+      "defaults": { "fullscreen": "0" }
+    },
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "help": "The height the game is drawn at. 1440p is the game's own; 1080p is lighter on the graphics card.",
+      "choices": [
+        { "label": "1080p", "set": { "game_res": "1080" } },
+        { "label": "1440p", "set": { "game_res": "1440" } },
+        { "label": "1800p", "set": { "game_res": "1800" } },
+        { "label": "4K", "set": { "game_res": "2160" } }
+      ],
+      "defaults": { "game_res": "1440" }
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame rate",
+      "help": "60 is what the game was made for. Display follows your monitor's refresh rate, which is experimental above 60.",
+      "choices": [
+        { "label": "30", "set": { "fps_limit": "30" } },
+        { "label": "60", "set": { "fps_limit": "60" } },
+        { "label": "Display", "set": { "fps_limit": "display" } }
+      ],
+      "defaults": { "fps_limit": "60" }
+    },
+    {
+      "id": "filtering",
+      "label": "Texture filtering",
+      "help": "Keeps the ground and walls sharp at shallow angles.",
+      "choices": [
+        { "label": "Game's own", "set": { "aniso": "game" } },
+        { "label": "4x", "set": { "aniso": "4" } },
+        { "label": "16x", "set": { "aniso": "16" } }
+      ],
+      "defaults": { "aniso": "game" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "The game's save and profile folder.", "open": "saves" }
+  ]
+}
