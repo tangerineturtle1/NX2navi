@@ -123,6 +123,30 @@ static void nvidia_cache_beside_exe(void) {
 }
 #endif
 
+// Mesa's Vulkan drivers on Linux (RADV, ANV, NVK) keep timeline semaphores as kernel sync objects, which cannot wait
+// for a value not submitted yet. Their queues therefore submit on the calling thread and use a thread of the queue's
+// own only for a submission that waits on such a value. Every other vkQueueSubmit2, the command stream's checks and
+// the kernel's ioctl, runs on the replaying thread, once for every part the replay hands to the queue early (vk_exec.c
+// maybe_split). MESA_VK_ENABLE_SUBMIT_THREAD=1 sends every submission to the queue's thread: in Kokiri Forest on an
+// RX 6800 XT (Mesa 26.2) the replay took 13.9 ms a frame with it and 15.0 ms without. NX2NAVI_SUBMIT_THREAD (default
+// 1 on Linux, 0 on Windows) sets it unless the environment already sets it; 0 leaves the driver's own choice. Drivers
+// that do not read the variable ignore it. vk_driver_cache_env calls this before any thread can load the driver.
+static const char *submit_thread_why;   // create_device logs it on a Mesa driver
+
+static void mesa_submit_thread(void) {
+    char cur[16];
+    if (plat_getenv("MESA_VK_ENABLE_SUBMIT_THREAD", cur, sizeof cur)) {
+        submit_thread_why = "MESA_VK_ENABLE_SUBMIT_THREAD is set in the environment";
+        return;
+    }
+    if (!cfg_bool("NX2NAVI_SUBMIT_THREAD")) {
+        submit_thread_why = "NX2NAVI_SUBMIT_THREAD=0: the driver's own choice";
+        return;
+    }
+    plat_setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "1");
+    submit_thread_why = "every one on the queue's own thread (NX2NAVI_SUBMIT_THREAD=0 leaves the driver's own choice)";
+}
+
 // A driver may read these variables when it loads, and a thread can load the Vulkan driver before create_instance:
 // widescreen.c's wide_init asks for the monitor's size (fullscreen with a monitor chosen and the picture at the
 // window's size), and SDL's load of the Vulkan library there lists the instance extensions, which loads the drivers,
@@ -134,6 +158,7 @@ void vk_driver_cache_env(void) {
     if (done) return;
     done = 1;
     mesa_cache_beside_exe();
+    mesa_submit_thread();
 #ifdef __linux__
     nvidia_cache_beside_exe();
 #endif
@@ -507,6 +532,7 @@ static int create_device(void) {
     VkResult r = vk_dlssg_create_device(g_vk.instance, g_vk.phys, &di, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
+    if (submit_thread_why && vk_caps.mesa) rt_log("vk: queue submissions: %s", submit_thread_why);
     vk_dlssg_device_ready(g_vk.phys, g_vk.device);
     if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
         vk_dpa = vk_dlssg_dpa();

@@ -89,6 +89,10 @@
 # recorder_core = 0
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).
 # submit_batch = 4
+# Mesa's Vulkan drivers (RADV, ANV, NVK): every submission to the GPU queue goes to a thread of the queue's own, so its
+# kernel call leaves the thread that prepares the frames, 0 or 1. Default: on (Linux), off (Windows). 0 leaves the
+# driver's own choice. Unused when MESA_VK_ENABLE_SUBMIT_THREAD is set.
+# submit_thread = 1
 # Occlusion query results are read back from the video card in batches, 0 or 1. Default: on. 0 reads each query with a
 # call of its own, as before, which on AMD's Windows driver held every frame's "GPU done" back by about 4 ms.
 # oq_batch = 1
