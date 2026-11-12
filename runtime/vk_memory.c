@@ -4507,6 +4507,17 @@ static void free_staging(VkCtx *c, Batch *b) {
     b->bytes = 0;
 }
 
+// An upload batch holding this much staging (its buffers and arena chunks) is submitted at the outermost vk_upload_end,
+// whatever NX2NAVI_UPLOAD_BATCH_MB says (the staging pool's comment, below).
+#define STG_FLUSH (64ull << 20)
+
+// cmd_lock held: the staging bytes of batch b (its buffers and arena chunks).
+static uint64_t batch_staging(const Batch *b) {
+    uint64_t n = (uint64_t)b->nchunk * ARENA_CHUNK;
+    for (int i = 0; i < b->nstg; i++) n += b->stg[i].size;
+    return n;
+}
+
 // The cached staging buffer that fits n with the least waste: at most four times the request, so a small upload does not
 // take a block-sized buffer another upload wanted.
 static int staging_cache_take(VkCtx *c, VkDeviceSize n, Staging *out, void **map) {
@@ -4676,9 +4687,11 @@ VkCommandBuffer vk_upload_begin(void) {
     return open_b.cb;
 }
 
-// NX2NAVI_UPLOAD_BATCH_MB (256 with low_end_gpu = 1; 0, the default, = no limit): once the open batch's staging buffers hold that much, the
-// outermost vk_upload_end submits it. A save load made thousands of textures between two replay submissions, and every
-// one of them went into one batch: about 1.5 GB of raw ASTC blocks plus the decoder's work in a single submission,
+// NX2NAVI_UPLOAD_BATCH_MB (256 with low_end_gpu = 1; 0, the default, = no limit of its own): once the open batch's
+// staging buffers hold that much, the outermost vk_upload_end submits it. It does so too once the batch's staging
+// reaches STG_FLUSH, so that an area load's staging stays inside the staging pool's blocks (the staging pool's
+// comment). A save load made thousands of textures between two replay submissions, and every one of them went into
+// one batch: about 1.5 GB of raw ASTC blocks plus the decoder's work in a single submission,
 // which AMD's 23.10 driver on an RX 580 refused with VK_ERROR_OUT_OF_DEVICE_MEMORY. Submitted early, a batch still
 // precedes the replay submission that uses its textures (the queue keeps order), and its staging is freed as it retires.
 static uint64_t upload_cap = UINT64_MAX - 1;   // UINT64_MAX - 1: not read yet
@@ -4690,9 +4703,10 @@ void vk_upload_end(void) {
         long mb = e && *e ? atol(e) : 0;
         upload_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
         if (mb > 0) rt_log("vk: upload batches submitted early above %ld MiB of staging (NX2NAVI_UPLOAD_BATCH_MB)", mb);
-        else rt_log("vk: upload batches not limited (NX2NAVI_UPLOAD_BATCH_MB=0)");
+        else rt_log("vk: upload batches submitted early above %llu MiB of staging only, the staging pool's limit "
+                    "(NX2NAVI_UPLOAD_BATCH_MB=0)", (unsigned long long)(STG_FLUSH >> 20));
     }
-    if (open_active && open_b.bytes >= upload_cap && cmd_lock.depth == 1) {
+    if (open_active && cmd_lock.depth == 1 && (open_b.bytes >= upload_cap || batch_staging(&open_b) >= STG_FLUSH)) {
         n_early++;
         if (n_early <= 4 || !(n_early & (n_early - 1)))
             rt_log("vk: upload batch submitted early with %.0f MiB of staging in %d buffers and %d arena chunks (%llu so far)",
@@ -4736,10 +4750,72 @@ void vk_mem_oom_report(const char *what, VkResult r) {
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
 // took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
 // pool.
+// The pool's blocks are also all the staging an area load gets (stg_create). Entering Hyrule Field uploads about 3,100
+// textures (1.2 GiB) in one frame; each upload kept its staging until its batch completed, so that frame made 221 new
+// staging buffers, 1.1 GiB of new host memory. On Linux every new block is a fresh kernel allocation that asks for
+// 2-4 MiB pages first, and with the free 2 MiB blocks used up the kernel compacted memory for each: on an RX 6800 XT
+// (amdgpu, 32 GB) the load frame then took 2.4 to 4.7 s instead of 0.4, the texture thread in the kernel all along,
+// the compaction scanning millions of pages per half second. Now a load stays inside the blocks made at boot: a
+// batch whose staging reaches STG_FLUSH is submitted at the end of that upload (vk_upload_end), and a staging buffer that
+// does not fit the blocks takes the room of the kept buffers and idle arena chunks, then of the batches in flight,
+// which it waits for in order (a wait covers all the queue's work submitted ahead of that batch, tens of ms on a heavy
+// frame, with cmd_lock held). Only when none of that makes room (the open batch's own staging, staging buffers their
+// callers hold, the blocks' fragmentation) does the pool grow by a block, and the log says so.
+// A discrete GPU keeps STG_MIN_BLOCKS blocks; an integrated one, whose host memory is the machine's RAM and where low
+// memory ended the game before (vk_mem_give_back), keeps STG_MIN_BLOCKS_UMA, and its loads wait for batches sooner.
 #define STG_BLOCK (64ull << 20)
-#define STG_MIN_BLOCKS 2
+#define STG_MIN_BLOCKS 4
+#define STG_MIN_BLOCKS_UMA 2
 static VmaPool stg_pool;
 static int stg_pool_tried;
+static uint64_t stg_room_cache, stg_room_wait, stg_room_new;   // cmd_lock: how stg_create found room (rt_log below)
+
+// vmaCreateBuffer of a staging buffer (*ai names stg_pool) inside the pool's blocks: when they are full, the kept
+// staging buffers and the arena's idle chunks go, then the oldest batch in flight is waited for and retired, until the
+// buffer fits. chunk: the buffer is an arena chunk, and VK_INCOMPLETE says that a retired batch gave chunks back to
+// arena_free, to take one of those instead. Without a batch to wait for (or once the device is lost) the pool grows.
+static VkResult stg_create(VkCtx *c, const VkBufferCreateInfo *bi, const VmaAllocationCreateInfo *ai, VkBuffer *b,
+                           VmaAllocation *a, VmaAllocationInfo *info, int chunk) {
+    VmaAllocationCreateInfo in = *ai;
+    in.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+    plat_rmutex_lock(&cmd_lock);
+    VkResult r;
+    for (;;) {
+        if ((r = vmaCreateBuffer(c->vma, bi, &in, b, a, info)) == VK_SUCCESS) break;
+        if (stg_ncache || narena_free) {
+            for (int i = 0; i < stg_ncache; i++) vmaDestroyBuffer(c->vma, stg_cache[i].buf, stg_cache[i].alloc);
+            for (int i = 0; i < narena_free; i++) vmaDestroyBuffer(c->vma, arena_free[i].buf, arena_free[i].alloc);
+            stg_ncache = 0, stg_cache_bytes = 0, narena_free = 0;
+            stg_room_cache++;
+            continue;
+        }
+        if (ninflight && !vk_device_is_lost()) {
+            int before = ninflight;
+            VkResult w = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            if (w != VK_SUCCESS) {
+                vk_device_lost_check(w, "the wait for an upload batch");
+                rt_fatal("vk: the wait for an upload failed (%d)", (int)w);
+            }
+            retire(c, 0);
+            stg_room_wait++;
+            if (chunk && narena_free) {
+                r = VK_INCOMPLETE;
+                break;
+            }
+            if (ninflight < before) continue;
+        }
+        r = vmaCreateBuffer(c->vma, bi, ai, b, a, info);
+        if (r == VK_SUCCESS && stg_room_new++ < 16)
+            rt_log("vk: the staging pool grew by a block for a buffer of %.1f MiB (the open upload batch holds %.0f MiB, "
+                   "%d batches in flight; room found so far by dropping kept buffers %llu times, by waiting for a batch "
+                   "%llu times; buffers callers hold and the blocks' fragmentation also take room)",
+                   bi->size / 1048576.0, open_active ? batch_staging(&open_b) / 1048576.0 : 0.0, ninflight,
+                   (unsigned long long)stg_room_cache, (unsigned long long)stg_room_wait);
+        break;
+    }
+    plat_rmutex_unlock(&cmd_lock);
+    return r;
+}
 
 // A staging buffer the driver refused (vk_staging): the buffers kept for reuse go back to the driver before one more
 // try, with the headroom's spare blocks (vk_headroom_release): the staging cache, the arena's free chunks and the
@@ -4787,13 +4863,14 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
         plat_rmutex_lock(&cmd_lock);
         if (!stg_pool_tried) {
             uint32_t type;
-            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
+            int keep = c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? STG_MIN_BLOCKS : STG_MIN_BLOCKS_UMA;
+            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = (size_t)keep};
             if (vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &aci, &type) == VK_SUCCESS) {
                 pi.memoryTypeIndex = type;
                 if (vmaCreatePool(c->vma, &pi, &stg_pool) != VK_SUCCESS) stg_pool = NULL;
             }
             rt_log("vk: staging pool %s (%d blocks of %llu MiB kept)", stg_pool ? "created" : "unavailable: default pool",
-                   STG_MIN_BLOCKS, (unsigned long long)(STG_BLOCK >> 20));
+                   keep, (unsigned long long)(STG_BLOCK >> 20));
             __atomic_store_n(&stg_pool_tried, 1, __ATOMIC_RELEASE);
         }
         plat_rmutex_unlock(&cmd_lock);
@@ -4812,7 +4889,7 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VmaAllocationInfo info;
     VkBuffer b;
     VmaAllocation a;
-    VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+    VkResult r = aci.pool ? stg_create(c, &bi, &aci, &b, &a, &info, 0) : vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
     if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && aci.pool) {
         // The staging pool can grow only in 64 MiB blocks of its one memory type. A smaller allocation may
         // still fit in a default block or another host-visible type. Keep the same mapping requirements.
@@ -4861,23 +4938,27 @@ void *vk_staging_at(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off) {
     VkDeviceSize at = (open_b.chunk_used + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1);
     if (!open_b.nchunk || at + size > ARENA_CHUNK) {
         StgChunk k;
-        if (narena_free) {
-            k = arena_free[--narena_free];
-        } else {
+        VkResult r = VK_INCOMPLETE;
+        if (!narena_free) {
             VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ARENA_CHUNK,
                                      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
             VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                            .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                                                     VMA_ALLOCATION_CREATE_MAPPED_BIT};
-            if (stg_pool) aci.pool = stg_pool;   // half of a staging block (STG_BLOCK)
+            if (stg_pool) aci.pool = stg_pool;   // an eighth of a staging block (STG_BLOCK)
             VmaAllocationInfo info;
-            if (vmaCreateBuffer(c->vma, &bi, &aci, &k.buf, &k.alloc, &info) != VK_SUCCESS)
-                return vk_staging(size, buf, NULL);
-            k.map = info.pMappedData;
-            vk_texstat_add(VK_TS_STG_NEW, 1, ARENA_CHUNK);
-            if (arena_made++ < 16) rt_log("vk: staging arena chunk %llu made (%llu MiB)", (unsigned long long)arena_made,
-                                          (unsigned long long)(ARENA_CHUNK >> 20));
+            r = stg_pool ? stg_create(c, &bi, &aci, &k.buf, &k.alloc, &info, 1)
+                         : vmaCreateBuffer(c->vma, &bi, &aci, &k.buf, &k.alloc, &info);
+            if (r != VK_SUCCESS && r != VK_INCOMPLETE) return vk_staging(size, buf, NULL);
+            if (r == VK_SUCCESS) {
+                k.map = info.pMappedData;
+                vk_texstat_add(VK_TS_STG_NEW, 1, ARENA_CHUNK);
+                if (arena_made++ < 16)
+                    rt_log("vk: staging arena chunk %llu made (%llu MiB)", (unsigned long long)arena_made,
+                           (unsigned long long)(ARENA_CHUNK >> 20));
+            }
         }
+        if (r == VK_INCOMPLETE) k = arena_free[--narena_free];   // one already free, or one a waited-for batch gave back
         if (open_b.nchunk == open_b.cap_chunk) grow((void **)&open_b.chunk, &open_b.cap_chunk, sizeof *open_b.chunk);
         open_b.chunk[open_b.nchunk++] = k;
         open_b.bytes += ARENA_CHUNK;   // the staging the batch holds (upload_cap)
