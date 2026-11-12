@@ -2800,6 +2800,97 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+
+// Optional private modules generated from exact local inputs by projective_recipe.py.
+// Mode 1 changes a complete coordinate pair; mode 2 guards one absorption material.
+static const char *water_projective_dir(void) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    static int checked;
+    static const char *dir;
+    plat_mutex_lock(&lock);
+    if (!checked) {
+        checked = 1;
+        const char *candidate = cfg_get("NX2NAVI_SPV_OVERRIDE");
+        if (candidate && *candidate) dir = candidate;
+    }
+    const char *result = dir;
+    plat_mutex_unlock(&lock);
+    return result;
+}
+
+static int water_local_module_exists(uint64_t hash) {
+    const char *dir = water_projective_dir();
+    if (!dir) return 0;
+    char path[700];
+    int n = snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)hash);
+    return n > 0 && n < (int)sizeof path && plat_file_exists(path);
+}
+
+static int water_projective_pair(const VkPipeState *s) {
+    if (!P.indep || !s->fs || !water_projective_dir()) return 0;
+    uint64_t vn = 0, fn = 0;
+    const uint32_t *f = gfx_shader_spirv(s->fs, &fn);
+    if (!f) return 0;
+    uint64_t fh = fnv(FNV0, f, (size_t)fn * 4);
+    // The absorption correction is independent of the coordinate pair.
+    if ((fh == 0xe73dfc0f4c556df8ull && water_local_module_exists(0xabfccea256824a78ull)) ||
+        (fh == 0x061318799d885bcfull && water_local_module_exists(0xb3cec6d0d78ac25aull))) return 2;
+    if (!s->vs) return 0;
+    const uint32_t *v = gfx_shader_spirv(s->vs, &vn);
+    if (!v) return 0;
+    uint64_t vh = fnv(FNV0, v, (size_t)vn * 4);
+    if (vh == 0xf6d753852c47b0deull && fh == 0xa39c3d09241441faull)
+        return water_local_module_exists(vh) && water_local_module_exists(0x3d3a316ab4da3bbaull);
+    if (vh == 0x8d83e3705d790fedull && fh == 0x3c20cb98dbaeb257ull)
+        return water_local_module_exists(vh) && water_local_module_exists(0x216bd323c6b48ee2ull);
+    return 0;
+}
+
+static VkShaderModule water_pair_module(const uint32_t *w, uint64_t n, int early, int mode) {
+    if (!mode) return make_module(w, n, early);
+    uint64_t h = fnv(FNV0, w, (size_t)n * 4);
+    int stage = -1;
+    if (mode == 2) {
+        // Vertex modules and unrelated fragment translations remain original.
+        if (h != 0xabfccea256824a78ull && h != 0xb3cec6d0d78ac25aull)
+            return make_module(w, n, early);
+        stage = 4;
+    } else {
+        if (h == 0xf6d753852c47b0deull || h == 0x8d83e3705d790fedull) stage = 0;
+        if (h == 0x3d3a316ab4da3bbaull || h == 0x216bd323c6b48ee2ull) stage = 4;
+        if (stage < 0) rt_fatal("water projective: paired module changed; refusing a partial recipe");
+    }
+    const char *dir = water_projective_dir();
+    if (!dir) rt_fatal("water projective: recipe directory unavailable");
+    char path[700];
+    int path_len = snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)h);
+    if (path_len < 0 || path_len >= (int)sizeof path) rt_fatal("water projective: module path too long");
+    FILE *file = fopen(path, "rb");
+    if (!file) rt_fatal("water projective: local module missing: %s", path);
+    fseek(file, 0, SEEK_END);
+    long bytes = ftell(file);
+    rewind(file);
+    uint32_t *code = bytes >= 20 && bytes <= 1048576 && !(bytes & 3) ? malloc((size_t)bytes) : NULL;
+    if (!code || fread(code, 1, (size_t)bytes, file) != (size_t)bytes)
+        rt_fatal("water projective: invalid local module: %s", path);
+    fclose(file);
+    if (code[0] != 0x07230203u) rt_fatal("water projective: invalid SPIR-V header");
+    int entries = 0;
+    for (size_t at = 5; at < (size_t)bytes / 4;) {
+        uint32_t len = code[at] >> 16, op = code[at] & 65535;
+        if (!len || at + len > (size_t)bytes / 4) rt_fatal("water projective: malformed instruction");
+        if (op == 15) {
+            if (len < 4 || code[at + 1] != (uint32_t)stage) rt_fatal("water projective: wrong module stage");
+            entries++;
+        }
+        at += len;
+    }
+    if (entries != 1) rt_fatal("water projective: unexpected entry-point count");
+    VkShaderModule result = make_module(code, (uint64_t)bytes / 4, early);
+    free(code);
+    return result;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
@@ -2853,9 +2944,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw, !k->a2c), fm_hash = mm_hash;
+        if (fcode) fm = water_pair_module(fcode, fw, !k->a2c, water_projective_pair(s)), fm_hash = mm_hash;
     }
-    vm = make_module(vcode, vw, 0), vm_hash = mm_hash;
+    vm = water_pair_module(vcode, vw, 0, water_projective_pair(s)), vm_hash = mm_hash;
     free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm) || (mesh && s->ts && !tm)) goto out;
@@ -3003,8 +3094,8 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
-typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
+typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, water_projective; GfxShaderIo fin[32]; } PrKey;
+typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, water_projective; const GfxShader *fs; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, fbl, pad[2]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;   // fbl: GKey.fbl, the feedback loop flags of the library (gpl_feedback)
 
@@ -3079,7 +3170,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         sw = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(vcode, vw, 0))) goto out;
+        if (!(m = water_pair_module(vcode, vw, 0, pk->water_projective))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -3096,7 +3187,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d);
-            if (!patched || !(m = make_module(patched, fw, !k->a2c))) goto out;
+            if (!patched || !(m = water_pair_module(patched, fw, !k->a2c, ((const FsKey *)key)->water_projective))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -3301,6 +3392,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
     memset(fk, 0, sizeof *fk);
     fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
+    pk->water_projective = fk->water_projective = (uint8_t)water_projective_pair(s);
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
     ok->blend_en = k->blend_en, ok->fbl = k->fbl, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
