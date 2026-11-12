@@ -1,38 +1,24 @@
-// AMD FSR 4 (FSR Upscaling 4.x, the machine-learned upscaler) through the libraries of AMD's FSR SDK 2.4:
-// amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to the executable, loaded at run time. The SDK's
-// headers are in third_party/ffx_sdk (MIT), at the paths they have in the SDK. FSR 3.1 and frame generation stay with
-// vk_ffx.cpp and the library of SDK 1.1.4: the two sets of headers name the same types with other layouts, so nothing
-// of the API crosses between the two files, and vk_ffx.cpp's vk_ffx_upscale calls in here first.
+// AMD FSR 4 (FSR Upscaling 4.x, the machine-learned upscaler). On Windows, through AMD's own FSR SDK 2.4:
+// amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to the executable, loaded at run time. On
+// Linux, through a single amd_fidelityfx_upscaler_vk.so next to the executable that answers the same five ffx-api
+// entry points itself (no separate loader step), AMD's own libraries being Windows-only. The SDK's headers are in
+// third_party/ffx_sdk (MIT), at the paths they have in the SDK. FSR 3.1 and frame generation stay with vk_ffx.cpp and
+// the library of SDK 1.1.4: the two sets of headers name the same types with other layouts, so nothing of the API
+// crosses between the two files, and vk_ffx.cpp's vk_ffx_upscale calls in here first.
 //
-// The loader answers which upscaler versions it can run on a device (ffxQueryDescGetVersions with the device given):
-// 4.1.2, 3.1.6 and 2.3.4 on a Radeon the ML upscaler supports (RX 6000, 7000 and 9000 cards and some Ryzen APUs, with
-// AMD's driver 26.10.1 or newer on Windows), 3.1.6 and 2.3.4 on any other. FSR 4 runs only where a 4.x version is
-// listed, and its contexts are made with that version asked for by its id, so the loader cannot hand out another.
-// Where it is not listed, or a context or a dispatch fails, vk_ffx.cpp's FSR 3.1 serves the frame as before.
+// The loader (Windows) or the library itself (Linux) answers which upscaler versions it can run on a device
+// (ffxQueryDescGetVersions with the device given): 4.1.2, 3.1.6 and 2.3.4 on a Radeon the ML upscaler supports
+// (RX 6000, 7000 and 9000 cards and some Ryzen APUs, with AMD's driver 26.10.1 or newer on Windows), 3.1.6 and 2.3.4
+// on any other. FSR 4 runs only where a 4.x version is listed, and its contexts are made with that version asked for
+// by its id. Where it is not listed, or a context or a dispatch fails, vk_ffx.cpp's FSR 3.1 serves the frame as before.
 //
 // The inputs are the ones FSR 3.1 takes (vk_ffx.cpp): the scene's light target in linear HDR, its D32F depth (not
 // inverted, the far plane at infinity) and the camera motion vectors in render pixels from this frame to the previous
 // one. FSR 4 needs no reactive or transparency mask.
 #define VK_FFX_NO_API   // vk_ffx.h: without the API declarations of the other set of headers
-#ifndef _WIN32
-// AMD publishes the SDK's libraries for Windows only: in any other build FSR 4 is never listed, vk_ffx.cpp's FSR 3.1
-// path is all there is, and the SDK's headers are not read.
-extern "C" {
-#include "vk.h"
-#include "vk_ffx.h"
-}
-extern "C" int vk_ffx4_available(void) { return 0; }
-extern "C" const char *vk_ffx4_name(void) { return "AMD FSR 4"; }
-extern "C" int vk_ffx4_upscale(VkCommandBuffer, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *,
-                               float, float, int, float, const VkFfxCamera *) {
-    return 0;
-}
-extern "C" void vk_ffx4_release(void) {}
-extern "C" int vk_ffx4_failed(void) { return 0; }
-extern "C" void vk_ffx4_retry(void) {}
-extern "C" void vk_ffx4_trim(uint64_t) {}
-#else
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <atomic>
 #include <mutex>
 #include <stdbool.h>
@@ -83,6 +69,7 @@ void message(uint32_t type, const wchar_t *msg) {
     if (told++ < 40) rt_log("ffx4: %s %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error:" : "warning:", s);
 }
 
+#ifdef _WIN32
 // a library of the SDK next to the executable; 0 when the path does not fit
 int beside_exe(const char *name, char *path, size_t size) {
     DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
@@ -94,9 +81,21 @@ int file_there(const char *path) {
     DWORD attr = GetFileAttributesA(path);
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
+#else
+// as vk_ffx.cpp's library_path: a library next to the executable; path[0] is 0 when the executable's path is unknown
+int beside_exe(const char *name, char *path, size_t size) {
+    char *cut = plat_exe_path(path, size - 64) ? plat_last_sep(path) : NULL;
+    if (cut) snprintf(cut + 1, 64, "%s", name);
+    else path[0] = 0;
+    return path[0] != 0;
+}
+
+int file_there(const char *path) { return plat_file_exists(path); }
+#endif
 
 int g_loader = -1;   // under g_lock: -1 not tried, 0 the loader is not there or does not load, 1 its entry points are in A
 
+#ifdef _WIN32
 // Loads the SDK's loader from beside the executable. Under g_lock, once the device exists (-1 before).
 int load(void) {
     if (g_loader >= 0) return g_loader;
@@ -121,6 +120,33 @@ int load(void) {
     }
     return g_loader = 1;
 }
+#else
+// AMD ships no Linux loader: amd_fidelityfx_upscaler_vk.so next to the executable answers the five entry points
+// itself, with no separate loader step.
+int load(void) {
+    if (g_loader >= 0) return g_loader;
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->device) return -1;   // asked before the device: again later
+    char path[4096];
+    if (!beside_exe("amd_fidelityfx_upscaler_vk.so", path, sizeof path) || !file_there(path))
+        return g_loader = 0;   // not shipped beside this build: nothing is said, FSR 3.1 is what the menu offers
+    void *m = plat_lib_open(path);
+    if (!m) {
+        rt_log("ffx4: %s does not load: FSR 4 off", path);
+        return g_loader = 0;
+    }
+    A.create = (PfnFfxCreateContext)plat_lib_sym(m, "ffxCreateContext");
+    A.destroy = (PfnFfxDestroyContext)plat_lib_sym(m, "ffxDestroyContext");
+    A.configure = (PfnFfxConfigure)plat_lib_sym(m, "ffxConfigure");
+    A.query = (PfnFfxQuery)plat_lib_sym(m, "ffxQuery");
+    A.dispatch = (PfnFfxDispatch)plat_lib_sym(m, "ffxDispatch");
+    if (!A.create || !A.destroy || !A.configure || !A.query || !A.dispatch) {
+        rt_log("ffx4: amd_fidelityfx_upscaler_vk.so lacks the API entry points: FSR 4 off");
+        return g_loader = 0;
+    }
+    return g_loader = 1;
+}
+#endif
 
 // The versions the loader lists for one kind of context on this device, in its order: their count, at most cap.
 // Under g_lock, the loader loaded.
@@ -145,8 +171,10 @@ int versions(uint64_t type, uint64_t *ids, const char **names, int cap) {
 int probe(void) {
     int loaded = load();
     if (loaded <= 0) return loaded;
+#ifdef _WIN32
     char upscaler[MAX_PATH];
     if (!beside_exe("amd_fidelityfx_upscaler_vk.dll", upscaler, sizeof upscaler) || !file_there(upscaler)) return 0;
+#endif
     uint64_t ids[16] = {};
     const char *names[16] = {};
     int n = versions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, ids, names, 16);
@@ -378,10 +406,11 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, cons
     ffxDispatchDescUpscale d = {};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = cb;
-    // Every image is in GENERAL, which the back end reads as its unordered-access state, and is left there
-    d.color = image(color, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
-    d.depth = image(depth, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
-    d.motionVectors = image(mv, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
+    // Every image is in GENERAL; the state is a hint for the back end's own barriers, read for every input and
+    // unordered access for the output it writes
+    d.color = image(color, FFX_API_RESOURCE_STATE_COMPUTE_READ, 0);
+    d.depth = image(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, 0);
+    d.motionVectors = image(mv, FFX_API_RESOURCE_STATE_COMPUTE_READ, 0);
     d.output = image(out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
     d.jitterOffset = {jx, jy};
     d.motionVectorScale = {1.0f, 1.0f};
@@ -411,7 +440,7 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, cons
 
 // The loader's calls for vk_fg4.cpp (vk_ffx4_api.h).
 extern "C" int vk_ffx4_api_file(const char *name) {
-    char path[MAX_PATH];
+    char path[4096];
     return beside_exe(name, path, sizeof path) && file_there(path);
 }
 extern "C" int vk_ffx4_api_versions(uint64_t create_type, uint64_t *ids, const char **names, int cap) {
@@ -439,4 +468,3 @@ extern "C" void vk_ffx4_release(void) {
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u = Up();
 }
-#endif   // _WIN32
