@@ -899,16 +899,24 @@ void vk_exec_pass_end(VkExec *ex) {
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed) vk_dump_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    // The targets are marked written outside tfr_lock: vk_texture_gpu_written takes the texture lock, and a chunk that
+    // holds the texture lock can end its pass here (a lookup's alias copy, vk_exec_inline_begin) and then wait for
+    // tfr_lock. Taken the other way round, a chunk holding tfr_lock and waiting for the texture lock deadlocked with it,
+    // the other chunks spinning in their turns (the loading screen after Continue, 3 replay workers). tfr_lock guards
+    // only the target history and takes no other lock inside.
+    for (int i = 0; i < 8; i++)
+        if (ex->color[i].image) vk_texture_gpu_written(ex->color[i].tex);
+    if (ex->depth.image) vk_texture_gpu_written(ex->depth.tex);
     int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&tfr_lock);
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) {
             TfrTarget ft = tfr_of(&ex->color[i]);
-            vk_texture_gpu_written(ex->color[i].tex), tfr_note(&ft, stamp);
+            tfr_note(&ft, stamp);
         }
     if (ex->depth.image) {
         TfrTarget ft = tfr_of(&ex->depth);
-        vk_texture_gpu_written(ex->depth.tex), tfr_note(&ft, stamp);
+        tfr_note(&ft, stamp);
     }
     if (lk) plat_mutex_unlock(&tfr_lock);
 }
