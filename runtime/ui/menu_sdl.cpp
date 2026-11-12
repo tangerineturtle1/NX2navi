@@ -49,6 +49,10 @@ extern "C" void menu_sdl_event(const SDL_Event *e) {
             menu_toggle();
             return;
         }
+        if (e->key.scancode == SDL_SCANCODE_F9 && menu_debug_enabled()) {   // the debug menu, while its setting is on
+            if (!e->key.repeat) menu_debug_toggle();
+            return;
+        }
         if (e->key.scancode == SDL_SCANCODE_F10) {
             if (!e->key.repeat) menu_perf_cycle();
             return;
@@ -59,6 +63,15 @@ extern "C" void menu_sdl_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_UP:
         if (!menu_is_open()) return;
         if (ImGuiKey k = key_of(e->key.scancode)) menu_event_key(k, e->type == SDL_EVENT_KEY_DOWN);
+        return;
+    case SDL_EVENT_TEXT_INPUT:   // UTF-8, between SDL_StartTextInput and SDL_StopTextInput (gfx_window_text_input)
+        if (!menu_is_open() || !e->text.text) return;
+        for (const unsigned char *p = (const unsigned char *)e->text.text; *p;) {
+            unsigned c = *p++, more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+            if (more) c &= 0x3f >> more;
+            for (; more && (*p & 0xc0) == 0x80; more--) c = c << 6 | (*p++ & 0x3f);
+            if (!more && c >= 0x20 && c != 0x7f) menu_event_char(c);
+        }
         return;
     case SDL_EVENT_MOUSE_MOTION:
         if (menu_is_open()) menu_event_mouse_pos(e->motion.x * d, e->motion.y * d);

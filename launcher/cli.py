@@ -98,7 +98,7 @@ def main(argv=None):
 
     if a.cmd == 'continue-update':
         gd = s.get('game_dir')
-        return follow(jobs.ContinueUpdateJob(ctx, gd if gd and build.built_version(gd) else '', a.old,
+        return follow(jobs.ContinueUpdateJob(ctx, gd if build.installed(gd) else '', a.old,
                                              s.get('dump')))
 
     if a.cmd == 'tools':

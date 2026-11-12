@@ -141,12 +141,66 @@ def register_font(path):
         return False
 
 
+def unregister_font(path):
+    '''Give up a font file register_font added, so the file can be written again: Windows keeps a registered font
+    file open, and writing it then fails with "Permission denied".'''
+    if os.name != 'nt':
+        return
+    try:
+        ctypes.windll.gdi32.RemoveFontResourceExW(ctypes.c_wchar_p(str(path)), 0x10, None)   # FR_PRIVATE
+    except (AttributeError, OSError):
+        pass
+
+
 def open_path(path):
     path = str(path)
     if os.name == 'nt':
         os.startfile(path)   # noqa: S606 — opens a folder in Explorer
     else:
         subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def reveal(path):
+    """Show a file in its folder, selected in Explorer (a file to drag into a bug report); elsewhere open the folder."""
+    path = Path(path)
+    if os.name == 'nt':
+        subprocess.Popen(['explorer', f'/select,{path}'])   # noqa: S603, S607
+    else:
+        open_path(path.parent)
+
+
+KNOWN_FOLDERS = {'downloads': '{374DE290-123F-4565-9164-39C4925E467B}',
+                 'desktop': '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}',
+                 'pictures': '{33E28130-4E1E-4676-835A-98395C3BC3BB}'}
+
+
+def known_folder(name):
+    """Windows: the folder the shell keeps for name ('downloads', 'desktop', 'pictures'), also when the player moved it to another
+    drive; None elsewhere or when the shell names none."""
+    if os.name != 'nt' or name not in KNOWN_FOLDERS:
+        return None
+    try:
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [('d1', wintypes.DWORD), ('d2', wintypes.WORD), ('d3', wintypes.WORD),
+                        ('d4', ctypes.c_ubyte * 8)]
+        ole32, shell32 = ctypes.WinDLL('ole32'), ctypes.WinDLL('shell32')   # private handles: argtypes stay here
+        ole32.CLSIDFromString.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(GUID))
+        ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+        shell32.SHGetKnownFolderPath.argtypes = (ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_void_p))
+        g, out = GUID(), ctypes.c_void_p()
+        if ole32.CLSIDFromString(KNOWN_FOLDERS[name], ctypes.byref(g)) != 0:
+            return None
+        if shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        try:
+            return Path(ctypes.wstring_at(out.value))
+        finally:
+            ole32.CoTaskMemFree(out)
+    except (AttributeError, OSError):
+        return None
 
 
 def start_game(exe):

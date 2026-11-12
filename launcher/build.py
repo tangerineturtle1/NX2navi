@@ -14,6 +14,11 @@ RUN = ('import os, runpy, sys; p = sys.argv[1]; s = sys.argv[2]; sys.argv = sys.
        'runpy.run_path(s, run_name="__main__")')
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+# The build runs below normal priority: a compile on every processor for ten minutes and more otherwise takes the
+# PC from whatever the player does meanwhile, which the job screen invites ("Keep using your PC if you like"). On an
+# idle PC it costs nothing. Windows hands a below-normal process's class on to the processes it starts, so the
+# compilers, the lifter's workers and the shader preparation that make_game.py starts run that way too.
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 
 
 def command(layout, args):
@@ -61,33 +66,47 @@ class Run:
         self.error = None
         kw = {}
         if os.name == 'nt':
-            kw['creationflags'] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            kw['creationflags'] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
         else:
             kw['start_new_session'] = True
         env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      cwd=cwd, env=env, text=True, encoding='utf-8', errors='replace', bufsize=1, **kw)
         self.cancelled = False
+        self.dropped = 0   # lines and events whose handler raised (_read)
         self._reader = threading.Thread(target=self._read, args=(on_event, on_line), daemon=True)
         self._reader.start()
 
     def _read(self, on_event, on_line):
+        """Reads the build's output to its end, whatever the handlers do. A handler that raises (the launcher's log
+        on a full disk, a drawing error) loses its line, counted in dropped, and the reading goes on: when this
+        thread ended on the exception nobody read the pipe any more, the build stopped at its next line once the
+        pipe was full, and the job waited for it for good."""
+        def call(handler, arg):
+            try:
+                handler(arg)
+            except Exception:   # noqa: BLE001 - any failure of a handler must leave the pipe read
+                self.dropped += 1
+
         for line in self.proc.stdout:
             line = line.rstrip('\r\n')
             if line.startswith('@@'):
                 try:
                     ev = json.loads(line[2:])
                 except ValueError:
-                    on_line(line)
+                    call(on_line, line)
                     continue
-                if ev.get('ev') == 'error':
-                    self.error = ev.get('message')
-                on_event(ev)
+                if isinstance(ev, dict):
+                    if ev.get('ev') == 'error':
+                        self.error = ev.get('message')
+                    call(on_event, ev)
+                else:   # "@@" before something that is no event
+                    call(on_line, line)
             elif line.startswith('error: ') and not self.error:
                 self.error = line[7:]
-                on_line(line)
+                call(on_line, line)
             else:
-                on_line(line)
+                call(on_line, line)
 
     def wait(self):
         code = self.proc.wait()
@@ -148,6 +167,38 @@ def built_version(game_dir):
     return ''
 
 
+def scan_report(game_dir):
+    """What the check of the game files found (tools/romfs_check.py writes <game>/romfs-check.json): (the paths of
+    the damaged files, how many of them got a stand-in), or None when the folder has no readable report."""
+    try:
+        with open(os.path.join(str(game_dir), 'romfs-check.json'), encoding='utf-8') as f:
+            report = json.load(f)
+        return sorted(report['damaged']), len(report.get('repaired') or ())
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def can_rebuild(game_dir):
     st = build_state(game_dir)
     return st.get('version') == 2 and all(s in st.get('steps', {}) for s in ('exefs', 'romfs'))
+
+
+def unpacked(game_dir):
+    """True when the game files a rebuild reads are in the game folder (make_game.py BuiltSource names the same
+    ones): the unpacked ExeFS, the RomFS image and its index."""
+    gd = str(game_dir)
+    return all(os.path.isfile(os.path.join(gd, *parts)) for parts in
+               (('exefs', 'main'), ('romfs', 'romfs.bin'), ('romfs', 'index.json')))
+
+
+def installed(game_dir):
+    """True when the game folder holds a game the player can start: a finished build, or the exe of the last
+    finished build beside a build that stopped later. make_game.py drops a step's record when a step before it
+    runs again, so an update that lifted again and then stopped in the compile (an error, Cancel, a power cut)
+    leaves state.json without `compile` and built_version says '': the old exe is still there and playable, and
+    a rebuild continues from the unpacked game files without the dump (can_rebuild)."""
+    if not game_dir:
+        return False
+    if built_version(game_dir):
+        return True
+    return os.path.isfile(os.path.join(str(game_dir), 'ocarina.exe')) and can_rebuild(game_dir)

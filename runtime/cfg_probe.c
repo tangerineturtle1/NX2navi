@@ -1,4 +1,5 @@
-// --probe-cfg: nx2navi.ini parsing, the environment override and a missing file (cfg.c). Needs no game files.
+// --probe-cfg: nx2navi.ini parsing, the environment override, a missing file and the settings waiting for a restart
+// (cfg.c). Needs no game files.
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,12 +11,33 @@
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
+#include "vk_dlssg.h"
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
 #define EQ(a, b) ((a) && !strcmp((a), (b)))
 
 int probe_cfg(void) {
+    // cfg_pending, before this probe's files replace the settings cfg_init read: a restart-only setting counts while its
+    // value differs from the one at start, a live one never
+    if (!cfg_from_env("NX2NAVI_MICROPHONE") && !cfg_from_env("NX2NAVI_VOLUME")) {
+        const char *mic = cfg_value("NX2NAVI_MICROPHONE");
+        int base = cfg_pending_count();
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE"), "pending: unchanged since the start");
+        cfg_set("NX2NAVI_MICROPHONE", strcmp(mic, "0") ? "0" : "1");
+        CHECK(cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base + 1, "pending: a restart-only setting changed");
+        cfg_set("NX2NAVI_MICROPHONE", mic);
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base, "pending: set back to its start value");
+        cfg_set("NX2NAVI_VOLUME", "7");
+        CHECK(!cfg_pending("NX2NAVI_VOLUME") && cfg_pending_count() == base, "pending: a live setting never counts");
+        // a value the environment sets after the start (the command line's --monitor arrives that way) never waits:
+        // no row can change it and a restart keeps it
+        if (!cfg_from_env("NX2NAVI_MONITOR")) {
+            cfg_setenv("NX2NAVI_MONITOR", "2");
+            CHECK(!cfg_pending("NX2NAVI_MONITOR") && cfg_pending_count() == base, "pending: set by the environment after the start");
+            cfg_setenv("NX2NAVI_MONITOR", NULL);
+        }
+    }
     char path[1024];
     if (!plat_exe_path(path, sizeof path)) return 1;
     char *cut = plat_last_sep(path);
@@ -49,6 +71,11 @@ int probe_cfg(void) {
     CHECK(cfg_get("NX2NAVI_CLOTH_REALTIME") == NULL, "absent key is NULL");
     CHECK(cfg_get("NX2NAVI_comment") == NULL, "comment is not a key");
     CHECK(EQ(cfg_get("NX2NAVI_NO_SUCH_SETTING"), "1"), "unknown key is still readable");
+    {
+        int n = -1;
+        const char *u = cfg_unknown_keys(&n);
+        CHECK(n == 2 && EQ(u, "no_such_setting, last"), "the keys that are no settings: listed lower-case, in the file's order");
+    }
     cfg_setenv("NX2NAVI_FPS60", "1");
     CHECK(EQ(cfg_get("NX2NAVI_FPS60"), "1"), "environment overrides the file");
     cfg_setenv("NX2NAVI_FPS60", NULL);
@@ -56,6 +83,80 @@ int probe_cfg(void) {
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("NX2NAVI_FPS60") == NULL, "missing file leaves no keys");
+    {
+        int n = -1;
+        CHECK(EQ(cfg_unknown_keys(&n), "") && n == 0, "a missing file leaves no unknown keys either");
+    }
+
+    // A player's file as a report showed it: settings the menu wrote, and three lines added by hand that are no
+    // settings of this version (the player took the first for the fix of a crash). The three are named as such, a
+    // repeated one once, a key of other characters is counted without being listed, and the menu's save keeps every
+    // line it does not change byte for byte, the three included: only the changed, the reset and the new key move.
+#define PLAYER_HEAD \
+        "[display]\n" \
+        "async_compute = 1\n" \
+        "fullscreen = 1\n" \
+        "window_size = 1920x1080\n" \
+        "gpu_index = 0\n" \
+        "perf_overlay = fps\n" \
+        "vk_present = mailbox\n" \
+        "upscaler = bilinear\n" \
+        "dlaa = 1\n" \
+        "framegen = off\n" \
+        "taa = fsr3\n" \
+        "hdr = 0\n" \
+        "aspect = fit\n" \
+        "game_res = 1800\n"
+#define PLAYER_MID \
+        "aniso = 2\n" \
+        "assume_focus = 1\n" \
+        "texture_detail = auto\n" \
+        "\n" \
+        "[input]\n" \
+        "bind_a = key:default, pad:south\n" \
+        "bind_b = key:default, pad:east\n" \
+        "\n" \
+        "[language]\n" \
+        "operation_mode = docked\n" \
+        "\n" \
+        "[performance]\n" \
+        "wb_lazy = 0\n" \
+        "vram_safe_mode = 1\n" \
+        "exception_handler = 1\n" \
+        "ASYNC_COMPUTE = 1\n" \
+        "f\xC3\xBCr sp\xC3\xA4ter = 1\n" \
+        "\n" \
+        "[frame rate]\n"
+    static const char player[] = PLAYER_HEAD "sharpness = 80\n" PLAYER_MID "fps_limit = 120\n";
+    static const char player_saved[] = PLAYER_HEAD PLAYER_MID "fps_limit = 60\n\n[audio]\nvolume = 55\n";
+#undef PLAYER_HEAD
+#undef PLAYER_MID
+    cfg_setenv("NX2NAVI_FPS_LIMIT", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_SHARPNESS", NULL);
+    cfg_setenv("NX2NAVI_WB_LAZY", NULL);
+    CHECK(plat_file_write(path, player, sizeof player - 1), "write the player's ini");
+    CHECK(cfg_load(path) == 1, "load the player's ini");
+    {
+        int n = -1;
+        const char *u = cfg_unknown_keys(&n);
+        CHECK(n == 4 && EQ(u, "async_compute, vram_safe_mode, exception_handler"),
+              "the player's three lines are named as no settings; a repeat counts once, a key of other characters is only counted");
+        CHECK(EQ(cfg_get("NX2NAVI_WB_LAZY"), "0") && cfg_is_set("NX2NAVI_WB_LAZY"), "wb_lazy = 0 is a setting, and set");
+        CHECK(!cfg_is_set("NX2NAVI_VK_NAN_PRESERVE"), "a key the file lacks is not set");
+        static const char *const reset[] = {"SHARPNESS"};
+        cfg_set("NX2NAVI_FPS_LIMIT", "60");
+        cfg_set("NX2NAVI_VOLUME", "55");
+        CHECK(cfg_reset(reset, 1) == 1 && cfg_save_to(path) == 1, "the menu changes, adds and resets a key and saves");
+        uint64_t pn = 0;
+        uint8_t *p = plat_file_read(path, &pn);
+        CHECK(p && pn == sizeof player_saved - 1 && !memcmp(p, player_saved, pn),
+              "the save keeps every other line byte for byte, the lines that are no settings included");
+        if (p && (pn != sizeof player_saved - 1 || memcmp(p, player_saved, pn))) fprintf(stderr, "---- saved:\n%s\n----\n", p);
+        free(p);
+    }
+    plat_file_delete(path);
+    CHECK(cfg_load(path) == 0, "the player's ini is gone again");
 
     // cfg_set / cfg_save: only changed lines move, comments stay, a missing key goes under its section
     static const char before[] =
@@ -161,6 +262,24 @@ int probe_cfg(void) {
     CHECK(m && EQ(m->def, "default") && m->values == NULL && !m->live, "meta: audio_device is free text, default, needs a restart");
     CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,
           "meta: keys the menu does not show are NULL");
+    m = cfg_meta("FRAMEGEN_MULTIPLIER");
+    CHECK(m && EQ(m->def, "2") && EQ(m->values, "2|3|4") && m->live, "meta: framegen_multiplier is 2|3|4, 2 by default, live");
+
+    // DLSS frame generation's multiplier (vk_dlssg.c): the setting clamped to what the GPU and driver allow, with the
+    // reason vk_dlssg_frame logs when it is not taken as it is
+    const char *why = "";
+    CHECK(vk_dlssg_multiplier_of("3", 4, &why) == 3 && !why, "multiplier: 3 where 4x runs");
+    CHECK(vk_dlssg_multiplier_of("4x", 4, &why) == 4 && !why, "multiplier: 4x reads as 4");
+    CHECK(vk_dlssg_multiplier_of("4", 2, &why) == 2 && why, "multiplier: 4 where 2x is the most is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("4", 3, &why) == 3 && why, "multiplier: 4 where 3x is the most is 3, with a reason");
+    CHECK(vk_dlssg_multiplier_of("9", 0, &why) == 4 && why, "multiplier: above 4 is 4, with a reason");
+    CHECK(vk_dlssg_multiplier_of("1", 4, &why) == 2 && why, "multiplier: below 2 is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("fast", 4, &why) == 2 && why, "multiplier: not a number is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("3y", 4, &why) == 2 && why, "multiplier: a number with other text after it is 2");
+    CHECK(vk_dlssg_multiplier_of("", 3, &why) == 2 && !why && vk_dlssg_multiplier_of(NULL, 3, NULL) == 2,
+          "multiplier: unset is 2");
+    CHECK(vk_dlssg_multiplier_of("4", 0, &why) == 4 && !why, "multiplier: kept as it is while the GPU's limit is not known");
+    CHECK(vk_dlssg_multiplier_max(NULL) == 0 && vk_dlssg_multiplier() == 1, "multiplier: 1, no limit, while DLSS-G does not run");
 
     // cfg_reset: the key's active lines leave nx2navi.ini, the commented example stays
     static const char rbase[] = "[audio]\n# volume = 100\n[input]\nmotion = 0\n";
@@ -201,6 +320,20 @@ int probe_cfg(void) {
     free(got);
     cfg_set("NX2NAVI_VOLUME", "60");
     CHECK(cfg_save_to(path) == 1, "reset: volume 60 again for the environment case");
+
+    // a file saved as UTF-16 (little and big endian, with a line ending of two characters) reads as the same lines
+    static const char wtext[] = "[audio]\r\nvolume = 35\r\n[input]\r\nmotion = 0\r\n";
+    for (int be = 0; be < 2; be++) {
+        uint8_t wbuf[2 + 2 * sizeof wtext];
+        size_t wn = 0;
+        wbuf[wn++] = be ? 0xFE : 0xFF, wbuf[wn++] = be ? 0xFF : 0xFE;
+        for (size_t i = 0; i + 1 < sizeof wtext; i++)
+            wbuf[wn++] = be ? 0 : (uint8_t)wtext[i], wbuf[wn++] = be ? (uint8_t)wtext[i] : 0;
+        CHECK(plat_file_write("cfg-probe-utf16.ini", wbuf, wn) && cfg_load("cfg-probe-utf16.ini") == 1 &&
+              EQ(cfg_get("NX2NAVI_VOLUME"), "35") && EQ(cfg_get("NX2NAVI_MOTION"), "0"),
+              be ? "an ini saved as UTF-16, big endian, is not read" : "an ini saved as UTF-16, little endian, is not read");
+    }
+    plat_file_delete("cfg-probe-utf16.ini");
 
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_VOLUME"), "60"), "reset: reload");
@@ -276,18 +409,22 @@ int probe_cfg(void) {
     CHECK(st[0] == -32767 && st[1] == 0, "keys: left arrow is right stick left");
     input_map_stick(dn, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "keys: arrows leave the left stick alone");
-    input_mouse_stick(30, 0, 1.0 / 60, 1, st);
+    input_mouse_stick(30, 0, 1.0 / 60, 1, 1, st);
     CHECK(st[0] == 32767 * 1800 / 3000 && st[1] == 0, "mouse: 30 counts in 1/60 s is 60% right");
-    input_mouse_stick(0, -10, 1.0 / 60, 1, st);
+    input_mouse_stick(0, -10, 1.0 / 60, 1, 1, st);
     CHECK(st[0] == 0 && st[1] > 0, "mouse: moving up is stick up");
-    input_mouse_stick(30, 0, 1.0 / 30, 1, st);
+    input_mouse_stick(30, 0, 1.0 / 30, 1, 1, st);
     CHECK(st[0] == 32767 * 900 / 3000, "mouse: the same counts over twice the time are half the deflection");
-    input_mouse_stick(15, 0, 1.0 / 60, 2, st);
+    input_mouse_stick(15, 0, 1.0 / 60, 2, 1, st);
     CHECK(st[0] == 32767 * 1800 / 3000, "mouse: doubling sensitivity halves the counts needed (15 counts at 2 = 30 at 1)");
-    input_mouse_stick(1000, 1000, 1.0 / 60, 1, st);
+    input_mouse_stick(1000, 1000, 1.0 / 60, 1, 1, st);
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
-    input_mouse_stick(30, 0, 1.0 / 60, 0, st);
+    input_mouse_stick(30, 0, 1.0 / 60, 0, 1, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    input_mouse_stick(30, 0, 1.0 / 60, 1, 1.5f, st);
+    CHECK(st[0] == 13107 && st[1] == 0, "mouse: a camera speed of 1.5 divides the deflection, so the turn per count stays");
+    input_mouse_stick(1000, 0, 1.0 / 60, 1, 1.5f, st);
+    CHECK(st[0] == 32767 && st[1] == 0, "mouse: a fast flick reaches full tilt at a camera speed of 1.5 too");
     input_pad_stick(3000, -2000, 0.15f, st);
     CHECK(st[0] == 0 && st[1] == 0, "pad stick: an 11% drift inside a 15% dead zone reads centred");
     input_pad_stick(4000, -3000, 0, st);
@@ -348,6 +485,13 @@ int probe_cfg(void) {
               input_prompts_pick("playstation", "xbox_prompts") == PROMPTS_PLAYSTATION &&
               input_prompts_pick("ps", "nintendo") == PROMPTS_NINTENDO,
           "prompts: playstation in any case; an unknown value is the game's own");
+    CHECK(input_prompts_pick("SteamDeck", "nintendo") == PROMPTS_STEAMDECK &&
+              input_prompts_pick("steamdeck", "xbox_prompts") == PROMPTS_STEAMDECK &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "nintendo"), "romfs-patches-steamdeck") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "xbox"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "auto"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, NULL), "romfs-patches-steamdeck-label"),
+          "prompts: steamdeck in any case, its face buttons by position for the Nintendo layout, by label otherwise");
     CHECK(EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox_prompts"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&

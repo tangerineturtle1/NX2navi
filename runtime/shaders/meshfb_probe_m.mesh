@@ -1,0 +1,75 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// build_shaders: keep functions
+//
+// --probe-meshfb (mesh_fb_probe.c): a mesh program without a task stage, in the shape the translator gives one
+// (tools/xlate/MeshSpirv.cs): the program itself is a function that writes its stage buffer into shared memory, and
+// the entry function calls it once and hands the buffer to the mesh pipeline. mesh_fb.c makes its compute module from
+// this one, as it does from a translated program. The layout is AmpereLowering.MeshInfo's for 64 vertices, 32
+// triangles and 8 output components (position, generic vector 0): vertex v's component l is word
+// ((v >> 5) * 8 + l) * 32 + (v & 31), the primitive count word 512, the index bytes from byte 2052.
+//
+// Workgroup g draws cell g of a grid: nine vertices (28 to 36, across the two vertex groups) and up to eight
+// triangles, none in every fifth cell.
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 64, max_primitives = 32) out;
+layout(location = 0) out vec4 o_color[];
+layout(set = 0, binding = 1) uniform Params { vec4 tint; uvec4 grid; } u;   // grid: columns, rows
+shared uint mem[540];
+
+#define VWORD(v, l) ((((v) >> 5) * 8u + (l)) * 32u + ((v) & 31u))
+#define COUNT_WORD 512u
+#define INDEX_BYTE 2052u
+
+void program() {
+    uint tid = gl_LocalInvocationIndex, cell = gl_WorkGroupID.x;
+    if (tid < 9u) {
+        uint v = tid + 28u, ix = tid % 3u, iy = tid / 3u;
+        vec2 p = -1.0 + (vec2(cell % u.grid.x, cell / u.grid.x) + 0.1 + 0.4 * vec2(ix, iy)) * (2.0 / vec2(u.grid.xy));
+        vec4 c = vec4(float(ix) * 0.5, float(iy) * 0.5, float(cell % 4u) / 3.0, 1.0) * u.tint;
+        mem[VWORD(v, 0u)] = floatBitsToUint(p.x);
+        mem[VWORD(v, 1u)] = floatBitsToUint(p.y);
+        mem[VWORD(v, 2u)] = floatBitsToUint(0.5);
+        mem[VWORD(v, 3u)] = floatBitsToUint(1.0);
+        mem[VWORD(v, 4u)] = floatBitsToUint(c.x);
+        mem[VWORD(v, 5u)] = floatBitsToUint(c.y);
+        mem[VWORD(v, 6u)] = floatBitsToUint(c.z);
+        mem[VWORD(v, 7u)] = floatBitsToUint(c.w);
+    }
+    if (tid == 0u) {   // one thread writes the index bytes: they share words
+        uint count = cell % 5u == 0u ? 0u : 2u + cell % 7u;
+        for (uint t = 0u; t < count; t++) {
+            uint q = t / 2u, a = (q / 2u) * 3u + q % 2u + 28u;
+            uvec3 tri = (t & 1u) == 0u ? uvec3(a, a + 1u, a + 3u) : uvec3(a + 1u, a + 4u, a + 3u);
+            for (uint k = 0u; k < 3u; k++) {
+                uint b = INDEX_BYTE + 3u * t + k, sh = (b & 3u) * 8u;
+                mem[b >> 2] = (mem[b >> 2] & ~(0xffu << sh)) | tri[k] << sh;
+            }
+        }
+        mem[COUNT_WORD] = count;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < 1u) mem[COUNT_WORD] = 0u;
+    barrier();
+    program();
+    barrier();
+    uint count = min(mem[COUNT_WORD], 32u);
+    SetMeshOutputsEXT(64u, count);
+    for (uint v = tid; v < 64u; v += 32u) {
+        gl_MeshVerticesEXT[v].gl_Position = vec4(uintBitsToFloat(mem[VWORD(v, 0u)]), uintBitsToFloat(mem[VWORD(v, 1u)]),
+                                                 uintBitsToFloat(mem[VWORD(v, 2u)]), uintBitsToFloat(mem[VWORD(v, 3u)]));
+        o_color[v] = vec4(uintBitsToFloat(mem[VWORD(v, 4u)]), uintBitsToFloat(mem[VWORD(v, 5u)]),
+                          uintBitsToFloat(mem[VWORD(v, 6u)]), uintBitsToFloat(mem[VWORD(v, 7u)]));
+    }
+    for (uint p = tid; p < count; p += 32u) {
+        uvec3 tri;
+        for (uint k = 0u; k < 3u; k++) {
+            uint b = INDEX_BYTE + 3u * p + k;
+            tri[k] = min(mem[b >> 2] >> ((b & 3u) * 8u) & 0xffu, 63u);
+        }
+        gl_PrimitiveTriangleIndicesEXT[p] = tri;
+    }
+}

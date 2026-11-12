@@ -113,8 +113,8 @@ LLVM_SKIP_SUFFIXES = {'.idl', '.tlb'}
 # tools/ files the installer steps run (and what they import), copied from the repo.
 TOOLS_FILES = ['build_game.py', 'build_shaders.py', 'button_icons.py', 'check_content.py', 'check_isa.py', 'extract.py',
                'hostmem.py', 'make_romfs_patches.py', 'ncz.py', 'pack_shader_cache.py', 'prepare_shaders.py',
-               'romfs_index.py', 'shader_census.py', 'shader_list.py', 'ultrawide_layout.py', 'cheats.py',
-               'exefs_patches.py']
+               'romfs_index.py', 'shader_census.py', 'shader_list.py', 'pipeline_list.py', 'ultrawide_layout.py', 'cheats.py',
+               'exefs_patches.py', 'mod_files.py']
 TOOLS_DIRS = ['vendor/macnativegames', 'data']   # data/: expected hashes
 RUNTIME_SUFFIXES = {'.h', '.inc', '.ico'}   # .ico: the installer window icon
 
@@ -427,7 +427,7 @@ def runtime_lib(out, llvm, pgo):
         shutil.copy2(ROOT / 'runtime' / name, rt / name)
 
 
-def build_sources(out, pgo):
+def build_sources(out, pgo, pipelines=None):
     copy_tree(ROOT / 'recomp', out / 'recomp', lambda r: not r.endswith(('.py', '.txt')) or '__pycache__' in r)
     for f in TOOLS_FILES:
         (out / 'tools').mkdir(exist_ok=True)
@@ -437,6 +437,8 @@ def build_sources(out, pgo):
     (out / 'data').mkdir(exist_ok=True)
     text = shader_list.history(MAIN_ROOT / 'refs' / 'MacNativeGames', MNG_COMMIT)
     (out / 'data' / 'shader_list.tsv').write_text(text, encoding='utf-8', newline='\n')
+    if pipelines:   # prepare_shaders.py reads it there (BUNDLED_PIPELINES)
+        shutil.copy2(pipelines, out / 'data' / 'pipeline_list.bin')
     for p in pgo.values():
         for f in (p, p.with_suffix('.json')):
             if f.is_file():
@@ -586,6 +588,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--out', type=Path, required=True, help='release folder (replaced)')
     ap.add_argument('--zip', type=Path, help='also write the folder as this zip')
+    ap.add_argument('--pipeline-list', type=Path, metavar='FILE',
+                    help='the shared pipeline list to carry (tools/pipeline_list.py merge writes it; it is derived from game data and stays out of the repository)')
     ap.add_argument('--prove', action='store_true', help='only run the compile-and-probe check on an existing folder')
     ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
                     help='--prove: build and run the check for this CPU level (default v3)')
@@ -604,7 +608,7 @@ def main():
     build_deps(out)
     pgo = profiles()
     runtime_lib(out, llvm, pgo)
-    build_sources(out, pgo)
+    build_sources(out, pgo, args.pipeline_list)
     build_launcher(out, llvm)
     collect_licenses(out)
     check_folder(out)

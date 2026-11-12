@@ -17,6 +17,9 @@ __pycache__/
 /generated/
 # Button art a release carries (tools/make_launcher.py --prompt-art); a checkout may hold it for a test build
 /prompt-art/
+# The shared pipeline list a release carries (tools/pipeline_list.py merge; tools/prepare_shaders.py reads it here)
+/tools/data/pipeline_list.bin
+/data/pipeline_list.bin
 *.xci
 *.xcz
 *.nsp
@@ -34,6 +37,15 @@ __pycache__/
 *.bntx
 *.bnsh
 *.webm
+
+# The runtime's own shaders compiled to SPIR-V (tools/build_shaders.py builds them from runtime/shaders/ and the
+# tools/make_*.py assemblers when the game is built; tools/check_content.py refuses them in a commit)
+/runtime/*_spv.h
+*.spv
+# The menu font's bytes as a header for compilers without #embed (tools/build_shaders.py EMBEDDED)
+/runtime/ui/roboto_ttf.h
+/runtime/smaa_area_tex.h
+/runtime/smaa_search_tex.h
 
 # Build outputs
 *.exe
@@ -76,3 +88,6 @@ desktop.ini
 
 # Agent task worktrees (tools/worktree.py)
 /.worktrees/
+
+# The release folder (tools/make_release.py): nx2navi_xlate.exe with its id file, hactool, ninja and the DLLs
+/bin/

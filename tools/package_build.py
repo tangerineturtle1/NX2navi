@@ -25,8 +25,8 @@ EXE = '.exe' if os.name == 'nt' else ''
 DLLS = ('SDL3.dll', 'libopus-0.dll', 'libiconv-2.dll') if os.name == 'nt' else ()
 # Prepared state next to the exe: translator answers, programs, the prepared list, pipeline cache and its keys, and the
 # variant lists `nx2navi.exe --prepare-shaders` reads (the driver keys its library cache by exe path, so each copy runs it).
-STATE = ('romfs-index.bin', 'pipeline-cache.bin', 'pipeline-keys.bin', 'shader-answers.bin', 'shader-programs.bin',
-         'shader-prepared.bin', 'seed-answers.bin', 'seed-programs.bin')
+STATE = ('romfs-index.bin', 'pipeline-cache.bin', 'pipeline-cache-play.bin', 'pipeline-keys.bin', 'shader-answers.bin',
+         'shader-programs.bin', 'shader-prepared.bin', 'seed-answers.bin', 'seed-programs.bin')
 
 def copy(src, dst):
     dst.parent.mkdir(parents=True, exist_ok=True)

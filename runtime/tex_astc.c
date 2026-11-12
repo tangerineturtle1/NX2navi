@@ -503,6 +503,89 @@ error:
     return false;
 }
 
+// Whether astc_decode_block gives every texel of the block alpha 255. The header tells for a void extent (its
+// constant's alpha), an error block (magenta, alpha 255) and colour endpoint modes without alpha (0 to 3, 6 to 9, 11,
+// 14 and 15; the HDR ones decode to magenta in this LDR decoder). The modes with alpha (4, 5, 10, 12, 13) can still
+// decode to 255 everywhere, so such a block is decoded and counted in *decoded. The CEM fields are read as in
+// astc_decode_block; a block whose one mode has no alpha is opaque whether its block mode is legal or an error, so only
+// partitions of different modes need the weight bits that place the rest of their CEM field.
+static inline bool cem_alpha(uint32_t m) { return m == 4 || m == 5 || m == 10 || m == 12 || m == 13; }
+
+static inline bool block_opaque(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint32_t *decoded) {
+    Bits128 b = {load64(block), load64(block + 8)};
+    uint32_t mode = (uint32_t)(b.lo & 0x7FF);
+    if ((mode & 0x1FF) == 0x1FC) {
+        if (mode & 0x200 || (b.lo >> 10 & 3) != 3) return true;
+        uint32_t s0 = rbits(&b, 12, 13), s1 = rbits(&b, 25, 13);
+        uint32_t t0 = rbits(&b, 38, 13), t1 = rbits(&b, 51, 13);
+        bool all_ones = s0 == 0x1FFF && s1 == 0x1FFF && t0 == 0x1FFF && t1 == 0x1FFF;
+        if ((s0 >= s1 || t0 >= t1) && !all_ones) return true;
+        return block[15] == 0xFF;
+    }
+    int pcount = (int)(b.lo >> 11 & 3) + 1;
+    uint32_t enc = (uint32_t)(b.lo >> 23 & 0x3F);
+    if (pcount == 1 || (enc & 3) == 0) {   // one mode for every partition
+        if (!cem_alpha(pcount == 1 ? (uint32_t)(b.lo >> 13 & 0xF) : enc >> 2 & 0xF)) return true;
+    } else {
+        BlockMode bm;
+        if (!block_mode_2d(mode, bw, bh, &bm) || (bm.dual && pcount == 4)) return true;
+        int high = 3 * pcount - 4;
+        enc |= rbits(&b, 128 - bm.wbits - high, high) << 6;
+        uint32_t base = (enc & 3) - 1;
+        bool alpha = false;
+        for (int i = 0; i < pcount; i++)
+            alpha |= cem_alpha(((enc >> (2 + i) & 1) + base) << 2 | (enc >> (2 + pcount + 2 * i) & 3));
+        if (!alpha) return true;
+    }
+    (*decoded)++;
+    uint8_t rgba[12 * 12 * 4];
+    astc_decode_block(block, bw, bh, srgb, rgba);   // an error found while decoding fills magenta, alpha 255
+    for (uint32_t i = 0; i < bw * bh; i++)
+        if (rgba[4 * i + 3] != 0xFF) return false;
+    return true;
+}
+
+bool astc_block_opaque(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint32_t *decoded) {
+    if (bw < 4 || bh < 4 || bw > 12 || bh > 12) return false;
+    return block_opaque(block, bw, bh, srgb, decoded);
+}
+
+// Checks of 4 KiB at a time, each copied to dst after its check, while the bytes are in the cache: the copy costs
+// what memcpy would, and the check little more than the read memcpy makes anyway.
+#define OPAQUE_RUN 256
+
+// The first 32 bits of a block settle almost every block: not a void extent, and one endpoint mode for the whole block
+// (one partition, or partitions that share it) that carries no alpha. The others go through block_opaque.
+#define CEM_ALPHA_MASK (1u << 4 | 1u << 5 | 1u << 10 | 1u << 12 | 1u << 13)
+static inline bool quick_opaque(const uint8_t *block) {
+    uint32_t w;
+    memcpy(&w, block, 4);   // little-endian, as load64 reads it
+    if ((w & 0x1FF) == 0x1FC) return false;
+    uint32_t cem;
+    if (!(w >> 11 & 3)) cem = w >> 13 & 0xF;
+    else if (!(w >> 23 & 3)) cem = w >> 25 & 0xF;
+    else return false;
+    return !(CEM_ALPHA_MASK >> cem & 1);
+}
+
+uint64_t astc_blocks_opaque(const uint8_t *blocks, uint64_t n, uint32_t bw, uint32_t bh, bool srgb, uint32_t max_decoded,
+                            uint32_t *decoded, uint8_t *dst) {
+    uint64_t bad = n;
+    bool ok = bw >= 4 && bh >= 4 && bw <= 12 && bh <= 12;
+    if (!ok) bad = 0;
+    for (uint64_t i = 0; i < n; i += OPAQUE_RUN) {
+        uint64_t m = n - i < OPAQUE_RUN ? n - i : OPAQUE_RUN;
+        for (uint64_t k = 0; ok && k < m; k++) {
+            const uint8_t *b = blocks + 16 * (i + k);
+            if (!quick_opaque(b) && (!block_opaque(b, bw, bh, srgb, decoded) || *decoded > max_decoded))
+                ok = false, bad = i + k;
+        }
+        if (dst) memcpy(dst + 16 * i, blocks + 16 * i, 16 * m);
+        else if (!ok) break;
+    }
+    return bad;
+}
+
 void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
                      bool srgb, uint8_t *rgba_out) {
     if (bw < 4 || bh < 4 || bw > 12 || bh > 12) return;

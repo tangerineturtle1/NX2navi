@@ -66,9 +66,10 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 // and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
 // frame), so it lands at the same game time at any frame rate and load length. A timed event shorter than a frame is
 // applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
-// when it starts, as the load ends at another tick in each run.
+// when it starts, as the load ends at another tick in each run. "<frame> MARK <name>" presses nothing: with
+// NX2NAVI_TRACE=perf it ends the running segment of frame times and starts one called <name> (perf.c perf_segment).
 // at, hold: ticks, or microseconds of the world clock when timed.
-typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
+typedef struct { uint64_t at, hold; int bit, stick, timed, mark; int32_t x, y; int logged; char text[48]; } ScriptEv;
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
     {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
@@ -99,7 +100,14 @@ static void script_load(void) {
         ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
         long a, b;
         double c;
-        if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
+        if (!strcmp(name, "MARK")) {
+            const char *s = line + off;
+            while (*s == ' ' || *s == '\t') s++;
+            size_t len = strcspn(s, "\r\n");
+            while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+            e.mark = 1, e.hold = 1;
+            snprintf(e.text, sizeof e.text, "%.*s", (int)len, s);
+        } else if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
             int n = sscanf(line + off, "%ld %ld %lf", &a, &b, &c);
             if (n < 2) { rt_log("input: script line %d: %s needs x y [hold]", ln, name); continue; }
             e.stick = name[0] == 'M' ? 3 : name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
@@ -135,13 +143,14 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
         if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
         uint64_t now = e->timed ? (uint64_t)w : tick;
         if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
-        if (e->stick == 3 && e->logged) continue;
+        if ((e->stick == 3 || e->mark) && e->logged) continue;
         if (!e->logged) {
             e->logged = 1;
             if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
             else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
         }
-        if (e->stick == 3) {
+        if (e->mark) perf_segment(e->text);
+        else if (e->stick == 3) {
             int64_t x = (int64_t)script_mouse[0] + e->x, y = (int64_t)script_mouse[1] + e->y;
             script_mouse[0] = (int32_t)(x < INT32_MIN ? INT32_MIN : x > INT32_MAX ? INT32_MAX : x);
             script_mouse[1] = (int32_t)(y < INT32_MIN ? INT32_MIN : y > INT32_MAX ? INT32_MAX : y);
@@ -368,17 +377,15 @@ static void mouse_camera(int32_t out[2], int selector) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
-            input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
+            input_mouse_stick(dx, dy, dt, mouse_sens_get(), cam_speed_applied(), held);
             frame = fr;
             t0 = now;
         } else if (age > 0.1) {
             held[0] = held[1] = 0;   // frames stopped: do not hold a deflection
         }
     }
-    double k = cam_speed_applied(), x = held[0] / k, y = held[1] / k, len = sqrt(x * x + y * y);
-    if (len > STICK_MAX) x *= STICK_MAX / len, y *= STICK_MAX / len;
-    out[0] = (int32_t)lround(x);
-    out[1] = (int32_t)lround(y);
+    out[0] = held[0];
+    out[1] = held[1];
 }
 
 static float stick_dead[2] = {-1, -1};     // input_pad_deadzone of the left and right stick; live (cfg_version)
@@ -395,9 +402,101 @@ static float stick_dead_get(int s) {
 }
 
 // One gamepad stick through the dead zone; SDL's Y grows downwards, the Switch's upwards.
-static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
-    input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
+// ---- SDL's gamepad update on a thread of its own
+// SDL_UpdateGamepads reads the controllers, and when a device came or went it first finds every device again, 100 ms
+// and more inside the system's input libraries. It ran on the game's polling thread with the input lock held: a
+// controller that disconnected (a wireless one going to sleep, a cable pulled) gave a burst of 120 to 240 ms frames,
+// one per device notification, with the game's other pollers queued on the lock.
+// The pad thread (up_main) makes SDL's initialisation and every update. A poll asks for an update and waits for it,
+// UP_WAIT_NS at most (sdl_enter): an ordinary update is done in microseconds and the poll reads fresh state, as before;
+// one that runs into the device search is not, and the poll goes on with what it read last. sdl_lock is held around
+// every SDL gamepad call: by the pad thread for an update, by everyone else through sdl_enter or a try
+// (plat_mutex_trylock), never by waiting, so no thread of the game stands behind the device search.
+#define UP_WAIT_NS 2000000ull     // how long a poll waits for its update
+#define UP_FRESH_NS 500000ull     // polls this soon after an update share it (the game reads several pads in a row)
+static PlatMutex sdl_lock = PLAT_MUTEX_INIT;
+static PlatMutex up_lock = PLAT_MUTEX_INIT;   // guards the fields below
+static PlatCond up_go = PLAT_COND_INIT, up_done = PLAT_COND_INIT;
+static int up_started, up_inited, up_init_ok, up_want, up_busy;
+static uint64_t up_gen, up_at, up_t0;         // updates finished; when the last one finished; when the running one began
+static uint64_t up_stale;                     // polls that went on without an update
+static volatile uint64_t up_test_ns;          // --probe-input: the next update takes this long, as a device search does
+
+static void up_main(void *arg) {
+    (void)arg;
+    // SDL drops gamepad presses while it thinks the program is in the background, and it judges that from windows of
+    // its own: the Win32 window (gfx_window_win.c) is not one, and keyboard focus is gated here (ikb_foreground)
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    int ok = SDL_Init(SDL_INIT_GAMEPAD);
+    if (!ok) rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError());
+    plat_mutex_lock(&up_lock);
+    up_inited = 1, up_init_ok = ok;
+    plat_cond_broadcast(&up_done);
+    while (ok) {
+        while (!up_want) plat_cond_wait(&up_go, &up_lock);
+        up_want = 0, up_busy = 1, up_t0 = plat_now_ns();
+        plat_mutex_unlock(&up_lock);
+        plat_mutex_lock(&sdl_lock);
+        uint64_t slow = __atomic_exchange_n(&up_test_ns, 0, __ATOMIC_RELAXED);
+        if (slow) plat_wait_ns(slow);
+        SDL_UpdateGamepads();
+#ifdef _WIN32
+        // The Windows window is our own (gfx_window_win.c), so nothing reads SDL's event queue, yet every axis and
+        // button change of a gamepad is queued there: at SDL's cap (about 65,000 events, several MB) each further one
+        // fails and sets SDL's error text. The state the getters read does not come from the queue.
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#endif
+        plat_mutex_unlock(&sdl_lock);
+        plat_mutex_lock(&up_lock);
+        uint64_t took = plat_now_ns() - up_t0;
+        up_busy = 0, up_gen++, up_at = plat_now_ns();
+        plat_cond_broadcast(&up_done);
+        static int logged;
+        if (took >= 20000000ull && logged++ < 16)
+            rt_log("input: the gamepad update took %.0f ms (devices found again after one came or went); %llu polls so far "
+                   "went on with their last state instead of waiting", took / 1e6, (unsigned long long)up_stale);
+    }
+    plat_mutex_unlock(&up_lock);
 }
+
+// Under lock: starts the pad thread and waits for SDL's initialisation on it. 1 when SDL's gamepads can be used.
+static int sdl_start(void) {
+    plat_mutex_lock(&up_lock);
+    if (!up_started) {
+        up_started = 1;
+        if (!plat_thread_spawn(up_main, NULL, "pads", 0)) rt_fatal("input: cannot start the gamepad thread");
+    }
+    while (!up_inited) plat_cond_wait(&up_done, &up_lock);
+    int ok = up_init_ok;
+    plat_mutex_unlock(&up_lock);
+    return ok;
+}
+
+// Under lock: brings SDL's gamepad state up to date and takes sdl_lock for the caller's SDL calls. 1 with it held
+// (sdl_leave gives it back); 0 when the update is not done within UP_WAIT_NS, and then nothing of SDL may be called.
+static int sdl_enter(void) {
+    plat_mutex_lock(&up_lock);
+    uint64_t now = plat_now_ns();
+    int ok = 1;
+    if (up_busy && now - up_t0 >= UP_WAIT_NS) {
+        ok = 0;   // the device search: the first poll waited for it, the ones after it do not
+    } else if (up_busy || now - up_at >= UP_FRESH_NS) {
+        uint64_t next = up_gen + 1;
+        if (!up_busy) up_want = 1, plat_cond_signal(&up_go);
+        while (up_gen < next) {
+            uint64_t el = plat_now_ns() - now;
+            if (el >= UP_WAIT_NS) break;
+            plat_cond_wait_ns(&up_done, &up_lock, UP_WAIT_NS - el);
+        }
+        ok = up_gen >= next;
+    }
+    if (!ok) up_stale++;
+    plat_mutex_unlock(&up_lock);
+    if (ok && !plat_mutex_trylock(&sdl_lock)) ok = 0;   // the next update began already, for another poller
+    return ok;
+}
+
+static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 
 // Every connected gamepad is kept open; `pad` is the one the game reads (and the one that rumbles and feeds motion):
 // the first one found, then whichever one the player presses (pad_follow). Taking only the first gamepad SDL lists
@@ -405,6 +504,7 @@ static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t ou
 // receiver's idle second slot, listed before the controller in the player's hands.
 enum { MAX_PADS = 8 };
 static SDL_Gamepad *pads[MAX_PADS];
+static uint8_t pad_rest[MAX_PADS];   // per open gamepad, bit a: axis a has been seen at rest (pad_axis)
 static int npads;
 static int pad_pressed_logged;       // the primary's first press was logged (once per primary)
 
@@ -435,7 +535,11 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
 
 // Under lock: closes the gamepads that went away and opens the ones that came; the primary falls back to the first
 // open one when it left. Logs each change.
+// The game is always told one controller is connected, so a disconnect read as nothing pressed and play went on
+// uncontrolled (the console would stop and ask for a controller). When the primary goes and no other gamepad takes
+// its place, the menu opens: the player sees it, and it takes the keyboard and mouse until it is closed.
 static void scan_pads(void) {
+    int had = pad != NULL;
     for (int i = 0; i < npads;) {
         if (SDL_GamepadConnected(pads[i])) { i++; continue; }
         rt_log("input: gamepad \"%s\" disconnected", SDL_GetGamepadName(pads[i]) ? SDL_GetGamepadName(pads[i]) : "?");
@@ -445,7 +549,8 @@ static void scan_pads(void) {
             for (int k = 0; k < 4; k++) plat_xchg32(&pad_labels[k], PAD_LABEL_NONE);
         }
         SDL_CloseGamepad(pads[i]);
-        pads[i] = pads[--npads];
+        --npads;
+        pads[i] = pads[npads], pad_rest[i] = pad_rest[npads];
     }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
@@ -455,19 +560,47 @@ static void scan_pads(void) {
         if (open) continue;
         SDL_Gamepad *p = SDL_OpenGamepad(ids[i]);
         if (!p) { rt_log("input: gamepad %u could not be opened (%s)", (unsigned)ids[i], SDL_GetError()); continue; }
+        pad_rest[npads] = 0;
         pads[npads++] = p;
         if (pad) rt_log("input: gamepad \"%s\" connected (the game switches to it at its first press)", SDL_GetGamepadName(p));
     }
     SDL_free(ids);
     if (!pad && npads) pad_primary(pads[0], "in use");
+    if (had && !pad && !menu_is_open()) {
+        rt_log("input: the gamepad in use went away and no other is connected: the menu opens");
+        menu_toggle();
+    }
 }
 
-// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count).
+// Under lock: axis a of open gamepad p, or 0 until the axis has been seen at rest (within a quarter of its range of the
+// middle; a trigger's rest is 0). A device that reports an axis held from the start (a virtual pad nobody holds, a
+// trigger or pedal mapped onto a stick, a stick that rests far off its middle) would otherwise turn the camera on its
+// own, and, counted as pressed, take the gamepad role from the controller in the player's hands for good (pad_follow).
+// A stick the player holds at the start counts once it has been let go.
+enum { AXIS_REST = 8192 };
+static int16_t pad_axis(SDL_Gamepad *p, SDL_GamepadAxis a) {
+    int16_t v = SDL_GetGamepadAxis(p, a);
+    for (int i = 0; i < npads; i++) {
+        if (pads[i] != p) continue;
+        if (pad_rest[i] >> a & 1) return v;
+        if (abs(v) >= AXIS_REST) return 0;
+        pad_rest[i] |= (uint8_t)(1u << a);
+        return v;
+    }
+    return v;
+}
+
+static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
+    input_pad_stick(pad_axis(pad, ax), -(int32_t)pad_axis(pad, ay), dead, out);
+}
+
+// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count,
+// nor an axis not yet seen at rest).
 static int pad_active(SDL_Gamepad *p) {
     for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
         if (SDL_GetGamepadButton(p, (SDL_GamepadButton)b)) return 1;
     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++)
-        if (abs(SDL_GetGamepadAxis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
+        if (abs(pad_axis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
     return 0;
 }
 
@@ -577,14 +710,12 @@ static void start(void) {
     binds_refresh();
     const char *e = cfg_get("NX2NAVI_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (NX2NAVI_INPUT=none)"); return; }
-    // SDL drops gamepad presses while it thinks the program is in the background, and it judges that from windows of
-    // its own: the Win32 window (gfx_window_win.c) is not one, and keyboard focus is gated here (ikb_foreground)
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
-    else state = 1;
-    if (state == 1) test_pad_attach();
+    state = sdl_start() ? 1 : -1;   // SDL's initialisation, on the pad thread (up_main)
     if (state == 1) {
+        plat_mutex_lock(&sdl_lock);   // the pad thread updates only when asked, and nobody has asked yet
+        test_pad_attach();
         scan_pads();
+        plat_mutex_unlock(&sdl_lock);
         if (!pad) rt_log("input: no gamepad (keyboard only until one is connected)");
     }
     if (state == -1) state = 2;   // keyboard only
@@ -620,23 +751,17 @@ static int32_t shake_stick(int held) {
     return (now - from) / SHAKE_SIDE_NS % 2 ? STICK_MAX : -STICK_MAX;
 }
 
-// Under lock, state 1: the open gamepad's inputs by position (pd[PAD_*] != 0 held); 0 without a connected gamepad.
+// Under lock and inside sdl_enter (the gamepads' state is up to date), state 1: the open gamepad's inputs by position
+// (pd[PAD_*] != 0 held); 0 without a connected gamepad.
 static int pad_physical(uint8_t pd[PAD_COUNT]) {
     test_pad_tick();
     // every RESCAN_MS, not only without a gamepad: a second controller, or one that wakes up after the start, is found
     if (plat_now_ns() / 1000000u >= next_scan) { next_scan = plat_now_ns() / 1000000u + RESCAN_MS; scan_pads(); }
-    SDL_UpdateGamepads();
-#ifdef _WIN32
-    // The Windows window is our own (gfx_window_win.c), so nothing reads SDL's event queue, yet every axis and button
-    // change of a gamepad is queued there: at SDL's cap (about 65,000 events, several MB) each further one fails and
-    // sets SDL's error text. The state the calls below read does not come from the queue.
-    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
-#endif
     pad_follow();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
-    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
-    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZL] = pad_axis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZR] = pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
     for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
     if (!pad_pressed_logged) {   // once per primary: the log then shows that its presses arrive
         for (int p = PAD_SOUTH; p < PAD_COUNT && !pad_pressed_logged; p++)
@@ -717,7 +842,26 @@ static int ds3_primary(uint8_t pd[PAD_COUNT], int32_t raw[4], int sdl_pad) {
 }
 #endif
 
+static int pad_read_now(uint64_t *b, int32_t sl[2], int32_t sr[2]);
+
+// Under lock, state 1: the gamepad's buttons (ORed into *b) and sticks; 0 without one. While SDL is finding devices
+// again (sdl_enter) the answer is the last one read: what was held stays held for those moments.
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    static uint64_t last_b;
+    static int32_t last_sl[2], last_sr[2];
+    static int last_ok;
+    if (sdl_enter()) {
+        uint64_t pb = 0;
+        int32_t l[2] = {0, 0}, r[2] = {0, 0};
+        last_ok = pad_read_now(&pb, l, r);
+        sdl_leave();
+        last_b = pb, last_sl[0] = l[0], last_sl[1] = l[1], last_sr[0] = r[0], last_sr[1] = r[1];
+    }
+    if (last_ok) *b |= last_b, sl[0] = last_sl[0], sl[1] = last_sl[1], sr[0] = last_sr[0], sr[1] = last_sr[1];
+    return last_ok;
+}
+
+static int pad_read_now(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     uint8_t pd[PAD_COUNT] = {0};
 #ifdef _WIN32
     int sdl = pad_physical(pd);
@@ -749,22 +893,23 @@ int input_pad_stick_percent(double pct[2]) {
     int ok = 0;
     pct[0] = pct[1] = 0;
     plat_mutex_lock(&lock);
+    int in = state == 1 && plat_mutex_trylock(&sdl_lock);   // not while SDL updates: this reading is skipped then
+    int sdl_pad = in && pad && SDL_GamepadConnected(pad);
 #ifdef _WIN32
     uint8_t dd[PAD_COUNT];
     int32_t raw[4];
-    if (state == 1 && ds3_primary(dd, raw, pad && SDL_GamepadConnected(pad))) {
+    if (state == 1 && ds3_primary(dd, raw, sdl_pad)) {
         pct[0] = input_stick_percent(raw[0], raw[1]);
         pct[1] = input_stick_percent(raw[2], raw[3]);
         ok = 1;
     } else
 #endif
-    if (state == 1 && pad && SDL_GamepadConnected(pad)) {   // the game's poll keeps the state fresh (SDL_UpdateGamepads)
-        pct[0] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-        pct[1] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+    if (sdl_pad) {   // the game's poll keeps the state fresh (sdl_enter)
+        pct[0] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTX), pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+        pct[1] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTX), pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
         ok = 1;
     }
+    if (in) sdl_leave();
     plat_mutex_unlock(&lock);
     return ok;
 }
@@ -786,8 +931,17 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             static int was_captured;
             static uint8_t mouse_ignore[KEY_COUNT];
             int cap = ikb_captured();
+            // A scan is one key state system call per key (about 95). The game reads several pads in a row: reads
+            // within a millisecond of a scan get its answers again.
+            static uint8_t raw[KEY_COUNT];
+            static uint64_t raw_at;
+            uint64_t now = plat_now_ns();
+            if (!raw_at || now - raw_at >= 1000000) {
+                for (int k = 1; k < KEY_COUNT; k++) raw[k] = (uint8_t)(ikb_down(k) != 0);
+                raw_at = now;
+            }
             for (int k = 1; k < KEY_COUNT; k++) {
-                down[k] = ikb_down(k);
+                down[k] = raw[k];
                 kbm_used |= down[k];
                 if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
                 if (cap && !was_captured) mouse_ignore[k] = down[k];
@@ -805,8 +959,12 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             input_map_stick(down, 1, k);
             if (walk) k[0] = (int32_t)(k[0] * walk_scale), k[1] = (int32_t)(k[1] * walk_scale);
             pick(&sr[0], &sr[1], k[0], k[1]);
-            int selector = b & (1ull << B_L) ? 1 : b & (1ull << B_UP) ? 2 :
-                           b & (1ull << B_LEFT) ? 3 : b & (1ull << B_RIGHT) ? 4 : 0;
+            // The buttons whose selector the right stick picks from. None in Ocarina (1.1.1): its D-pad acts at once
+            // (ocarina, accessory, Navi, boots), and with L or R held the camera input update goes on taking the
+            // mouse; where an update stops taking it, the mouse is the right stick again (mouse_camera).
+            int selector = rt_game_version == 111 ? 0
+                               : b & (1ull << B_L) ? 1 : b & (1ull << B_UP) ? 2 :
+                                 b & (1ull << B_LEFT) ? 3 : b & (1ull << B_RIGHT) ? 4 : 0;
             mouse_camera(k, selector);
             pick(&sr[0], &sr[1], k[0], k[1]);
             int32_t shake = shake_stick(input_map_held(down, B_SHAKE));
@@ -945,7 +1103,7 @@ int input_capture(int reset, int *id) {
     int esc = fg && ikb_escape();
     plat_mutex_lock(&lock);
     if (!state) start();
-    if (state == 1) pad_physical(p);
+    if (state == 1 && sdl_enter()) pad_physical(p), sdl_leave();
 #ifdef _WIN32
     if (state == 1) {   // a DualShock 3 the reader has: its presses can be bound too
         uint8_t dd[PAD_COUNT];
@@ -979,9 +1137,10 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     static unsigned seen;
     if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
     plat_mutex_lock(&lock);
-    if (state == 1 && pad && pad_rumble) {
+    if (state == 1 && pad && pad_rumble && plat_mutex_trylock(&sdl_lock)) {   // one skipped while SDL updates
         ok = SDL_RumbleGamepad(pad, low, high, ms);
         if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
+        sdl_leave();
     }
 #ifdef _WIN32
     if (state == 1 && ds3_rumble(low, high, ms)) ok = 1;   // no-op unless the DualShock 3 reader has a controller
@@ -1045,10 +1204,10 @@ static void motion_main(void *arg) {
         float a[3], g[3];
         int have = 0;
         plat_mutex_lock(&lock);
-        if (pad && SDL_GamepadConnected(pad)) {
-            SDL_UpdateGamepads();
-            have = sensors_ready() && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, a, 3) &&
-                   SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
+        if (pad && sdl_enter()) {   // no sample while SDL finds devices again
+            have = SDL_GamepadConnected(pad) && sensors_ready() &&
+                   SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, a, 3) && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
+            sdl_leave();
         }
         plat_mutex_unlock(&lock);
         if (!have || !input_motion_enabled()) continue;
@@ -1070,4 +1229,71 @@ void input_motion_start(void) {
         }
     }
     plat_mutex_unlock(&lock);
+}
+
+// --probe-input: the gamepad path on SDL's virtual test gamepad (NX2NAVI_TEST_PAD). The pad thread comes up, a poll
+// reads the gamepad, polls are quick, and while an update takes as long as a device search (up_test_ns) the polls go on
+// with their last state instead of waiting for it. Needs no game files and no controller.
+int probe_gamepad(void) {
+    int fails = 0;
+    cfg_setenv("NX2NAVI_TEST_PAD", "20000,-12000,0,0");
+    uint64_t b = 0;
+    int32_t lx = 0, ly = 0;
+    uint64_t t0 = plat_now_ns();
+    int ok = input_pad_read(&b, &lx, &ly);
+    printf("input: first poll %.1f ms (SDL comes up on the pad thread), gamepad %s\n", (plat_now_ns() - t0) / 1e6,
+           ok ? "read" : "not read");
+    if (!ok) fails++, printf("FAIL: no gamepad was read, with the test gamepad attached\n");
+    plat_mutex_lock(&lock);
+    const char *nm = pad && plat_mutex_trylock(&sdl_lock) ? SDL_GetGamepadName(pad) : NULL;
+    int test = nm && strstr(nm, "test gamepad");
+    if (nm) sdl_leave();
+    plat_mutex_unlock(&lock);
+    if (test && (lx < 8000 || ly == 0)) fails++, printf("FAIL: the test gamepad's left stick read %d,%d\n", lx, ly);
+    if (!test) printf("input: another gamepad is the primary one; the stick values are not checked\n");
+    // ordinary polls: each asks the pad thread for an update unless one is fresh
+    uint64_t worst = 0, sum = 0;
+    enum { N = 400 };
+    for (int i = 0; i < N; i++) {
+        plat_wait_ns(700000);   // past UP_FRESH_NS: every poll asks
+        uint64_t p0 = plat_now_ns();
+        int32_t x, y;
+        ok = input_pad_read(&b, &x, &y);
+        uint64_t d = plat_now_ns() - p0;
+        sum += d;
+        if (d > worst) worst = d;
+        if (!ok || (test && x != lx)) { fails++, printf("FAIL: poll %d read %d (stick %d, was %d)\n", i, ok, x, lx); break; }
+    }
+    printf("input: %d polls, each with its own update: %.0f us on average, %.0f us the longest\n", N, sum / 1e3 / N, worst / 1e3);
+    if (worst > UP_WAIT_NS + 3000000) fails++, printf("FAIL: a poll took %.1f ms\n", worst / 1e6);
+    uint64_t stale0 = up_stale;
+    // an update that takes 300 ms: the first poll waits UP_WAIT_NS for it, the others not at all, and all get the stick
+    __atomic_store_n(&up_test_ns, 300000000ull, __ATOMIC_RELAXED);
+    plat_wait_ns(700000);
+    uint64_t s0 = plat_now_ns(), first = 0, rest = 0;
+    int n = 0;
+    while (plat_now_ns() - s0 < 250000000ull) {
+        uint64_t p0 = plat_now_ns();
+        int32_t x, y;
+        ok = input_pad_read(&b, &x, &y);
+        uint64_t d = plat_now_ns() - p0;
+        if (!n) first = d;
+        else if (d > rest) rest = d;
+        n++;
+        if (!ok || (test && x != lx)) { fails++, printf("FAIL: a poll during the long update read %d (stick %d, was %d)\n", ok, x, lx); break; }
+        plat_wait_ns(1000000);
+    }
+    printf("input: during a 300 ms update: %d polls, the first %.1f ms, the longest after it %.0f us, %llu went on with "
+           "the last state\n", n, first / 1e6, rest / 1e3, (unsigned long long)(up_stale - stale0));
+    if (first > UP_WAIT_NS + 3000000 || rest > 1500000 || up_stale - stale0 < (uint64_t)n - 1)
+        fails++, printf("FAIL: polls waited for the long update\n");
+    plat_wait_ns(120000000);   // the long update ends: polls are fresh again
+    uint64_t g0 = up_gen;
+    ok = input_pad_read(&b, &lx, &ly);
+    if (!ok || up_gen == g0) fails++, printf("FAIL: no update after the long one\n");
+    double pct[2];
+    input_pad_stick_percent(pct);
+    input_rumble(1000, 1000, 10);
+    printf("probe-input: %s\n", fails ? "FAILED" : "passed");
+    return fails != 0;
 }

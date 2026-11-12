@@ -106,6 +106,21 @@ static void probe_device_and_pools(void) {
     CHECK(nvn_pool_find(U(pmem) + 0x100, 0x200) == P() && !nvn_pool_find(U(pmem) + PROBE_POOL_SIZE - 8, 16), "pool index");
     n_objects += 6;
 
+    // getters asked of no object answer 0 instead of reading address 0 (nvn_no_object); a buffer with no pool maps to
+    // writable memory of its own, not to 0
+    CHECK(CALL(nvnMemoryPoolGetFlags, 0) == 0 && CALL(nvnMemoryPoolGetSize, 0) == 0 && CALL(nvnMemoryPoolMap, 0) == 0 &&
+              CALL(nvnMemoryPoolGetBufferAddress, 0) == 0, "pool getters of no pool");
+    CALL(nvnMemoryPoolInvalidateMappedRange, 0, 0, 0x100);
+    CHECK(CALL(nvnTextureBuilderGetStorageSize, 0) == 0 && CALL(nvnTextureBuilderGetStorageAlignment, 0) == 0,
+          "storage size and alignment of no texture builder");
+    {
+        static NVNbuffer nopool;   // zeroed, as a buffer whose initialization failed
+        uint8_t *m = (uint8_t *)(uintptr_t)CALL(nvnBufferMap, U(&nopool));
+        int ok = m != NULL;
+        if (ok) memset(m, 0xab, 0x3d0), ok = m[0x3cf] == 0xab;
+        CHECK(ok, "a buffer with no pool maps to writable memory");
+    }
+
     // refused: no storage, PHYSICAL | VIRTUAL, a size that is not a 64 KiB multiple
     static NVNmemoryPool bad;
     CHECK(make_pool(&bad, NULL, 0x10000, NVN_MEMORY_POOL_FLAGS_CPU_CACHED) == 0, "a pool without storage is refused");

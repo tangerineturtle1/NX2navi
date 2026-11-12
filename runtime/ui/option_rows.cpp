@@ -130,13 +130,83 @@ void opt_end(void) {
 struct RowView {
     const char *value;   // right side; "" for none
     bool is_default;     // the value is the setting's default: the "default" mark, the value not highlighted
-    bool arrows;         // a stepper: < value >, the arrows click too
+    bool arrows;         // a stepper: [<] value [>]; the mouse changes the value on the two framed arrows only
     const char *note;    // under the value instead of the "default" mark; NULL for none
+    float col;           // the width of the widest value the row can show (value_width); 0: this value's
+    bool end_l, end_r;   // the value is the first / last one: that arrow is drawn faint and does nothing
 };
 
-// One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right),
-// 3 / 4 (move up / down, movable rows only) or 0; always 0 for a row the environment fixes (greyed out, still selectable
-// so its description shows). movable: the top / left face buttons, Ctrl+Up / Ctrl+Down and two drawn arrows move it.
+// The width of the widest of n values at the current font size: a stepper's left arrow stands that far from the right
+// one whatever value shows, so it stays under the pointer while it is clicked through the values.
+static float value_width(const char *const *names, int n) {
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize(), w = 0;
+    for (int i = 0; i < n; i++)
+        if (names[i]) w = fmaxf(w, font->CalcTextSizeA(fs, FLT_MAX, 0, names[i]).x);
+    return w;
+}
+
+// One framed arrow of a stepper over [a, b]: a white frame with the arrow in its middle, filled a little while the
+// pointer is on it and more while it is pressed; faint when it does nothing (dim: the row is greyed out or the value
+// is at this end).
+static void arrow_box(ImDrawList *dl, ImVec2 a, ImVec2 b, bool left, bool hot, bool down, bool dim, float s) {
+    const int al = dim ? 70 : hot ? 255 : 215;
+    const ImU32 white = IM_COL32(255, 255, 255, al);
+    if (hot && !dim) dl->AddRectFilled(a, b, IM_COL32(255, 255, 255, down ? 96 : 44), 4 * s);
+    dl->AddRect(a, b, white, 4 * s, 0, fmaxf(1.0f, (hot && !dim ? 2.2f : 1.6f) * s));
+    float cx = (a.x + b.x) * 0.5f, cy = (a.y + b.y) * 0.5f, aw = (b.y - a.y) * 0.38f, ah = aw * 0.8f;
+    float tip = left ? -aw * 0.55f : aw * 0.55f, back = left ? aw * 0.45f : -aw * 0.45f;
+    dl->AddTriangleFilled(ImVec2(cx + tip, cy), ImVec2(cx + back, cy - ah), ImVec2(cx + back, cy + ah), white);
+}
+
+// ---- test hook. NX2NAVI_MENU_TEST_CLICK=<key>:<part>[,<key>:<part>...], with NX2NAVI_MENU_TEST opening the menu on the
+// page that has the rows (menu.cpp): mouse clicks on steppers by their setting's name (without NX2NAVI_), part l (the
+// left arrow), r (the right arrow) or b (the row's body, on its label). One click after another, each over a dozen
+// frames: the pointer goes there, the button goes down and up, and the log says what the setting is then. So a run
+// checks that the arrows step a setting and that an arrow at its end and a click on the body do not, with the fonts
+// and sizes of the game.
+static struct ClickTest { int parsed, n, at, frame; struct { char key[56]; char part; } c[24]; } g_click;
+
+static void click_test(const char *key, ImVec2 la, ImVec2 lb, ImVec2 ra, ImVec2 rb, ImVec2 label) {
+    ClickTest &t = g_click;
+    if (!t.parsed) {
+        t.parsed = 1;
+        const char *s = cfg_get("NX2NAVI_MENU_TEST_CLICK");
+        while (s && *s && t.n < 24) {
+            size_t n = strcspn(s, ",");
+            const char *colon = (const char *)memchr(s, ':', n);
+            if (colon) {
+                snprintf(t.c[t.n].key, sizeof t.c[0].key, "NX2NAVI_%.*s", (int)(colon - s), s);
+                t.c[t.n++].part = colon[1];
+            }
+            s += n;
+            if (*s == ',') s++;
+        }
+    }
+    if (t.at >= t.n || strcmp(key, t.c[t.at].key)) return;
+    const char part = t.c[t.at].part;
+    const ImVec2 to = part == 'l'   ? ImVec2((la.x + lb.x) * 0.5f, (la.y + lb.y) * 0.5f)
+                      : part == 'r' ? ImVec2((ra.x + rb.x) * 0.5f, (ra.y + rb.y) * 0.5f)
+                                    : label;
+    ImGuiIO &io = ImGui::GetIO();
+    const int f = t.frame++;
+    if (f == 0) io.AddMousePosEvent(to.x, to.y);
+    else if (f == 4) io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+    else if (f == 7) io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    else if (f == 12) {
+        rt_log("menu: test hook: click on %s of %s: now %s",
+               part == 'l' ? "the left arrow" : part == 'r' ? "the right arrow" : "the body", key, cfg_value(key));
+        t.at++, t.frame = 0;
+    }
+}
+
+// One row: draws it, handles A / click and left / right while selected. Returns 2 (A, or a click on a row without
+// arrows), -1 / +1 (left / right, or the mouse on a stepper's framed arrow), 3 / 4 (move up / down, movable rows only)
+// or 0; always 0 for a row the environment fixes (greyed out, still selectable so its description shows). movable: the
+// top / left face buttons, Ctrl+Up / Ctrl+Down and two drawn arrows move it.
+// A stepper takes the mouse on its two framed arrows only: a click anywhere else on the row selects it and changes
+// nothing. A click on the row used to step to the next value, and the left arrow stood left of the value's text, so
+// it moved when a value of another width came up and the next click at the same place landed on the row instead.
 static int row_text(const char *key, const char *label, const char *desc, const RowView &v, bool movable) {
     const CfgMeta *m = cfg_meta(key);
     const char *disabled = g_disable_next ? g_disable_note : NULL;
@@ -212,19 +282,38 @@ static int row_text(const char *key, const char *label, const char *desc, const 
         vfs = fmaxf(fs * cap / tv, fs * 0.75f);
         tv = fminf(font->CalcTextSizeA(vfs, FLT_MAX, 0, v.value).x, cap);
     }
-    if (v.arrows && v.value[0]) {   // < value >, drawn (the font has no arrow glyphs); a click on one steps
-        float aw = fs * 0.42f, gap = fs * 0.55f, cy = ty + fs * 0.52f;
-        float rx = right - aw, lx = rx - gap - tv - gap - aw;
-        ImU32 ac = off ? kGrey : hov || foc ? SKIN_TEXT : SKIN_TEXT_DIM;
-        dl->AddTriangleFilled(ImVec2(lx, cy), ImVec2(lx + aw, cy - aw * 0.75f), ImVec2(lx + aw, cy + aw * 0.75f), ac);
-        dl->AddTriangleFilled(ImVec2(rx + aw, cy), ImVec2(rx, cy - aw * 0.75f), ImVec2(rx, cy + aw * 0.75f), ac);
-        if (by_mouse && !off) {
-            float mx = ImGui::GetIO().MousePos.x;
-            if (mx >= lx - gap && mx <= lx + aw + gap) step = -1;
-            else if (mx >= rx - gap && mx <= rx + aw + gap) step = 1;
+    float value_mid = -1;   // a stepper's value and its note are centred here, between the arrows
+    if (v.arrows) {         // [<] value [>]: the arrows are drawn (the font has no arrow glyphs), each in a white frame
+        // The frames stand in fixed places: the right one at the row's right edge, the left one the width of the row's
+        // widest value before it. They fit over the note line, in the label line's height.
+        const float bw = floorf(fs * 1.3f), bh = floorf(fs * 1.02f), gap = floorf(fs * 0.4f), cy = floorf(ty + fs * 0.52f);
+        float col = fminf(fmaxf(v.col, tv), fmaxf(cap - 2 * (bw + gap), fs));
+        if (tv > col) {   // a value wider than the room between the arrows: smaller, then clipped
+            vfs = fmaxf(fs * col / font->CalcTextSizeA(fs, FLT_MAX, 0, v.value).x, fs * 0.75f);
+            tv = fminf(font->CalcTextSizeA(vfs, FLT_MAX, 0, v.value).x, col);
         }
-        right = rx - gap;
-        value_left = lx;
+        const ImVec2 ra(right - bw, cy - bh * 0.5f), rb(right, cy + bh * 0.5f);
+        const ImVec2 la(ra.x - gap - col - gap - bw, ra.y), lb(ra.x - gap - col - gap, rb.y);
+        if (!g_click.parsed || g_click.at < g_click.n) click_test(key, la, lb, ra, rb, ImVec2(p.x + w * 0.25f, p.y + h * 0.5f));
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        // the pointer on an arrow: its frame and two pixels around it, so a click on the frame's own line counts
+        const float slop = 2 * g_scale;
+        auto on = [&](ImVec2 a, ImVec2 b) {
+            return hov && mp.x >= a.x - slop && mp.x < b.x + slop && mp.y >= a.y - slop && mp.y < b.y + slop;
+        };
+        const bool hl = on(la, lb), hr = on(ra, rb), down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        if (by_mouse) step = 0;   // a click on the row itself only selects it
+        // The press steps, and a held button repeats as a held key does; after a second it also goes ten steps at a
+        // time over a long range (opt_slider), as held left / right do.
+        if (!off && ((hl && !v.end_l) || (hr && !v.end_r)) && ImGui::IsMouseClicked(ImGuiMouseButton_Left, true)) {
+            step = hl ? -1 : 1;
+            if (ImGui::GetIO().MouseDownDuration[ImGuiMouseButton_Left] > 1.0f) g_held = true;
+        }
+        arrow_box(dl, la, lb, true, hl, hl && down, off || v.end_l, g_scale);
+        arrow_box(dl, ra, rb, false, hr, hr && down, off || v.end_r, g_scale);
+        value_mid = (lb.x + ra.x) * 0.5f;
+        right = ra.x - gap;
+        value_left = la.x;
     }
     if (movable) {   // up and down arrows left of the value; a click on one moves the row
         // a fixed value column (On / Off differ in width) keeps the arrows of the rows in one line
@@ -241,8 +330,8 @@ static int row_text(const char *key, const char *label, const char *desc, const 
         value_left = cx - gap;
     }
     if (v.value[0]) {
-        float vx = right - tv;
-        ImVec4 vclip(vx, p.y, right, p.y + h);
+        float vx = value_mid >= 0 ? floorf(value_mid - tv * 0.5f) : right - tv;
+        ImVec4 vclip(vx, p.y, vx + tv, p.y + h);
         dl->AddText(font, vfs, ImVec2(vx, ty + (fs - vfs) * 0.5f),
                     off ? kGrey : v.is_default ? IM_COL32(232, 222, 198, 255) : IM_COL32(255, 255, 255, 255), v.value, NULL,
                     0, &vclip);
@@ -252,18 +341,21 @@ static int row_text(const char *key, const char *label, const char *desc, const 
     if (v.note || v.is_default) {   // under the value, right-aligned with it; its start shows when it is too long
         const char *t = v.note ? v.note : menu_text(UI_MENU_DEFAULT_MARK);
         float tw = fminf(font->CalcTextSizeA(small, FLT_MAX, 0, t).x, cap);
-        ImVec4 nclip(right - tw, p.y, right, p.y + h);
-        dl->AddText(font, small, ImVec2(right - tw, ny), v.note ? IM_COL32(250, 206, 130, 255) : SKIN_TEXT_DIM, t, NULL, 0,
-                    &nclip);
-        if (tw > 0) note_right = right - tw - fs * 0.6f;
+        // a stepper's note is centred under its value, as far as the row's right edge lets it
+        float nx = value_mid >= 0 ? fminf(floorf(value_mid - tw * 0.5f), p.x + w - pad - tw) : right - tw;
+        ImVec4 nclip(nx, p.y, nx + tw, p.y + h);
+        dl->AddText(font, small, ImVec2(nx, ny), v.note ? IM_COL32(250, 206, 130, 255) : SKIN_TEXT_DIM, t, NULL, 0, &nclip);
+        if (tw > 0) note_right = nx - fs * 0.6f;
     }
-    // the label and its note, clipped before the value
+    // the label and its note, clipped before the value. A restart-only setting says "after restart" while its value
+    // differs from the one the game started with (cfg_pending), so the note marks what a restart would change; the
+    // description says it whatever the value (desc_set)
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
     dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : SKIN_TEXT, label, NULL, 0, &clip);
-    const char *note = disabled        ? disabled
-                     : off             ? menu_text(UI_MENU_SET_BY_ENV)
-                     : m && !m->live ? menu_text(UI_MENU_AFTER_RESTART)
-                                     : NULL;
+    const char *note = disabled                          ? disabled
+                     : off                               ? menu_text(UI_MENU_SET_BY_ENV)
+                     : m && !m->live && cfg_pending(key) ? menu_text(UI_MENU_AFTER_RESTART)
+                                                         : NULL;
     ImVec4 note_clip(p.x, p.y, note_right, p.y + h);
     if (note)
         dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : SKIN_TEXT_DIM, note, NULL, 0,
@@ -311,11 +403,17 @@ int opt_save_tick(int force) {
 
 // ---- rows
 
+// An on / off row is a stepper too: either arrow, A, left or right flips it.
+static float on_off_width(void) {
+    const char *const names[] = {menu_text(UI_MENU_ON), menu_text(UI_MENU_OFF)};
+    return value_width(names, 2);
+}
+
 bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted) {
     const char *d = cfg_default(key);
     bool set = cfg_bool(key) != 0, def = d && *d && strcmp(d, "0") != 0;
     bool on = set != inverted;   // what the row shows
-    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, false, NULL};
+    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, true, NULL, on_off_width()};
     if (!row(key, label, desc, v)) return false;   // any step flips it
     apply(key, set ? "0" : "1");
     return true;
@@ -326,7 +424,7 @@ bool opt_toggle_value(const char *key, UiTextId label, UiTextId desc, const char
     // when it is an on value, so turning the switch off and on again puts the profile's own value back
     const char *d = cfg_default(key);
     bool on = strcmp(cfg_value(key), off_value) != 0, def = d && strcmp(d, off_value) != 0;
-    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), on == def, false, note};
+    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), on == def, true, note, on_off_width()};
     if (!row(key, label, desc, v)) return false;   // any step flips it
     apply(key, on ? off_value : def && *d ? d : on_value);
     return true;
@@ -339,7 +437,8 @@ bool opt_button(const char *id, UiTextId label, UiTextId desc, const char *value
 
 bool opt_toggle_text(const char *id, const char *label, const char *desc, bool on, const char *value) {
     // off is the plain state: its value drawn dim, without the "default" mark
-    RowView v = {value ? value : menu_text(on ? UI_MENU_ON : UI_MENU_OFF), !on, false, on ? NULL : ""};
+    RowView v = {value ? value : menu_text(on ? UI_MENU_ON : UI_MENU_OFF), !on, true, on ? NULL : "",
+                 value ? 0 : on_off_width()};
     return row_text(id, label, desc, v, false) != 0;   // any step flips it
 }
 
@@ -391,7 +490,7 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
     int def = -1;
     for (int i = 0; d && i < n; i++)
         if (!strcmp(values[i], d)) def = i;
-    RowView v = {cur >= 0 ? names[cur] : now, cur == def, true, note};
+    RowView v = {cur >= 0 ? names[cur] : now, cur == def, true, note, value_width(names, n), cur == 0, cur == n - 1};
     int step = row(key, label, desc, v);
     if (!step || n <= 0) return false;
     int nv;
@@ -405,7 +504,8 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
 
 int opt_choice_index(const char *key, UiTextId label, const char *const *names, int n, int cur, int def, UiTextId desc,
                      const char *note) {
-    RowView v = {cur >= 0 && cur < n ? names[cur] : "", cur == def, true, note};
+    RowView v = {cur >= 0 && cur < n ? names[cur] : "", cur == def, true, note, value_width(names, n), cur == 0,
+                 cur == n - 1};
     int step = row(key, label, desc, v);
     if (!step || n <= 0) return -1;
     int nv = cur < 0 ? (step < 0 ? n - 1 : 0) : step == 2 ? (cur + 1) % n : cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;
@@ -452,9 +552,13 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     // follows the fallback's default, not 0, even once the key is set.
     if (fallback && !(d && *d)) d = cfg_default(fallback);
     double v = cfg_double(src), def = d && *d ? strtod(d, NULL) : lo;
-    char shown[48];
+    char shown[48], ends[2][48];
     snprintf(shown, sizeof shown, fmt, v);
-    RowView rv = {shown, fabs(v - def) < step * 0.01, true, note};
+    snprintf(ends[0], sizeof ends[0], fmt, (double)lo);
+    snprintf(ends[1], sizeof ends[1], fmt, (double)hi);
+    const char *const widest[] = {shown, ends[0], ends[1]};
+    RowView rv = {shown, fabs(v - def) < step * 0.01, true, note, value_width(widest, 3), v <= lo + step * 0.01,
+                  v >= hi - step * 0.01};
     int s = row(key, label, desc, rv);
     if (!s) return false;
     int steps = g_held && (hi - lo) > 40 * step ? 10 : 1;   // held: ten steps at a time over a long range

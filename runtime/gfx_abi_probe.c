@@ -71,7 +71,8 @@ static void check_write_watch(void) {
     CHECK(!mem_frozen(heap) && p[0x3000] == 7, "a write into a frozen region did not thaw it");
     n = mem_written_pages(heap, 0x200000, pages, 8);
     CHECK(n == 1 && pages[0] == heap + 0x3000, "write after a thaw: %llu pages reported (want 1)", (unsigned long long)n);
-    CHECK(mem_freeze(heap) == 1, "refreeze after a write thaw");
+    // written moments after its freeze: a region the game keeps writing, held thawed for a while (memory.c "Hot regions")
+    CHECK(mem_freeze(heap) == 0 && !mem_frozen(heap), "a region a write thawed right after its freeze was frozen again");
     mem_thaw(heap + 0x6000, 0x1000);
     CHECK(!mem_frozen(heap) && mem_freeze(heap) == 0, "mem_thaw did not thaw and hold the region");
     p[0x6000] = 8;
@@ -94,6 +95,29 @@ static void check_write_watch(void) {
     CHECK(plat_mem_state(a, a + 0x10000, &end) == PLAT_PROT_RW && end == a + 0x4000, "the thawed pages are not read-write");
     CHECK(plat_mem_state(a + 0x4000, a + 0x4001, &end) == PLAT_MEM_RESERVED, "a hole got committed");
     printf("write-watch: region with reserved holes frozen and thawed by a write\n");
+    // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): a probed region is inaccessible until its first access, which is
+    // noted and runs again; a frozen one goes back to read-only first and then thaws on a write; mem_thaw ends a probe
+    // and holds the region. With the setting off mem_probe arms nothing.
+    if (mem_probing()) {
+        volatile uint8_t *q = (volatile uint8_t *)(uintptr_t)a;
+        CHECK(mem_probe(ra, 0x200000) == 1, "probe of a 2 MiB region");
+        CHECK(plat_mem_state(a, a + 1, &end) == PLAT_PROT_NONE, "a probed region is not inaccessible");
+        CHECK(q[0x2000] == 9, "a read of a probed region did not return its byte");
+        CHECK(plat_mem_state(a, a + 0x10000, &end) == PLAT_PROT_RW && end == a + 0x4000, "the read did not end the probe");
+        CHECK(mem_freeze(ra) == 1 && mem_probe(ra, 0x200000) == 1, "probe of a frozen region");
+        q[0x3000] = 5;   // ends the probe (read-only again), faults once more and thaws
+        CHECK(!mem_frozen(ra) && q[0x3000] == 5, "a write into a probed frozen region did not land");
+        CHECK(plat_mem_state(a, a + 0x10000, &end) == PLAT_PROT_RW && end == a + 0x4000, "its pages are not read-write after it");
+        CHECK(mem_probe(ra, 0x200000) == 1, "probe again");
+        mem_thaw(a, 0x1000);
+        CHECK(plat_mem_state(a, a + 1, &end) == PLAT_PROT_RW && mem_probe(ra, 0x200000) == 0,
+              "mem_thaw did not end the probe and hold the region");
+        mem_probe_report(0);
+        printf("write-back probe: a read and a write end a probe and run again, a frozen region thaws after it, "
+               "mem_thaw ends and holds\n");
+    } else {
+        CHECK(mem_probe(ra, 0x200000) == 0, "mem_probe armed a region with the probe off");
+    }
     CHECK(mem_unmap_physical(a, 0x4000) == 0, "UnmapPhysicalMemory");
     CHECK(mem_written_pages(RT_KERNEL_BASE, 0x1000, pages, 8) == UINT64_MAX, "kernel region is not write-watched");
     CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");

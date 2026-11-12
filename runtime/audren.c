@@ -48,6 +48,8 @@ typedef struct AudrenStats {
     // voices (under the lock)
     uint64_t dry, late[3], late_max;   // next buffer late by 1-2 passes, 3-8, 9-AS_LATE_PASSES
     int events;
+    uint64_t voices_ns;                // the game's update (under the lock): the last voice census line
+    int voices_most;                   // the most voices in use a census found
 } AudrenStats;
 
 // NX2NAVI_AUDIO_GAME_PRIO (default 0): the host priority of the game's thread that sends RequestUpdate. 0 leaves it
@@ -307,6 +309,8 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
             }
         } else
             memcpy(&v, voices + i * voice_stride, sizeof v);
+        // An unused slot can have a zero id. Release its own voice and leave voice zero playing.
+        if (!v.in_use) v.id = (uint32_t)i;
         update_voice(r, &v);
         ServerVoice *server = &r->voices[v.id];
         server->use_float_biquads = (uint8_t)float_voices;
@@ -370,6 +374,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     memcpy(w, &r->elapsed_frames, 8);
     AudrenStats *st = r->stats;
     uint64_t late_gap = 0, late_passes = 0;
+    int voices_line = 0, voices_used = 0, voices_playing = 0, voices_most = 0;
     if (st) {   // NX2NAVI_AUDIO_STATS: the game's cadence and how long its update held the lock
         uint64_t now = kern_now_ns(), gap = st->upd_last_ns ? now - st->upd_last_ns : 0,
                  passes = st->upd_last_ns ? r->elapsed_frames - st->upd_pass_last : 0;
@@ -380,8 +385,21 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
         if (gap > AS_UPDATE_EVENT_NS && r->state == 0 && st->events < AS_EVENTS)
             st->events++, late_gap = gap, late_passes = passes;
         st->upd_last_ns = now, st->upd_pass_last = r->elapsed_frames, st->upd_n++;
+        // The voices the game holds: its sound engine takes one per sound from a budget of the renderer's voice count,
+        // so sounds that are never let go show as a count that climbs from area to area until new sounds are refused.
+        if (now - st->voices_ns >= AS_WINDOW_NS) {
+            int used = 0, playing = 0;
+            for (int k = 0; k < r->param.voice_count; k++)
+                used += r->voices[k].in.in_use != 0, playing += r->voices[k].in.in_use && r->voices[k].state == SV_STARTED;
+            if (used > st->voices_most) st->voices_most = used;
+            st->voices_ns = now;
+            voices_line = 1, voices_used = used, voices_playing = playing, voices_most = st->voices_most;
+        }
     }
     plat_mutex_unlock(&r->lock);
+    if (voices_line)
+        rt_log("audio: voices in use %d, playing %d, of %d (the most so far %d), game frame %llu", voices_used,
+               voices_playing, r->param.voice_count, voices_most, (unsigned long long)game_frame());
     if (late_gap)
         rt_log("audio: the game's audio update came %.1f ms after its last one (%llu render passes of 5 ms), game frame "
                "%llu", late_gap / 1e6, (unsigned long long)late_passes, (unsigned long long)game_frame());

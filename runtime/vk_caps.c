@@ -6,7 +6,8 @@
 //   - minStorageBufferOffsetAlignment above 4 (NX2NAVI_VK_SSBO_ALIGN=<power of two> raises it): the translator computes
 //     storage offsets from the guest address rounded down to that alignment (the translator's unaligned storage path), and
 //     vk_exec_draw.c ssbo_info binds the rounded-down address, so shader writes reach guest memory instead of a copy.
-//   - no graphics pipeline library with fast linking (NX2NAVI_GPL=0 forces it): vk_caps.gpl = 0, the extension stays disabled, and pipelines are built whole.
+//   - no graphics pipeline library with fast linking (NX2NAVI_GPL=0 forces it; it also defaults off on AMD's Windows
+//     driver for RDNA 2 and older, see vk_caps_gpl): vk_caps.gpl = 0, the extension stays disabled, and pipelines are built whole.
 //   - no 32-lane pin (no subgroupSizeControl, 32 outside min..max, or NX2NAVI_VK_SUBGROUP_PIN=0): stages run at the
 //     device's subgroupSize (SPIR-V 1.3 without a required size) and the translator is told that size.
 //     NX2NAVI_VK_SUBGROUP=<n> pins n instead of 32 where the driver allows it.
@@ -24,6 +25,10 @@
 VkCaps vk_caps = {.float64 = 1, .sg_size = 32};
 static int f64_supported;
 static VkBool32 gpl_lib, gpl_fast;   // the driver's graphicsPipelineLibrary (feature), ...FastLinking (property)
+static const char *gpl_off;          // why gpl is off, for the boot report; NULL when it is on
+static char summary[832];           // vk_caps_summary: written once, in vk_caps_init, before any other thread reads it
+
+const char *vk_caps_summary(void) { return summary; }
 
 static uint32_t env_u32(const char *name, uint32_t def) {
     const char *e = cfg_get(name);
@@ -41,25 +46,37 @@ void vk_caps_driver(VkPhysicalDevice p) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
     vkGetPhysicalDeviceProperties2(p, &p2);
     vk_caps.amd = p2.properties.vendorID == 0x1002;
+    vk_caps.driver_id = (uint32_t)drv.driverID;
     // AMD split RDNA 1 and 2 off into a driver branch of their own; its driverInfo reads
     // "26.10.1 (AMD proprietary shader compiler)" where the RDNA 3 and 4 driver names LLPC.
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
+    vk_caps.amd_llpc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !vk_caps.amd_sc;
     vk_caps.mesa = drv.driverID == VK_DRIVER_ID_MESA_RADV || drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
                    drv.driverID == VK_DRIVER_ID_MESA_NVK;
 }
 
-// NX2NAVI_GPL=0 turns graphics pipeline libraries off; they are on wherever the driver has fast linking. AMD's RDNA 1/2
-// driver branch had them off for a while: its device losses at boot (issue #5) came with a cold pipeline cache, but
-// their cause was GPU writes past 3D BC images (vk_exec.c, "3D BC render targets"). With that fixed, the RDNA 1/2
-// driver boots with GPL from a cold cache and fast-links without a failure, while with GPL off every new pipeline is
-// built whole on the draw's path (frames of 0.5-1.2 s on an RX 6600, issue #381). RDNA 4 under RADV is reported to
-// hang the GPU at the title screen with GPL.
+// NX2NAVI_GPL=0 turns graphics pipeline libraries off and 1 turns them on; unset, they are on wherever the driver has
+// fast linking, except on AMD's Windows driver for RDNA 2 and older (vk_caps.amd_sc: RX 400 to RX 6000). On an
+// RX 6700 XT the game ended with code 71 at every enemy killed, from 0.5 on, and no longer with gpl = 0; an RX 5700 XT
+// showed the same ending (issue #418). Where in the driver it faults is not established: a kill draws its effects
+// for the first time, which asks for a burst of new pipelines linked from stage libraries, and building them whole
+// avoids it. The price there: with libraries off a pipeline the game needs for the first time is built whole by a
+// worker while its draw is left out (vk_exec_draw.c, "pipeline still building"), so new things appear some frames
+// late, and the start waits for every recorded pipeline instead of 20 s at most (vk_pipeline.c prewarm_run). The
+// same driver had libraries off before, for device losses at boot (issue #5), whose cause was GPU writes past 3D BC
+// images (vk_exec.c, "3D BC render targets"); it boots with them since that was fixed, so gpl = 1 is there to try on
+// a newer driver. RDNA 4 under RADV is reported to hang the GPU at the title screen with GPL.
 int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
                 const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p) {
     gpl_lib = f->graphicsPipelineLibrary;
     gpl_fast = p->graphicsPipelineLibraryFastLinking;
     const char *e = cfg_get("NX2NAVI_GPL");
-    vk_caps.gpl = gpl_lib && gpl_fast && !(e && !strcmp(e, "0"));
+    int want = !e || !*e ? !vk_caps.amd_sc : strcmp(e, "0") != 0;
+    vk_caps.gpl = gpl_lib && gpl_fast && want;
+    gpl_off = vk_caps.gpl ? NULL
+             : !gpl_lib || !gpl_fast ? "the driver has no fast linking"
+             : e && *e ? "NX2NAVI_GPL=0"
+                       : "default on AMD's driver for RDNA 2 and older (NX2NAVI_GPL=1 turns it on)";
     return vk_caps.gpl;
 }
 
@@ -131,6 +148,8 @@ void vk_caps_init(VkCtx *c) {
 
     char dv[32];
     driver_version(dv, sizeof dv, c->props.vendorID, c->props.driverVersion);
+    snprintf(summary, sizeof summary, "%s, driver %s \"%s\" version %s", c->props.deviceName, drv.driverName,
+             drv.driverInfo, dv);
     uint32_t v = c->props.apiVersion;
     VkPhysicalDevice p = c->phys;
     rt_log("vk caps: %s, vendor %#06x device %#06x, driver %s \"%s\" (id %d, version %s, raw %#x), api %u.%u.%u",
@@ -151,8 +170,11 @@ void vk_caps_init(VkCtx *c) {
            has_ext(ep, ne, "VK_EXT_graphics_pipeline_library"), depth_ok(p, VK_FORMAT_D16_UNORM),
            depth_ok(p, VK_FORMAT_D24_UNORM_S8_UINT), depth_ok(p, VK_FORMAT_X8_D24_UNORM_PACK32), depth_ok(p, VK_FORMAT_D32_SFLOAT),
            depth_ok(p, VK_FORMAT_D32_SFLOAT_S8_UINT));
+    char gpl_note[128];
+    if (gpl_off) snprintf(gpl_note, sizeof gpl_note, ", off by %s", gpl_off);
+    else gpl_note[0] = '\0';
     rt_log("vk caps: gpl %s fast-link %s (graphicsPipelineLibrary %u%s)", vk_caps.gpl ? "yes" : "no",
-           gpl_fast ? "yes" : "no", (unsigned)gpl_lib, !gpl_lib || !gpl_fast || vk_caps.gpl ? "" : ", off by NX2NAVI_GPL=0");
+           gpl_fast ? "yes" : "no", (unsigned)gpl_lib, gpl_note);
     rt_log("vk caps: fallbacks: float64 %s, storage buffers %s %u, subgroup pin %u on stages %#x, translator subgroup vs/fs/cs %u/%u/%u",
            vk_caps.float64 ? "native" : "softfloat64", vk_caps.sbuf_align ? "rounded down to" : "exact, alignment",
            (unsigned)l->minStorageBufferOffsetAlignment, want, (unsigned)vk_caps.sg_pin_stages, told[0], told[1], told[2]);

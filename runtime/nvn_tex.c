@@ -55,12 +55,14 @@ static fmt_t fmt_of(int f) {
 
 int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb; }
 
-static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
-static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }
-static unsigned pick_tile(uint32_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
-static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
+// Sizes in 64 bits: a descriptor's width or height times its samples or bytes per block can pass 2^32 (a texture
+// garbled or not yet set up), which in 32 bits wrapped to a small size and a small allocation.
+static uint64_t mip(uint64_t s, unsigned l) { s >>= l; return s ? s : 1; }
+static uint64_t blk(uint64_t s, uint64_t b) { return (s + b - 1) / b; }
+static unsigned pick_tile(uint64_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
+static unsigned adj_tile(unsigned shift, uint64_t unit, uint64_t dim) {
     if (!shift) return 0;
-    uint32_t x = unit << (shift - 1);
+    uint64_t x = unit << (shift - 1);
     if (x >= dim) while (--shift) { x >>= 1; if (x < dim) break; }
     return shift;
 }
@@ -90,14 +92,14 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     uint64_t off = 0;
     for (unsigned i = 0; i < level; i++) {
-        uint32_t lw = blk(mip(w * sx, i), t.bw);
-        uint32_t lh = dpl >= 2 ? blk(mip(h * sy, i), t.bh) : 1;
-        uint32_t ld = dpl >= 3 ? mip(z, i) : 1;
-        uint32_t lwb = lw * t.bpb;
+        uint64_t lw = blk(mip((uint64_t)w * sx, i), t.bw);
+        uint64_t lh = dpl >= 2 ? blk(mip((uint64_t)h * sy, i), t.bh) : 1;
+        uint64_t ld = dpl >= 3 ? mip(z, i) : 1;
+        uint64_t lwb = lw * t.bpb;
         unsigned th = adj_tile(tileH, 8, lh), td = adj_tile(tileD, 1, ld);
-        uint32_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
-        uint32_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
-        off += (uint64_t)wt * ht * dt << (9 + th + td);
+        uint64_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
+        uint64_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
+        off += wt * ht * dt << (9 + th + td);
     }
     return off;
 }
@@ -116,7 +118,7 @@ static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered,
                             uint32_t w, uint32_t h, uint32_t z, unsigned tileH, unsigned tileD, fmt_t t) {
     uint64_t ls = level_offset(d, d->levels ? d->levels : 1, dpl, w, h, z, tileH, tileD, t);
     if (layered) {
-        uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
+        uint64_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
         while (th && hh <= (8u << (th - 1))) th--;
         while (td && z <= (1u << (td - 1))) td--;
         uint64_t align = 1ull << (th + td + 9);
@@ -150,7 +152,7 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFF;
         if (dpl >= 2) tileH = pl & 0xF;
         if (dpl == 3) tileD = pl >> 4;
-    } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
+    } else if (dpl == 2) { uint64_t ah = blk((uint64_t)h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
     if ((d->flags & 0x200) && !d->pkg_block_h && minimal_layout_on()) {
@@ -178,8 +180,8 @@ void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, 
     shape(d, &dpl, &layered, &w, &h, &z);
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     nvn_texlayout L; nvn_tex_layout(d, &L);
-    uint32_t lh = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
-    uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
+    uint64_t lh = dpl >= 2 ? blk(mip((uint64_t)h * sy, level), t.bh) : 1;
+    uint64_t ld = dpl >= 3 ? mip(z, level) : 1;
     *tileH = adj_tile(L.tileH, 8, lh);
     *tileD = adj_tile(L.tileD, 1, ld);
 }

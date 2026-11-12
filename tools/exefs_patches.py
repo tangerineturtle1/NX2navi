@@ -29,7 +29,7 @@ comma separated, or "-": the runtime switches them off while the mod is on, so t
 
 A file the rules cannot express is unsupported as a whole: half of a patch is worse than none.
 
-Standard library, recomp/ and tools/cheats.py only.
+Standard library, recomp/, tools/cheats.py and tools/mod_files.py only.
 """
 import argparse
 import re
@@ -38,29 +38,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cheats import TITLE, Main, convert, fnv  # noqa: E402
+from cheats import Main, convert, fnv  # noqa: E402
+from mod_files import patch_files  # noqa: E402
 
 NSO_HEADER = 0x100
-EXEFS_PLACES = ('exefs', f'atmosphere/contents/{TITLE}/exefs', f'contents/{TITLE}/exefs', f'{TITLE}/exefs')
-
-
-def patch_files(mods):
-    """[(mod folder name, path in the mod, file)] of the folders of mods, by name: the .ips and .pchtxt files of the
-    first exefs place that exists (runtime/mods.c find_root) and of atmosphere/exefs_patches/<name>/."""
-    out = []
-    for mod in sorted((d for d in mods.iterdir() if d.is_dir()), key=lambda d: d.name) if mods.is_dir() else []:
-        folders = []
-        exefs = next((mod / w for w in EXEFS_PLACES if (mod / w).is_dir()), None)
-        if exefs:
-            folders.append(exefs)
-        patches = mod / 'atmosphere' / 'exefs_patches'
-        if patches.is_dir():
-            folders += sorted(d for d in patches.iterdir() if d.is_dir())
-        for folder in folders:
-            for f in sorted(folder.iterdir()):
-                if f.is_file() and f.suffix.lower() in ('.ips', '.pchtxt'):
-                    out.append((mod.name, f.relative_to(mod).as_posix(), f))
-    return out
 
 
 def same_build(name, build_id):

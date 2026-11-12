@@ -300,6 +300,11 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
     return &r->t;
 }
 
+// The ops whose payload names pins (op_pins): five of the op kinds. The walks over every record of a recording
+// (flatten_recording, pin_refs) test this mask before they call op_pins.
+#define PIN_OPS (1ull << OP_SET_RT | 1ull << OP_COPY_B2T | 1ull << OP_COPY_T2B | 1ull << OP_CLEAR_TEX | 1ull << OP_COPY_T2T)
+_Static_assert(OP_COUNT_ <= 64, "PIN_OPS holds one bit per op kind");
+
 // The pins an op's payload names, into out (at most 9); returns how many.
 static int op_pins(uint32_t op, const void *a, const tex_t *out[9]) {
     int k = 0;
@@ -347,6 +352,7 @@ static uint32_t pin_refs(const uint8_t *copy, int delta) {
     uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
     uint32_t n = 0;
     for (const op_hdr *h = nvn_op_first((uintptr_t)copy); h->op != OP_END; h = nvn_op_next(h)) {
+        if (h->op >= 64 || !(PIN_OPS >> h->op & 1)) continue;
         const tex_t *p[9];
         int k = op_pins(h->op, nvn_op_payload(h), p);
         for (int i = 0; i < k; i++) pin_ref(p[i], delta, now);
@@ -426,20 +432,38 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
     zombies[nzombies++] = pf;
 }
 
-static void copy_free(copy_prefix *pf) {   // copy_lock held
+static void copy_free(copy_prefix *pf) {   // copy_lock not held
     if (pf->pins) pin_refs((const uint8_t *)(pf + 1), -1);
     free(pf);
 }
 
-static void zombie_sweep(uint64_t replayed) {   // copy_lock held
+// Released copies nothing reads any more are freed once copy_lock is dropped: uncounting a copy's pins walks its ops,
+// and that walk and free() under the exclusive lock held up every thread that was recording or submitting (the
+// main-loop thread waited there for 2.8% of its time). doom chains a copy for that, through made_at, which nothing
+// reads after the release; doom_free frees the chain.
+static copy_prefix *doom(copy_prefix *list, copy_prefix *pf) {   // copy_lock held
+    pf->made_at = (uint64_t)(uintptr_t)list;
+    return pf;
+}
+
+static void doom_free(copy_prefix *list) {   // copy_lock not held
+    while (list) {
+        copy_prefix *next = (copy_prefix *)(uintptr_t)list->made_at;
+        copy_free(list);
+        list = next;
+    }
+}
+
+static copy_prefix *zombie_sweep(uint64_t replayed, copy_prefix *doomed) {   // copy_lock held; returns the doom chain
     for (uint32_t i = 0; i < nzombies;) {
         if (zombies[i]->used_at <= replayed) {
-            copy_free(zombies[i]);
+            doomed = doom(doomed, zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
             i++;
         }
     }
+    return doomed;
 }
 
 static copy_prefix *copy_find(uint64_t handle) {   // copy_lock held
@@ -488,7 +512,7 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
         const tex_t *pinned[9];
-        int k = op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned);
+        int k = PIN_OPS >> h.op & 1 ? op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned) : 0;
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
         pins_named += (uint64_t)k;
         at += h.size;
@@ -532,8 +556,9 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
     uint64_t replayed = gfx_replayed_submits();
+    copy_prefix *doomed = NULL;
     plat_mutex_lock(&copy_lock);
-    if (nzombies) zombie_sweep(replayed);
+    if (nzombies) doomed = zombie_sweep(replayed, doomed);
     for (uintptr_t pg = lo >> COPY_PAGE_SHIFT; pg <= (hi - 1) >> COPY_PAGE_SHIFT; pg++) {
         copy_bucket *b = nvn_hm_get(&copy_pages, &pg);
         if (!b) continue;
@@ -547,7 +572,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_bytes -= pf->bytes;
             pf->magic = 0;
             if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
-            else copy_free(pf);
+            else doomed = doom(doomed, pf);
             b->v[i] = b->v[--b->n];
         }
         if (!b->n) {
@@ -557,6 +582,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    doom_free(doomed);
 }
 
 // ---------- CommandBuffer: object and memory
@@ -1237,8 +1263,9 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     uint64_t replayed = gfx_replayed_submits();
+    copy_prefix *doomed = NULL;
     plat_mutex_lock(&copy_lock);
-    if (nzombies) zombie_sweep(replayed);
+    if (nzombies) doomed = zombie_sweep(replayed, doomed);
     for (int i = 0; i < n; i++) {
         copy_prefix *pf = copy_find(handles[i]);
         if (!pf) {
@@ -1263,6 +1290,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    doom_free(doomed);
     for (int i = 0; i < n; i++) {
         int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
@@ -1286,4 +1314,25 @@ const char *nvn_op_name(uint32_t op) {
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): live recording copies and the zombies waiting for their submissions, texture
+// pins with their sweep queue, and the recording-buffer pool.
+void nvn_cmd_sizes(PerfSizes *s) {
+    plat_mutex_lock_shared(&copy_lock);
+    uint64_t nc = ncopies, cb = copy_bytes, nz = nzombies, zb = 0;
+    for (uint32_t i = 0; i < nzombies; i++) zb += zombies[i]->bytes;
+    plat_mutex_unlock_shared(&copy_lock);
+    plat_mutex_lock(&pin_lock);
+    uint64_t pins = pins_live, pq = pin_qn - pin_qh;
+    plat_mutex_unlock(&pin_lock);
+    plat_mutex_lock(&pool_lock);
+    uint64_t np = npool, pb = 0;
+    for (uint32_t i = 0; i < npool; i++) pb += pool[i].size;
+    plat_mutex_unlock(&pool_lock);
+    perf_size(s, "recording copies", nc, 0, cb);
+    perf_size(s, "recording copy zombies", nz, 0, zb);
+    perf_size(s, "texture pins", pins, 0, PERF_SIZE_NONE);
+    perf_size(s, "pin sweep queue", pq, 0, PERF_SIZE_NONE);
+    perf_size(s, "recording-buffer pool", np, POOL_SLOTS, pb);
 }

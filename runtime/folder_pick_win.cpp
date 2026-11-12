@@ -1,6 +1,8 @@
-// The Win32 front end of folder_pick.h: the shell's folder dialog (IFileOpenDialog with FOS_PICKFOLDERS), owned by the
-// game window, on a thread of its own so the present thread that draws the menu keeps running.
+// The Win32 front end of folder_pick.h: the shell's open dialog (IFileOpenDialog; FOS_PICKFOLDERS for a folder), owned
+// by the game window, on a thread of its own so the present thread that draws the menu keeps running, and the shell's
+// Downloads folder.
 #include <windows.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 #include <stdlib.h>
 #include <string>
@@ -14,6 +16,7 @@ extern "C" {
 
 struct PickReq {
     std::string start;
+    std::string ext;   // a file of this extension; empty: a folder
     FolderPickDone done;
     void *ctx;
 };
@@ -54,7 +57,14 @@ static void pick_main(void *arg) {
     if (SUCCEEDED(hr)) {
         FILEOPENDIALOGOPTIONS opt = 0;
         d->GetOptions(&opt);
-        d->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        if (r->ext.empty()) {
+            d->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        } else {
+            d->SetOptions(opt | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+            std::wstring pattern = L"*." + wide(r->ext);   // the pattern is its own name: no text to translate
+            COMDLG_FILTERSPEC types[] = {{pattern.c_str(), pattern.c_str()}, {L"*.*", L"*.*"}};
+            d->SetFileTypes(2, types);
+        }
         set_start(d, r->start);
         hr = d->Show(gfx_window_handle());
         IShellItem *item = NULL;
@@ -68,17 +78,38 @@ static void pick_main(void *arg) {
         }
         d->Release();
     }
-    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED)) rt_log("folder_pick: the folder dialog failed (0x%08lx)", (unsigned long)hr);
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        rt_log("folder_pick: the %s dialog failed (0x%08lx)", r->ext.empty() ? "folder" : "file", (unsigned long)hr);
     r->done(chosen.empty() ? NULL : chosen.c_str(), r->ctx);
     if (SUCCEEDED(co)) CoUninitialize();
     delete r;
 }
 
-extern "C" void folder_pick(const char *start, FolderPickDone done, void *ctx) {
-    PickReq *r = new PickReq{start ? start : "", done, ctx};
+static void pick(const char *start, const char *ext, FolderPickDone done, void *ctx) {
+    PickReq *r = new PickReq{start ? start : "", ext ? ext : "", done, ctx};
     if (!plat_thread_spawn(pick_main, r, "folder dialog", 0)) {
         rt_log("folder_pick: cannot start the dialog thread");
         done(NULL, ctx);
         delete r;
     }
+}
+
+extern "C" void folder_pick(const char *start, FolderPickDone done, void *ctx) { pick(start, NULL, done, ctx); }
+
+extern "C" void file_pick(const char *start, const char *ext, FolderPickDone done, void *ctx) {
+    pick(start, ext && *ext ? ext : "*", done, ctx);
+}
+
+extern "C" int folder_downloads(char *out, size_t cap) {
+    // FOLDERID_Downloads, spelled out so no import library has to carry it
+    static const GUID downloads = {0x374de290, 0x123f, 0x4565, {0x91, 0x64, 0x39, 0xc4, 0x92, 0x5e, 0x46, 0x7b}};
+    PWSTR path = NULL;
+    int ok = 0;
+    if (SUCCEEDED(SHGetKnownFolderPath(downloads, 0, NULL, &path)) && path) {
+        std::string s = utf8(path);
+        ok = !s.empty() && s.size() < cap;
+        if (ok) memcpy(out, s.c_str(), s.size() + 1);
+    }
+    CoTaskMemFree(path);
+    return ok;
 }

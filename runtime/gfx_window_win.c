@@ -52,6 +52,8 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
 #define WND_STYLE WS_OVERLAPPEDWINDOW
 #define WM_APP_SETTINGS (WM_APP + 1)
 #define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, retried at the first activation
+#define WM_APP_TEXT_INPUT (WM_APP + 3)   // the menu's text field takes text (wParam 1) or no longer (0)
+#define WM_APP_PASTE (WM_APP + 4)        // the menu's Paste: the clipboard's text, read on the window thread
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
 
@@ -187,6 +189,18 @@ void gfx_window_apply_settings(void) {
 
 void gfx_window_request_close(void) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+}
+
+// The menu's text field lives in this window, which has no IME (detached at creation, below): while the field takes
+// text the window gets the default one, so a player can type a name in Chinese, Japanese or Korean (Windows hands the
+// composed characters over as WM_CHAR, which menu_window_msg passes on), and it is detached again after. Posted to
+// the window thread, which owns the window's input context.
+void gfx_window_text_input(int on) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TEXT_INPUT, (WPARAM)(on != 0), 0);
+}
+
+void gfx_window_paste(void) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_PASTE, 0, 0);
 }
 
 // ---- refresh rate of the window's monitor (NX2NAVI_FPS_LIMIT=display), measured when the window opens, lands on another
@@ -477,7 +491,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
-        if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
+        // bit 30: auto-repeat. Not with Ctrl or Shift held: overlays and capture tools take such F11 shortcuts for their
+        // own (Alt+F11 comes as WM_SYSKEYDOWN)
+        if (w == VK_F11 && !(l & (1 << 30)) && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_SHIFT) >= 0) {
             input_cursor_suspend(1);
             toggle_fullscreen(h);
             input_cursor_suspend(0);
@@ -496,6 +512,16 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_cursor_suspend(0);
         }
         return 0;
+    case WM_APP_TEXT_INPUT:
+        if (w) ImmAssociateContextEx(h, NULL, IACE_DEFAULT);
+        else ImmAssociateContext(h, NULL);
+        return 0;
+    case WM_APP_PASTE: {
+        char text[256];
+        plat_clipboard_get(text, sizeof text);
+        menu_event_paste(text);
+        return 0;
+    }
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) gfx_window_mark_dirty();
@@ -681,7 +707,8 @@ static void window_main(void *arg) {
         // An IME switched on over the game attaches to this window and then shows its candidate window and eats the keys
         // it composes, although there is nothing here to type into (a Chinese IME takes Shift, the B button by default).
         // Detaching the game's window leaves the software keyboard alone: its edit box sits in a window of its own
-        // (swkbd_win.c) and gets the IME it needs.
+        // (swkbd_win.c) and gets the IME it needs. The menu's text field attaches one while it takes text
+        // (gfx_window_text_input).
         ImmAssociateContext(g_hwnd, NULL);
         // The frame was measured at the system DPI (or the chosen monitor's); the window may have opened on a monitor at
         // another scale. When the size changes on a chosen monitor, the window is centred again in its work area;

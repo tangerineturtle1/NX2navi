@@ -1,10 +1,12 @@
 """Report for a NX2NAVI_PROFILE sampling profile (runtime/prof_win.c): top functions and the guest/runtime/outside split.
 
-usage: prof_report.py <profile> <nx2navi.map> [--top 40] [--chains 30]
+usage: prof_report.py <profile> <nx2navi.map | nm -n output> [--top 40] [--chains 30]
 
-The map is the lld one from the link (build/<version>/nx2navi.map); its addresses are RVAs, the profile header carries the
+The map is the one from the link (build/<version>/nx2navi.map from lld, whose addresses are RVAs, or a GNU ld map such
+as the launcher's build-cache/ocarina.map, whose addresses include the image base); the profile header carries the
 runtime image base, so ASLR does not matter. Symbols in the map are labels without sizes: a Rip belongs to the nearest
-symbol at or below it.
+symbol at or below it. A map lists global symbols only, so a static function's time lands on the global function before
+it: the output of `nm -n <exe>` in the map's place names the static functions too.
 
 A profile taken with NX2NAVI_PROFILE_RENDER=1 or NX2NAVI_PROFILE_CHAINS=1 also has call chains: the report then adds the inclusive time per
 function (a function counted once per chain), and for each module outside the exe the exe functions that call into it
@@ -19,6 +21,7 @@ from pathlib import Path
 
 SYM = re.compile(r'^([0-9a-f]{8}) +[0-9a-f]{8} +\d+ {2,}(\S+)$')   # In column empty: object lines have a path:(section) there
 SYM_LD = re.compile(r'^\s*0x([0-9a-f]{8,16})\s+(\S+)\s*$')          # a GNU ld map: the address, then the name, no size
+SYM_NM = re.compile(r'^([0-9a-f]{16}) [tT] (\S+)$')                 # nm -n of the exe: code symbols, static ones too
 
 
 def load_map(path):
@@ -26,8 +29,8 @@ def load_map(path):
     with open(path, encoding='utf-8', errors='replace') as f:
         for line in f:
             line = line.rstrip('\n')
-            m = SYM.match(line) or SYM_LD.match(line)
-            if m and '(' not in m.group(2):
+            m = SYM_NM.match(line) or SYM.match(line) or SYM_LD.match(line)
+            if m and '(' not in m.group(2) and m.group(2) != '.text':   # nm lists each object's .text section too
                 syms.setdefault(int(m.group(1), 16), m.group(2))
     addrs = sorted(syms)
     return addrs, [syms[a] for a in addrs]
@@ -66,6 +69,23 @@ def report_chains(prof, name_of, in_exe, top):
     print(f'\ninclusive, top {top} (% of chain samples)')
     for f, n in incl.most_common(top):
         print(f'  {100 * n / total:6.2f}%  {n:8d}  {f}')
+    # Where running threads are: the innermost exe frame of each chain that does not end in a wait. A chain whose leaf is
+    # in ntdll, win32u or KERNELBASE is taken as blocked, which also drops the few running samples inside them (clock
+    # reads); a leaf in another module (the driver, the C library) is charged to the exe function that called it.
+    waits = ('ntdll.dll', 'win32u.dll', 'KERNELBASE.dll')
+    self_t = collections.Counter()
+    for n, chain in stacks:
+        if not in_exe(chain[0]) and name_of(chain[0]).split('!')[0] in waits:
+            continue
+        i = next((k for k, r in enumerate(chain) if in_exe(r)), None)
+        if i is None:
+            self_t['(' + name_of(chain[0]).split('!')[0] + ', no exe frame)'] += n
+        else:
+            self_t[name_of(chain[i]) + ('' if i == 0 else '  [in ' + name_of(chain[0]).split('!')[0] + ']')] += n
+    run = sum(self_t.values()) or 1
+    print(f'\nself time of running chains, top {top} ({run} samples, {100 * run / total:.1f}% of the chain samples)')
+    for f, n in self_t.most_common(top):
+        print(f'  {100 * n / run:6.2f}%  {n:8d}  {f}')
     # Per outside module: the innermost exe frame of each chain whose leaf is in that module
     by_mod = collections.defaultdict(collections.Counter)
     paths = collections.defaultdict(collections.Counter)
@@ -122,8 +142,7 @@ def main():
     cats = collections.Counter()
     for rip, n in prof['rips']:
         if base <= rip < exe_end:
-            i = bisect.bisect_right(addrs, rip - base) - 1
-            name = names[i] if i >= 0 else '?'
+            name = sym_at(rip)   # as the call chains below: right for a map with or without the image base
             funcs[name] += n
             cats['guest (f_*)' if name.startswith('f_') else 'runtime host (exe)'] += n
             continue

@@ -38,6 +38,18 @@ void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, ui
 void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh, bool srgb,
                      uint8_t *rgba_out);
 bool astc_decode_block(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint8_t *rgba_out);
+// Whether the block decodes to alpha 255 in every texel; mostly from its header, blocks of the endpoint modes with
+// alpha by a decode (counted in *decoded).
+bool astc_block_opaque(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint32_t *decoded);
+// The first of the n blocks (16 bytes each) that is not opaque, or that took *decoded past max_decoded; n when none
+// is. dst (optional): all n blocks are copied there too, as by memcpy, the rest also after a block that is not opaque.
+uint64_t astc_blocks_opaque(const uint8_t *blocks, uint64_t n, uint32_t bw, uint32_t bh, bool srgb, uint32_t max_decoded,
+                            uint32_t *decoded, uint8_t *dst);
+// tex_astc_mt.c: astc_blocks_opaque with the blocks of a large texture spread over the decode workers, each also
+// copying its part to dst when given; whether every block is opaque (and *decoded stayed within max_decoded, summed
+// over the workers).
+bool astc_blocks_opaque_mt(const uint8_t *blocks, uint64_t n, uint32_t bw, uint32_t bh, bool srgb, uint32_t max_decoded,
+                           uint32_t *decoded, uint8_t *dst);
 // tex_astc_mt.c: the same bytes as astc_decode_ldr, large images split by block rows over a worker pool; blocks.
 void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh, bool srgb,
                         uint8_t *rgba_out);
@@ -54,7 +66,8 @@ typedef struct TexVkFormat {
     uint8_t astc_bw, astc_bh;     // nonzero: ASTC decoded into vk (RGBA8, same colour space) by vk_astc.c or tex_astc.c;
                                   // zero for native ASTC (vk == ideal, raw blocks as for BC)
     uint8_t astc_srgb;
-    uint8_t astc_bc;              // ASTC decoded and then encoded to BC3 (vk BC3, NX2NAVI_ASTC_BC; vk_astc.c)
+    uint8_t astc_bc;              // ASTC decoded and then encoded on the GPU (vk_astc.c): 1 BC3 (NX2NAVI_ASTC_BC),
+                                  // 2 BC1 for a texture whose every block decodes opaque (vk_texture.c "ASTC as BC1")
     uint8_t depth, stencil;       // aspect flags of depth / stencil formats
     const char *note;             // why a fallback or an expansion was chosen; NULL when the mapping is direct
     const char *reason;           // unmapped formats only: why there is no Vulkan format

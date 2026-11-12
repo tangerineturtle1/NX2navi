@@ -43,9 +43,42 @@ static struct {
     int64_t up0, up;
 } g_win;
 
+// The frame times the overlay shows (the rate, the lows, the graph) are those of the pictures as they go out: the
+// present thread reports each one (perfmon_shown). The game's present calls come at other times: with the replay on
+// the submitting thread, work held for an event is replayed in the next frame's first submission, so the calls came
+// 36 and 9 ms apart in turn in a village while the pictures went out every 17 to 27 ms, and the graph drew a sawtooth
+// the screen did not show. A frame held back (vk_backend.c frame_hold) is not shown and lengthens its interval.
+// Without a present thread reporting (another back end) the game's present calls are taken, as before.
+static uint64_t g_shown_last;      // when the last picture went out; 0: none yet
+static uint64_t g_shown_report;    // when perfmon_shown last ran: perfmon_frame leaves the intervals to it for a second
+
+static void interval_add(uint64_t now, uint64_t interval_ns) {   // (lock held)
+    g_ring[g_ring_pos] = (float)(interval_ns / 1e6);
+    g_ring_at[g_ring_pos] = now;
+    g_ring_pos = (g_ring_pos + 1) % PERF_HISTORY;
+    if (g_ring_n < PERF_HISTORY) g_ring_n++;
+    if (now - g_low_t0 >= 1000000000ull) {   // the next second: its slice starts empty
+        g_low_cur = (g_low_cur + 1) % LOW_SLICES;
+        memset(g_low_hist[g_low_cur], 0, sizeof g_low_hist[0]);
+        g_low_t0 = now;
+    }
+    uint64_t bin = interval_ns / 250000ull;
+    uint16_t *h = &g_low_hist[g_low_cur][bin < LOW_BINS ? bin : LOW_BINS - 1];
+    if (*h < 65535) (*h)++;
+}
+
+void perfmon_shown(uint64_t now) {
+    plat_mutex_lock(&g_lock);
+    // a gap of a second or more is a load or a pause, not a frame time
+    if (g_shown_last && now > g_shown_last && now - g_shown_last < 1000000000ull) interval_add(now, now - g_shown_last);
+    g_shown_last = g_shown_report = now;
+    plat_mutex_unlock(&g_lock);
+}
+
 void perfmon_frame(uint64_t now, uint64_t interval_ns, const uint64_t *wait_ns, uint64_t replay_ns,
                    int64_t tex_uploads) {
     plat_mutex_lock(&g_lock);
+    if (g_shown_report && now - g_shown_report < 1000000000ull) interval_ns = 0;   // perfmon_shown has them
     if (interval_ns) {
         g_ring[g_ring_pos] = (float)(interval_ns / 1e6);
         g_ring_at[g_ring_pos] = now;
@@ -145,6 +178,9 @@ static uint8_t g_gpu_luid[8];
 static int g_gpu_luid_ok;
 static int g_gpu_bus = -1;
 static float g_vram_total_mb = -1;
+static float (*g_vram_game)(void);
+
+void perfmon_set_vram_game(float (*used_mb)(void)) { __atomic_store_n(&g_vram_game, used_mb, __ATOMIC_RELEASE); }
 
 void perfmon_set_gpu(const char *name, const uint8_t *luid, int pci_bus, float vram_total_mb) {
     plat_mutex_lock(&g_lock);
@@ -308,6 +344,7 @@ static void machine_clear(PerfStats *s) {
     s->cpu_total_pct = s->cpu_game_pct = s->cpu_temp_c = -1;
     s->ram_used_mb = s->ram_total_mb = s->ram_game_mb = -1;
     s->gpu_pct = s->gpu_temp_c = s->gpu_power_w = s->gpu_clock_mhz = s->vram_used_mb = s->vram_total_mb = -1;
+    s->vram_game_mb = -1;
 }
 
 static void machine_copy(PerfStats *d, const PerfStats *s) {
@@ -317,6 +354,7 @@ static void machine_copy(PerfStats *d, const PerfStats *s) {
     d->ram_used_mb = s->ram_used_mb, d->ram_total_mb = s->ram_total_mb, d->ram_game_mb = s->ram_game_mb;
     d->gpu_pct = s->gpu_pct, d->gpu_temp_c = s->gpu_temp_c, d->gpu_power_w = s->gpu_power_w;
     d->gpu_clock_mhz = s->gpu_clock_mhz, d->vram_used_mb = s->vram_used_mb, d->vram_total_mb = s->vram_total_mb;
+    d->vram_game_mb = s->vram_game_mb;
 }
 
 static void sampler(void *arg) {
@@ -343,6 +381,8 @@ static void sampler(void *arg) {
         plat_mem_info(&s.ram_used_mb, &s.ram_total_mb, &s.ram_game_mb);
         plat_gpu_load(l, &s.gpu_pct, &s.vram_used_mb);
         s.vram_total_mb = vram_total;
+        float (*game)(void) = __atomic_load_n(&g_vram_game, __ATOMIC_ACQUIRE);
+        if (game) s.vram_game_mb = game();
         nvml_sample(&s);
         adl_sample(&s);
         plat_mutex_lock(&g_lock);

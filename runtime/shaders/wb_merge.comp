@@ -4,12 +4,16 @@
 // submission's GPU work, so words the GPU did not change keep what the CPU wrote meanwhile.
 // One invocation per word of the listed ranges; ranges are sorted by their first invocation (x: word offset in the
 // mirror and imported bindings, y: word offset in the snapshot binding, z: words, w: first invocation).
+// With track set (shadow storage) a word that changed also marks its 4 KiB page of guest memory in Pages: page0 is the
+// bindings' start within its page, so the CPU's write-back at the fence reads only the marked pages of the shadow
+// (vk_memory.c, shadow_wb_cb).
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) readonly buffer Post { uint post[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Pre { uint pre[]; };
 layout(std430, set = 0, binding = 2) buffer Dst { uint dst[]; };
 layout(std430, set = 0, binding = 3) readonly buffer Ranges { uvec4 rng[]; };
-layout(push_constant) uniform Push { uint nranges, total; } pc;
+layout(std430, set = 0, binding = 4) writeonly buffer Pages { uint pages[]; };
+layout(push_constant) uniform Push { uint nranges, total, page0, track; } pc;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -23,5 +27,8 @@ void main() {
     uvec4 r = rng[lo];
     uint k = i - r.w;
     uint v = post[r.x + k];
-    if (v != pre[r.y + k]) dst[r.x + k] = v;
+    if (v != pre[r.y + k]) {
+        dst[r.x + k] = v;
+        if (pc.track != 0u) pages[(pc.page0 + (r.x + k) * 4u) >> 12] = 1u;
+    }
 }

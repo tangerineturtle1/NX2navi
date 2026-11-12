@@ -12,6 +12,7 @@
 
 #include "gfx.h"
 #include "cfg.h"
+#include "coop_game.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
@@ -134,6 +135,7 @@ NVN_API(nvnTextureBuilderGetStorageClass) { ret_x(c, storage_class(&TB(c)->d)); 
 NVN_API(nvnTextureBuilderGetFlags) { ret_x(c, (uint32_t)TB(c)->d.flags); }
 // size_t nvnTextureBuilderGetStorageSize(const NVNtextureBuilder *b)
 NVN_API(nvnTextureBuilderGetStorageSize) {
+    if (nvn_no_object(c, "nvnTextureBuilderGetStorageSize")) return;
     nvn_texlayout L;
     nvn_tex_layout(&TB(c)->d, &L);
     if (!L.bpb) rt_log("nvn: TextureBuilderGetStorageSize: unknown format %#x", TB(c)->d.format);
@@ -141,6 +143,7 @@ NVN_API(nvnTextureBuilderGetStorageSize) {
 }
 // size_t nvnTextureBuilderGetStorageAlignment(const NVNtextureBuilder *b)
 NVN_API(nvnTextureBuilderGetStorageAlignment) {
+    if (nvn_no_object(c, "nvnTextureBuilderGetStorageAlignment")) return;
     nvn_texlayout L;
     nvn_tex_layout(&TB(c)->d, &L);
     ret_x(c, L.align);
@@ -443,6 +446,15 @@ NVN_API(nvnProgramFinalize) {
     prog_release(o);
     o->magic = 0;
 }
+// NX2NAVI_PROG_LEAD=1 (diagnostics): when each program was made, by serial (direct-mapped; a serial that lost its
+// slot reads 0). vk_exec_draw.c prog_lead compares it with the program's first draw.
+#define PROG_MADE_N 16384
+static uint64_t prog_made_serial[PROG_MADE_N], prog_made_at[PROG_MADE_N];
+uint64_t nvn_prog_made_ns(uint64_t serial) {
+    uint32_t i = (uint32_t)serial & (PROG_MADE_N - 1);
+    return __atomic_load_n(&prog_made_serial[i], __ATOMIC_RELAXED) == serial ? __atomic_load_n(&prog_made_at[i], __ATOMIC_RELAXED) : 0;
+}
+
 static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     if (n < 0 || n > 6 || (n && !sd)) {
         rt_log("nvn: ProgramSetShaders with %d stages at %p", n, (const void *)sd);
@@ -452,6 +464,13 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
     o->serial = nvn_new_serial();
+    static int lead = -1;
+    if (lead < 0) lead = cfg_get("NX2NAVI_PROG_LEAD") != NULL && strcmp(cfg_get("NX2NAVI_PROG_LEAD"), "0") != 0;
+    if (lead) {
+        uint32_t i = (uint32_t)o->serial & (PROG_MADE_N - 1);
+        __atomic_store_n(&prog_made_at[i], plat_now_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&prog_made_serial[i], o->serial, __ATOMIC_RELAXED);
+    }
     NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }
@@ -756,12 +775,20 @@ static uint64_t present_period(const win_t *o) {
 
 // The present slot is the previous slot plus one period. Early: wait for the slot. Late by
 // less than a period: present at once and keep the phase. Behind by a period or more: restart from now, no catch-up
-// burst. Returns the ns to wait.
+// burst, except while a movie plays (frame_step_movie_hz): then the slots are kept through a lateness up to
+// MOVIE_CATCHUP_NS and the frames after a late one go at once until the game is back on them. A movie shows one
+// picture per game update and its sound plays by the clock (frame_rate.c ocarina_step), so every period dropped here
+// was a picture the movie fell behind for good: with a 70 ms frame every two seconds (NX2NAVI_TEST_HITCH=120:70) the
+// updates averaged 58.9 a second and the Triforce movie's picture fell 190 ms behind its sound every ten seconds, 2.2 s
+// by the end of its 117 s, at every frame limit from 60 to unlimited; with the slots kept it stayed within 22 ms. A
+// stall of a second or more (a load) restarts the slots as before. Returns the ns to wait.
+#define MOVIE_CATCHUP_NS 1000000000ull
 static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     if (!period || !*target) { *target = now; return 0; }
     uint64_t next = *target + period;
     if (now <= next) { *target = next; return next - now; }
-    *target = now - next < period ? next : now;
+    uint64_t keep = frame_step_movie_hz() > 0 ? MOVIE_CATCHUP_NS : period;
+    *target = now - next < keep ? next : now;
     return 0;
 }
 
@@ -770,7 +797,10 @@ static void sleep_until(uint64_t deadline) {
         uint64_t now = kern_now_ns();
         if (now >= deadline) return;
         uint64_t d = deadline - now;
-        if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
+        // The high-resolution wait never returns early and at most PLAT_WAIT_LATE_NS late, so it takes the wait up to
+        // that margin before the deadline and only the rest is spent yielding. The coarse sleep that stood here left
+        // 1 to 2 ms of every paced frame to the yield loop.
+        if (d > PLAT_WAIT_LATE_NS + 100000) plat_wait_ns(d - PLAT_WAIT_LATE_NS - 100000);
         else plat_yield();
     }
 }
@@ -811,7 +841,10 @@ NVN_API(nvnWindowAcquireTexture) {
     // first submission (nvn_api_core.c nvnQueueSubmitCommands) removes the rest. NX2NAVI_ACQUIRE_WAIT=0 leaves it to the
     // clock; =2 waits for the newest present of any image (one frame in flight at most).
     static int acq_wait = -1;
-    if (acq_wait < 0) acq_wait = rt_knob("ACQUIRE_WAIT", "1");
+    if (acq_wait < 0) {   // a number: the on/off reader took every value but 0 for 1, so 2 could not be chosen
+        const char *e = cfg_get("NX2NAVI_ACQUIRE_WAIT");
+        acq_wait = e && (*e == '0' || *e == '2') && !e[1] ? *e - '0' : 1;
+    }
     uint64_t *fe = img_fence_of(o, idx), want = fe ? *fe : 0;
     if (acq_wait == 2) want = last_present_fence;
     if (acq_wait && want) {
@@ -842,12 +875,23 @@ NVN_API(nvnQueuePresentTexture) {
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
+    coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
+    nvn_call_note(1, (uintptr_t)arg_p(c, 0), 1);
     o->presents++;
-    nvn_submits_in_frame = 0;
+    __atomic_store_n(&nvn_submits_in_frame, 0, __ATOMIC_RELAXED);
     const tex_t *t = (const tex_t *)o->tex[idx];
+    static int hitch_every = -1, hitch_ms;   // NX2NAVI_TEST_HITCH=<every>:<ms>: a late frame every so many presents
+    if (hitch_every < 0) {
+        const char *e = cfg_get("NX2NAVI_TEST_HITCH");
+        int every = 0, ms = 0;
+        hitch_every = e && sscanf(e, "%d:%d", &every, &ms) == 2 && every > 0 && ms > 0 ? every : 0;
+        hitch_ms = ms;
+        if (hitch_every) rt_log("nvn: a %d ms late frame every %d presents (NX2NAVI_TEST_HITCH)", hitch_ms, hitch_every);
+    }
+    if (hitch_every && o->presents % (uint64_t)hitch_every == 0) plat_wait_ns((uint64_t)hitch_ms * 1000000);
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
@@ -858,4 +902,5 @@ NVN_API(nvnQueuePresentTexture) {
     last_present_fence = nvn_fence_last();
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
+    nvn_call_note(1, (uintptr_t)arg_p(c, 0), 0);
 }

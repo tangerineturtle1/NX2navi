@@ -1,0 +1,90 @@
+# The Linux AppImage of each release (tools/make_appimage.py), built on a Linux runner and attached to the release
+# itself: the release is assembled on Windows (tools/make_release.py), and the AppImage needs Linux (the translator's
+# NativeAOT build for linux-x64, appimagetool). It holds the build kit only, no game files, as the setup does.
+name: Linux AppImage
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build the AppImage for (it replaces one already attached)'
+        required: true
+
+permissions:
+  contents: write   # gh release upload
+
+concurrency:
+  group: linux-appimage-${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: astral-sh/setup-uv@v6
+      - name: Shader compilers
+        # make_appimage.py compiles the runtime's own shaders (tools/build_shaders.py: glslc, spirv-as, spirv-val)
+        # On 2026-11-11 the runners could not resolve Ubuntu's archive hosts (azure.archive.ubuntu.com, then
+        # archive.ubuntu.com) and apt failed every fetch for hours. When they do not resolve, the three tools come from
+        # LunarG's Vulkan SDK for Linux instead, which holds all of them.
+        run: |
+          if getent hosts azure.archive.ubuntu.com >/dev/null || getent hosts archive.ubuntu.com >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y glslc spirv-tools && exit 0
+            echo "::warning::apt failed: the shader compilers come from the Vulkan SDK"
+          else
+            echo "::warning::Ubuntu's archive does not resolve: the shader compilers come from the Vulkan SDK"
+          fi
+          sdk="$RUNNER_TEMP/vulkan-sdk"
+          mkdir -p "$sdk"
+          for f in vulkan-sdk.tar.xz vulkan-sdk.tar.gz; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://sdk.lunarg.com/sdk/download/latest/linux/$f" &&
+              tar -xf "$RUNNER_TEMP/$f" -C "$sdk" && break
+          done
+          bin=$(dirname "$(find "$sdk" -type f -name glslc -path '*/bin/*' | head -1)")
+          test -x "$bin/glslc" && test -x "$bin/spirv-as" && test -x "$bin/spirv-val"
+          echo "$bin" >> "$GITHUB_PATH"
+          if ! "$bin/spirv-as" --version >/dev/null 2>&1; then   # the SDK's tools may link its own shared libraries
+            echo "LD_LIBRARY_PATH=$(cd "$bin/../lib" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          "$bin/glslc" --version | head -1
+      - name: Shader translator and VMA
+        run: |
+          uv venv -q --python 3.12 .venv
+          uv pip install -q --python .venv/bin/python pillow
+          .venv/bin/python tools/build_xlate.py
+          .venv/bin/python -c 'import sys; sys.path.insert(0, "tools"); import build_game; print("VMA:", build_game.vma_include())'
+      - name: Button art from the release's app zip
+        run: |
+          # make_release.py uploads the zip with the release; wait for it if the release was published first
+          for i in $(seq 1 20); do
+            gh release download "$TAG" -p 'NX2navi-app-*.zip' -D "$RUNNER_TEMP/app" && break
+            echo "no app zip on $TAG yet ($i)"; sleep 30
+          done
+          unzip -q "$RUNNER_TEMP"/app/NX2navi-app-*.zip 'prompt-art/*' -d "$RUNNER_TEMP/app" || true
+          ls -d "$RUNNER_TEMP/app/prompt-art" 2>/dev/null || echo "::warning::no prompt-art in the app zip: the AppImage's builds keep the Switch prompts"
+      - name: AppImage
+        run: |
+          uv python install -q 3.14
+          py=$(find "$(uv python dir)" -maxdepth 1 -type d -name 'cpython-3.14.*-linux-x86_64-gnu' | sort -V | tail -1)
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          art=(); [ -d "$RUNNER_TEMP/app/prompt-art" ] && art=(--prompt-art "$RUNNER_TEMP/app/prompt-art")
+          APPIMAGE_EXTRACT_AND_RUN=1 .venv/bin/python tools/make_appimage.py --python "$py" \
+            --appimagetool "$RUNNER_TEMP/appimagetool" --out dist "${art[@]}"
+          appimage=$(ls dist/NX2navi-Linux-*-x86_64.AppImage)
+          APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help | head -3
+          (cd dist && sha256sum NX2navi-Linux-*-x86_64.AppImage > SHA256SUMS-linux.txt && cat SHA256SUMS-linux.txt)
+      - name: Attach to the release
+        run: gh release upload "$TAG" --clobber dist/NX2navi-Linux-*-x86_64.AppImage dist/SHA256SUMS-linux.txt

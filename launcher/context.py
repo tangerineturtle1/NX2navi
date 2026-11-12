@@ -29,17 +29,27 @@ class Context:
             self._file = None
         self.log(f'--- NX2navi launcher {self.version} ({"checkout" if self.layout.dev else "release"}) in '
                  f'{self.layout.root}')
+        from .toolchain import zstd_missing
+        self.zstd_missing = zstd_missing(self.layout)
+        if self.zstd_missing:
+            self.log(self.zstd_missing)
         if self.settings.unreadable:
             self.log(f'{self.layout.settings} is not valid JSON: the settings start from their defaults; the file as '
                      'it was is kept as launcher.json.bad')
 
     def log(self, line):
+        """One line (or several) into launcher.log. A log that cannot be written (a full disk, a file closed under
+        it) loses the line and nothing else: the callers log from the build's reader thread and from the window's
+        timers, where an exception would stop the build's output from being read or the timer from running."""
         stamp = time.strftime('%H:%M:%S')
         with self._lock:
             if self._file:
-                for part in str(line).splitlines() or ['']:
-                    self._file.write(f'{stamp} {part}\n')
-                self._file.flush()
+                try:
+                    for part in str(line).splitlines() or ['']:
+                        self._file.write(f'{stamp} {part}\n')
+                    self._file.flush()
+                except (OSError, ValueError):   # ValueError: the file was closed
+                    pass
         if self.echo:
             print(line, flush=True)
 

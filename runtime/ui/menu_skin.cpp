@@ -262,7 +262,7 @@ void skin_atlas_fill(ImFontAtlas *fa) {
     if (!px || !r || !r->IsPacked()) return;
     // value noise of three octaves on a lattice that wraps, with a little fine speckle: blotches and grain
     auto lattice = [](int x, int y, int seed) {
-        unsigned v = (unsigned)(x * 374761393 + y * 668265263 + seed * 2246822519u);
+        unsigned v = (unsigned)x * 374761393u + (unsigned)y * 668265263u + (unsigned)seed * 2246822519u;   // unsigned: the products wrap
         v = (v ^ (v >> 13)) * 1274126177u;
         return ((v ^ (v >> 16)) & 0xffff) / 65535.0f;
     };

@@ -15,7 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audren.h"
 #include "cfg.h"
+#include "coop.h"
 #include "flight.h"
 #include "fs.h"
 #include "gfx.h"
@@ -31,6 +33,7 @@
 
 #define FRAMES 2
 #define MAX_IMAGES 16
+#define NG_MAX 5   // generated frames per rendered one at most (DLSS Frame Generation through NGX, 6x)
 #define VSYNC_NS 1000000000ull
 #define VSYNC_HZ 60
 
@@ -80,9 +83,13 @@ void gfx_window_closed(void) {
     int restart = plat_cas32(&g_restart, 0, 0) != 0;
     rt_log("gfx: window closed; %s", restart ? "restarting" : "exiting");
     cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp); closing sooner kept the old file
-    vk_pipeline_save();
+    // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
+    // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
+    vk_pipeline_prewarm_marker_clear();
+    vk_pipeline_save_exit();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
+    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
@@ -238,7 +245,8 @@ int gfx_window_focused(void) { return g_focused; }
 unsigned gfx_window_focus_messages(void) { return (unsigned)g_focus_msgs; }
 
 // Present path (g_pl held): a settings change (cfg_version) reaches the window thread, which applies a changed size or
-// fullscreen; a changed NX2NAVI_VK_PRESENT rebuilds the swapchain at this present.
+// fullscreen; a changed NX2NAVI_VK_PRESENT or NX2NAVI_HDR rebuilds the swapchain at this present.
+static int g_sc_hdr_wanted;   // vk_hdr_wanted when the swapchain was made (create_swapchain)
 static void window_settings_live(void) {
     static unsigned seen;
     static int started;
@@ -253,7 +261,11 @@ static void window_settings_live(void) {
         if (started) plat_xchg32(&g_dirty, 1);
     }
     if (started && vk_fg_wanted() != vk_fg_active()) plat_xchg32(&g_dirty, 1);   // frame generation switched: its own swapchain
+    // HDR switched in the menu: a swapchain of the other format. Compared with what the swapchain was made for, not
+    // with what it got: on a display without HDR10 the setting stays on and the swapchain SDR, and that is settled.
+    if (started && vk_hdr_wanted() != g_sc_hdr_wanted) plat_xchg32(&g_dirty, 1);
     ov_operation_mode_live();
+    audio_channels_live();
     if (started) gfx_window_apply_settings();
     started = 1;
 }
@@ -307,7 +319,7 @@ static void flip_locked(void) {
     VkResult r = vk_dlssg_active() ? vk_dlssg_present(vk_ctx()->gfx_queue, &pi)
                : vk_fg_active()    ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
-    vk_device_fault_report(r);
+    vk_device_lost_check(r, "the present");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
 
@@ -343,8 +355,10 @@ static void drop_swapchain_locked(VkCtx *c) {
 // read: a resize that arrives while the swapchain is being made (AMD's frame generation swapchain takes tens of ms)
 // sets it again, where clearing it at the end lost that resize and kept a swapchain of the old size, whose acquires
 // then timed out frame after frame behind AMD's presenter (the picture stopped).
+static void ng_drain(void);
 static int create_swapchain(void) {
     flip_locked();   // the acquired image goes out before its swapchain is replaced
+    ng_drain();      // and what the NGX frame generation presenter still holds (nothing unless it runs)
     plat_xchg32(&g_dirty, 0);
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
@@ -362,14 +376,18 @@ static int create_swapchain(void) {
     if (!nf) return plat_xchg32(&g_dirty, 1), 0;
     // UNORM: the blit writes the bytes the game wrote (no sRGB encode). NX2NAVI_HDR: HDR10 when the surface offers it.
     VkSurfaceFormatKHR sf = fmts[0];
-    int hdr = vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
+    g_sc_hdr_wanted = vk_hdr_wanted();
+    int hdr = g_sc_hdr_wanted && vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
-    uint32_t count = caps.minImageCount + 1;
+    // NGX frame generation's presenter holds the generated frames' images too, and the rendered frame waits for it:
+    // room for both
+    const uint32_t ngx = vk_ngxfg_wanted() ? 1 : 0, most = ngx ? 12 : 8;
+    uint32_t count = caps.minImageCount + 1 + (ngx ? 2u + NG_MAX : 0u);
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
-    if (count > 8) count = 8;
+    if (count > most) count = most;
 
     vk_queue_lock();
     vkDeviceWaitIdle(c->device);
@@ -428,6 +446,10 @@ static int create_swapchain(void) {
     drop_swapchain_locked(c);
     g_sc = made;
     g_sc_fmt = sf.format;
+    static int hdr_was = -1;   // the log says when a later swapchain is of the other kind (the menu's HDR row)
+    if (hdr_was >= 0 && hdr_was != hdr)
+        rt_log("gfx: the swapchain is now %s (format %d)", hdr ? "HDR10" : "SDR", (int)sf.format);
+    hdr_was = hdr;
     g_sc_hdr = hdr;
     vk_hdr_set_active(hdr);
     if (hdr) vk_hdr_metadata(g_sc, 1);
@@ -615,7 +637,13 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
     return ok;
 }
 
-// The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha.
+static float g_pic[4];   // gfx_picture_rect
+static volatile int32_t g_pic_ok;
+
+// The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha. From an HDR10 swapchain the
+// log also gets the luminance in nits of the picture's rectangle (vk_hdr_luminance_stats: the black floor of a dark
+// scene, for one), and <path>.pq10 keeps the raw pixels: "PQ10", width, height, 1 when A2R10G10B10 (u32 each), then
+// the pixels as the swapchain holds them.
 static void save_capture(const char *path) {
     size_t n = (size_t)g_cap_w * (size_t)g_cap_h * 4;
     uint8_t *px = malloc(n);
@@ -631,15 +659,36 @@ static void save_capture(const char *path) {
     rt_write_png(path, px, (uint32_t)g_cap_w, (uint32_t)g_cap_h);
     free(px);
     rt_log("gfx: menu test shot %s (%dx%d)", path, g_cap_w, g_cap_h);
+    if (!g_sc_hdr) return;
+    int a2r = g_sc_fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    int rect[4] = {0, 0, g_cap_w, g_cap_h};
+    if (__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) {
+        rect[0] = (int)(g_pic[0] * (float)g_cap_w + 0.5f), rect[1] = (int)(g_pic[1] * (float)g_cap_h + 0.5f);
+        rect[2] = (int)(g_pic[2] * (float)g_cap_w + 0.5f), rect[3] = (int)(g_pic[3] * (float)g_cap_h + 0.5f);
+        if (rect[2] <= 0 || rect[3] <= 0 || rect[0] + rect[2] > g_cap_w || rect[1] + rect[3] > g_cap_h)
+            rect[0] = rect[1] = 0, rect[2] = g_cap_w, rect[3] = g_cap_h;
+    }
+    float st[7];
+    vk_hdr_luminance_stats(g_cap_ptr, g_cap_w, rect, a2r, st);
+    rt_log("gfx: shot %s, HDR10 luminance of the picture (%dx%d at %d,%d) in nits: darkest %.5f, 0.1%% %.5f, 1%% %.5f, "
+           "median %.3f, 99%% %.1f, brightest %.1f; %.2f%% of pixels under 0.01", path, rect[2], rect[3], rect[0], rect[1],
+           st[0], st[1], st[2], st[3], st[4], st[5], 100.0f * st[6]);
+    char raw[1200];
+    snprintf(raw, sizeof raw, "%s.pq10", path);
+    FILE *f = fopen(raw, "wb");
+    if (f) {
+        uint32_t head[4] = {0x30315150u /* "PQ10" */, (uint32_t)g_cap_w, (uint32_t)g_cap_h, (uint32_t)a2r};
+        fwrite(head, sizeof head, 1, f);
+        fwrite(g_cap_ptr, 4, (size_t)g_cap_w * (size_t)g_cap_h, f);
+        fclose(f);
+    }
 }
 
 // The rectangle {x, y, w, h} of a dw x dh swapchain image the cw x ch picture goes into: the whole image with
 // NX2NAVI_ASPECT=stretch, else (fit, the default) the largest one of the picture's own aspect ratio, centred (a 16:9 picture
 // on the Steam Deck's 1280x800 screen gets bars of 40 rows above and below; a 16:9 picture in a 21:9 window, bars at the
 // sides).
-// Where the last present put the picture, as fractions of the swapchain (x, y, w, h): menu_cursor.c's pointer
-static float g_pic[4];
-static volatile int32_t g_pic_ok;
+// Where the last present put the picture, as fractions of the swapchain (x, y, w, h; g_pic): menu_cursor.c's pointer
 int gfx_picture_rect(float out[4]) {
     if (!__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) return 0;
     memcpy(out, g_pic, sizeof g_pic);
@@ -835,9 +884,12 @@ static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
 // vk_fg_presents, vk_dlssg.c vk_dlssg_shown) over half a second, sampled at each of the game's presents
 // (gfx_output_fps).
 static volatile double g_out_fps;
+static uint64_t ng_presented(void);   // frames the NGX frame generation presenter showed (0: it does not run)
+static int ng_running(void);          // that presenter is in use
 static void output_rate(void) {
     static uint64_t t0, n0;
-    uint64_t n = vk_dlssg_active() ? vk_dlssg_shown() : vk_fg_presents(g_sc), t = plat_now_ns();
+    uint64_t ng_n = ng_presented();
+    uint64_t n = ng_n ? ng_n : vk_dlssg_active() ? vk_dlssg_shown() : vk_fg_presents(g_sc), t = plat_now_ns();
     if (!n) { g_out_fps = 0, t0 = 0; return; }
     if (!t0 || n < n0) { t0 = t, n0 = n; return; }
     if (t - t0 >= 500000000ull) g_out_fps = (double)(n - n0) * 1e9 / (double)(t - t0), t0 = t, n0 = n;
@@ -855,7 +907,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!vk_fg_active() || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
         return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
@@ -900,12 +952,413 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     return g_hl;
 }
 
+
+// ---------------------------------------------------------------- DLSS Frame Generation through NGX (vk_ngxfg_*)
+// NX2NAVI_FRAMEGEN = dlss where Streamline does not run (every build but the Windows one; vk_ngxfg_wanted is 0 there
+// and none of this is reached). Each frame is composed into an image of its own (ng.bb) instead of a swapchain image.
+// At the end of the frame's command buffer DLSS Frame Generation makes the generated frames from it
+// (vk_ngxfg_evaluate, the multiplier less one) and the picture is copied aside. The presenter thread then shows them
+// in order, each copied into a swapchain image it acquires itself, and the rendered frame last, spaced evenly over the
+// time between two rendered frames, as NVIDIA's frame generation guide paces them. Two sets of images take turns: a
+// set is written again two frames later, after the presenter's copies from it are done (the timeline ng.copied).
+// Every frame goes through the presenter while it runs, so the timelines advance in order.
+// Three things froze the picture while this was written, and the code keeps away from each:
+// - a frame's own command buffer never waits for a swapchain acquire: on Wayland an acquire's semaphore can signal
+//   only after a later present, and every later present would come from that command buffer;
+// - a timeline wait is never submitted ahead of its signal on the same queue (ng_wait_signaled);
+// - an acquire never blocks while it holds the queue lock the presenter presents with (ng_acquire).
+typedef struct { VkImage img; VmaAllocation mem; VkImageView view; } NgImg;
+static struct {
+    int tried, on, fresh;         // tried: 0 nothing made, 1 the objects below exist, 2 it cannot run here
+    int thread_up;                // the presenter thread runs (started once, kept over a release)
+    uint32_t w, h;
+    VkFormat fmt;
+    NgImg bb, out[2][NG_MAX], real[2];
+    VkSemaphore rendered, copied;   // timelines: frame n's command buffer submitted/done, the presenter done with frame n
+    uint64_t n;                     // frames handed to the presenter
+    VkCommandPool pool;
+    VkCommandBuffer cb[2][NG_MAX + 1];   // per shown frame: the generated ones, then the rendered one
+    VkSemaphore acq[2][NG_MAX + 1];
+    PlatMutex m;
+    PlatCond cv;
+    int busy, pending;
+    struct { uint32_t idx; int count, set, shown; uint64_t n, t; VkSwapchainKHR sc; } job;
+    uint64_t signaled;              // the last value of ng.copied the presenter submitted a signal for (ng.m)
+    uint64_t last_t, interval;      // average time between rendered frames (ns)
+    volatile uint64_t presents;     // frames presented while it runs, generated ones included
+} ng = {.m = PLAT_MUTEX_INIT};
+
+// An acquire that never blocks while it holds the queue lock: the swapchain is shared by the game thread and the
+// presenter (both acquire, the presenter presents), and an image is freed only by a present, which needs that lock.
+// A blocking acquire under the lock waited for the present it held off: the picture froze (1 s acquire timeouts).
+static VkResult ng_acquire(VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx) {
+    VkDevice dev = vk_ctx()->device;
+    uint64_t end = plat_now_ns() + timeout;
+    for (;;) {
+        vk_queue_lock();
+        VkResult r = vkAcquireNextImageKHR(dev, sc, 0, sem, VK_NULL_HANDLE, idx);
+        vk_queue_unlock();
+        if (r != VK_NOT_READY && r != VK_TIMEOUT) return r;
+        if (plat_now_ns() >= end) return VK_TIMEOUT;
+        plat_sleep_ns(200000);
+    }
+}
+
+static void ng_drain(void) {   // waits until the presenter has shown everything handed to it
+    if (!ng.tried) return;
+    plat_mutex_lock(&ng.m);
+    while (ng.pending || ng.busy) plat_cond_wait(&ng.cv, &ng.m);
+    plat_mutex_unlock(&ng.m);
+}
+
+static void ng_sleep_until(uint64_t t) {
+    uint64_t now = plat_now_ns();
+    if (t > now && t - now < 100000000ull) plat_sleep_ns(t - now);
+}
+
+static void ng_present(VkSwapchainKHR sc, uint32_t idx) {
+    VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+                           .pWaitSemaphores = &g_render_done[idx], .swapchainCount = 1, .pSwapchains = &sc,
+                           .pImageIndices = &idx};
+    vk_queue_lock();
+    VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
+    vk_queue_unlock();
+    vk_device_lost_check(r, "the present of a generated frame");
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    __atomic_add_fetch(&ng.presents, 1, __ATOMIC_RELAXED);
+}
+
+static void ng_signal_copied(uint64_t v) {   // after everything submitted before it (frame v's copies included)
+    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.copied, .value = v,
+                                 .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    vk_queue_lock();
+    vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    plat_mutex_lock(&ng.m);
+    ng.signaled = v;
+    plat_cond_broadcast(&ng.cv);
+    plat_mutex_unlock(&ng.m);
+}
+
+// A frame's submission waits for ng.copied >= n - 2 on the GPU. That signal must be submitted first: one queue runs
+// its submissions in order, and a wait queued ahead of its signal stopped the queue for good (the picture froze).
+static void ng_wait_signaled(uint64_t v) {
+    plat_mutex_lock(&ng.m);
+    while (ng.signaled < v) plat_cond_wait(&ng.cv, &ng.m);
+    plat_mutex_unlock(&ng.m);
+}
+
+// Acquires a swapchain image, copies img (GENERAL, the swapchain's size and format) into it once frame n's command
+// buffer is done (ng.rendered), and presents it. Only the presenter acquires while it runs: the frame's own command
+// buffer never waits for an acquire, whose image the compositor may give back only after a later present.
+static int ng_show(VkImage img, int set, int slot, uint64_t n) {
+    VkCtx *c = vk_ctx();
+    uint32_t j = 0;
+    VkResult r = ng_acquire(ng.job.sc, 1000000000ull, ng.acq[set][slot], &j);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        static int told;
+        if (told++ < 5) rt_log("ngxfg: presenter acquire failed (%d)", (int)r);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT) plat_xchg32(&g_dirty, 1);
+        return 0;
+    }
+    VkCommandBuffer cb = ng.cb[set][slot];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    sync_barrier(cb, g_sc_img[j], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .extent = {ng.w, ng.h, 1}};
+    vkCmdCopyImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, g_sc_img[j], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    sync_barrier(cb, g_sc_img[j], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+    vkEndCommandBuffer(cb);
+    VkSemaphoreSubmitInfo wait[2] = {
+        {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.acq[set][slot], .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+        {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.rendered, .value = n,
+         .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}};
+    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_render_done[j],
+                                 .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 2, .pWaitSemaphoreInfos = wait,
+                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
+                        .pSignalSemaphoreInfos = &sig};
+    vk_queue_lock();
+    r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) { vk_device_lost_check(r, "the submit of a generated frame"); return 0; }
+    ng_present(ng.job.sc, j);
+    return 1;
+}
+
+static void ng_run(void) {
+    VkCtx *c = vk_ctx();
+    uint64_t t = ng.job.t, n = ng.job.n;
+    int set = ng.job.set, count = ng.job.count;
+    ng.job.shown = 0;
+    if (ng.last_t && t > ng.last_t) {
+        uint64_t d = t - ng.last_t;
+        if (d > 2000000ull && d < 100000000ull) ng.interval = ng.interval ? (ng.interval * 7 + d) / 8 : d;
+    }
+    ng.last_t = t;
+    uint64_t step = ng.interval / (uint64_t)(count + 1);
+    if (n > 2) {   // the command buffers and acquire semaphores of this set: their last use (frame n - 2) is over
+        uint64_t v = n - 2;
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &ng.copied,
+                                  .pValues = &v};
+        vkWaitSemaphores(c->device, &wi, 2000000000ull);
+    }
+    for (int i = 0; i < count; i++) {
+        if (i) ng_sleep_until(t + (uint64_t)i * step);   // the first one at once: the least latency
+        if (!ng_show(ng.out[set][i].img, set, i, n)) break;
+        ng.job.shown = i + 1;
+    }
+    static uint64_t jobs, gen_ok, gen_want;
+    jobs++, gen_want += (uint64_t)count;
+    if (count) ng_sleep_until(t + (uint64_t)count * step);
+    ng_show(ng.real[set].img, set, NG_MAX, n);   // the rendered frame, last
+    ng_signal_copied(n);   // after the copies out of this set
+    gen_ok += (uint64_t)ng.job.shown;
+    if (jobs == 60 || jobs % 1200 == 0)
+        rt_log("ngxfg: presenter: %llu rendered frames, %llu of %llu generated frames shown, %llu presents; %.2f ms between rendered frames",
+               (unsigned long long)jobs, (unsigned long long)gen_ok, (unsigned long long)gen_want,
+               (unsigned long long)__atomic_load_n(&ng.presents, __ATOMIC_RELAXED), (double)ng.interval / 1e6);
+}
+
+static void ng_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        plat_mutex_lock(&ng.m);
+        while (!ng.pending) {
+            if (!plat_cond_wait_ms(&ng.cv, &ng.m, 1500) && ng.on && ng.n) {   // nothing for 1.5 s: where the GPU stands
+                uint64_t rv = 0, cv = 0;
+                vkGetSemaphoreCounterValue(vk_ctx()->device, ng.rendered, &rv);
+                vkGetSemaphoreCounterValue(vk_ctx()->device, ng.copied, &cv);
+                static int told;
+                if (told++ < 3)
+                    rt_log("ngxfg: watchdog: no frame for 1.5 s; frames handed %llu, copied signal submitted %llu; GPU rendered %llu copied %llu",
+                           (unsigned long long)ng.n, (unsigned long long)ng.signaled, (unsigned long long)rv, (unsigned long long)cv);
+            }
+        }
+        ng.pending = 0, ng.busy = 1;
+        plat_cond_broadcast(&ng.cv);
+        plat_mutex_unlock(&ng.m);
+        ng_run();
+        plat_mutex_lock(&ng.m);
+        ng.busy = 0;
+        plat_cond_broadcast(&ng.cv);
+        plat_mutex_unlock(&ng.m);
+    }
+}
+
+static void ng_free_image(NgImg *im) {
+    VkCtx *c = vk_ctx();
+    if (im->view) vkDestroyImageView(c->device, im->view, NULL);
+    if (im->img) vmaDestroyImage(c->vma, im->img, im->mem);
+    memset(im, 0, sizeof *im);
+}
+
+static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
+    VkCtx *c = vk_ctx();
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                            .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateImage(c->vma, &ii, &ai, &im->img, &im->mem, NULL) != VK_SUCCESS) return im->img = VK_NULL_HANDLE, 0;
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                .format = f, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    return vkCreateImageView(c->device, &vi, NULL, &im->view) == VK_SUCCESS;
+}
+
+// The presenter and the images for the current swapchain (g_pl held). 0: frames go out the plain way.
+static int ng_ready(void) {
+    if (!vk_ngxfg_wanted()) return 0;   // the Windows build, or a run that started without DLSS upscaling
+    int want = vk_ngxfg_on() && !g_sc_hdr && !vk_fg_active() && !vk_dlssg_active();
+    if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
+    if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
+        if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
+        return 0;
+    }
+    if (ng.on && ng.w == g_sc_ext.width && ng.h == g_sc_ext.height && ng.fmt == g_sc_fmt) return 1;
+    VkCtx *c = vk_ctx();
+    if (!ng.tried) {
+        ng.tried = 1;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(c->phys, g_sc_fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            rt_log("ngxfg: the swapchain format %d is no storage format here: frame generation off", (int)g_sc_fmt);
+            return ng.on = 0, ng.tried = 2, 0;
+        }
+        if (!ng.thread_up) plat_cond_init(&ng.cv);
+        VkSemaphoreTypeCreateInfo tl = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo tci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &tl};
+        vkCreateSemaphore(c->device, &tci, NULL, &ng.rendered);
+        vkCreateSemaphore(c->device, &tci, NULL, &ng.copied);
+        VkSemaphoreCreateInfo semi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = c->gfx_family};
+        vkCreateCommandPool(c->device, &pci, NULL, &ng.pool);
+        for (int s = 0; s < 2; s++) {
+            VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = ng.pool,
+                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = NG_MAX + 1};
+            vkAllocateCommandBuffers(c->device, &ai, ng.cb[s]);
+            for (int i = 0; i <= NG_MAX; i++) vkCreateSemaphore(c->device, &semi, NULL, &ng.acq[s][i]);
+        }
+        if (!ng.thread_up && !plat_thread_spawn(ng_thread, NULL, "fg present", 0)) {
+            rt_log("ngxfg: the presenter thread did not start: frame generation off");
+            return ng.on = 0, ng.tried = 2, 0;
+        }
+        ng.thread_up = 1;
+    }
+    if (ng.tried == 2) return 0;
+    ng_drain();
+    vk_queue_lock();
+    vkDeviceWaitIdle(c->device);
+    vk_queue_unlock();
+    ng_free_image(&ng.bb);
+    for (int s = 0; s < 2; s++) {
+        ng_free_image(&ng.real[s]);
+        for (int i = 0; i < NG_MAX; i++) ng_free_image(&ng.out[s][i]);
+    }
+    uint32_t w = g_sc_ext.width, h = g_sc_ext.height;
+    int ok = ng_image(&ng.bb, w, h, g_sc_fmt);
+    for (int s = 0; s < 2 && ok; s++) {
+        ok = ng_image(&ng.real[s], w, h, g_sc_fmt);
+        for (int i = 0; i < NG_MAX && ok; i++) ok = ng_image(&ng.out[s][i], w, h, g_sc_fmt);
+    }
+    if (!ok) {
+        rt_log("ngxfg: frame generation images (%ux%u) could not be made: frame generation off", w, h);
+        return ng.on = 0;
+    }
+    ng.w = w, ng.h = h, ng.fmt = g_sc_fmt, ng.fresh = 1, ng.on = 1;
+    vk_ngxfg_reset();
+    rt_log("ngxfg: presenter ready at %ux%u (up to %dx)", w, h, vk_ngxfg_max() + 1);
+    return 1;
+}
+
+// NX2NAVI_FG_MULT: 2 to 6, or dynamic: only the frames needed to reach the display's refresh rate at the rendered frame
+// rate (240 Hz at 60 fps: 4x), between 2x and what the GPU allows, as NVIDIA describes its dynamic multi frame
+// generation; a new multiplier must hold for 30 frames before it is taken, so it does not flicker.
+static int ng_multiplier(int max) {
+    const char *v = cfg_value("NX2NAVI_FG_MULT");
+    int m;
+    if (!strcmp(v, "dynamic")) {
+        static int cur = 2, cand, held;
+        double hz = gfx_window_refresh_hz(), ms = (double)ng.interval / 1e6;
+        int fit = hz > 0 && ms > 0 ? (int)(hz * ms / 1000.0 + 0.1) : 2;   // shown frames per rendered one that fit
+        if (fit < 2) fit = 2;
+        if (fit > max + 1) fit = max + 1;
+        if (fit != cur) {
+            held = fit == cand ? held + 1 : 0, cand = fit;
+            if (held >= 30) cur = fit, held = 0;
+        } else held = 0;
+        m = cur;
+    } else {
+        m = atoi(v);
+    }
+    if (m < 2) m = 2;
+    if (m > max + 1) m = max + 1;
+    return m;
+}
+
+// Records the copy of the frame's picture and DLSS-G's frames (the end of present_image's command buffer, dst in
+// layout *last). Returns the number of generated frames, -1 when the frame goes out the plain way.
+static int ng_record(VkCommandBuffer cb, VkImage dst, VkImageLayout *last, VkPipelineStageFlags2 *stage, VkAccessFlags2 *write,
+                     VkImage hudless, int *set, int gen) {
+    if (!ng.on) return -1;
+    if (ng.fresh) {   // every image to GENERAL, once
+        NgImg *all[1 + 2 + 2 * NG_MAX];
+        int k = 0;
+        all[k++] = &ng.bb;
+        for (int s = 0; s < 2; s++) {
+            all[k++] = &ng.real[s];
+            for (int i = 0; i < NG_MAX; i++) all[k++] = &ng.out[s][i];
+        }
+        for (int i = 0; i < k; i++)
+            sync_barrier(cb, all[i]->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        ng.fresh = 0;
+    }
+    *set = (int)((ng.n + 1) & 1);
+    // the frame's picture is in dst (ng.bb): to GENERAL for DLSS-G and the copy into this set's rendered-frame image
+    sync_barrier(cb, dst, *last, VK_IMAGE_LAYOUT_GENERAL, *stage, *write, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_MEMORY_READ_BIT);
+    *last = VK_IMAGE_LAYOUT_GENERAL, *stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, *write = 0;
+    int made = 0;
+    if (!gen || menu_is_open()) {
+        vk_ngxfg_reset();   // generation pauses while the menu is open
+    } else {
+        int max = vk_ngxfg_max(), want = ng_multiplier(max) - 1;
+        VkNgxImage bb = {ng.bb.img, ng.bb.view, ng.fmt, ng.w, ng.h};
+        VkNgxImage hl = {hudless, g_hl_view, g_hl_fmt, g_hl_w, g_hl_h};
+        VkNgxImage out[NG_MAX], real = {ng.real[*set].img, ng.real[*set].view, ng.fmt, ng.w, ng.h};
+        for (int i = 0; i < NG_MAX; i++) out[i] = (VkNgxImage){ng.out[*set][i].img, ng.out[*set][i].view, ng.fmt, ng.w, ng.h};
+        int hl_ok = hudless && g_hl_w == ng.w && g_hl_h == ng.h && g_hl_fmt == ng.fmt;
+        made = vk_ngxfg_evaluate(cb, &bb, hl_ok ? &hl : NULL, out, want, &real);
+    }
+    // the rendered frame for the presenter (ng.bb is drawn again by the next frame)
+    sync_barrier(cb, ng.real[*set].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .extent = {ng.w, ng.h, 1}};
+    vkCmdCopyImage(cb, dst, VK_IMAGE_LAYOUT_GENERAL, ng.real[*set].img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    sync_barrier(cb, ng.real[*set].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+    *stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT, *write = 0;
+    return made;
+}
+
+// gfx_window_release_vk, the device idle: the presenter shows what it holds, then its images, semaphores and command
+// buffers go with the device. The thread stays and waits; a later device makes the objects again (ng_ready).
+static void ng_release(void) {
+    if (!ng.tried) return;
+    ng_drain();
+    VkCtx *c = vk_ctx();
+    vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // what the presenter submitted while it drained
+    ng_free_image(&ng.bb);
+    for (int s = 0; s < 2; s++) {
+        ng_free_image(&ng.real[s]);
+        for (int i = 0; i < NG_MAX; i++) ng_free_image(&ng.out[s][i]);
+    }
+    if (ng.rendered) vkDestroySemaphore(c->device, ng.rendered, NULL);
+    if (ng.copied) vkDestroySemaphore(c->device, ng.copied, NULL);
+    for (int s = 0; s < 2; s++)
+        for (int i = 0; i <= NG_MAX; i++)
+            if (ng.acq[s][i]) vkDestroySemaphore(c->device, ng.acq[s][i], NULL), ng.acq[s][i] = VK_NULL_HANDLE;
+    if (ng.pool) vkDestroyCommandPool(c->device, ng.pool, NULL);   // its command buffers with it
+    ng.rendered = ng.copied = VK_NULL_HANDLE, ng.pool = VK_NULL_HANDLE;
+    plat_mutex_lock(&ng.m);
+    ng.on = ng.tried = 0, ng.n = ng.signaled = 0;   // new timelines start at 0
+    plat_mutex_unlock(&ng.m);
+}
+
+static uint64_t ng_presented(void) { return ng.on ? __atomic_load_n(&ng.presents, __ATOMIC_RELAXED) : 0; }
+static int ng_running(void) { return ng.on; }
+
+// Hands the submitted frame to the presenter (it shows count generated frames, then swapchain image idx).
+static void ng_hand(uint32_t idx, int count, int set, uint64_t n) {
+    plat_mutex_lock(&ng.m);
+    while (ng.pending) plat_cond_wait(&ng.cv, &ng.m);
+    ng.job.idx = idx, ng.job.count = count < 0 ? 0 : count, ng.job.set = set, ng.job.n = n, ng.job.t = plat_now_ns();
+    ng.job.sc = g_sc;
+    ng.pending = 1;
+    plat_cond_broadcast(&ng.cv);
+    plat_mutex_unlock(&ng.m);
+}
+
 static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     {   // the presented image's format, when it changes (an HDR picture comes in another one)
         static VkFormat last = VK_FORMAT_UNDEFINED;
         if (src && fmt != last) last = fmt, rt_log("gfx: the game presents %dx%d images of format %d", w, h, (int)fmt);
     }
+    if (vk_device_is_lost()) return;   // the run is ending (vk_device.c vk_device_lost_check): nothing touches the device
     gfx_window_start();
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
@@ -921,7 +1374,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         goto out;
     }
     uint32_t idx = 0;
-    VkResult r = vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
+    // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
+    const int ngp = ng_ready();
+    VkResult r = ngp               ? VK_SUCCESS
+               : vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
                : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
                                    : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -931,8 +1387,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
           : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
                               : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
-    vk_device_fault_report(r);
-    // lost, not ready: skip the frame. Acquires that keep timing out (1 s each) mean a swapchain nothing will free an
+    vk_device_lost_check(r, "the acquire of a swapchain image");
+    // not ready: skip the frame. Acquires that keep timing out (1 s each) mean a swapchain nothing will free an
     // image of again: three in a row rebuild it, where the picture used to stop for good.
     static uint32_t n_timeouts;
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
@@ -962,13 +1418,15 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (cw <= 0 || ch <= 0) cx = cy = 0, cw = w, ch = h;   // a crop outside the image (the game's nvnWindowSetCrop):
                                                              // the whole image, not an inverted blit rectangle
     window_settings_live();
+    cam_speed_tick();
     // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
     const char *menu_shot = NULL;
     MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue,
                      g_sc_hdr ? VK_FORMAT_R8G8B8A8_UNORM : g_sc_fmt, g_sc_ext.width,
                      g_sc_ext.height, cw, ch, g_scaler};
     // without a source image (gfx_present_boot): a black frame with the boot screen
-    int overlay = g_sc_view[idx] &&
+    VkImageView dst_view = ngp ? ng.bb.view : g_sc_view[idx];
+    int overlay = dst_view &&
                   (src ? menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot)
                        : menu_boot_frame(&mt));
     // NX2NAVI_SHOT_EVERY=<s> with NX2NAVI_SHOT_DIR=<dir>: the presented frame as shot_<n>.png every s seconds
@@ -1001,7 +1459,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vkBeginCommandBuffer(cb, &bi);
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
-    VkImage dst = g_sc_img[idx];
+    VkImage dst = ngp ? ng.bb.img : g_sc_img[idx];
     sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const int rect[4] = {cx, cy, cw, ch};
@@ -1048,7 +1506,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                        .imageView = menu_view ? menu_view : g_sc_view[idx],
+                                        .imageView = menu_view ? menu_view : dst_view,
                                         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                         .loadOp = menu_view ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
                                         .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
@@ -1057,7 +1515,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         vkCmdBeginRendering(cb, &ri);
         menu_overlay_draw(cb);
         vkCmdEndRendering(cb);
-        if (menu_view) vk_hdr_ui_compose(cb, g_sc_view[idx], g_sc_fmt, g_sc_ext.width, g_sc_ext.height);
+        if (menu_view) vk_hdr_ui_compose(cb, dst_view, g_sc_fmt, g_sc_ext.width, g_sc_ext.height);
         last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1084,7 +1542,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     if (src) output_rate();
     if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
-    sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
+    // presenter are recorded; otherwise the swapchain image is ready to present
+    int ng_set = 0;
+    const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, hudless, &ng_set, src != VK_NULL_HANDLE) : -1;
+    const int via_ng = ng_count >= 0;
+    if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);
 
@@ -1096,20 +1559,36 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    const uint64_t ng_n = ng.n + 1;   // through the presenter: this frame's number on its timelines
+    if (via_ng) {
+        // No acquire to wait for. The frame writes one of the presenter's two image sets: it waits on the GPU until
+        // the presenter is done with the frame before last, which used that set, and that signal is submitted first
+        // (ng_wait_signaled). It signals the timeline the presenter's copies wait for instead of a render-done semaphore.
+        wait = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.copied,
+                                       .value = ng_n > 2 ? ng_n - 2 : 0, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        sig = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.rendered,
+                                      .value = ng_n, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        si.waitSemaphoreInfoCount = ng_n > 2 ? 1u : 0u;
+        if (ng_n > 2) ng_wait_signaled(ng_n - 2);
+    }
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
-    if (r == VK_SUCCESS) {
+    if (r == VK_SUCCESS && via_ng) {   // the presenter shows the generated frames, then this one
+        ng.n = ng_n;
+        ng_hand(idx, ng_count, ng_set, ng_n);
+    } else if (r == VK_SUCCESS) {
         g_flip_on = 1;
         g_flip_idx = idx;
         if (!defer) flip_locked();
     } else {
-        vk_device_fault_report(r);
+        vk_device_lost_check(r, "the present's submit");
         rt_log("gfx: present submit failed (%d)", (int)r);
         // The fence was reset after the acquire and the acquire's semaphore is signalled: left so, this slot's fence
         // wait would time out (5 s) at every later present and the picture stop for good. An empty batch takes the
         // semaphore and signals the fence; the acquired image goes back with the swapchain, made again next frame.
-        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1,
+        // (through the presenter nothing was acquired: the batch only signals the fence)
+        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = via_ng ? 0u : 1u,
                                 .pWaitSemaphoreInfos = &wait};
         vk_queue_lock();
         VkResult r2 = vkQueueSubmit2(c->gfx_queue, 1, &settle, g_fence[slot]);
@@ -1143,6 +1622,7 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 void gfx_present_boot(void) { present_image(VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_UNDEFINED, 1920, 1080, NULL, 0); }
 
 void vk_present_flip(void) {
+    if (vk_device_is_lost()) return;
     plat_rmutex_lock(&g_pl);
     flip_locked();
     plat_rmutex_unlock(&g_pl);
@@ -1165,6 +1645,7 @@ void gfx_window_release_vk(void) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        ng_release();    // NGX frame generation's presenter shows nothing more; its images go before the device
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();

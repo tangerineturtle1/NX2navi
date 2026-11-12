@@ -14,6 +14,7 @@ The feed (app/<version>/feed.json, or the player's override in settings) is eith
 """
 import json
 import re
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -78,6 +79,30 @@ def _check_manifest(m, where):
     return m
 
 
+def retry_text(headers, now=None):
+    """When GitHub takes requests again, for the message of a refused one: "after 14:32 (in 25 minutes)". From
+    X-RateLimit-Reset, the time the hourly allowance is whole again, when the response says the allowance is used
+    up (X-RateLimit-Remaining: 0), else from Retry-After, the seconds to wait. '' when the response says neither
+    or says something that cannot be right (more than a day)."""
+    now = time.time() if now is None else now
+    try:
+        if headers.get('X-RateLimit-Remaining') == '0' and headers.get('X-RateLimit-Reset'):
+            wait = int(headers.get('X-RateLimit-Reset')) - now
+        elif headers.get('Retry-After'):
+            wait = int(headers.get('Retry-After'))
+        else:
+            return ''
+    except (AttributeError, TypeError, ValueError):
+        return ''
+    if wait > 86400:
+        return ''
+    if wait <= 0:   # the allowance is whole again by this PC's clock
+        return 'in a minute'
+    minutes = int(-(-wait // 60))
+    return (f'after {time.strftime("%H:%M", time.localtime(now + wait))} '
+            f'(in {minutes} minute{"" if minutes == 1 else "s"})')
+
+
 def _github(feed, channel, token, version):
     api = feed.get('api', GITHUB_API).rstrip('/')
     headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
@@ -89,8 +114,9 @@ def _github(feed, channel, token, version):
         code = getattr(e, 'code', None)
         if code == 404:
             raise FeedError(f'no releases found for {feed["repo"]} (a private repository needs a token)') from e
-        if code == 403:
-            raise FeedError('GitHub refused the request (rate limit); try again in an hour') from e
+        if code in (403, 429):   # GitHub answers either when the allowance of requests is used up
+            when = retry_text(getattr(e, 'headers', None))
+            raise FeedError(f'GitHub refused the request (rate limit); try again {when or "in an hour"}') from e
         raise FeedError(f'GitHub could not be reached: {e}') from e
     # The API lists the newest release first: the first one the channel takes that has a manifest is the answer.
     for r in releases:

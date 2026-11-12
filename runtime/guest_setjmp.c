@@ -31,11 +31,13 @@ typedef struct {
     uint64_t x[12], sp;              // x19-x30, sp
     __uint128_t d[8];                // d8-d15 (the low halves are what the ABI keeps)
     PlatJmp frame;
+    uint64_t seq;                    // jt_seq at its last setjmp: the smallest is the entry filled longest ago
 } JmpEnt;
 
 #define JMP_N 1024
 static JmpEnt jt[JMP_N];
 static PlatMutex jt_lock = PLAT_MUTEX_INIT;
+static uint64_t jt_seq;              // jt_lock
 
 // Host function starts of the lifted code, sorted, with their guest starts: the guest function a host address runs.
 typedef struct { uintptr_t host; uint64_t guest; } Rev;
@@ -124,9 +126,24 @@ static void ov_setjmp(Cpu *c) {
                  (unsigned long long)caller, (unsigned long long)c->x[30]);
     plat_mutex_lock(&jt_lock);
     JmpEnt *s = slot_of(env, 1);
-    if (!s) rt_fatal("setjmp: more than %d buffers", JMP_N);
+    int replaced = 0;
+    if (!s) {
+        // Every slot holds a buffer (entries are never removed, and a long session keeps meeting new buffer
+        // addresses): the one filled longest ago gives its slot. With no free slot left a lookup walks the whole
+        // table, so the new buffer is found wherever it sits. A longjmp to the replaced buffer ends the process as
+        // one to an unknown buffer does (ov_longjmp); before, the 1025th buffer itself ended it.
+        s = &jt[0];
+        for (int k = 1; k < JMP_N; k++)
+            if (jt[k].seq < s->seq) s = &jt[k];
+        replaced = 1;
+    }
+    e.seq = ++jt_seq;
     *s = e;
     plat_mutex_unlock(&jt_lock);
+    static volatile int32_t n_replaced;
+    if (replaced && plat_inc32(&n_replaced) == 1)
+        rt_log("setjmp: all %d buffer slots are in use; the buffer filled longest ago gives its slot from now on "
+               "(logged once)", JMP_N);
     c->x[0] = 0;
 }
 
@@ -166,3 +183,12 @@ static void ov_longjmp(Cpu *c) {
 
 HOST_OVERRIDE("setjmp", ov_setjmp);
 HOST_OVERRIDE("longjmp", ov_longjmp);
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the jmp_buf table's entries (entries are never removed; fatal when full).
+void setjmp_sizes(PerfSizes *s) {
+    uint64_t n = 0;
+    plat_mutex_lock(&jt_lock);
+    for (int k = 0; k < JMP_N; k++) n += jt[k].env != 0;
+    plat_mutex_unlock(&jt_lock);
+    perf_size(s, "setjmp buffers", n, JMP_N, PERF_SIZE_NONE);
+}

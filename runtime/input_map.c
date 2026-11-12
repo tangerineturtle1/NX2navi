@@ -299,6 +299,7 @@ int input_prompts_pick(const char *prompts, const char *pad_layout) {
     if (prompts && *prompts)
         return !strcasecmp(prompts, "xbox")          ? PROMPTS_XBOX
                : !strcasecmp(prompts, "playstation") ? PROMPTS_PLAYSTATION
+               : !strcasecmp(prompts, "steamdeck")   ? PROMPTS_STEAMDECK
                : !strcasecmp(prompts, "pc")          ? PROMPTS_PC
                                                      : PROMPTS_NINTENDO;
     return pad_layout && !strcasecmp(pad_layout, "xbox_prompts") ? PROMPTS_XBOX : PROMPTS_NINTENDO;
@@ -306,11 +307,12 @@ int input_prompts_pick(const char *prompts, const char *pad_layout) {
 
 const char *input_prompts_folder(int prompts, const char *pad_layout) {
     if (prompts == PROMPTS_PC) return "romfs-patches-pc";
-    if (prompts != PROMPTS_XBOX && prompts != PROMPTS_PLAYSTATION) return NULL;
+    if (prompts != PROMPTS_XBOX && prompts != PROMPTS_PLAYSTATION && prompts != PROMPTS_STEAMDECK) return NULL;
     // The folders are read at start, before a pad is open: auto counts as Xbox, as for a pad without Nintendo labels.
     // A Nintendo-labelled pad under auto plays by label too (its A is on the button labelled A), so it matches as well.
     int by_position = input_pad_layout_pick(pad_layout, 0) == PAD_LAYOUT_NINTENDO;
     if (prompts == PROMPTS_PLAYSTATION) return by_position ? "romfs-patches-playstation" : "romfs-patches-playstation-label";
+    if (prompts == PROMPTS_STEAMDECK) return by_position ? "romfs-patches-steamdeck" : "romfs-patches-steamdeck-label";
     return by_position ? "romfs-patches-xbox" : "romfs-patches-xbox-label";
 }
 
@@ -347,10 +349,10 @@ void input_map_stick(const uint8_t down[KEY_COUNT], int stick, int32_t out[2]) {
     out[1] = dy * m;
 }
 
-void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t out[2]) {
+void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, float cam, int32_t out[2]) {
     out[0] = out[1] = 0;
-    if (!(dt_s > 0) || !(sens > 0)) return;
-    double k = STICK_MAX * (double)sens / (MOUSE_FULL_CPS * dt_s);
+    if (!(dt_s > 0) || !(sens > 0) || !(cam > 0)) return;
+    double k = STICK_MAX * (double)sens / (MOUSE_FULL_CPS * dt_s * cam);
     double x = dx * k, y = -dy * k, len = sqrt(x * x + y * y);
     if (len > STICK_MAX) { x *= STICK_MAX / len; y *= STICK_MAX / len; }
     out[0] = (int32_t)lrint(x);

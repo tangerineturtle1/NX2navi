@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// build_shaders: keep functions
+//
+// --probe-meshfb (mesh_fb_probe.c): a task program in the shape the translator gives one (tools/xlate/MeshSpirv.cs):
+// the program writes its payload into shared memory, and the entry function copies that out and starts the mesh
+// workgroups the program counted into word 1. The payload is 288 bytes: the header, then the program's data from
+// word 4.
+//
+// Task workgroup t starts 0 to 4 mesh workgroups (the uniform block shifts which tasks start how many) and tells each
+// the grid cell it draws; the last payload word carries a mark the mesh program checks.
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 1) uniform Params { uvec4 shift; } u;
+shared uint mem[72];
+taskPayloadSharedEXT uint payload[72];
+
+void program() {
+    uint tid = gl_LocalInvocationIndex, t = gl_WorkGroupID.x;
+    uint count = (t * 3u + u.shift.x) % 5u;
+    if (tid == 0u) mem[1] = count;
+    if (tid < count) mem[4u + tid] = t * 4u + tid;
+    if (tid == 31u) mem[71] = 0x600df00du + t;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < 1u) mem[1] = 0u;
+    barrier();
+    program();
+    barrier();
+    for (uint i = tid; i < 72u; i += 32u) payload[i] = mem[i];
+    EmitMeshTasksEXT(min(mem[1], 32u), 1u, 1u);
+}

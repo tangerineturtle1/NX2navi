@@ -21,9 +21,25 @@ The log names the layout in effect (`input: gamepad layout ...`) and each gamepa
 (`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
 letters unless *Button prompts* says otherwise (below).
 
+The action prompt (top right) shows the four face buttons as a diamond. The game draws it in the Switch places (A right,
+B bottom, X top, Y left), which `nintendo` keeps. Under `xbox`, `playstation` and `auto` the diamond follows such a
+pad instead (A bottom, B right, X left, Y top), whatever *Button prompts* is.
+
+The game reads the diamond once at start, before a gamepad is open:
+
+- `auto` gets the Xbox diamond, so a Switch Pro Controller under `auto` sees A at the bottom although its A is on the
+  right. Pick `nintendo` for that pad.
+- A change of layout shows after a restart; until then *Button prompts* says *prompts change after restart*.
+- A RomFS mod that changes the action prompt keeps its own diamond. A mod that replaces the same archive for other
+  reasons gets the diamond moved on top of its changes.
+
+The log says what happened in a line that starts with `action prompt:`. How the layout is changed:
+`runtime/action_prompt.c` (`DoCommand_00` in `UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs`, served
+from `<profile>/action-prompt/`).
+
 ## Button prompts
 
-`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
+`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation`, `steamdeck` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
 
 - the button font every prompt in text uses (dialogue, the button guides, the controls screen): A B X Y, L R ZL ZR, Plus and Minus, the d-pad and the sticks with their directions become that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create; its d-pad and sticks), or the keys. Power, Home and the console stay;
 - the letter in the action prompt (top right);
@@ -35,13 +51,13 @@ A, B, X and Y show the button the *Button layout* presses: with `nintendo` (by p
 
 The game reads the font and the interface textures once at start, so a change shows after a restart (the row says so; the menu's Restart button restarts). A button or key remapped on this tab keeps its old prompt until the folders are made again.
 
-The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romfs-patches-xbox-label`, `romfs-patches-playstation` and `romfs-patches-playstation-label` (by position and by label) and `romfs-patches-pc`, which `runtime/romfs.c` loads in place of the game's files. `tools/pad_prompts.py` draws them on the player's machine from the player's own RomFS and a folder of button art, which the repository does not hold. A launcher release or build kit made with `--prompt-art` carries that art (`prompt-art`, `tools/prompt_art.py`), and `tools/make_game.py` draws every folder in its last step, again whenever the art, the tools or the `bind_` lines change (so a rebuild after rebinding keys brings the keyboard prompts up to date). By hand:
+The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romfs-patches-xbox-label`, `romfs-patches-playstation`, `romfs-patches-playstation-label`, `romfs-patches-steamdeck` and `romfs-patches-steamdeck-label` (by position and by label) and `romfs-patches-pc`, which `runtime/romfs.c` loads in place of the game's files. `tools/pad_prompts.py` draws them on the player's machine from the player's own RomFS and a folder of button art, which the repository does not hold. A launcher release or build kit made with `--prompt-art` carries that art (`prompt-art`, `tools/prompt_art.py`), and `tools/make_game.py` draws every folder in its last step, again whenever the art, the tools or the `bind_` lines change (so a rebuild after rebinding keys brings the keyboard prompts up to date). By hand:
 
 ```
 python tools\pad_prompts.py --art <art pack>\Source --game <install folder>
 ```
 
-`--style xbox|playstation|pc` makes one style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
+`--style xbox|playstation|steamdeck|pc` makes one style; `steamdeck` shows the Deck's own labels (A B X Y where an Xbox pad has them, L1 R1 L2 R2 and L3 R3, Menu and View) and is drawn from the Xbox and PlayStation pictures, as the art has no Deck style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
 
 The actions are the game's own, as its *Basic Controls* screen (Plus menu, System) names them:
 
@@ -74,11 +90,11 @@ The game's *Swap Jump Controls* option trades B and X (jump on B, put away on X)
 |---|---|---|
 | F1 or Esc | Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
-| F11 | | borderless fullscreen on or off, saved to `nx2navi.ini` |
+| F11 | | borderless fullscreen on or off, saved to `nx2navi.ini`; not with Ctrl, Shift or Alt held, which overlays and capture tools use |
 
-The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, device name, name, desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a device name (`display3`) or monitor name; when nothing matches, the log lists the monitors and the window is placed as with `auto`. Windows only.
+The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, name (on Windows its device name too), desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a monitor name (on Windows also a device name such as `display3`; on Linux the name carries the connector, such as `dp-2`); when nothing matches, the log lists the monitors and the window is placed as with `auto`. On Wayland a window cannot place itself: only fullscreen (`fullscreen = 1`) opens on the chosen monitor, and a windowed window opens where the compositor puts it.
 
-The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
+The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above). With the mouse, a click on a row selects it and a setting changes on the two framed arrows beside its value (held, an arrow repeats); a click anywhere else on the row changes nothing.
 
 ## Audio output
 
@@ -108,13 +124,17 @@ bind_Y = pad:north, key:mouse_l
 
 ## Mouse camera
 
-Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * NX2NAVI_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
+Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * NX2NAVI_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. With a camera speed other than 1 (`NX2NAVI_STICK_SENS`) the deflection is divided by that factor before it is limited to full tilt: the turn for a given movement stays the same, and the fastest turn a flick reaches is the game's top speed with the factor in it. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
 
-`NX2NAVI_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `NX2NAVI_INPUT=none` disables the capture too.
+`NX2NAVI_MOUSE_MODE` (`mouse_mode`, the *Mouse camera* row on the Controls tab, live) chooses that right-stick deflection (`stick`) or mouselook (`direct`, the default). In `direct` the camera's input update (`main+0x37c300`) takes the raw counts itself, after the game's stick dead zone, clamp and response curve (`recomp/patches-v111.txt`, set `mouse_direct`; `runtime/mouse_direct.c` `camera_input_oot`). The camera turns by how far the mouse moved, the same on both axes: about 0.08 degrees a count at `NX2NAVI_MOUSE_SENS` 1, at any frame rate and any `NX2NAVI_STICK_SENS`, with no dead zone and no top speed. The game's own camera sensitivity (its Options) scales the mouse as it scales the stick. A gamepad's right stick and the arrow keys still go through the game's response and add to the mouse. While the game takes no camera input (it switched camera input off, or the pause after a camera reset runs) the mouse is the right stick as above. `NX2NAVI_MOUSE_DIRECT_PATCH=0` turns the patch set off, and the mouse is the right stick whatever the mode. `NX2NAVI_MOUSE_TRACE=1` logs each camera input update (the stick, the counts taken and what they added) and, with `dlaa` on (DLAA, DLSS or FSR 3.1, which read the game's camera), the camera's direction in each frame, for measuring the turn per count.
+
+`NX2NAVI_MOUSE_SENS` (the *Mouse camera sensitivity* row, live; 0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off, the row goes down to 0.05). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `NX2NAVI_INPUT=none` disables the capture too.
 
 `NX2NAVI_STICK_DEADZONE` (0 to 50, default 8) is the gamepad stick dead zone in percent of full deflection, the same for both sticks. It is round: a stick inside the circle reads centred, and the rest of its travel is scaled to start at 0 at the edge, so full deflection still reaches full. Raise it for a stick that drifts. The game's own dead zone applies after it. `NX2NAVI_LSTICK_DEADZONE` and `NX2NAVI_RSTICK_DEADZONE` (the *Left/Right stick dead zone* rows under *Analog sticks* on the Controls tab) set one stick each and fall back to `NX2NAVI_STICK_DEADZONE` while unset, so a worn stick can get a larger zone than the other. With a gamepad connected each row shows its stick's deflection now, before the dead zone (*stick now*): let go of the stick and set the row a few percent above the value it rests at.
 
 The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sticks at 50% deflection. With no gamepad connected the log says `input: no gamepad`.
+
+Keys tilt a stick all the way, so on the keyboard alone Link always runs. `NX2NAVI_WALK_KEY` (`walk_key`, the *Walk key* row under *Analog sticks* on the Controls tab) names a key that, while held, scales the stick values the keys give (movement and camera keys) to `NX2NAVI_WALK_SCALE` of full (`walk_scale`, the *Walk scale* row; 0.2 to 0.9, default 0.51), so Link walks. The value is a key name of the `bind_` lines, or `none` (the default: off). The row offers Shift, Alt, Ctrl, Tab and Caps Lock and names the button a chosen key also presses: with the default bindings Shift is A, Ctrl is B and Tab is Plus, while Alt and Caps Lock are free. The gamepad's sticks and the mouse camera are not scaled. The default is just above half because half of a key's full value falls one short of the 50% the direction bits need. Both settings apply at once while the game runs.
 
 ## Nintendo Switch 2 controllers
 
@@ -147,6 +167,8 @@ The PS button is not used. The Controls tab binds and remaps its buttons like an
 `<frame>` counts 60 Hz ticks of game time since the first frame (presented frames at 60 fps). Each event logs once (`input: script frame N tick T: A`).
 
 `NX2NAVI_INPUT_RECORD=<file>` (`input_record` in `nx2navi.ini`) writes the merged input in the same format, one line per button press and per stick segment. The file replays as a script, which makes it the repro to attach to a bug report.
+
+`tools/run_game.py <game folder> --save <save> --seconds <s> --wall <w> [--script <file>] [--shot <png>]` runs the game on a copy of its profile with a save swapped in, under the script (default `tools/input/load_save.txt`: title screen to the first save slot). `<save>` names one of the game's save backups (`profile/save-backup/<time>`; the game keeps the last three) or is a save folder or `.zip` from elsewhere, such as the zipped profile folder of a crash report; a single slot (`slot_NN`) replaces only that slot. The run ends once `<s>` seconds of game time passed after the save loaded, `--shot` saving that frame as a PNG and `--env NX2NAVI_SHOTS=w<from>-<to>:<step>` one every `<step>` seconds of game time along the way (480x270, full size with `NX2NAVI_SHOTS_FULL=1`), or after `<w>` seconds of wall time. `--env NX2NAVI_SHOT_DIR=<dir> --env NX2NAVI_SHOT_AFTER=<s> --env NX2NAVI_SHOT_EVERY=<s>` takes pictures by wall time instead, for a script that never reaches a place where game time counts. On Windows it also takes `build\<ver>` folders and the saves in `build\save-backup`.
 
 `NX2NAVI_TEST_PAD=<lx>,<ly>,<rx>,<ry>` attaches an SDL virtual gamepad at start whose sticks rest at these raw SDL axis values (-32768 to 32767, down is +y), so a drifting or held stick can be tested without a controller: the values go through the gamepad mapping and `NX2NAVI_STICK_DEADZONE` like a real pad's, and `NX2NAVI_INPUT_RECORD` shows what reached the game. `NX2NAVI_TEST_PAD_AT=<ms>` attaches it that long after input starts instead and presses its south button a second later, which tests a controller switched on in play.
 

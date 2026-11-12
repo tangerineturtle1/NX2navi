@@ -86,7 +86,7 @@ static void open_input(Cpu *c) {
     }
     MicCapture *m = mic_open(f[0], f[1], f[2], frames);
     if (!m) {
-        rt_log("mic: cannot open the default recording device: %s", mic_error());
+        rt_log("mic: cannot prepare the input stream: %s", mic_error());
         ret_x(c, BAD_INPUT);
         return;
     }
@@ -97,7 +97,7 @@ static void open_input(Cpu *c) {
     s->next_log = (uint64_t)f[2] * 5;
     uint64_t impl = key + 8;
     memcpy(ipc_guest(key, 8), &impl, 8);
-    rt_log("mic: default recording device opened; bounded buffer %d frames", mic_capacity(m));
+    rt_log("mic: input stream ready; bounded buffer %d frames; device opens when capture starts", mic_capacity(m));
     ret_x(c, 0);
 }
 static void start_input(Cpu *c) {
@@ -115,6 +115,8 @@ static void stop_input(Cpu *c) {
     Input *s = find(c->x[0]);
     if (s) {
         mic_stop(s->mic);
+        if (s->running)
+            rt_log("mic: capture stopped; recording device released");
         s->running = 0;
     }
     ret_x(c, 0);

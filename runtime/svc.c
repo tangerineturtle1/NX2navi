@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "coop.h"
 #include "fs.h"
 #include "host.h"
 #include "kernel.h"
@@ -24,7 +25,7 @@ RtStats rt_stats(void) {
     return (RtStats){__atomic_load_n(&g_svcs, __ATOMIC_RELAXED), kern_threads_created(), hostfn_calls()};
 }
 
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
+static int readable(uint64_t a, uint64_t n) { return mem_host_readable(a, n); }
 
 void kern_backtrace(const Cpu *c) {
     char d[160];
@@ -243,8 +244,10 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
                    // profile saved, logs flushed, exit code 0
         char at[160];
         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
+        coop_shutdown();   // LEAVE and BYE to the room, before the process ends
         fs_save_flush();
-        vk_pipeline_save();
+        vk_pipeline_prewarm_marker_clear();   // as the window's close (gfx_present.c gfx_window_closed)
+        vk_pipeline_save_exit();
         prof_write();
         rtss_limit_restore();
         fflush(NULL);

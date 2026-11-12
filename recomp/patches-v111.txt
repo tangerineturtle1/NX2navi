@@ -17,6 +17,10 @@ set wide_hud    NX2NAVI_PATCH_WIDE_HUD    0
 set wide_movie  NX2NAVI_PATCH_WIDE_MOVIE  0
 set res_fixed   NX2NAVI_PATCH_RES_FIXED   0
 set ostep       NX2NAVI_OCARINA_REALTIME  1
+set zstd        NX2NAVI_ZSTD_NATIVE       1
+set osolver     NX2NAVI_PHYSICS_STEPS     1
+set opickup     NX2NAVI_PICKUP_COUNT      1
+set freecam     NX2NAVI_PATCH_FREECAM     0
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
 # nominal frame through main+0x3b4e300 (+0x10 frames per update, +0x14 the inverse, +0x18 seconds, +0x1c the rate),
@@ -26,6 +30,65 @@ set ostep       NX2NAVI_OCARINA_REALTIME  1
 # (runtime/frame_rate.c). x10 is rewritten before it is read again, and the tst's flags feed only the fcsel.
 site ostep main 6e6cc0 1e220c21 @page:x10   # fcsel s1, s1, s2, eq -> adrp x10, page
 site ostep main 6e6cc4 1e201828 bd410148    # fdiv s8, s1, s0 -> ldr s8, [x10, #256]
+# The engine's second step: the graphics system's update (main+0x3b4ea90) also divides 60.0 by the same nominal rate
+# (its +0x2c8) and stores the result as a global, main+0x4d41fc8, the 60 Hz frames of the last update. Its reader is the
+# hold-to-repeat timer of the buttons (main+0x3483680), which adds it to each held button's time and repeats the button
+# once that passes the button's delay and period in 60 Hz frames; above 60 fps it added 1.0 a rendered frame, so a held
+# button repeated fps / 60 times too often. The global takes frames per update from the patch page too, so the two steps
+# never differ. x9 is not read in the function and is free across the call that follows; the store keeps x8.
+site ostep main 3b4eaf4 5e21d800 @page:x9   # scvtf s0, s0 -> adrp x9, page
+site ostep main 3b4eaf8 1e201820 bd410120   # fdiv s0, s1, s0 -> ldr s0, [x9, #256]
+# The time of day: its update (main+0x3cdf70) adds trunc(2 * frames per update) game seconds a frame to the seconds of
+# the day (+0x3c of its object, carried into the day count by the code after it). With the step above below one frame
+# per update the sum was 1 from 61 to 119 fps (the day at 83% of its pace at 100 fps) and 0 above 120, where the clock
+# stood still and the sun swung back and forth around a frozen hour; at 60 fps a step a little under one frame lost a
+# second too. The cut calls the page's +0xf60 instead (runtime/frame_rate.c frame_rate_day_host): the frame's seconds
+# with the fraction kept for the next frame, so the day keeps the game's pace at any frame rate. x30 is the function's
+# own saved one, and the call at main+0x3cdfc8 sets it again.
+site ostep main 3cdfc0 1e380008 952b4be8   # fcvtzs w8, s0 -> bl page+0xf60
+
+# Physics solver steps: the physics system's step setup (main+0x38aeb80, and the same code in main+0x38afc10) gives the
+# rigid body world its solver step count for the frame, trunc(frames per update * count + 0.001) with the count at
+# system +0x244 (4, set by the constructor main+0x38ae800), and the world keeps the result's inverse beside it (world
+# vtable +0x88, main+0x3a24c20: world +0xc48 and +0xcb8). That is 4 at 60 fps and 8 at 30, the two rates the game ships
+# with: 240 solver steps a second. Below one frame per update it truncates to fewer a second (3 a frame from 61 to 80
+# fps, 2 to 120, 1 to 240: 144 a second at 144 fps), and to 0 under a quarter frame, with an infinite inverse. The
+# solver (main+0x180b0a0) runs its solve and sub-integration loop that many times and skips it at 0 (main+0x180b380):
+# such a frame solves no contact or friction and moves no rigid body, so whatever stands on a moving body is left
+# behind in it. At a 240 fps limit that was the frame after a late one, whose display interval is shorter than the
+# period (runtime/frame_rate.c ocarina_step). The count rounds up instead, ceil(frames per update * count - 0.25): 4 and 8 as before at 60 and 30
+# fps, also with a step a few percent off them, never fewer steps a second than at 60 fps, and at least 1 down to a
+# 16th of a frame. s2 is loaded only for this sum, and none of the words reads or writes the flags.
+site osolver main 38aebe4 bd440d02 1e2a1002   # ldr s2, [x8, #0x40c] (0.001) -> fmov s2, #0.25
+site osolver main 38aebf0 1f010800 1f218800   # fmadd s0, s0, s1, s2 -> fnmsub s0, s0, s1, s2 (s0 * s1 - s2)
+site osolver main 38aebf4 1e380001 1e280001   # fcvtzs w1, s0 -> fcvtps w1, s0 (round up)
+site osolver main 38afd10 bd440d02 1e2a1002   # the same three words in the second copy
+site osolver main 38afd1c 1f010800 1f218800
+site osolver main 38afd20 1e380001 1e280001
+
+# Pick-up window count: the window that shows a pick-up above the character (its update is main+0xa67e50) moves the
+# number it shows (+0x360) to the new total (+0x35c) by trunc(frames per update * max(1, difference / 50)) a frame, and
+# closes only once the two are equal. Below one frame per update that is 0: above 60 fps, and at 60 while the step runs
+# a little under one frame, the count never ends, so the window stayed until the area was left, and for an amount over
+# 9 the counting sound was started again every frame and its closing sound never came. The increment is floored at 1
+# without the flags (clz is 32 only for 0, so increment += clz >> 5); at one and two frames per update it is what the
+# game computes. Above 60 fps a small amount then counts one a rendered frame, faster than at 60. w13 held the time
+# manager, last read at main+0xa682ec, and every path from the site reaches a call before it reads x13 again.
+site opickup main a68300 1e38000c 1e38000c 5ac0118d 53057dad 0b0d018c   # fcvtzs w12, s0; clz w13, w12; lsr w13, w13, #5; add w12, w12, w13
+
+# Mouse camera: the camera's stick input update (main+0x37c300) puts the right stick through a radial dead zone of
+# 0.005, scales the radius to one, clamps it and raises it to StickExponent (2, the default of
+# game__component__PlayerCameraParam); then come the reset timer at +0x5e0 (the stick reads zero while it runs), the X/Y
+# inversion (w21 bits 1 and 2) and the idle test (flags +0x530 bit 4: the processed stick under 10%). At 37c45c s1 and
+# s0 hold the processed x and y for the stores at +0x538 and +0x53c: the host callback performs the displaced store of
+# s1 and adds the raw mouse counts to both (runtime/mouse_direct.c camera_input_oot), so the mouse never becomes a stick
+# value and meets no dead zone or curve. At 37c4f0, the displaced ldp d9, d8, [sp, #0x10] before the update's last
+# `str w8, [x20, #0x530]`, w8 holds the flags: a second callback clears the idle bit for an update the mouse moved in
+# (camera_activity_oot). x30 is the function's own saved one at both sites. The callbacks' addresses are page +0xfd0
+# and +0xfc0; the page is main+0x4ea0000 on this build.
+set mouse_direct NX2NAVI_MOUSE_DIRECT_PATCH 1
+site mouse_direct main 37c45c bd053a81 952c92dd   # str s1, [x20, #0x538] -> bl page+0xfd0
+site mouse_direct main 37c4f0 6d4123e9 952c92b4   # ldp d9, d8, [sp, #0x10] -> bl page+0xfc0
 
 # Game image: the graphics setup (main+0x1202ce0) fills the renderer's configuration with the size of the picture the
 # game presents, 2560x1440 at every console mode (config +0x14, copied to renderer +0x9c, which main+0x346be50 reads
@@ -88,3 +151,24 @@ site wide_hud main 774368 ad401041 ad401041 @page:x16 fd404a10 6e040431 6e0c2491
 # Pre-rendered movies: the movie layer's draw (main+0x3b5c71c) builds a viewport over the whole picture (sead viewport
 # at x29 - 40: min x +8, max x +16); it moves in by the page's margin on each side, the middle 16:9 of the picture.
 site wide_movie main 3b5c758 a941a269 d100a3b0 bd400a10 bd401211 1e303a32 @page:x17 bd40c233 1e330a52 1e322a10 1e323a31 bd000a10 bd001211 a941a269   # movie layer viewport: ldp x9, x8, [x19, #0x18]
+
+# The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c): the
+# three calls of ZSTD_decompressMultiFrame (main+0xeb380: dctx, dst, capacity, src, size, dict, dict size, ddict) go to
+# the host function on the patch page (+0xff0). main+0xe910c is the file loader's call for a file that fits one read
+# chunk. The loading threads decode most of the data through the game's stream feed (main+0xf5c80: state, src, size,
+# ddict), called once per chunk read at main+0xf5c2c: that call goes to the host's stream decoder on the patch page
+# (+0xf80), which takes a stream from its first chunk or leaves it to the game (ov_zstd.c host_stream). Until a check
+# run has compared the two decoders on this build, the host functions pass every call on to the game's decoder unless
+# zstd_native = 1 is set (ov_zstd.c trusted).
+site zstd main e910c  9400089d 9536dfb9   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main bf72e0 97d3d028 950aa744   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main f50164 97c66c87 94fd43a3   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
+
+# The debug menu's free camera (runtime/debug_tools.c dbg_freecam_host; switched on by the menu, never by a setting). The
+# camera update (main+0x4c48c0) chooses the frame's position and target (doubles) and up vector between the camera's
+# own and an override; every path of that choice joins at main+0x4c4e50 with them in d0-d2, d3-d5 and s7, s16, s6,
+# before they are stored into the look-at camera and its matrix is made. That instruction goes to the host function
+# on the patch page (+0xf70), which puts the free camera's vectors into those registers and does the instruction's
+# own work.
+site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70

@@ -99,6 +99,17 @@ int probe_nvn_tex(void) {
     if (l.size != 160ull * 4 || l.align != 32) return fail("linear", 0, 0x25, 40, 4, l.size, 640);
     n += 2;
 
+    // A width past 2^30 (a garbled descriptor): its size in 64 bits, never wrapped to a small one. RGBA8 2^30 + 64
+    // texels by 8 rows is one GOB row of (2^32 + 256)-byte rows: 2^26 + 4 GOBs of 512 bytes, 2^35 + 2048 bytes (in
+    // 32 bits the row wrapped to 256 bytes and the texture to 2048).
+    nvn_texdesc wide = {.target = 1, .format = 0x25, .samples = 1, .width = (1u << 30) + 64, .height = 8, .depth = 1, .levels = 1};
+    nvn_tex_layout(&wide, &l);
+    if (l.size != (1ull << 35) + 2048) return fail("width past 2^30", 0, 0x25, wide.width, 8, l.size, (1ull << 35) + 2048);
+    nvn_texdesc wide_lin = wide;
+    wide_lin.flags = 0x10;
+    if (nvn_tex_linear_stride(&wide_lin) != UINT32_MAX) return fail("linear stride past 2^32", 0, 0x25, wide.width, 8, nvn_tex_linear_stride(&wide_lin), UINT32_MAX);
+    n += 2;
+
     printf("probe-nvn-tex: passed (%u cases)\n", n);
     return 0;
 }

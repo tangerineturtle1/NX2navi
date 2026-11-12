@@ -3,7 +3,11 @@
 // call's arguments; its pointers point into the packet itself, so the recorder passes the payload to the driver as
 // it is. A packet never wraps: one that does not fit before the end is preceded by a pad. The producer publishes head
 // after each packet; the recorder makes the calls and advances tail, which the producer waits on when the ring is
-// full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event.
+// full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event, and a sleep
+// that ends with nothing new goes on without spinning first. The producer wakes a sleeping recorder once: it takes the
+// sleeping flag back itself, so the packets it makes while the recorder is still waking cost no further system call.
+// head, tail and the producer's own words sit on cache lines of their own: the producer writes head and its counters
+// per packet while the recorder reads head in its spin, and the recorder writes tail.
 #define VK_REC_IMPL
 #include <immintrin.h>
 #include <stdlib.h>
@@ -16,10 +20,12 @@
 
 #define RING_WORDS (1u << 21)   // 16 MiB: a part of a submission is ~1-2 MiB of packets in the town
 static uint64_t ring[RING_WORDS];
-static volatile uint64_t head, tail;   // words published by the producer / consumed by the recorder
+static _Alignas(64) volatile uint64_t head;   // words published by the producer
+static _Alignas(64) volatile uint64_t tail;   // words consumed by the recorder
 static volatile int32_t sleeping;         // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
-static uint64_t put_h;                 // producer: words written (published up to head)
+static _Alignas(64) uint64_t put_h;    // producer: words written (published up to head)
+static uint64_t tail_seen;             // producer: tail as it last read it (wait_space); tail only grows
 static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
@@ -43,7 +49,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate,
+    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate, R_DrawIndirect,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -56,18 +62,21 @@ static void rec_main(void *arg) {
     (void)arg;
     plat_thread_priority(rec_prio);
     uint64_t t = 0;
+    int slept = 0;   // the last thing it did was sleep: nothing new then means still idle, so no spin before the next sleep
     for (;;) {
         uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            for (int i = 0; i < 4096 && t == h; i++) _mm_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            for (int i = 0; !slept && i < 4096 && t == h; i++) _mm_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
             if (t == h) {
                 __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
                 if (t == h) plat_event_wait_ns(&wake_ev, 2000000);   // a missed wake costs at most 2 ms
                 __atomic_store_n(&sleeping, 0, __ATOMIC_RELAXED);
+                slept = 1;
                 continue;
             }
         }
+        slept = 0;
         // NX2NAVI_REC_DELAY_US (debug): the recorder falls this far behind each batch it finds, as on a slow machine,
         // so objects the replay lets go of meet packets it has not made yet (NX2NAVI_REC_CHECK).
         if (rec_delay_ns) plat_sleep_ns(rec_delay_ns);
@@ -85,18 +94,27 @@ static void rec_main(void *arg) {
 
 // ---- producer
 
+// Wakes the recorder when it sleeps or is about to: whoever takes the flag back sets the event, once per sleep. Setting
+// the event for a recorder that has not reached its wait yet makes that wait return at once.
+static void wake_if_sleeping(void) {
+    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED) && __atomic_exchange_n(&sleeping, 0, __ATOMIC_SEQ_CST))
+        plat_event_set(&wake_ev);
+}
+
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    wake_if_sleeping();
 }
 
 static void wait_space(uint64_t need) {
-    if (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
+    if (put_h + need - tail_seen <= RING_WORDS) return;   // room even by the older tail
+    tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+    if (put_h + need - tail_seen <= RING_WORDS) return;
     RS_.full_waits++;
     uint64_t t0 = now_ns();
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
-    while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) _mm_pause();
+    while (put_h + need - (tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
     full_ns_all += now_ns() - t0;
 }
 
@@ -122,7 +140,7 @@ static void *put(uint32_t op, size_t bytes) {
 
 static void pub(void) {
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    wake_if_sleeping();
 }
 
 void rec_drain(void) {
@@ -328,6 +346,9 @@ FIXED(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int3
       uint32_t n, i, f; int32_t v; uint32_t fi)
 #define PACK_DrawIndexedIndirect *a = (A_DrawIndexedIndirect){b, o, n, s}
 FIXED(DrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
+      VkBuffer b; VkDeviceSize o; uint32_t n, s)
+#define PACK_DrawIndirect *a = (A_DrawIndirect){b, o, n, s}
+FIXED(DrawIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
       VkBuffer b; VkDeviceSize o; uint32_t n, s)
 #define PACK_EndQuery *a = (A_EndQuery){p, q}
 FIXED(EndQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q), (cb, p, q), VkQueryPool p; uint32_t q)
@@ -687,6 +708,7 @@ static void exec_packet(uint32_t op, void *p) {
     F(Draw, a->n, a->i, a->f, a->fi)
     F(DrawIndexed, a->n, a->i, a->f, a->v, a->fi)
     F(DrawIndexedIndirect, a->b, a->o, a->n, a->s)
+    F(DrawIndirect, a->b, a->o, a->n, a->s)
     F(EndQuery, a->p, a->q)
     F(FillBuffer, a->b, a->o, a->n, a->v)
     F(ResetQueryPool, a->p, a->f, a->n)

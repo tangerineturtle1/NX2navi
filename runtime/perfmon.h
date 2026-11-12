@@ -28,6 +28,9 @@ typedef struct {
     // ADL (AMD)
     char gpu_name[96];
     float gpu_pct, gpu_temp_c, gpu_power_w, gpu_clock_mhz, vram_used_mb, vram_total_mb;
+    // of vram_used_mb, which counts every program on the card, what this process holds (the driver's figure for
+    // the device-local heaps, perfmon_set_vram_game); -1 unknown
+    float vram_game_mb;
     // per frame, averaged over the last half second: replay (NVN to Vulkan recording), GPU busy time (timestamps; -1
     // without them), the render thread's waits for pipeline builds, shader translation and texture uploads, and the
     // textures uploaded
@@ -41,9 +44,14 @@ void perfmon_mode(int mode);
 // The Vulkan device the game renders on: its name, its LUID (8 bytes; NULL when the driver gives none), its PCI bus
 // (-1 unknown) and its device-local memory. Before the first perfmon_mode(2).
 void perfmon_set_gpu(const char *name, const uint8_t *luid, int pci_bus, float vram_total_mb);
+// How the sampling thread asks for the device-local memory this process holds, in MB (vk_memory.c
+// vk_mem_device_used_mb; negative when the driver does not report it). Called twice a second while the overlay is full.
+void perfmon_set_vram_game(float (*used_mb)(void));
 // A game frame was presented (perf_present, the render thread, only while the overlay is on): the time since the last
 // one, the render thread's waits of this frame (PERF_N entries, host.h), its replay time and the running count of
 // texture uploads.
+// A picture went out (the present thread, vk_backend.c): the overlay's frame times are the intervals between these.
+void perfmon_shown(uint64_t now_ns);
 void perfmon_frame(uint64_t now_ns, uint64_t interval_ns, const uint64_t *wait_ns, uint64_t replay_ns,
                    int64_t tex_uploads);
 // The latest numbers (the overlay, present path).

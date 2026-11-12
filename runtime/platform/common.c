@@ -1,6 +1,7 @@
 // The parts of platform.h built on its locks rather than on the OS: recursive mutexes, one-time initialisation and
-// events. Every OS shares them.
+// events, and the network address helpers. Every OS shares them.
 #include "platform.h"
+#include <string.h>
 
 // ---- recursive mutex: owner is the holder's thread id (0 when free); only the holder writes depth.
 
@@ -99,4 +100,62 @@ int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
     if (got && !e->manual) e->set = 0;
     plat_mutex_unlock(&e->m);
     return got;
+}
+
+// ---- network addresses: the OS-free part of platform.h's UDP sockets. Layout of PlatAddr.b: the IPv6 address at 0 (an
+// IPv4 one as ::ffff:a.b.c.d), the port big-endian at 16, the scope id little-endian at 18, zeros after.
+
+void plat_addr_set(PlatAddr *a, const uint8_t ip[16], uint16_t port, uint32_t scope) {
+    memset(a, 0, sizeof *a);
+    memcpy(a->b, ip, 16);
+    a->b[16] = (uint8_t)(port >> 8), a->b[17] = (uint8_t)port;
+    for (int i = 0; i < 4; i++) a->b[18 + i] = (uint8_t)(scope >> (8 * i));
+}
+
+void plat_addr_get(const PlatAddr *a, uint8_t ip[16], uint32_t *scope) {
+    memcpy(ip, a->b, 16);
+    if (scope) *scope = (uint32_t)a->b[18] | (uint32_t)a->b[19] << 8 | (uint32_t)a->b[20] << 16 | (uint32_t)a->b[21] << 24;
+}
+
+uint16_t plat_addr_port(const PlatAddr *a) { return (uint16_t)(a->b[16] << 8 | a->b[17]); }
+
+int plat_addr_eq(const PlatAddr *a, const PlatAddr *b) { return !memcmp(a, b, sizeof *a); }
+
+static int addr_is_v4(const uint8_t *ip) {
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    return !memcmp(ip, mapped, sizeof mapped);
+}
+
+int plat_addr_str(const PlatAddr *a, char *out, size_t cap) {
+    char s[96];
+    int n;
+    uint32_t scope;
+    uint8_t ip[16];
+    plat_addr_get(a, ip, &scope);
+    if (addr_is_v4(ip)) {
+        n = snprintf(s, sizeof s, "%u.%u.%u.%u:%u", ip[12], ip[13], ip[14], ip[15], plat_addr_port(a));
+    } else {
+        unsigned g[8];
+        for (int i = 0; i < 8; i++) g[i] = (unsigned)ip[2 * i] << 8 | ip[2 * i + 1];
+        int best = -1, best_len = 1;   // the longest run of two or more zero groups becomes "::"
+        for (int i = 0, run; i < 8; i += run ? run : 1) {
+            run = 0;
+            while (i + run < 8 && !g[i + run]) run++;
+            if (run > best_len) best = i, best_len = run;
+        }
+        n = snprintf(s, sizeof s, "[");
+        for (int i = 0; i < 8; i++) {
+            if (i == best) {
+                n += snprintf(s + n, sizeof s - (size_t)n, "::");
+                i += best_len - 1;
+                continue;
+            }
+            n += snprintf(s + n, sizeof s - (size_t)n, "%s%x", i && i != best + best_len ? ":" : "", g[i]);
+        }
+        if (scope) n += snprintf(s + n, sizeof s - (size_t)n, "%%%u", scope);
+        n += snprintf(s + n, sizeof s - (size_t)n, "]:%u", plat_addr_port(a));
+    }
+    if (n <= 0 || (size_t)n >= sizeof s || (size_t)n >= cap) return 0;
+    memcpy(out, s, (size_t)n + 1);
+    return n;
 }

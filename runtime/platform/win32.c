@@ -1,8 +1,12 @@
 // Windows implementation of platform.h: CreateThread, QueryPerformanceCounter, high-resolution waitable timers,
 // SRW locks and condition variables.
 #include <io.h>
+#include <limits.h>
 #include <stdio.h>
+#include <winsock2.h>   // before windows.h, which would otherwise pull in the old winsock.h
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <aclapi.h>     // SetNamedSecurityInfoW (plat_file_private)
 #include <bcrypt.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -93,6 +97,32 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
         }
     free(buf);
     return cores;
+}
+
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
+    DWORD_PTR proc, sys;
+    *l3_kb = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = len ? malloc(len) : NULL;
+    uint64_t die = 0;
+    DWORD big = 0, small = ~0u;
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, buf, &len))
+        for (DWORD off = 0; off < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)((char *)buf + off);
+            const CACHE_RELATIONSHIP *c = &e->Cache;
+            if (c->Level == 3 && c->GroupMask.Group == 0) {   // every L3, also those outside the process's set
+                if (c->CacheSize > big) big = c->CacheSize, die = 0;
+                if (c->CacheSize == big) die |= c->GroupMask.Mask;
+                if (c->CacheSize < small) small = c->CacheSize;
+            }
+            off += e->Size;
+        }
+    free(buf);
+    if (!die || big == small) return 0;
+    *l3_kb = big >> 10;
+    return die & proc;
 }
 
 int plat_process_affinity(uint64_t mask) { return SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)mask) != 0; }
@@ -305,8 +335,9 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
 // core. The core is the highest-numbered one of the fastest efficiency class (a performance core on a hybrid CPU),
 // with both its logical processors when it has two; only processors in group 0 and in the process's affinity mask
 // count. CPU sets are soft: the scheduler may still use the core when nothing else wants it. Returns the logical
-// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify.
-int plat_cpu_reserve(void) {
+// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify; *which
+// (when not NULL, size bytes) receives their numbers, such as "10,11".
+int plat_cpu_reserve(char *which, size_t size) {
     typedef BOOL(WINAPI * GetInfoFn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
     typedef BOOL(WINAPI * SetProcFn)(HANDLE, const ULONG *, ULONG);
     typedef BOOL(WINAPI * SetThreadFn)(HANDLE, const ULONG *, ULONG);
@@ -336,6 +367,7 @@ int plat_cpu_reserve(void) {
         o += s->Size;
     }
     ULONG rest[64], mine[8];
+    unsigned mine_cpu[8];   // the logical processor numbers of mine
     int nrest = 0, nmine = 0;
     for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
         const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
@@ -343,7 +375,7 @@ int plat_cpu_reserve(void) {
         if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
             (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
             if (s->CpuSet.EfficiencyClass == best_class && s->CpuSet.CoreIndex == best_core) {
-                if (nmine < 8) mine[nmine++] = s->CpuSet.Id;
+                if (nmine < 8) mine_cpu[nmine] = s->CpuSet.LogicalProcessorIndex, mine[nmine++] = s->CpuSet.Id;
             } else if (nrest < 64) {
                 rest[nrest++] = s->CpuSet.Id;
             }
@@ -357,8 +389,16 @@ int plat_cpu_reserve(void) {
         set_proc(GetCurrentProcess(), NULL, 0);   // back to every processor
         return 0;
     }
+    if (which && size) {
+        size_t n = 0;
+        which[0] = 0;
+        for (int i = 0; i < nmine && n < size; i++)
+            n += (size_t)snprintf(which + n, size - n, "%s%u", n ? "," : "", mine_cpu[i]);
+    }
     return nmine;
 }
+
+int plat_cpu_reserve_sweep(void) { return 0; }
 
 uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -662,8 +702,15 @@ static int write_swap(const char *path, const void *data, size_t n, int durable)
     if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, a, WPATH) || !widen(path, b, WPATH)) return 0;
     HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD put = 0;
-    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && (!durable || FlushFileBuffers(h));
+    // In pieces: WriteFile takes a 32-bit count, so a block of 4 GB or more (a pipeline cache can grow that far)
+    // would otherwise be cut to its low 32 bits and the write refused.
+    int ok = 1;
+    for (size_t at = 0; ok && at < n;) {
+        DWORD piece = n - at > (1u << 30) ? (1u << 30) : (DWORD)(n - at), put = 0;
+        ok = WriteFile(h, (const char *)data + at, piece, &put, NULL) && put == piece;
+        at += piece;
+    }
+    ok = ok && (!durable || FlushFileBuffers(h));
     CloseHandle(h);
     if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0))) return 1;
     DeleteFileW(a);
@@ -715,6 +762,27 @@ int plat_file_set_readonly(const char *path, int on) {
     DWORD a = GetFileAttributesW(w);
     if (a == INVALID_FILE_ATTRIBUTES) return 0;
     return SetFileAttributesW(w, on ? a | FILE_ATTRIBUTE_READONLY : a & ~(DWORD)FILE_ATTRIBUTE_READONLY) != 0;
+}
+
+// The file or folder gets an access list of its own with one entry, full control for the account the game runs as,
+// and inherits none from its folder: a game folder outside the user's own folders is often readable by every account
+// of the PC. Administrators can still take ownership, as on any file.
+int plat_file_private(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH) || GetFileAttributesW(w) == INVALID_FILE_ATTRIBUTES) return 0;
+    HANDLE tok = NULL;
+    union { TOKEN_USER u; BYTE raw[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } user;
+    DWORD got = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 0;
+    BOOL have = GetTokenInformation(tok, TokenUser, &user, sizeof user, &got);
+    CloseHandle(tok);
+    if (!have) return 0;
+    union { ACL acl; BYTE raw[sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE]; } list;
+    if (!InitializeAcl(&list.acl, sizeof list, ACL_REVISION) ||
+        !AddAccessAllowedAceEx(&list.acl, ACL_REVISION, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, GENERIC_ALL, user.u.User.Sid))
+        return 0;
+    return SetNamedSecurityInfoW(w, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL,
+                                 NULL, &list.acl, NULL) == ERROR_SUCCESS;
 }
 
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
@@ -793,6 +861,11 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
     return 1;
 }
 
+int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
+    (void)addr; (void)n;
+    return 0;
+}
+
 // Contains code Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 // GetWriteWatch with the reset flag.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
@@ -807,14 +880,22 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write, uint64_t ip);
 
-// A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+// A read or write access violation (ExceptionInformation[0] 0 or 1) goes to the access hook when there is one, then a
+// write to the write-fault hook; registered first, before the crash handler.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] > 1)
         return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    int write = er->ExceptionInformation[0] == 1;
+    uint64_t addr = (uint64_t)er->ExceptionInformation[1];
+    if (access_hook && access_hook(addr, write, (uint64_t)(uintptr_t)er->ExceptionAddress)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (!write) return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook(addr) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
+
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) { access_hook = fn; }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
@@ -1086,13 +1167,23 @@ __attribute__((constructor)) static void pgo_flush_start(void) {
 }
 #endif
 
+void (*plat_exit_hook)(void);
+
 void plat_exit(int code) {
+    if (plat_exit_hook) plat_exit_hook();
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
 #endif
-    fflush(stdout);
-    fflush(stderr);
-    ExitProcess((UINT)code);
+    fflush(NULL);   // every open stream: nothing below runs the C runtime's own exit
+    // The process ends here, without the libraries' detach calls that ExitProcess makes. The callers have saved what
+    // is to be kept (gfx_present.c gfx_window_closed: settings, pipeline cache, profile, saves), and the game's other
+    // threads are still running when this is called. ExitProcess stops them wherever they are and then runs every
+    // library's detach on this thread: NVIDIA's NGX core, which still held the device and the DLSS features, read a
+    // dead pointer in its detach on the window thread after the window was closed (an access violation in
+    // _nvngx.dll after the last save, once in 5 scripted runs that had freed and made a DLSS feature again), and the
+    // crash handler wrote a FATAL for a run that had ended cleanly.
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code);   // not reached
 }
 
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's
@@ -1624,6 +1715,19 @@ int plat_clipboard_set(const char *utf8) {
     return ok;
 }
 
+int plat_clipboard_get(char *out, size_t cap) {
+    if (!cap) return 0;
+    out[0] = 0;
+    if (!OpenClipboard(NULL)) return 0;   // reading needs no owner window
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *w = h ? GlobalLock(h) : NULL;
+    int n = w ? WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) : 0;   // 0 when it does not fit
+    if (w) GlobalUnlock(h);
+    CloseClipboard();
+    if (n <= 0) out[0] = 0;
+    return out[0] != 0;
+}
+
 static DWORD WINAPI open_folder_main(void *arg) {
     ShellExecuteW(NULL, L"open", arg, NULL, NULL, SW_SHOWNORMAL);
     free(arg);
@@ -1847,6 +1951,37 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 
 int plat_commit_enforced(void) { return 1; }
 
+// The numbers name the one limit there is, the system's commit.
+int plat_commit_note(char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+// The driver charges the device memory it allocates to the system's commit.
+int plat_commit_counts_vram(void) { return 1; }
+
+// The PagingFiles value under Memory Management, one "<path> <initial MB> <maximum MB>" per page file: a path of
+// "?:\..." (System managed size on every drive) or no sizes or "0 0" (System managed size on that drive) leaves the
+// size to Windows. Read once; the setting takes effect only after a restart.
+int plat_page_file_managed(void) {
+    static int managed = -2;
+    if (managed != -2) return managed;
+    wchar_t v[2048];
+    DWORD size = sizeof v - sizeof(wchar_t) * 2;
+    int r = -1;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                     L"PagingFiles", RRF_RT_REG_MULTI_SZ, NULL, v, &size) == ERROR_SUCCESS) {
+        v[size / sizeof(wchar_t)] = v[size / sizeof(wchar_t) + 1] = 0;
+        for (wchar_t *e = v; *e; e += wcslen(e) + 1) {
+            wchar_t *sp = wcschr(e, L' ');
+            unsigned long lo = sp ? wcstoul(sp, &sp, 10) : 0, hi = sp ? wcstoul(sp, NULL, 10) : 0;
+            int own = e[0] == L'?' || (!lo && !hi);
+            r = own && r != 0 ? 1 : 0;   // a page file with its sizes set is the user's choice: no advice then
+        }
+    }
+    return managed = r;
+}
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
     *resident = *private_bytes = 0;
@@ -2001,6 +2136,194 @@ void plat_ipc_close(PlatIpc *p) {
     if (!p) return;
     CloseHandle(p->h);
     free(p);
+}
+
+// ---- UDP sockets (platform.h): the co-op layer's transport. Winsock starts at the first call that needs it.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#define WSA_FLAG_NO_HANDLE_INHERIT 0x80
+#endif
+
+struct PlatUdp { SOCKET s; int v6; };
+
+static PlatOnce wsa_once = PLAT_ONCE_INIT;
+static int wsa_ok;
+
+static void wsa_start(void *arg) {
+    WSADATA d;
+    (void)arg;
+    wsa_ok = WSAStartup(MAKEWORD(2, 2), &d) == 0;
+}
+
+static int net_ready(void) {
+    plat_once(&wsa_once, wsa_start, NULL);
+    return wsa_ok;
+}
+
+static void addr_from_sockaddr(PlatAddr *out, const SOCKADDR_STORAGE *ss) {
+    uint8_t ip[16] = {0};
+    if (ss->ss_family == AF_INET6) {
+        const SOCKADDR_IN6 *a = (const SOCKADDR_IN6 *)ss;
+        memcpy(ip, &a->sin6_addr, 16);
+        plat_addr_set(out, ip, ntohs(a->sin6_port), a->sin6_scope_id);
+    } else {
+        const SOCKADDR_IN *a = (const SOCKADDR_IN *)ss;
+        ip[10] = ip[11] = 0xff;
+        memcpy(ip + 12, &a->sin_addr, 4);
+        plat_addr_set(out, ip, ntohs(a->sin_port), 0);
+    }
+}
+
+// The socket address of a for a socket of family v6 (1: AF_INET6, 0: AF_INET); 0 when an IPv4 socket cannot reach it.
+static int addr_to_sockaddr(const PlatAddr *a, int v6, SOCKADDR_STORAGE *ss, int *len) {
+    uint8_t ip[16];
+    uint32_t scope;
+    plat_addr_get(a, ip, &scope);
+    memset(ss, 0, sizeof *ss);
+    if (v6) {
+        SOCKADDR_IN6 *s = (SOCKADDR_IN6 *)ss;
+        s->sin6_family = AF_INET6;
+        s->sin6_port = htons(plat_addr_port(a));
+        s->sin6_scope_id = scope;
+        memcpy(&s->sin6_addr, ip, 16);
+        *len = (int)sizeof *s;
+        return 1;
+    }
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (memcmp(ip, mapped, sizeof mapped)) return 0;
+    SOCKADDR_IN *s = (SOCKADDR_IN *)ss;
+    s->sin_family = AF_INET;
+    s->sin_port = htons(plat_addr_port(a));
+    memcpy(&s->sin_addr, ip + 12, 4);
+    *len = (int)sizeof *s;
+    return 1;
+}
+
+int plat_net_resolve(const char *host, uint16_t port, PlatAddr *out) {
+    wchar_t whost[256];
+    if (!host || !*host || !net_ready() || !widen(host, whost, 256)) return 0;
+    ADDRINFOW hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM}, *res = NULL, *pick = NULL;
+    if (GetAddrInfoW(whost, NULL, &hints, &res) != 0) return 0;
+    for (ADDRINFOW *r = res; r; r = r->ai_next) {
+        if (r->ai_addrlen > sizeof(SOCKADDR_STORAGE) || (r->ai_family != AF_INET && r->ai_family != AF_INET6)) continue;
+        if (!pick || (r->ai_family == AF_INET && pick->ai_family != AF_INET)) pick = r;   // IPv4 first
+    }
+    int ok = pick != NULL;
+    if (ok) {
+        SOCKADDR_STORAGE ss;
+        memset(&ss, 0, sizeof ss);
+        memcpy(&ss, pick->ai_addr, pick->ai_addrlen);
+        addr_from_sockaddr(out, &ss);
+        uint8_t ip[16];
+        uint32_t scope;
+        plat_addr_get(out, ip, &scope);
+        plat_addr_set(out, ip, port, scope);
+    }
+    FreeAddrInfoW(res);
+    return ok;
+}
+
+// A non-blocking UDP socket of family af that no child process inherits, with Windows' report of an ICMP port-unreachable
+// as a failed receive (WSAECONNRESET on an unconnected socket) switched off: a peer that is gone is not an error here.
+static SOCKET udp_socket(int af) {
+    SOCKET s = WSASocketW(af, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+    if (s == INVALID_SOCKET) return s;
+    u_long nonblocking = 1;
+    BOOL report = FALSE;
+    DWORD got = 0;
+    if (ioctlsocket(s, FIONBIO, &nonblocking) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    WSAIoctl(s, SIO_UDP_CONNRESET, &report, sizeof report, NULL, 0, &got, NULL, NULL);
+    return s;
+}
+
+PlatUdp *plat_udp_open(uint16_t port, int dual_stack) {
+    if (!net_ready()) return NULL;
+    int v6 = dual_stack;
+    SOCKET s = v6 ? udp_socket(AF_INET6) : INVALID_SOCKET;
+    if (s != INVALID_SOCKET) {
+        DWORD only_v6 = 0;   // Windows defaults to IPv6 only
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&only_v6, sizeof only_v6);
+        SOCKADDR_IN6 a;
+        memset(&a, 0, sizeof a);   // in6addr_any
+        a.sin6_family = AF_INET6;
+        a.sin6_port = htons(port);
+        if (bind(s, (SOCKADDR *)&a, sizeof a) != 0) closesocket(s), s = INVALID_SOCKET;
+    }
+    if (s == INVALID_SOCKET) {   // IPv4 only, asked for or all the machine has
+        v6 = 0;
+        s = udp_socket(AF_INET);
+        if (s == INVALID_SOCKET) return NULL;
+        SOCKADDR_IN a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(s, (SOCKADDR *)&a, sizeof a) != 0) {
+            closesocket(s);
+            return NULL;
+        }
+    }
+    PlatUdp *u = malloc(sizeof *u);
+    if (!u) {
+        closesocket(s);
+        return NULL;
+    }
+    u->s = s, u->v6 = v6;
+    return u;
+}
+
+uint16_t plat_udp_port(const PlatUdp *u) {
+    SOCKADDR_STORAGE ss;
+    int len = (int)sizeof ss;
+    if (!u || getsockname(u->s, (SOCKADDR *)&ss, &len) != 0) return 0;
+    PlatAddr a;
+    addr_from_sockaddr(&a, &ss);
+    return plat_addr_port(&a);
+}
+
+int plat_udp_send(PlatUdp *u, const PlatAddr *to, const void *p, size_t n) {
+    SOCKADDR_STORAGE ss;
+    int len;
+    if (!u || n > 65507 || !addr_to_sockaddr(to, u->v6, &ss, &len)) return 0;
+    if (sendto(u->s, (const char *)p, (int)n, 0, (SOCKADDR *)&ss, len) != SOCKET_ERROR) return 1;
+    // a full buffer, a missing route or an ICMP error is a lost datagram; a datagram too long or a socket that is not
+    // ours to use can never be sent
+    int e = WSAGetLastError();
+    return e != WSAEMSGSIZE && e != WSAENOTSOCK && e != WSAEINVAL && e != WSAEAFNOSUPPORT;
+}
+
+int plat_udp_recv(PlatUdp *u, void *buf, size_t cap, PlatAddr *from, uint32_t ms) {
+    if (!u) return -1;
+    WSAPOLLFD pf = {.fd = u->s, .events = POLLRDNORM};
+    int r = WSAPoll(&pf, 1, ms > (uint32_t)INT_MAX ? INT_MAX : (int)ms);
+    if (r == SOCKET_ERROR) return WSAGetLastError() == WSAEINTR ? 0 : -1;
+    if (r == 0) return 0;
+    SOCKADDR_STORAGE ss;
+    int len = (int)sizeof ss;
+    int k = recvfrom(u->s, (char *)buf, cap > (size_t)INT_MAX ? INT_MAX : (int)cap, 0, (SOCKADDR *)&ss, &len);
+    if (k == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e == WSAEMSGSIZE) {   // longer than buf: Windows reports it as an error but has filled buf
+            k = cap > (size_t)INT_MAX ? INT_MAX : (int)cap;
+        } else {
+            return e == WSAEWOULDBLOCK || e == WSAEINTR || e == WSAECONNRESET || e == WSAENETRESET || e == WSAEHOSTUNREACH ||
+                           e == WSAENETUNREACH
+                       ? 0 : -1;
+        }
+    }
+    if (from) addr_from_sockaddr(from, &ss);
+    return k;
+}
+
+void plat_udp_close(PlatUdp *u) {
+    if (!u) return;
+    closesocket(u->s);
+    free(u);
 }
 
 

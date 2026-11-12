@@ -41,23 +41,58 @@ static uint64_t g_table_bytes, g_functions;
 static struct { uint64_t addr; GuestFn fn; } g_host[HOST_CAP];
 static uint64_t g_nhost;
 
-void rt_fatal(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+static void (*fatal_notes[4])(void);
+static int n_fatal_notes;
+
+void rt_fatal_note_add(void (*fn)(void)) {
+    for (int i = 0; i < n_fatal_notes; i++)
+        if (fatal_notes[i] == fn) return;
+    if (n_fatal_notes < (int)(sizeof fatal_notes / sizeof *fatal_notes)) fatal_notes[n_fatal_notes++] = fn;
+}
+
+// Once per process: a second fatal error, on another thread or inside a note, adds none.
+void rt_fatal_notes(void) {
+    static volatile int32_t done;
+    if (plat_xchg32(&done, 1)) return;
+    for (int i = 0; i < n_fatal_notes; i++) fatal_notes[i]();
+}
+
+__attribute__((weak)) void fs_save_crash_wait(void) {}   // fs_host.c; builds without it (the unit checks) have no saves
+
+// The fatal line, the report's notes and what has to be flushed, then the exit with `code`.
+static void fatal_end(int code, const char *fmt, va_list ap) __attribute__((noreturn));
+static void fatal_end(int code, const char *fmt, va_list ap) {
+    rt_log_sync();   // main.c: the lines queued for the log thread, then these, written here
     rt_log_raw("FATAL: ", 7);
     rt_vlogf(fmt, ap);
     rt_log_raw("\n", 1);
-    va_end(ap);
     // A failed allocation (malloc, realloc, VirtualAlloc) means the commit limit was reached: this line tells a leak of
     // ours (process private bytes near the limit) from a machine short of page file.
     double proc, used, limit;
     plat_commit_info(&proc, &used, &limit);
     rt_log("fatal: memory commit: this process %.0f MB, the system %.0f of %.0f MB", proc, used, limit);
+    rt_fatal_notes();
     kern_free_cores_note();
+    fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded)
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
+    // RivaTuner Statistics Server's profile as it was: left with the game's limit in it, the next run would take that
+    // limit for the player's own (rtss_limit.c; it gives up after a second if the failing thread holds its lock)
+    rtss_limit_restore();
     fflush(stdout);
     fflush(stderr);
-    _Exit(70);
+    _Exit(code);
+}
+
+void rt_fatal(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fatal_end(RT_FATAL_EXIT, fmt, ap);
+}
+
+void rt_fatal_code(int code, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fatal_end(code, fmt, ap);
 }
 
 static const RtModule *module_at(uint64_t pc) {

@@ -1,0 +1,18 @@
+#version 450
+// SMAA pass 0 (runtime/vk_aa.c): the luma SMAA looks for edges in, from the game's linear composite, in the square-root
+// space the scene target stores (aa_common.glsl). One channel: SMAA's luma edge detection takes the dot product of the
+// colour it reads with its luma weights, and a one-channel image reads as (r, 0, 0), so r holds the luma over the red
+// weight.
+#extension GL_GOOGLE_include_directive : require
+#include "aa_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16f) uniform writeonly image2D dst;
+layout(push_constant) uniform Push { vec4 metrics; } pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.metrics.z) || p.y >= int(pc.metrics.w)) return;
+    const vec3 W = vec3(0.2126, 0.7152, 0.0722);   // smaa.glsl SMAALumaEdgeDetectionPS's weights
+    imageStore(dst, p, vec4(dot(aa_encode(texelFetch(src, p, 0).rgb), W) / W.r, 0.0, 0.0, 1.0));
+}

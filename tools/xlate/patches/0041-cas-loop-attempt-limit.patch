@@ -1,0 +1,89 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -1118,7 +1118,7 @@
+                     case Instruction.AtomicAdd | Instruction.FP32:
+                         // NX2NAVI: the word is read, the float sum swapped in if the word is still the one read,
+                         // and the loop repeats otherwise (InstEmitMemory EmitAtomicOp marks these)
+-                        resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                        resultValue = GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
+                         {
+                             return context.FPAdd(memValue, value);
+                         });
+@@ -1137,7 +1137,7 @@
+                         }
+                         else
+                         {
+-                            resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                            resultValue = GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
+                             {
+                                 return context.IMaximumS32(memValue, value);
+                             });
+@@ -1154,7 +1154,7 @@
+                         }
+                         else
+                         {
+-                            resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                            resultValue = GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
+                             {
+                                 return context.IMinimumS32(memValue, value);
+                             });
+@@ -1190,7 +1190,7 @@
+                 {
+                     Operand bitOffset = HelperFunctionManager.GetBitOffset(context, offset);
+ 
+-                    GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                    GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
+                     {
+                         return context.BitfieldInsert(memValue, value, bitOffset, Const(bitSize));
+                     });
+@@ -1235,8 +1235,19 @@
+             return true;
+         }
+ 
+-        private static Operand GenerateAtomicCasLoop(EmitterContext context, Operand wordOffset, int binding, Func<Operand, Operand> opCallback)
++        // NX2NAVI: the most attempts a storage buffer compare-and-swap loop makes before it gives up. The loop otherwise
++        // ends only when its compare-and-swap succeeds; on a word outside its buffer robust buffer access lets the
++        // atomics return anything, so the compare may never match, and the GPU hangs (device lost). Contention on a
++        // word takes about as many attempts as invocations race for it, far below this. Shared memory loops
++        // (HelperFunctionManager) stay unbounded: a shared word in range is always settled, and the mesh programs'
++        // byte stores run that loop for every primitive index.
++        private const int CasAttemptLimit = 4096;
++
++        private static Operand GenerateAtomicCasLoop(EmitterContext context, ResourceManager resourceManager, Operand wordOffset, int binding, Func<Operand, Operand> opCallback)
+         {
++            int attempts = resourceManager.CasAttemptsMemoryId;
++            context.Store(StorageKind.LocalMemory, attempts, Const(0));
++
+             // NX2NAVI: each attempt reads the word with an atomic OR of 0, which returns its current value; a plain load
+             // could keep returning a stale cached copy (seen on AMD), so an invocation that lost the race never matched
+             // again and the loop did not end. The read stays inside the loop: this pass runs on SSA form, and the
+@@ -1258,7 +1269,10 @@
+ 
+             Operand casFail = context.ICompareNotEqual(casResult, oldValue);
+ 
+-            context.BranchIfTrue(lblLoopHead, casFail);
++            Operand made = context.IAdd(context.Load(StorageKind.LocalMemory, attempts), Const(1));
++            context.Store(StorageKind.LocalMemory, attempts, made);
++
++            context.BranchIfTrue(lblLoopHead, context.BitwiseAnd(casFail, context.ICompareLessUnsigned(made, Const(CasAttemptLimit))));
+ 
+             return oldValue;
+         }
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -143,6 +143,15 @@
+             }
+         }
+ 
++        // NX2NAVI: a per-invocation count of compare-and-swap attempts, for the storage buffer loops of
++        // GlobalToStorage (GenerateAtomicCasLoop). Private memory, not a local: that pass runs on SSA form, where copy
++        // propagation takes a local as assigned once, so no local can count round a loop. Made on first use.
++        private int _casAttemptsMemoryId = -1;
++
++        public int CasAttemptsMemoryId => _casAttemptsMemoryId >= 0
++            ? _casAttemptsMemoryId
++            : _casAttemptsMemoryId = AddMemoryDefinition("cas_attempts", AggregateType.U32);
++
+         private int AddMemoryDefinition(string name, AggregateType type, int arrayLength = 1)
+         {
+             return Properties.AddLocalMemory(new MemoryDefinition(name, type, arrayLength));

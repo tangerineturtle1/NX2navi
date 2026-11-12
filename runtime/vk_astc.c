@@ -4,13 +4,16 @@
 // NX2NAVI_ASTC_BC = 1 (gpu mode only; unset: by the video memory and RAM, create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
 // texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
+// NX2NAVI_ASTC_BC1 = 1 (default; with BC3 on): a texture whose every ASTC block decodes opaque (vk_texture.c "ASTC as
+// BC1") is BC1 instead, the colour half of the BC3 blocks the same pass would write: the same texels at 4 bits per
+// texel.
 //
 // NX2NAVI_ASTC = auto (default): native when the device reports textureCompressionASTC_LDR and the format's features,
 // else gpu. gpu: compute decode into RGBA8 (runtime/shaders/astc_decode.comp). native: like auto, but logs when the
 // device cannot. cpu: astc_decode_ldr_mt on the uploading thread, as before. check: gpu, and every upload is also
 // decoded on the CPU and compared (waits for the GPU; for testing only).
 //
-// The decode is recorded into the upload batch (vk_memory.c) in chunks of at most 32 MiB of texels: a chunk's raw
+// The decode is recorded into the upload batch (vk_memory.c) in chunks of at most 16 MiB of texels: a chunk's raw
 // blocks go from staging to a device-local scratch buffer, its dispatches write RGBA8 texels behind them, and a
 // buffer-to-image copy puts them into the image; the next chunk reuses the scratch after a barrier. The next texture
 // reuses it too, behind the same barrier, while it records into the same command buffer (scratch_get): a buffer per
@@ -109,7 +112,9 @@ static struct {
     VkPipelineLayout layout;
     VkPipeline pipe;
     VkPipeline bc_pipe;           // the BC3 encoder (NX2NAVI_ASTC_BC): the decoder's layout, bindings 0 and 1
+    VkPipeline bc1_pipe;          // the same shader writing BC1 blocks (NX2NAVI_ASTC_BC1)
     int bc;                       // 1: ASTC images are BC3 (vk_astc_bc)
+    int bc1;                      // 1: opaque ones are BC1 (vk_astc_bc1)
     PFN_vkCmdPushDescriptorSetKHR push;
     VkBuffer tab;                 // device-local copy of the tables
     VmaAllocation tab_alloc;
@@ -312,6 +317,28 @@ static int create_pipeline(VkCtx *c) {
 // So RGBA8 needs 48 GiB of RAM as well.
 #define BC_KEEP_RGBA8_VRAM (20ull << 30)
 #define BC_KEEP_RGBA8_RAM_MB (48.0f * 1024 - 1024)   // a 48 GiB PC reports a little under 48 GiB
+
+// The encoder's pipeline: BC3 blocks, or with bc1 BC1 blocks (bc3_encode.comp's specialization constant BC1).
+static VkResult bc_pipeline(VkCtx *c, int bc1, VkPipeline *out) {
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
+                                   .pCode = bc3_encode_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(c->device, &mi, NULL, &m);
+    if (r != VK_SUCCESS) return r;
+    VkBool32 on = (VkBool32)(bc1 != 0);
+    VkSpecializationMapEntry me = {.constantID = 0, .offset = 0, .size = sizeof on};
+    VkSpecializationInfo si = {.mapEntryCount = 1, .pMapEntries = &me, .dataSize = sizeof on, .pData = &on};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
+                                                .pSpecializationInfo = &si},
+                                      .layout = G.layout};
+    r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, out);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) *out = VK_NULL_HANDLE;
+    return r;
+}
+
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("NX2NAVI_ASTC_BC");
     VkDeviceSize vram = 0;
@@ -332,16 +359,7 @@ static int create_bc_pipeline(VkCtx *c) {
         rt_log("vk: NX2NAVI_ASTC_BC: the device does not sample BC3; ASTC stays RGBA8");
         return 0;
     }
-    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
-                                   .pCode = bc3_encode_spv};
-    VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) return 0;
-    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
-                                      .layout = G.layout};
-    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &G.bc_pipe);
-    vkDestroyShaderModule(c->device, m, NULL);
+    VkResult r = bc_pipeline(c, 0, &G.bc_pipe);
     if (r != VK_SUCCESS) {
         G.bc_pipe = VK_NULL_HANDLE;
         rt_log("vk: NX2NAVI_ASTC_BC: the BC3 encoder pipeline failed (%d); ASTC stays RGBA8", (int)r);
@@ -349,6 +367,23 @@ static int create_bc_pipeline(VkCtx *c) {
     }
     rt_log("vk: ASTC textures are encoded to BC3 after the decode (NX2NAVI_ASTC_BC)");
     return 1;
+}
+
+// NX2NAVI_ASTC_BC1 (with BC3 on): opaque ASTC textures as BC1, when the device samples and copies into both BC1
+// formats.
+static int bc1_on(VkCtx *c) {
+    int on = cfg_bool("NX2NAVI_ASTC_BC1");
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    for (int i = 0; i < 2 && on; i++) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(c->phys, i ? VK_FORMAT_BC1_RGB_SRGB_BLOCK : VK_FORMAT_BC1_RGB_UNORM_BLOCK, &p);
+        if ((p.optimalTilingFeatures & need) != need) on = 0, rt_log("vk: NX2NAVI_ASTC_BC1: the device lacks BC1 features");
+    }
+    VkResult r = on ? bc_pipeline(c, 1, &G.bc1_pipe) : VK_SUCCESS;
+    if (r != VK_SUCCESS) on = 0, rt_log("vk: NX2NAVI_ASTC_BC1: the BC1 encoder pipeline failed (%d)", (int)r);
+    rt_log("vk: opaque ASTC textures %s (NX2NAVI_ASTC_BC1)", on ? "are BC1, the others BC3" : "are BC3 like the others");
+    return on;
 }
 
 static int native_device(VkCtx *c) { return c->has_astc_ldr; }
@@ -383,6 +418,7 @@ int vk_astc_mode(void) {
         }
         if (G.failed && m != VK_ASTC_NATIVE) m = VK_ASTC_CPU;
         G.bc = m == VK_ASTC_GPU && G.pipe && create_bc_pipeline(c);
+        G.bc1 = G.bc && bc1_on(c);
         G.mode = m;
         rt_log("vk: ASTC textures: %s (textureCompressionASTC_LDR %d)", mode_name(m), native_device(c));
     }
@@ -420,6 +456,15 @@ int vk_astc_bc(void) {
     return on;
 }
 
+int vk_astc_bc1(void) {
+    VkCtx *c = vk_ctx();
+    if (!vk_astc_bc()) return 0;
+    plat_mutex_lock_shared(&g_lock);
+    int on = G.dev == c->device && G.bc1;
+    plat_mutex_unlock_shared(&g_lock);
+    return on;
+}
+
 static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessFlags2 sa, VkPipelineStageFlags2 dst,
                         VkAccessFlags2 da) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = src, .srcAccessMask = sa,
@@ -430,8 +475,13 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 
 // Scratch per vk_astc_record: texels of at most this many bytes at a time (or one region, when larger), so a large
 // texture array (169 M texels, 677 MB as RGBA8, on monsters2) does not need its whole RGBA8 copy as scratch.
-#define CHUNK_OUT (32ull << 20)
-#define SCRATCH_MIN (64ull << 20)   // the shared scratch's least size: one chunk's texels plus its blocks and BC3
+// The scratch is made per upload batch and kept until that batch completes (scratch_keep), and an area load records
+// many batches in one frame: 12 scratches in the frame that uploaded 2617 textures entering an area, all alive at once.
+// So each is kept to half a VMA block (vk_vma_block_size's default 64 MiB), where VMA still places it in a block, not in
+// memory of its own: 16 MiB of texels, their blocks and BC3 fit in 32 MiB.
+#define CHUNK_OUT (16ull << 20)
+#define SCRATCH_MIN (32ull << 20)   // the shared scratch's usual least size: one chunk's texels plus its blocks and BC3
+                                    // (smaller only after the device ran out of memory: scratch_get's second try)
 
 // The shared scratch and the command buffer it was last recorded into. An upload batch's command buffer is used again
 // only after that batch completed (vk_memory.c: completed batches go to the spare list), so the same handle means the
@@ -439,7 +489,7 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns; } S;
 static uint64_t n_scratch_new, n_scratch_reuse;
 
-// NX2NAVI_ASTC_SCRATCH_KEEP=1 (default 0 until a play test measured it): the scratch outlives its upload batch. Every
+// NX2NAVI_ASTC_SCRATCH_KEEP=1 (the default): the scratch outlives its upload batch. Every
 // batch goes to gfx_queue, so the reuse barrier at the start of the next batch's first chunk (vk_astc_record) orders it
 // after the earlier batches' copies and dispatches, as it does between two textures of one batch; it then also waits
 // for their writes (WAW). With
@@ -447,6 +497,8 @@ static uint64_t n_scratch_new, n_scratch_reuse;
 // old one (324 in one Kokiri Forest to Hyrule Field run), and one that found no room in a VMA block allocated a new
 // block on the replay thread during an area load (8-19 ms per block on NVIDIA, vk_headroom.c). A scratch grown past
 // SCRATCH_MIN for a large texture goes back to SCRATCH_MIN once no texture needed more for SCRATCH_SHRINK_NS.
+// On a Kakariko walk at 1440p (2026-11-11) the scratch was made 3 times instead of 60, the walk allocated device memory
+// 265 times instead of 342, and NX2NAVI_ASTC=check found 0 of 1920 textures differing from the CPU decode.
 // 0: a scratch per batch.
 #define SCRATCH_SHRINK_NS 5000000000ull
 static int scratch_keep(void) {
@@ -461,7 +513,12 @@ static int scratch_keep(void) {
 
 // A scratch of at least need bytes for recording into cb; *reused: earlier work (in cb, or with the keep rule in an
 // earlier batch) may still use it. 0 on failure.
+// A test's hook (vk.h): the next n requests for the scratch buffer fail, as when the video memory is used up.
+static volatile int32_t scratch_fail_n;
+void vk_astc_scratch_fail(int n) { plat_xchg32(&scratch_fail_n, n); }
+
 static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int *reused) {
+    if (plat_cas32(&scratch_fail_n, 0, 0) > 0 && plat_add32(&scratch_fail_n, -1) >= 0) return VK_NULL_HANDLE;
     int keep = scratch_keep();
     plat_mutex_lock(&g_lock);
     uint64_t now = kern_now_ns();
@@ -479,13 +536,19 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
         VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer b;
         VmaAllocation a;
-        if (vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL) != VK_SUCCESS) {
+        VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bi.size > need) {
+            // The usual scratch leaves room for later textures. This upload can still fit without the spare bytes.
+            bi.size = need;
+            r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        }
+        if (r != VK_SUCCESS) {
             plat_mutex_unlock(&g_lock);
             return VK_NULL_HANDLE;
         }
         // the old one may still be read by its command buffer: freed once the batches recorded so far completed
         if (S.buf && S.dev == c->device) vk_defer_buffer(S.buf, S.alloc);
-        S.buf = b, S.alloc = a, S.size = size, S.dev = c->device;
+        S.buf = b, S.alloc = a, S.size = bi.size, S.dev = c->device;
         n_scratch_new++;
         vk_texstat_time(VK_TS_SCRATCH, t0);
     } else {
@@ -495,6 +558,14 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
     VkBuffer out = S.buf;
     plat_mutex_unlock(&g_lock);
     return out;
+}
+
+// The shared scratch's size, for the log's VRAM breakdown (scratches still owned by an upload batch not counted).
+uint64_t vk_astc_scratch_bytes(void) {
+    plat_mutex_lock(&g_lock);
+    uint64_t n = S.buf ? S.size : 0;
+    plat_mutex_unlock(&g_lock);
+    return n;
 }
 
 static VkDeviceSize region_out(const VkAstcRegion *r) { return (VkDeviceSize)r->w * r->h * r->slices * 4; }
@@ -509,10 +580,12 @@ static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
     uint64_t gh = 8ull << r->th, gd = 1ull << r->td;
     return (VkDeviceSize)((row_bytes + 63) / 64 * ((rows + gh - 1) / gh) * ((r->slices + gd - 1) / gd) * (512ull << r->th << r->td));
 }
-static VkDeviceSize region_bc(const VkAstcRegion *r) { return tight_in(r, 4, 4); }   // BC3: 16 bytes per 4x4 block
+// The encoded blocks of a region: 16 bytes per 4x4 block for BC3 (bc 1), 8 for BC1 (bc 2)
+static VkDeviceSize region_bc(const VkAstcRegion *r, int bc) { return tight_in(r, 4, 4) / (bc == 2 ? 2 : 1); }
 VkDeviceSize vk_astc_region_bytes(const VkAstcRegion *r, uint32_t bw, uint32_t bh) { return region_in(r, bw, bh); }
 
 typedef struct { uint32_t in_base, out_base, width, height, bx, bslice; } BcPush;   // bc3_encode.comp Params
+_Static_assert(sizeof(BcPush) <= sizeof(Push), "the encoder's push constants lie in the decoder's range");
 
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback) {
@@ -521,7 +594,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkCtx *c = vk_ctx();
     if (!c || !vk_astc_gpu() || bw < 4 || bh < 4 || bw > 12 || bh > 12) return 0;
     plat_mutex_lock_shared(&g_lock);
-    VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE, bc_pipe = G.dev == c->device ? G.bc_pipe : VK_NULL_HANDLE;
+    VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE;
+    VkPipeline bc_pipe = G.dev != c->device ? VK_NULL_HANDLE : bc == 2 ? G.bc1_pipe : G.bc_pipe;
     plat_mutex_unlock_shared(&g_lock);
     if (!pipe || (bc && !bc_pipe)) return 0;
     if (bc) {
@@ -539,7 +613,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     for (int i = 0; i < n; i++) {
         VkDeviceSize o = region_out(&rg[i]), b = region_in(&rg[i], bw, bh);
         if (co && co + o > CHUNK_OUT) ci = co = cb3 = 0;
-        ci += b, co += o, cb3 += region_bc(&rg[i]), out_total += o;
+        ci += b, co += o, cb3 += region_bc(&rg[i], bc), out_total += o;
         if (ci > cap_in) cap_in = ci;
         if (co > cap_out) cap_out = co;
         if (cb3 > cap_bc) cap_bc = cb3;
@@ -554,9 +628,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkBuffer sb = scratch_get(c, cb, cap_in + cap_out + cap_bc, &reused);
     if (!sb) {
         if (plat_inc32(&n_fail) <= 16)
-            rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
+            rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded for now",
                    (unsigned long long)(cap_in + cap_out + cap_bc));
-        return 0;
+        return -1;   // no memory at this moment: the caller tries again later (vk_texture.c upload)
     }
     plat_mutex_lock(&g_lock);
     int need_tab = !G.tab_uploaded;
@@ -642,7 +716,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         }
         if (slot >= 0)
             vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot + 1);
-        if (bc) {   // the chunk's texels to BC3 blocks behind them; the image copy then takes the blocks
+        if (bc) {   // the chunk's texels to BC3 (or BC1) blocks behind them; the image copy then takes the blocks
             mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
             VkDescriptorBufferInfo bdi[2] = {{sb, cap_in, cap_out}, {sb, cap_in + cap_out, cap_bc}};
@@ -657,13 +731,14 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             for (int i = i0; i < i1; i++) {
                 const VkAstcRegion *r = &rg[i];
                 uint32_t bx4 = (r->w + 3) / 4, by4 = (r->h + 3) / 4;
-                BcPush pc = {.in_base = (uint32_t)(to / 4), .out_base = (uint32_t)(bo / 16), .width = r->w, .height = r->h,
+                uint32_t bb = bc == 2 ? 8 : 16;   // bytes per block
+                BcPush pc = {.in_base = (uint32_t)(to / 4), .out_base = (uint32_t)(bo / bb), .width = r->w, .height = r->h,
                              .bx = bx4, .bslice = bx4 * by4};
                 vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 vkCmdDispatch(cb, (bx4 + 7) / 8, (by4 + 7) / 8, r->slices);
                 VkBufferImageCopy *cp = &copies[i - i0];
                 cp->bufferOffset = cap_in + cap_out + bo, cp->bufferRowLength = bx4 * 4, cp->bufferImageHeight = by4 * 4;
-                to += region_out(r), bo += region_bc(r);
+                to += region_out(r), bo += region_bc(r, bc);
             }
         }
         mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

@@ -9,17 +9,21 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-HARNESS = r'''
+# What both harnesses stand in for the rest of the runtime with.
+STUBS = r'''
 #include <assert.h>
 #include <stdio.h>
 #include "mouse_direct.c"
 static int raw_x, raw_y, takes, captured=1, foreground=1, allowed=1, mode=1, patched=1, selecting;
-static float ratio=0.5f;
+static float ratio=0.5f, frames=1, speed=1;
+static double sens=1;
 static uint64_t now=1000000000;
 static GuestFn hook, activity_hook, begin_hook, angles_hook, hand_hook;
-const char *cfg_get(const char *key) { (void)key; return mode ? "direct" : "stick"; }
+const char *cfg_get(const char *key) { return strcmp(key, "NX2NAVI_MOUSE_MODE") ? NULL : mode ? "direct" : "stick"; }
 const char *cfg_value(const char *key) { return cfg_get(key); }
-double cfg_double(const char *key) { (void)key; return 1; }
+double cfg_double(const char *key) { (void)key; return sens; }
+float frame_step_frames(void) { return frames; }
+float cam_speed_applied(void) { return speed; }
 int rt_patch_set(const char *s) { (void)s; return 0; }
 int rt_patch_enabled(int s) { (void)s; return patched; }
 int ikb_captured(void) { return captured; }
@@ -44,8 +48,12 @@ void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 static float scalar(__uint128_t v) { float f; memcpy(&f,&v,4); return f; }
+'''
+
+HARNESS = STUBS + r'''
+const int rt_game_version = 143;
 int main(void) {
-    assert(hook && activity_hook);
+    assert(hook && activity_hook && begin_hook && angles_hook && hand_hook);
     Cpu c, expected;
     unsigned char target[0x500] = {0};
     memset(&c, 0x5a, sizeof c);
@@ -208,6 +216,82 @@ int main(void) {
 }
 '''
 
+# Ocarina 1.1.1 (recomp/patches-v111.txt, set mouse_direct): the two sites of camera_input_oot and camera_activity_oot.
+OOT_HARNESS = STUBS + r'''
+const int rt_game_version = 111;
+int main(void) {
+    assert(hook && activity_hook && !begin_hook && !angles_hook && !hand_hook);   // no orbit or held-object site
+    Cpu c, expected;
+    unsigned char target[0x600] = {0};
+    memset(&c, 0x5a, sizeof c);
+    c.x[20]=(uintptr_t)target; c.x[21]=0; c.v[1]=c.v[0]=0;
+    expected=c;
+    // s1 and s0 carry the processed x and y. 100 counts to the right and 50 up, at one frame per update.
+    raw_x=100; raw_y=-50;
+    hook(&c);
+    assert(fabsf(scalar(c.v[1])-100*(float)INPUT_OOT_COUNT_X)<1e-5f);
+    assert(fabsf(scalar(c.v[0])-50*(float)INPUT_OOT_COUNT_Y)<1e-5f);
+    // The displaced store of s1 at +0x538 carries the mouse's part; the store of s0 at +0x53c is the game's own.
+    float stored; memcpy(&stored,target+0x538,4); assert(stored==scalar(c.v[1]));
+    memcpy(&stored,target+0x53c,4); assert(stored==0);
+    expected.v[1]=c.v[1]; expected.v[0]=c.v[0]; assert(!memcmp(&expected,&c,sizeof c));
+    assert(input_direct_mouse_active() && input_direct_mouse_available());
+    // The next update sees no repeated movement.
+    expected=c; hook(&c); assert(!memcmp(&expected,&c,sizeof c));
+    // The game multiplies the processed stick by the frames it steps and by its camera speed: an equal mouse distance
+    // gives an equal turn at 30, 60 and 144 fps and at every stick camera speed, and nothing clamps a fast flick.
+    float steps[]={2,1,60/144.0f}, speeds[]={1,3};
+    for(int i=0;i<3;i++) for(int j=0;j<2;j++) {
+        frames=steps[i]; speed=speeds[j]; raw_x=10000; raw_y=10000; c.v[1]=c.v[0]=0; hook(&c);
+        assert(fabsf(scalar(c.v[1])*frames*speed-10000*(float)INPUT_OOT_COUNT_X)<0.01f);
+        assert(fabsf(scalar(c.v[0])*frames*speed+10000*(float)INPUT_OOT_COUNT_Y)<0.01f);
+    }
+    frames=speed=1;
+    // One count is not discarded by a dead zone, and the sensitivity scales it.
+    raw_x=1; raw_y=0; c.v[1]=c.v[0]=0; hook(&c); assert(scalar(c.v[1])>0);
+    float one=scalar(c.v[1]);
+    sens=2.5; raw_x=1; c.v[1]=c.v[0]=0; hook(&c); assert(fabsf(scalar(c.v[1])-2.5f*one)<1e-6f);
+    sens=0; raw_x=1; c.v[1]=c.v[0]=0; hook(&c); assert(c.v[1]==0 && c.v[0]==0); sens=1;
+    // The stick's own processed value stays and the mouse adds to it.
+    { float px=0.25f, py=-0.5f; uint32_t b; memcpy(&b,&px,4); c.v[1]=b; memcpy(&b,&py,4); c.v[0]=b; }
+    raw_x=10; raw_y=0; hook(&c);
+    assert(fabsf(scalar(c.v[1])-(0.25f+10*(float)INPUT_OOT_COUNT_X))<1e-6f && scalar(c.v[0])==-0.5f);
+    // The idle bit of the flags (w8 at the second site) is cleared for an update the mouse moved in; the site's
+    // displaced ldp d9, d8, [sp, #0x10] is performed. The game's next instruction stores w8, so memory is not touched.
+    uint64_t stack[4]={0,0,0x123456789abcdef0ull,0x456789abcdef0123ull}; c.sp=(uintptr_t)stack;
+    uint32_t idle=0x38, mem=0x77; memcpy(target+0x530,&mem,4);
+    c.x[8]=idle; activity_hook(&c);
+    assert((uint32_t)c.x[8]==0x28);
+    uint32_t after; memcpy(&after,target+0x530,4); assert(after==mem);
+    assert(c.v[9]==stack[2] && c.v[8]==stack[3]);
+    // A controller-only update keeps the game's idle bit.
+    c.v[1]=c.v[0]=0; hook(&c); c.x[8]=idle; activity_hook(&c); assert((uint32_t)c.x[8]==idle);
+    // While the pause after a camera reset runs (+0x5e0) or camera input is off (w21 bit 0), the game reads no stick:
+    // the counts are left where they are and the registers as the game made them.
+    float pause=12; memcpy(target+0x5e0,&pause,4);
+    raw_x=42; int before=takes; c.v[1]=c.v[0]=0; expected=c; hook(&c);
+    assert(takes==before && raw_x==42 && !memcmp(&expected,&c,sizeof c));
+    assert(!input_direct_mouse_active());
+    pause=0; memcpy(target+0x5e0,&pause,4);
+    c.x[21]=1; hook(&c);
+    assert(takes==before && raw_x==42 && !input_direct_mouse_active()); c.x[21]=0;
+    selecting=1; hook(&c); assert(takes==before && raw_x==42); selecting=0;
+    // Focus loss and host menus do not move the camera.
+    captured=0; hook(&c); assert(takes==before); captured=1;
+    foreground=0; hook(&c); assert(takes==before); foreground=1;
+    allowed=0; hook(&c); assert(takes==before); allowed=1;
+    // Stick emulation: the counts stay for the stick path.
+    mode=0; hook(&c);
+    assert(takes==before && raw_x==42 && !input_direct_mouse_active()); mode=1;
+    patched=0; hook(&c);
+    assert(takes==before && !input_direct_mouse_active() && !input_direct_mouse_available()); patched=1;
+    raw_x=0; hook(&c); assert(input_direct_mouse_active());
+    now+=150000001; assert(!input_direct_mouse_active());
+    puts("direct mouse 1.1.1: register contract, displaced store and load, equal turn at every frame rate and stick speed passed");
+    puts("direct mouse 1.1.1: single count, sensitivity, stick kept, idle bit, reset pause, capture and mode checks passed");
+}
+'''
+
 INPUT_HARNESS = r'''
 #include <assert.h>
 #include "input.c"
@@ -216,11 +300,17 @@ InputMap input_map;
 // Other input entry points are linked by PE unwind metadata; reaching them is outside this script-only test.
 void ikb_cursor_update(void) { abort(); }
 void ikb_menu_closed(void) { abort(); }
+// The gamepad thread's (sdl_enter, probe_gamepad): not reached by a script.
+void plat_wait_ns(uint64_t ns) { (void)ns; abort(); }
+int plat_mutex_trylock(PlatMutex *m) { (void)m; abort(); }
+int cfg_setenv(const char *name, const char *value) { (void)name; (void)value; abort(); }
+const char *SDL_GetGamepadName(SDL_Gamepad *g) { (void)g; abort(); }
 int cfg_bool(const char *key) { (void)key; abort(); }
 int input_menu_gate(int *h,int open,uint64_t *b,int32_t s[4]) { (void)h;(void)open;(void)b;(void)s;abort(); }
 int input_overlay_gate(int *h,uint64_t *b) { (void)h;(void)b;abort(); }
 int menu_is_open(void) { abort(); }
 void menu_toggle(void) { abort(); }
+void perf_segment(const char *name) { (void)name; }   // a script line's mark: no perf trace here
 void menu_perf_cycle(void) { abort(); }
 const char *input_action_name(int action) { (void)action;abort(); }
 void input_map_configure(void) { abort(); }
@@ -292,12 +382,13 @@ def main():
         folder = Path(tmp)
         (folder / 'patches.h').write_text('#define RT_PATCH_PAGE 0x7003adf000ull\n')
         source = folder / 'check.c'
-        source.write_text(HARNESS)
         exe = folder / ('check.exe' if os.name == 'nt' else 'check')
         link = [] if os.name == 'nt' else ['-lm']
-        subprocess.run([args.cc, '-O2', '-Wall', '-Wextra', '-I', str(folder), '-I', str(ROOT/'runtime'),
-                        str(source), *link, '-o', str(exe)], check=True)
-        subprocess.run([str(exe)], check=True)
+        for harness in (HARNESS, OOT_HARNESS):
+            source.write_text(harness)
+            subprocess.run([args.cc, '-O2', '-Wall', '-Wextra', '-I', str(folder), '-I', str(ROOT/'runtime'),
+                            str(source), *link, '-o', str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
         if args.deps:
             source.write_text(INPUT_HARNESS)
             script = folder / 'input.txt'

@@ -69,6 +69,7 @@ __attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uin
 }
 __attribute__((weak)) int gfx_replay_async(void) { return 0; }
 __attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
+__attribute__((weak)) void gfx_event_signalling(const void *value, uint32_t to) { (void)value, (void)to; }
 
 // ---------- pools: GPU window (section 3.1) and the address index
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;   // guards gva and index
@@ -354,10 +355,23 @@ NVN_API(nvnMemoryPoolFlushMappedRange) {
     if (rt_trace & RT_TRACE_PERF) flush_note(0, p, size);
     if (p && off >= 0 && (uint64_t)off < p->size) nvn_pool_flushed(p, (uint64_t)off, size < p->size - (uint64_t)off ? size : p->size - (uint64_t)off);
 }
+int nvn_no_object(Cpu *c, const char *what) {
+    if (arg_x(c, 0)) return 0;
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+        rt_log("nvn: %s of no object (caller %#llx): 0", what, (unsigned long long)c->x[30]);
+    ret_x(c, 0);
+    return 1;
+}
+
 // NVNmemoryPoolFlags nvnMemoryPoolGetFlags(const NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolGetFlags) { ret_x(c, ((const pool_t *)arg_p(c, 0))->flags); }
+NVN_API(nvnMemoryPoolGetFlags) {
+    if (nvn_no_object(c, "nvnMemoryPoolGetFlags")) return;
+    ret_x(c, ((const pool_t *)arg_p(c, 0))->flags);
+}
 // void *nvnMemoryPoolMap(const NVNmemoryPool *p): NULL for CPU_NO_ACCESS
 NVN_API(nvnMemoryPoolMap) {
+    if (nvn_no_object(c, "nvnMemoryPoolMap")) return;
     const pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { ret_x(c, 0); return; }
     ret_x(c, (uintptr_t)o->mem);
@@ -413,7 +427,10 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     ret_x(c, 1);
 }
 // NVNbufferAddress nvnMemoryPoolGetBufferAddress(const NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolGetBufferAddress) { ret_x(c, (uintptr_t)((const pool_t *)arg_p(c, 0))->mem); }
+NVN_API(nvnMemoryPoolGetBufferAddress) {
+    if (nvn_no_object(c, "nvnMemoryPoolGetBufferAddress")) return;
+    ret_x(c, (uintptr_t)((const pool_t *)arg_p(c, 0))->mem);
+}
 
 // ---------- Buffers: they reference their pool and own no storage
 // void nvnBufferBuilderSetDevice(NVNbufferBuilder *b, NVNdevice *d)
@@ -447,9 +464,35 @@ NVN_API(nvnBufferInitialize) {
 // void nvnBufferFinalize(NVNbuffer *b)
 NVN_API(nvnBufferFinalize) { memset(arg_p(c, 0), 0, sizeof(buf_t)); }
 static uint64_t buf_address(const buf_t *o) { return o->pool && o->pool->mem ? (uintptr_t)o->pool->mem + (uint64_t)o->off : 0; }
+// The mapping of a buffer with no pool behind it (no buffer, or one whose nvnBufferInitialize failed): memory of its
+// own, zero at first, instead of address 0, since the game's scene-loading thread has been seen filling such a mapping
+// (0x3d0 bytes) without looking at it. 64 KiB, or the buffer's size when it records a larger one; a larger block
+// replaces the smaller for later calls, and none is freed (the game may still hold one). Guest addresses are host
+// addresses.
+static uint64_t no_pool_mapping(const buf_t *o, uint64_t lr) {
+    static uint8_t first[64 << 10] __attribute__((aligned(256)));
+    static void *block = first;
+    static uint64_t block_size = sizeof first;
+    static int told;
+    static PlatMutex mu = PLAT_MUTEX_INIT;
+    uint64_t want = o && o->magic == BUF_MAGIC && o->size <= (256ull << 20) ? o->size : 0;
+    plat_mutex_lock(&mu);
+    if (want > block_size) {
+        void *b = calloc(1, want);
+        if (b) block = b, block_size = want;
+    }
+    void *r = block;
+    if (told++ < 4)
+        rt_log("nvn: nvnBufferMap of a buffer with no memory pool (caller %#llx): %llu bytes of scratch memory",
+               (unsigned long long)lr, (unsigned long long)block_size);
+    plat_mutex_unlock(&mu);
+    return (uintptr_t)r;
+}
 // void *nvnBufferMap(const NVNbuffer *b): NULL in a GPU-window pool, which has no CPU view
 NVN_API(nvnBufferMap) {
-    uint64_t a = buf_address(arg_p(c, 0));
+    const buf_t *o = arg_p(c, 0);
+    if (!o || !o->pool) { ret_x(c, no_pool_mapping(o, c->x[30])); return; }
+    uint64_t a = buf_address(o);
     ret_x(c, nvn_gpu_only(a) ? 0 : a);
 }
 // NVNbufferAddress nvnBufferGetAddress(const NVNbuffer *b)
@@ -540,7 +583,10 @@ NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);
     uint32_t v = (uint32_t)arg_x(c, 2);
-    if ((uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v;
+    int add = (uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD;
+    // before the write: the replay tells a signal that came after a submission's copies from one before them
+    gfx_event_signalling((const void *)e->val, add ? *e->val + v : v);
+    if (add) *e->val += v;
     else *e->val = v;
 }
 
@@ -620,12 +666,47 @@ static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 // core given up (section 2.2), or queued for the replay thread (NX2NAVI_REPLAY_ASYNC, vk_backend.c); the newest fence
 // value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
 // for both.
+// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once. The
+// synchronous replay's front end (vk_backend.c submit_sync, vk_be_present's held present, nvn_submits_in_frame) takes
+// no lock of its own, so it relies on one thread at a time; this tells a run whether that holds.
+void nvn_call_note(int present, uintptr_t q, int enter) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    static volatile int32_t inside;
+    static volatile int32_t overlaps;
+    static PlatMutex seen_lock = PLAT_MUTEX_INIT;
+    static struct { uint32_t tid; uintptr_t q; int present; } seen[32];
+    static int nseen;
+    if (!enter) {
+        plat_dec32(&inside);
+        return;
+    }
+    int32_t n = plat_inc32(&inside);
+    uint32_t tid = plat_thread_id();
+    if (n > 1) {
+        int32_t k = plat_inc32(&overlaps);
+        if (k <= 16 || !(k & (k - 1)))
+            rt_log("nvn: thread %u enters %s on queue %#llx while %d other submit or present call%s run (overlap %d, "
+                   "frame %llu)", tid, present ? "a present" : "a submit", (unsigned long long)q, n - 1, n > 2 ? "s" : "",
+                   k, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    }
+    plat_mutex_lock(&seen_lock);
+    int i = 0;
+    while (i < nseen && !(seen[i].tid == tid && seen[i].q == q && seen[i].present == present)) i++;
+    int fresh = i == nseen && nseen < 32;
+    if (fresh) seen[nseen++] = (typeof(seen[0])){tid, q, present};
+    plat_mutex_unlock(&seen_lock);
+    if (fresh)
+        rt_log("nvn: thread %u %s on queue %#llx (first at frame %llu)", tid, present ? "presents" : "submits",
+               (unsigned long long)q, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+}
+
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
     if (n < 0 || (n && !h)) rt_fatal("nvn: QueueSubmitCommands with %d handles at %p", n, (const void *)h);
     NVN_BLOCKING();
+    nvn_call_note(0, (uintptr_t)q, 1);
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
     q->submits++;
     uint64_t f;
@@ -660,14 +741,25 @@ NVN_API(nvnQueueSubmitCommands) {
     // point). Copies of the data at submit made it worse, a mix of two frames' versions.
     // NX2NAVI_SUBMIT_FINISH=<mask>: bit i waits after the i-th submission of a frame (default 0x1); a plain 1 waits
     // after every submission, 0 never.
+    // The wait (exec_wait, vk_sync.c vk_sync_exec_wait) ends when the GPU has run the submission's passes and the
+    // results the game reads once it goes on are in its memory, the last frame's occlusion counts among them; the
+    // write-backs and the completion thread's other side effects are not waited for. NX2NAVI_WB_SPLIT=0 makes it
+    // the fence's wait, which covers those too (vk_sync.c "the executed timeline" has what each leaves out and costs).
     static long long finish_mask = -2;
     if (finish_mask == -2) {
         const char *e = cfg_get("NX2NAVI_SUBMIT_FINISH");
         finish_mask = e && *e ? strtoll(e, NULL, 0) : 1;
         if (e && *e && finish_mask == 1 && !(e[0] == '0' && (e[1] == 'x' || e[1] == 'X'))) finish_mask = -1;   // "1": all
     }
-    int idx = nvn_submits_in_frame++;
-    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->fence_wait(f, UINT64_MAX);
+    // several guest threads submit at once (the pause menu's first frame on): a plain ++ lost counts, and with one the
+    // frame's first submission went without its wait, or a later one waited
+    int idx = __atomic_fetch_add(&nvn_submits_in_frame, 1, __ATOMIC_RELAXED);
+    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) {
+        gfx_tl_note('W', 0, f, 0);
+        gfx_backend()->exec_wait(f, UINT64_MAX);
+        gfx_tl_note('w', 0, 0, 0);
+    }
+    nvn_call_note(0, (uintptr_t)q, 0);
 }
 
 // The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
@@ -675,7 +767,7 @@ NVN_API(nvnQueueSubmitCommands) {
 static void obs_release_read(Cpu *c) {
     uint64_t lr = c->x[30], obj = c->x[19];
     rt_original(c);
-    if (lr != 0x70008c70c8ull) return;
+    if (rt_game_version != 121 || lr != 0x70008c70c8ull) return;   // the address is 1.2.1's: no other build has this producer there
     static int on = -1;
     if (on < 0) {
         on = cfg_bool("NX2NAVI_LOD_GUARD");

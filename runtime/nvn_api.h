@@ -22,6 +22,11 @@ void nvn_called(uint8_t *seen, const char *name);          // the counting prolo
 // A wait for the GPU, the display or another thread gives the virtual core up until the end of the enclosing scope.
 #define NVN_BLOCKING() __attribute__((cleanup(kern_core_back))) int nvn_away_ = kern_core_away()
 static inline int nvn_arg_bool(const Cpu *c, int i) { return (int)(arg_x(c, i) & 0xff); }   // NVNboolean: low 8 bits only
+// 1 when argument 0, the object of a getter, is NULL: the call is answered with 0 instead of reading the object at
+// address 0 plus a field's offset. The game's scene-loading thread makes a few such calls while an area or Kakariko's
+// time of day changes (a memory pool's flags, a texture builder's storage size). The first calls are logged with
+// their caller (nvn_api_core.c).
+int nvn_no_object(Cpu *c, const char *what);
 
 #define NVN_POOL_MAGIC MAGIC('P', 'O', 'O', 'L')           // pool_t.magic of an initialized pool
 #define NVN_VPOOL_PAGE 0x10000ull                          // NVN virtual mapping granularity (64 KiB)
@@ -42,7 +47,12 @@ typedef struct {                                           // NVNmappingRequest 
 _Static_assert(sizeof(nvn_mapping_t) == 0x28, "NVNmappingRequest stride");
 
 const pool_t *nvn_pool_find(uint64_t addr, uint64_t len);  // GPU-visible pool holding [addr, addr+len], NULL if none
+uint64_t nvn_prog_made_ns(uint64_t serial);                    // NX2NAVI_PROG_LEAD: when the program was made, 0 unknown
 uint64_t nvn_new_serial(void);                             // next tex_t / prog_t serial, from 1
+// NX2NAVI_TRACE=perf: a guest thread enters (enter 1) or leaves (0) QueueSubmitCommands (present 0) or
+// QueuePresentTexture (1) on queue q: the first call of each thread, kind and queue gets a line, and so does a call
+// that enters while another of these calls runs (nvn_api_core.c nvn_call_note).
+void nvn_call_note(int present, uintptr_t q, int enter);
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
 extern int nvn_submits_in_frame;                           // nvnQueueSubmitCommands calls since the last present (NX2NAVI_SUBMIT_FINISH)
@@ -56,6 +66,7 @@ void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the co
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);
 int gfx_replay_async(void);                                // 1: the back end replays submissions on its own thread
 uint64_t gfx_replayed_submits(void);                       // newest submit number (nvn_submit_count) replayed
+void gfx_event_signalling(const void *value, uint32_t to); // nvnEventSignal is about to write `to` into the event's value
 #define NVN_HANDLE_TEX(h) ((int)((h) & 0xfffff))           // combined texture handle = texture id | sampler id << 20
 #define NVN_HANDLE_SAMP(h) ((int)(((h) >> 20) & 0xfff))
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:

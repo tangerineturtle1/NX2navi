@@ -105,8 +105,13 @@ static void pass_marks_init(VkCtx *c) {
     set_checkpoint = c->has_nv_checkpoints
                          ? (PFN_vkCmdSetCheckpointNV)vk_dpa(c->device, "vkCmdSetCheckpointNV") : NULL;
     pm_amd = !off && write_marker && words;
-    vk_pass_marks_on = pm_amd || set_checkpoint;
-    if (vk_pass_marks_on)
+    // Timestamp profiling needs pass labels, but no vendor breadcrumb extension.
+    const char *timing = cfg_get("NX2NAVI_GPU_PASSES");
+    int timestamps = timing && *timing && strcmp(timing, "0");
+    vk_pass_marks_on = pm_amd || set_checkpoint || timestamps;
+    if (timestamps && !pm_amd && !set_checkpoint)
+        rt_log("vk: pass labels on for timestamp profiling; vendor breadcrumbs unavailable");
+    else if (vk_pass_marks_on)
         rt_log("vk: pass marks on (%s%s%s; NX2NAVI_PASS_CRUMBS=0 turns them off%s)", pm_amd ? "VK_AMD_buffer_marker" : "",
                pm_amd && set_checkpoint ? " and " : "", set_checkpoint ? "VK_NV_device_diagnostic_checkpoints" : "",
                set_checkpoint ? "" : ", =1 adds NVIDIA checkpoints where the driver has them");
@@ -133,6 +138,23 @@ void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
 #define GP_TOP 30
 typedef struct { uint8_t kind, used; uint32_t w, h, d, draws, layer; int c0; uint64_t vs, fs; } GpLabel;
 static GpLabel gp_labels[GP_SLOTS];
+// The gap ledger: what the timed frames' parts spend outside their passes and dispatches. A part (vk_sync.c: one command
+// buffer of a submission) takes a slot of its own, kind GP_KIND_PART, with a timestamp at its start and its end. A gap
+// runs from the part's start or the end of a mark to the start of the next mark or the part's end; vk_gpu_gap_note
+// names the kinds of commands the replay records in the gap it is in (copies, clears, the upscaler, the write-back
+// merge). A gap nobody noted holds barriers and state only. The report sums the gaps by the kinds noted in them. A pass
+// split over two parts (vk_sync_split) keeps its own time, the wait for the second part included, and makes no gap.
+#define GP_KIND_PART 3   // beside VK_MARK_PASS and VK_MARK_DISPATCH
+#define GP_GAPS 16384
+typedef struct { uint32_t from, to, kinds; } GpGap;   // query numbers in gp_pool; kinds: bits of VK_GAP_*
+static GpGap gp_gaps[GP_GAPS];
+static uint32_t gp_ngaps, gp_gap_from = UINT32_MAX, gp_gap_kinds, gp_part = UINT32_MAX;
+static int gp_in_mark;                                // between a mark's start and its end
+static uint64_t gp_kind_n[VK_GAP_N], gp_kind_units[VK_GAP_N];
+static const char *const gp_kind_names[VK_GAP_N] = {
+    "buffer copies", "buffer to texture copies", "texture to buffer copies", "texture copies", "buffer fills",
+    "texture clears", "target clears", "the temporal upscaler", "write-back merges", "write-back copies",
+    "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies"};
 static VkQueryPool gp_pool, gp_prims;   // gp_prims: mesh primitives generated per pass (with meshShaderQueries)
 static VkQueryPool gp_stats;            // fragment shader invocations per pass
 static int gp_state, gp_phase, gp_capture;   // state 0 not set up, 1 on, -1 off; phase 0 idle, 1 capturing, 2 waiting
@@ -159,9 +181,38 @@ static int kind_is_pass(const VkPassMark *m) { return m->kind == VK_MARK_PASS; }
 
 int vk_gpu_passes_capturing(void) { return gp_capture; }
 
+static void gp_gap_close(uint32_t to) {
+    if (gp_gap_from != UINT32_MAX && gp_ngaps < GP_GAPS) gp_gaps[gp_ngaps++] = (GpGap){gp_gap_from, to, gp_gap_kinds};
+    gp_gap_from = UINT32_MAX, gp_gap_kinds = 0;
+}
+
+void vk_gpu_gap_note(int kind, uint64_t units) {
+    if (!gp_capture || gp_part == UINT32_MAX || kind < 0 || kind >= VK_GAP_N) return;
+    gp_gap_kinds |= 1u << kind;
+    gp_kind_n[kind]++, gp_kind_units[kind] += units;
+}
+
+void vk_gpu_passes_part(VkCommandBuffer cb, int end) {
+    if (!end) {
+        gp_part = UINT32_MAX, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0;
+        if (!gp_capture || gp_n >= GP_SLOTS) return;
+        gp_labels[gp_n] = (GpLabel){.kind = GP_KIND_PART};
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
+        gp_part = gp_n++;
+        if (!gp_in_mark) gp_gap_from = gp_part * 2;
+        return;
+    }
+    if (gp_part == UINT32_MAX) return;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_part * 2 + 1);
+    if (!gp_in_mark) gp_gap_close(gp_part * 2 + 1);
+    gp_labels[gp_part].used = 1;
+    gp_part = UINT32_MAX, gp_gap_from = UINT32_MAX;
+}
+
 static void gp_begin(VkCommandBuffer cb, VkPassMark *m) {
     m->gp = 0;
     if (!gp_capture || gp_n >= GP_SLOTS) return;
+    if (gp_part != UINT32_MAX) gp_gap_close(gp_n * 2);   // the gap before this mark ends at its start
     gp_labels[gp_n].used = 0;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
     if (gp_prims && kind_is_pass(m)) vkCmdBeginQuery(cb, gp_prims, gp_n, 0);
@@ -181,6 +232,64 @@ static void gp_end(VkCommandBuffer cb, const VkPassMark *m) {
     l->c0 = m->kind == VK_MARK_PASS && m->ncolor ? (int)m->color[0] : 0;
     l->vs = gp_shader_hash(m->first[0]), l->fs = m->kind == VK_MARK_PASS ? gp_shader_hash(m->first[1]) : 0;
     l->used = 1;
+    if (gp_part != UINT32_MAX) gp_gap_from = i * 2 + 1, gp_gap_kinds = 0;   // the next gap starts at this mark's end
+}
+
+// One timestamp of gp_pool in ticks; 0 when it is not there.
+static int gp_tick(VkCtx *c, uint32_t q, uint64_t *t) {
+    uint64_t v[2] = {0};
+    if (vkGetQueryPoolResults(c->device, gp_pool, q, 1, sizeof v, v, sizeof v,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != VK_SUCCESS || !v[1])
+        return 0;
+    *t = v[0];
+    return 1;
+}
+
+// The gaps of the timed frames, summed by the kinds noted in them, and the parts' own time for comparison with the
+// perf line's GPU time (which counts the mirror prologues too and leaves out the time between parts).
+static void gp_report_gaps(double tick_ms, double parts_ms, uint32_t parts) {
+    enum { MAX_SETS = 64 };
+    static struct { uint32_t kinds, n; double ms; } sets[MAX_SETS];
+    VkCtx *c = vk_ctx();
+    int n = 0;
+    double total = 0;
+    uint32_t read = 0;
+    for (uint32_t i = 0; i < gp_ngaps; i++) {
+        uint64_t a, b;
+        if (!gp_tick(c, gp_gaps[i].from, &a) || !gp_tick(c, gp_gaps[i].to, &b) || b < a) continue;
+        double ms = (double)(b - a) * tick_ms;
+        int s = 0;
+        while (s < n && sets[s].kinds != gp_gaps[i].kinds) s++;
+        if (s == n) {
+            if (n == MAX_SETS) continue;
+            sets[n].kinds = gp_gaps[i].kinds, sets[n].n = 0, sets[n].ms = 0, n++;
+        }
+        sets[s].ms += ms, sets[s].n++, total += ms, read++;
+    }
+    rt_log("gpu passes:   outside the passes and dispatches: %.2f ms per frame in %u gaps; the parts themselves %.2f ms per "
+           "frame in %u parts", total / GP_FRAMES, read, parts_ms / GP_FRAMES, parts);
+    for (int k = 0; k < n && k < 12; k++) {   // the most expensive sets first
+        int top = k;
+        for (int j = k + 1; j < n; j++)
+            if (sets[j].ms > sets[top].ms) top = j;
+        if (top != k) {
+            uint32_t tk = sets[k].kinds, tn = sets[k].n;
+            double tm = sets[k].ms;
+            sets[k].kinds = sets[top].kinds, sets[k].n = sets[top].n, sets[k].ms = sets[top].ms;
+            sets[top].kinds = tk, sets[top].n = tn, sets[top].ms = tm;
+        }
+        char what[256];
+        int o = 0;
+        what[0] = 0;
+        for (int b = 0; b < VK_GAP_N && o < (int)sizeof what - 40; b++)
+            if (sets[k].kinds >> b & 1) o += snprintf(what + o, sizeof what - (size_t)o, "%s%s", o ? ", " : "", gp_kind_names[b]);
+        rt_log("gpu passes:     %7.3f ms  x%-5.1f gaps with %s", sets[k].ms / GP_FRAMES, (double)sets[k].n / GP_FRAMES,
+               o ? what : "barriers and state only");
+    }
+    for (int b = 0; b < VK_GAP_N; b++)
+        if (gp_kind_n[b])
+            rt_log("gpu passes:     %s: %.1f per frame, %.2f M units per frame (bytes of buffers, texels of images)",
+                   gp_kind_names[b], (double)gp_kind_n[b] / GP_FRAMES, gp_kind_units[b] / 1e6 / GP_FRAMES);
 }
 
 typedef struct { GpLabel l; double ms; uint32_t n; uint64_t draws, prims, frags; } GpSum;
@@ -196,18 +305,23 @@ static void gp_report(uint64_t frame) {
     VkCtx *c = vk_ctx();
     int n = 0;
     uint32_t read = 0, unread = 0;
-    double tick_ms = c->props.limits.timestampPeriod / 1e6, total = 0;
+    double tick_ms = c->props.limits.timestampPeriod / 1e6, total = 0, parts_ms = 0;
+    uint32_t parts = 0;
     for (uint32_t i = 0; i < gp_n; i++) {
         const GpLabel *l = &gp_labels[i];
         uint64_t q[4] = {0};
         if (!l->used || vkGetQueryPoolResults(c->device, gp_pool, i * 2, 2, sizeof q, q, 2 * sizeof q[0],
                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != VK_SUCCESS ||
             !q[1] || !q[3]) {
-            unread++;
+            if (l->kind != GP_KIND_PART) unread++;
+            continue;
+        }
+        double ms = (double)(q[2] - q[0]) * tick_ms;
+        if (l->kind == GP_KIND_PART) {   // a part of a submission: for the gap ledger's line only
+            parts_ms += ms, parts++;
             continue;
         }
         read++;
-        double ms = (double)(q[2] - q[0]) * tick_ms;
         total += ms;
         // a pass of many draws and its neighbours differ in the draw count: the sum is by targets and shaders alone
         int s = 0;
@@ -249,6 +363,7 @@ static void gp_report(uint64_t frame) {
         rt_log("gpu passes:   indirect mesh draws: %.1f per frame, %.0f workgroups per frame, largest %u; first:%s", (double)mn / GP_FRAMES,
                (double)sum / GP_FRAMES, top, list);
     }
+    gp_report_gaps(tick_ms, parts_ms, parts);
     for (int s = 0; s < n && s < GP_TOP; s++) {
         const GpSum *e = &sums[s];
         if (e->l.kind == VK_MARK_DISPATCH)
@@ -318,6 +433,8 @@ void vk_gpu_passes_frame(uint64_t frame) {
         vkResetQueryPool(c->device, gp_pool, 0, GP_SLOTS * 2);
         if (gp_prims) vkResetQueryPool(c->device, gp_prims, 0, GP_SLOTS);
         if (gp_stats) vkResetQueryPool(c->device, gp_stats, 0, GP_SLOTS);
+        gp_ngaps = 0, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0, gp_part = UINT32_MAX;
+        memset(gp_kind_n, 0, sizeof gp_kind_n), memset(gp_kind_units, 0, sizeof gp_kind_units);
         gp_n = 0, gp_start = frame, gp_capture = 1, gp_phase = 1;
     } else if (gp_phase == 1) {
         if (frame < gp_start + GP_FRAMES) return;
@@ -336,11 +453,13 @@ VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
     m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX;
     rec_pass_mark(cb, id, 0);
     gp_begin(cb, m);
+    gp_in_mark = 1;
     return m;
 }
 
 void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) {
     if (!m || !cb) return;
+    gp_in_mark = 0;
     gp_end(cb, m);
     rec_pass_mark(cb, m->id, 1);
 }

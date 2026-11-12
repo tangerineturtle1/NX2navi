@@ -1,0 +1,74 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// build_shaders: keep functions
+//
+// --probe-meshfb (mesh_fb_probe.c): the mesh program that meshfb_probe_t.task feeds, in the translator's shape
+// (meshfb_probe_m.mesh says which). Its shared memory holds the task payload behind the stage buffer, from word 540.
+// The workgroup id is its index among its task's mesh workgroups: payload word 4 + id names the cell it draws, and
+// the mark in the last payload word names its task, which the colour shows when either is wrong.
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 64, max_primitives = 32) out;
+layout(location = 0) out vec4 o_color[];
+layout(set = 0, binding = 1) uniform Params { vec4 tint; uvec4 grid; } u;   // grid: columns, rows
+shared uint mem[612];
+taskPayloadSharedEXT uint payload[72];
+
+#define VWORD(v, l) ((((v) >> 5) * 8u + (l)) * 32u + ((v) & 31u))
+#define COUNT_WORD 512u
+#define INDEX_BYTE 2052u
+#define PAYLOAD 540u
+
+void program() {
+    uint tid = gl_LocalInvocationIndex, cell = mem[PAYLOAD + 4u + gl_WorkGroupID.x];
+    bool mine = mem[PAYLOAD + 71u] == 0x600df00du + cell / 4u && cell % 4u == gl_WorkGroupID.x;
+    if (tid < 9u) {
+        uint v = tid + 28u, ix = tid % 3u, iy = tid / 3u;
+        vec2 p = -1.0 + (vec2(cell % u.grid.x, cell / u.grid.x) + 0.1 + 0.4 * vec2(ix, iy)) * (2.0 / vec2(u.grid.xy));
+        vec4 c = mine ? vec4(float(ix) * 0.5, float(iy) * 0.5, float(cell % 4u) / 3.0, 1.0) * u.tint : vec4(1.0, 0.0, 1.0, 1.0);
+        mem[VWORD(v, 0u)] = floatBitsToUint(p.x);
+        mem[VWORD(v, 1u)] = floatBitsToUint(p.y);
+        mem[VWORD(v, 2u)] = floatBitsToUint(0.5);
+        mem[VWORD(v, 3u)] = floatBitsToUint(1.0);
+        mem[VWORD(v, 4u)] = floatBitsToUint(c.x);
+        mem[VWORD(v, 5u)] = floatBitsToUint(c.y);
+        mem[VWORD(v, 6u)] = floatBitsToUint(c.z);
+        mem[VWORD(v, 7u)] = floatBitsToUint(c.w);
+    }
+    if (tid == 0u) {   // one thread writes the index bytes: they share words
+        uint count = 2u + cell % 7u;
+        for (uint t = 0u; t < count; t++) {
+            uint q = t / 2u, a = (q / 2u) * 3u + q % 2u + 28u;
+            uvec3 tri = (t & 1u) == 0u ? uvec3(a, a + 1u, a + 3u) : uvec3(a + 1u, a + 4u, a + 3u);
+            for (uint k = 0u; k < 3u; k++) {
+                uint b = INDEX_BYTE + 3u * t + k, sh = (b & 3u) * 8u;
+                mem[b >> 2] = (mem[b >> 2] & ~(0xffu << sh)) | tri[k] << sh;
+            }
+        }
+        mem[COUNT_WORD] = count;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < 1u) mem[COUNT_WORD] = 0u;
+    for (uint i = tid; i < 72u; i += 32u) mem[PAYLOAD + i] = payload[i];
+    barrier();
+    program();
+    barrier();
+    uint count = min(mem[COUNT_WORD], 32u);
+    SetMeshOutputsEXT(64u, count);
+    for (uint v = tid; v < 64u; v += 32u) {
+        gl_MeshVerticesEXT[v].gl_Position = vec4(uintBitsToFloat(mem[VWORD(v, 0u)]), uintBitsToFloat(mem[VWORD(v, 1u)]),
+                                                 uintBitsToFloat(mem[VWORD(v, 2u)]), uintBitsToFloat(mem[VWORD(v, 3u)]));
+        o_color[v] = vec4(uintBitsToFloat(mem[VWORD(v, 4u)]), uintBitsToFloat(mem[VWORD(v, 5u)]),
+                          uintBitsToFloat(mem[VWORD(v, 6u)]), uintBitsToFloat(mem[VWORD(v, 7u)]));
+    }
+    for (uint p = tid; p < count; p += 32u) {
+        uvec3 tri;
+        for (uint k = 0u; k < 3u; k++) {
+            uint b = INDEX_BYTE + 3u * p + k;
+            tri[k] = min(mem[b >> 2] >> ((b & 3u) * 8u) & 0xffu, 63u);
+        }
+        gl_PrimitiveTriangleIndicesEXT[p] = tri;
+    }
+}

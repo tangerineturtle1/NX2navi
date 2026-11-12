@@ -35,6 +35,7 @@ enum { KERN_WAIT_NONE, KERN_WAIT_LOCK, KERN_WAIT_CONDVAR, KERN_WAIT_ADDRESS, KER
 int kern_thread_state(uint32_t handle);               // KERN_WAIT_*, KERN_THREAD_EXITED, or -1 for a bad handle
 void kern_core_stats(int *held_now, int *held_max);   // virtual-core holders now and the most ever at once
 void kern_core_stats_reset(void);
+int kern_cores(void);   // the virtual cores that run threads: 6, or NX2NAVI_CORES
 extern volatile int kern_test_cv_old_order;           // WaitProcessWideKeyAtomic: release the lock before setting
                                                       // the key (the old order, the negative control)
 extern void (*volatile kern_test_cv_hook)(void);      // called right after the lock release, holding the kernel lock

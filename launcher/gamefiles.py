@@ -1,14 +1,20 @@
-"""The player's game files, as far as the launcher reads them itself: finding a .nup dump, and the game's Cetra
-Display font for the window (runtime/menu_assets.c reads the same font for the in-game menu's titles).
+"""The player's game files, as far as the launcher reads them itself: finding a .nup dump, the game's Cetra
+Display font for the window (runtime/menu_assets.c reads the same font for the in-game menu's titles) and the game's
+interface sounds for the window's sound effects (runtime/menu_sound.c plays the same files in the in-game menu).
 
-The font comes from the built game's romfs/ (romfs.bin and index.json, tools/make_game.py) or, before the first
-build, straight from the .nup. They are decoded once into data/cache/fonts, which stays on the player's PC like the
-rest of what is built from their game. Nothing of the game ships with the launcher.
+They come from the built game's romfs/ (romfs.bin and index.json, tools/make_game.py) or, before the first
+build, straight from the .nup. They are decoded once into data/cache/fonts and data/cache/sounds, which stay on the
+player's PC like the rest of what is built from their game. Nothing of the game ships with the launcher.
 
 - .zs files are zstd frames, most with one of the dictionaries of Pack/ZsDic.pack.zs (a SARC, compressed without a
   dictionary; a frame names its dictionary by id).
 - A .bfotf font is an OpenType file behind an 8-byte header, every big-endian 32-bit word XORed with one key: the
   first word is 0x7f9a0218 under it, the second the payload size.
+- A .bwav sound: "BWAV", a byte order mark, a version, a CRC32, a prefetch flag and the channel count (u16 at 0x0e),
+  then 0x4c bytes per channel from 0x10: the codec (u16: 0 PCM16, 1 DSP-ADPCM), the pan (u16: 0 left, 1 right,
+  2 middle), the sample rate and the sample count (u32 each), 16 DSP coefficients (s16 from +0x10) and the offset of
+  the samples in the file (u32 at +0x30). DSP-ADPCM: 8-byte frames of a header byte (coefficient pair, scale
+  exponent) and 14 four-bit samples.
 """
 import json
 import os
@@ -19,6 +25,10 @@ from pathlib import Path
 TITLE_ID = 0x0400486024DEC000
 FONTS = {   # role -> RomFS path; the window sets all its text in Cetra Display
     'title': 'Font2/Scalable/CetraDisplayPro-Medium.Nin_Ounce_NVN2.bfotf.zs',
+}
+SOUNDS = {   # the window's sound effect (launcher/ui/sound.py) -> the game's interface sound
+    'select': 'Sound/Resource/Stream/SE_Sys_Do00.bwav',
+    'back': 'Sound/Resource/Stream/SE_Sys_Cancel00.bwav',
 }
 DICTS = 'Pack/ZsDic.pack.zs'
 DICT_NAMES = ('zs.zsdic', 'pack.zsdic', 'bcett.byml.zsdic', 'bkprb.zsdic')
@@ -316,7 +326,96 @@ def extract_fonts(layout, game_dir='', dump=''):
         fam = font_family(otf) if otf else None
         if not otf or not fam:
             continue
-        (d / f'{role}.otf').write_bytes(otf)
+        p = d / f'{role}.otf'
+        if not (p.is_file() and p.read_bytes() == otf):   # a file this process registered as a font stays as it is
+            p.write_bytes(otf)
         (d / f'{role}.family').write_text(fam, encoding='utf-8')
         out[role] = (d / f'{role}.otf', fam)
+    return out
+
+
+# ---------------------------------------------------------------- interface sounds
+
+def bwav_to_pcm(b):
+    """A .bwav as (sample rate, frames): frames a list of (left, right) 16-bit samples, or None when it is no BWAV of
+    one or two channels this reads. A middle-panned channel goes to both sides at 0.707 when it is the only one."""
+    if not b or len(b) < 0x10 or b[:4] != b'BWAV':
+        return None
+    channels = struct.unpack_from('<H', b, 0x0e)[0]
+    if channels not in (1, 2) or 0x10 + channels * 0x4c > len(b):
+        return None
+    rate, frames = struct.unpack_from('<II', b, 0x10 + 4)
+    if not 8000 <= rate <= 96000 or not 0 < frames <= rate * 10:
+        return None
+    left, right = [0.0] * frames, [0.0] * frames
+    for c in range(channels):
+        info = 0x10 + c * 0x4c
+        codec, pan = struct.unpack_from('<HH', b, info)
+        count = min(struct.unpack_from('<I', b, info + 8)[0], frames)
+        coef = struct.unpack_from('<16h', b, info + 0x10)
+        off = struct.unpack_from('<I', b, info + 0x30)[0]
+        if codec == 0:
+            if off + count * 2 > len(b):
+                return None
+            samples = struct.unpack_from(f'<{count}h', b, off)
+        elif codec == 1:
+            if off + (count + 13) // 14 * 8 > len(b):
+                return None
+            samples, h1, h2 = [], 0, 0
+            for i in range(count):
+                fr = off + i // 14 * 8
+                k = i % 14
+                c1, c2 = coef[2 * (b[fr] >> 4 & 7)], coef[2 * (b[fr] >> 4 & 7) + 1]
+                nib = b[fr + 1 + k // 2] >> (0 if k & 1 else 4) & 15
+                if nib >= 8:
+                    nib -= 16
+                v = (((nib << (b[fr] & 15)) << 11) + c1 * h1 + c2 * h2 + 1024) >> 11
+                v = -32768 if v < -32768 else 32767 if v > 32767 else v
+                h2, h1 = h1, v
+                samples.append(v)
+        else:
+            return None
+        gain = 0.7071 if channels == 1 else 1.0
+        for i, v in enumerate(samples):
+            if pan != 1:
+                left[i] += v * gain
+            if pan != 0:
+                right[i] += v * gain
+    clip = lambda v: -32768 if v < -32768 else 32767 if v > 32767 else int(round(v))   # noqa: E731
+    return rate, [(clip(a), clip(c)) for a, c in zip(left, right)]
+
+
+def pcm_to_wav(rate, frames):
+    """A 16-bit stereo WAV of frames, a list of (left, right) samples."""
+    pcm = struct.pack(f'<{len(frames) * 2}h', *[v for fr in frames for v in fr])
+    return (b'RIFF' + struct.pack('<I', 36 + len(pcm)) + b'WAVEfmt '
+            + struct.pack('<IHHIIHH', 16, 1, 2, rate, rate * 4, 4, 16) + b'data' + struct.pack('<I', len(pcm)) + pcm)
+
+
+def cached_sounds(layout):
+    """{effect: path} of the game's interface sounds decoded earlier."""
+    d = layout.cache / 'sounds'
+    return {name: d / f'{name}.wav' for name in SOUNDS if (d / f'{name}.wav').is_file()}
+
+
+def extract_sounds(layout, game_dir='', dump=''):
+    """Decode the game's select and back sounds into data/cache/sounds as WAV files; {effect: path} of the ones
+    found."""
+    romfs = open_romfs(layout, game_dir, dump)
+    if romfs is None:
+        return {}
+    d = layout.cache / 'sounds'
+    d.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for name, rel in SOUNDS.items():
+        try:
+            got = bwav_to_pcm(romfs.read(rel))
+        except Exception:
+            got = None
+        if not got:
+            continue
+        tmp = d / f'{name}.wav.tmp'
+        tmp.write_bytes(pcm_to_wav(*got))
+        os.replace(tmp, d / f'{name}.wav')
+        out[name] = d / f'{name}.wav'
     return out

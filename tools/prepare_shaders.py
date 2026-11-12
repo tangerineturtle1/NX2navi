@@ -21,6 +21,13 @@ shader-prepared.bin (one record per variant, in priority order) and builds every
 pipeline once, so the GPU driver's own disk cache holds them (vk_pipeline.c "stage library prebuild"). The seed files
 can be deleted afterwards.
 
+The shared pipeline list (tools/pipeline_list.py: graphics pipelines players met, with the shader variants they name)
+is read beside the shader list when there is one: tools/data/pipeline_list.bin, data/pipeline_list.bin in a release
+folder, or --pipeline-list. Its variants of shaders this game version has join the seed, and its key records are
+written as seed-pipeline-keys.bin, which --prepare-shaders builds into the pipeline caches once the seed is translated
+(vk_pipeline.c "the shared pipeline list"; mesh pipelines by default). That file stays in the build directory:
+`nx2navi.exe --warm-shaders` and `--prepare-pipelines` build from it again after an update or a new driver.
+
 A driver whose shader compiler crashes on a variant crashes on it in every run (NVIDIA 615.78.08 on an RTX 5080, issue
 #30). The translations and shader-prepared.bin are written by then, and the journal the run leaves names the variants
 the driver was building (vk_pipeline.c skip_init), so only the driver step runs again (`nx2navi.exe --warm-shaders`), up to
@@ -47,6 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 while not (ROOT / 'tools' / 'shader_census.py').is_file() and ROOT != ROOT.parent:
     ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT / 'tools'))
+import pipeline_list  # noqa: E402
 import shader_list  # noqa: E402
 from shader_census import inventory  # noqa: E402
 
@@ -81,6 +89,44 @@ RETRIES = 3
 BUNDLED_LIST = ROOT / 'tools' / 'data' / 'shader_list.tsv'   # the installer archive carries a copy (no git, no refs/)
 if not BUNDLED_LIST.is_file():
     BUNDLED_LIST = ROOT / 'data' / 'shader_list.tsv'          # release folder layout (tools/make_release.py)
+
+
+BUNDLED_PIPELINES = ROOT / 'tools' / 'data' / 'pipeline_list.bin'   # as BUNDLED_LIST: out of the repository
+if not BUNDLED_PIPELINES.is_file():
+    BUNDLED_PIPELINES = ROOT / 'data' / 'pipeline_list.bin'
+SEED_KEYS = 'seed-pipeline-keys.bin'
+LIST_PRIORITY = 1   # a pipeline list variant's seed priority: with the warm-up rows
+
+
+def read_pipeline_list(path):
+    """(answers records, pipeline-keys.bin image) of the pipeline list at path, or of the bundled one; None without
+    a list. A file that is not a list stops the run: a release that names one must not go on without it."""
+    p = Path(path) if path else BUNDLED_PIPELINES
+    if not p.is_file():
+        if path:
+            sys.exit(f'prepare_shaders: no pipeline list at {p}')
+        return None
+    got = pipeline_list.unpack(p.read_bytes())
+    if got is None:
+        sys.exit(f'prepare_shaders: {p} is not a pipeline list (tools/pipeline_list.py merge writes one)')
+    return got
+
+
+def list_variants(answers_recs, have, seen):
+    """Seed records for the pipeline list's shader variants: those whose shader (runtime code hash) is in `have` and
+    whose (hash, answers) the seed does not hold yet. The input id is left zero, as for every seed record: the runtime
+    finds it, and finds the id the list's key records name, since it depends on the code and the answers alone."""
+    out, absent = [], 0
+    for a in answers_recs:
+        h, packed = a[4:36], a[68:68 + 147]
+        if h not in have:
+            absent += 1
+            continue
+        if (h, packed) in seen:
+            continue
+        seen.add((h, packed))
+        out.append(a[:36] + bytes(32) + packed + bytes([LIST_PRIORITY]))
+    return out, absent
 
 
 def read_list(path):
@@ -190,6 +236,8 @@ def main():
     ap.add_argument('--list', help='a shader_list.tsv instead of tools/data/shader_list.tsv or refs/MacNativeGames')
     ap.add_argument('--no-run', action='store_true', help='write the seed files only')
     ap.add_argument('--no-list', action='store_true', help='default variants only, without a shared shader list')
+    ap.add_argument('--pipeline-list', help='a pipeline list instead of tools/data/pipeline_list.bin (tools/pipeline_list.py)')
+    ap.add_argument('--no-pipeline-list', action='store_true', help='no shared pipeline list, also when one is bundled')
     ap.add_argument('--all-shaders', action='store_true',
                     help='also the default variants SLOW_UNUSED leaves out (an hour more of GPU driver builds)')
     ap.add_argument('--exe', default='nx2navi.exe' if os.name == 'nt' else 'nx2navi',
@@ -235,8 +283,18 @@ def main():
         rec = struct.pack('<I', stage) + h + bytes(32) + packed + bytes([prio.get(key, 2) | (DEFAULT_FLAG if default else 0)])
         assert len(rec) == ANS_REC
         recs.append((prio.get(key, 2), rec))
-    recs.sort(key=lambda r: r[0])   # stable: list order within a priority
     out = a.build.resolve()
+    plist = None if a.no_pipeline_list else read_pipeline_list(a.pipeline_list)
+    (out / SEED_KEYS).unlink(missing_ok=True)   # a list this build no longer has
+    if plist:
+        extra, absent = list_variants(plist[0], {h for h, _ in progs.values()}, seen)
+        recs += [(LIST_PRIORITY, r) for r in extra]
+        (out / SEED_KEYS).write_bytes(plist[1])
+        n_keys = len(pipeline_list.read_keys(plist[1])[3])
+        print(f'pipeline list: {n_keys} pipelines; of its {len(plist[0])} shader variants (the ones they name and the '
+              f'compute variants), {len(extra)} join the seed, {absent} are of shaders {a.version} does not have, the '
+              'others are in it already', flush=True)
+    recs.sort(key=lambda r: r[0])   # stable: list order within a priority
     with open(out / 'seed-programs.bin', 'wb') as f:
         f.write(b'NX2NSPRG' + struct.pack('<II', 1, 0))
         for _, body in progs.values():

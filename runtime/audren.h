@@ -194,5 +194,6 @@ int audio_mixer_out_stats(AudioRenderer *r, AudioOutStats *o);
 uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames);   // source samples over one frame; advances v->fraction
 int audio_buffer_empty(const AudrenWaveBuffer *b);   // no samples to decode: played as soon as it is reached
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // IAudioDevice
+void audio_channels_live(void);   // after a settings change: another NX2NAVI_AUDIO_CHANNELS reaches the game and the mixer
 void audio_dmg_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);      // auddmg:u (Switch 2)
 void audio_sysmix_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // audsmx:u (Switch 2)

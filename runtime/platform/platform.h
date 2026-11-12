@@ -31,17 +31,31 @@ void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
 // Restricts t (NULL: the calling thread) to the logical processors in mask (bit n = processor n of the first group).
 // Returns the previous mask, 0 on failure.
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
-// The calling thread gets a core to itself: the process's other threads are kept off it and the caller on it (Windows:
-// CPU sets, a performance core; Linux: the last processor of the affinity mask). Returns the logical processors
-// reserved, 0 when it could not.
-int plat_cpu_reserve(void);
+// The calling thread gets a fast core to itself: the process's other threads are kept off it and the caller on it, with
+// both logical processors of the core when it has two; threads the caller starts later run with the others. Windows
+// takes the highest-numbered core of the fastest efficiency class (CPU sets). Linux takes the core of a hybrid CPU's
+// performance cores that clocks highest, else of the highest capacity or clock, and none when fewer than four cores
+// are that fast. Returns the logical processors reserved, 0 when it could not; *which (when not NULL, size bytes)
+// receives them as text, such as "10,11" (Linux adds what makes the core fast: "10,11 of a performance core").
+int plat_cpu_reserve(char *which, size_t size);
+// Keeps the reserved core reserved: on Linux a thread the holder starts through a library inherits its mask, the core
+// alone, and gets the others' processors here; once the holder has ended, the core goes back to every thread. Returns
+// the threads moved, -1 when the core went back. Windows needs none of it (threads without CPU sets of their own run
+// on the process's default sets, which leave the core out) and returns 0.
+int plat_cpu_reserve_sweep(void);
 uint32_t plat_cpu_count(void);            // logical processors of the machine (system info)
 uint32_t plat_cpu_usable(void);           // the ones this process may run on (its affinity mask): size thread pools by it
 uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id tid (plat_thread_id) so far; 0 unknown
 // The logical processors the process may use (bit n = processor n, the first 64), into *all, and the lowest of each
 // physical core among them into *first; returns the number of physical cores, 0 when unknown.
 int plat_cpu_cores(uint64_t *all, uint64_t *first);
-int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
+// The logical processors of the process's set (the first 64) that share the largest L3 cache, when the L3 caches
+// are not all the same size: the die with AMD's 3D V-Cache on a two-die X3D processor. 0 when they are (one die, or
+// equal dies) or the topology is unknown. *l3_kb: that cache's size.
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb);
+// Every thread of the process to the processors in mask; 1 on success. On Linux the core plat_cpu_reserve took stays
+// out of the mask for every thread but its holder, which keeps the processors it has.
+int plat_process_affinity(uint64_t mask);
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it
 // wherever it runs, reads where it is, may send it elsewhere, and lets it go on. While it is stopped the caller must not
@@ -240,9 +254,17 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+// Before the host itself writes [addr, addr+n) of a watched reservation: clears the write watch's protection of those
+// pages in one call, where the watch works by protecting pages (Linux), so the stores do not fault page by page. The
+// pages count as written. Returns 0 when there is nothing to clear or it cannot be done; the write is valid either way.
+int plat_mem_prepare_write(uint64_t addr, uint64_t n);
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
+// A read or write that faulted at addr (write: 1 for a write; ip: the faulting instruction) goes to fn before the
+// write-fault hook; fn returns 1 when it made the page accessible and the access should run again, 0 to let the fault
+// go on. fn sees every access violation of the process and tells its own pages apart. One hook per process.
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);
@@ -281,6 +303,7 @@ void plat_aligned_free(void *p);
 
 // ---- process
 _Noreturn void plat_exit(int code);       // ends the process at once: other threads stop, no atexit handlers run
+extern void (*plat_exit_hook)(void);      // called first by plat_exit when set (main.c: the queued log lines)
 int plat_setenv(const char *name, const char *value);    // value NULL removes it; 1 on success
 uint32_t plat_process_id(void);
 // CPU time of the process since it started (user and kernel), and wall time since it started, in ns; 0 when unknown.
@@ -336,6 +359,7 @@ void plat_file_delete(const char *path);
 int plat_file_truncate(const char *path, uint64_t size);  // 1 on success
 int64_t plat_file_size(const char *path);                 // bytes of a file, -1 when missing or unreadable
 int plat_file_set_readonly(const char *path, int on);     // sets or clears the read-only attribute; 1 on success
+int plat_file_private(const char *path);                  // only this account may read it (0600, a folder 0700); 1 on success
 // A file that only grows and other processes may read meanwhile: each write lands whole at its end, from any thread,
 // and reaches the file even if the process dies right after (no user-space buffer, no flush to the disk).
 typedef struct PlatAppend PlatAppend;
@@ -422,8 +446,12 @@ int plat_is_wine(void);                                   // 1 when the Windows 
 // The file the process's stderr (the log) goes to, as a UTF-8 path; 0 when stderr is not a file (a console, a pipe).
 int plat_stderr_path(char *out, size_t cap);
 
-// ---- desktop: the in-game menu's "Copy system info" and "Open log folder"
+// ---- desktop: the in-game menu's "Copy system info", "Open log folder" and the Co-op tab's secret
 int plat_clipboard_set(const char *utf8);                 // replaces the clipboard's text; 1 on success
+// The clipboard's text as UTF-8 in out (cap bytes with the NUL; a longer text: "" on Windows, cut at a character
+// elsewhere); 1 when it had text. With SDL only on the window thread, as SDL asks: the menu goes through
+// gfx_window_paste (ui/menu.h).
+int plat_clipboard_get(char *out, size_t cap);
 int plat_open_folder(const char *path);                   // shows the folder in the file manager; 1 on success
 
 // ---- dynamic libraries: a library some machines lack (a GPU vendor's), loaded at run time. A bare name is searched
@@ -449,9 +477,23 @@ void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb);
 void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 // Commit charge in MB: this process's private bytes, the system's commit in use and its limit (RAM plus page files).
 // An allocation fails when the system's reaches the limit, however much physical memory is free. -1 when unknown.
+// Linux overcommits and ends the process instead (the OOM killer), so there the limit is the one with the least
+// headroom of the cgroup v2 limits (memory.max, memory.high) the process lives under and the machine's RAM
+// (MemAvailable against MemTotal), with vm.overcommit_memory = 2 also CommitLimit.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);
-// Whether an allocation fails at that limit: always on Windows; on Linux only with vm.overcommit_memory = 2.
+// Whether the limit is one to stay below: always on Windows (an allocation fails at it); on Linux whenever the kernel
+// reports a memory limit. 0 when none is known.
 int plat_commit_enforced(void);
+// The limits the first plat_commit_info call found, for the log, as text into out ("memory limits: cgroup ... memory.max
+// 12288 MB (...); RAM ...; the one with the least headroom counts (now: ...)"); 0 when there is nothing to add to the
+// numbers (Windows, whose one limit is the system's commit).
+int plat_commit_note(char *out, size_t cap);
+// Whether a discrete GPU's own memory counts against that limit: on Windows the driver charges device memory to the
+// system's commit; Linux's limits count system memory only.
+int plat_commit_counts_vram(void);
+// Whether Windows sizes every page file by itself (System managed size): 1; 0 when a page file has its sizes set; -1
+// when unknown, there is none, or not Windows.
+int plat_page_file_managed(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
@@ -479,6 +521,34 @@ PlatIpc *plat_ipc_connect(const char *name);   // NULL when nothing listens unde
 int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms);
 int plat_ipc_write(PlatIpc *p, const void *buf, size_t n);   // 1 when all n bytes were written, 0 the connection broke
 void plat_ipc_close(PlatIpc *p);
+
+// ---- UDP sockets: the co-op layer's transport (coop.c). One unconnected datagram socket per PlatUdp; who a datagram
+// came from is checked by the protocol, not by the OS. On Windows the first call of any of these starts Winsock.
+// A PlatAddr is an IPv6 address (an IPv4 one as ::ffff:a.b.c.d), the port and the scope id in the same layout on every
+// OS, so two equal addresses compare equal bytewise (plat_addr_eq) whichever way the OS reported them.
+typedef struct PlatUdp PlatUdp;
+typedef struct { uint8_t b[32]; } PlatAddr;
+// host (a name, or an IPv4 or IPv6 literal without brackets) and port into *out. Blocks while the resolver runs: call
+// it on a thread that may wait, never on the game's. An IPv4 answer is preferred over an IPv6 one. 1 on success.
+int plat_net_resolve(const char *host, uint16_t port, PlatAddr *out);
+// A non-blocking UDP socket bound to port (0: any free port) on every local address. dual_stack 1: IPv6 with IPv4 in the
+// same socket (IPv4 alone where the machine has no IPv6); 0: IPv4 only. NULL on failure.
+PlatUdp *plat_udp_open(uint16_t port, int dual_stack);
+uint16_t plat_udp_port(const PlatUdp *u);   // the port it is bound to; 0 on failure
+// One datagram to *to; never blocks. 1 when it was sent or the OS dropped it (a full send buffer, no route, an ICMP
+// error: a datagram may be lost anyway), 0 when it can never be sent (too long, an address the socket cannot reach).
+int plat_udp_send(PlatUdp *u, const PlatAddr *to, const void *p, size_t n);
+// The next datagram into buf, waiting at most ms for it; *from (may be NULL) gets its sender. Bytes received (a datagram
+// longer than cap is cut to cap), 0 when none came in time, -1 when the socket is unusable.
+int plat_udp_recv(PlatUdp *u, void *buf, size_t cap, PlatAddr *from, uint32_t ms);
+void plat_udp_close(PlatUdp *u);
+// Address helpers that need no OS (common.c); the back ends build addresses with plat_addr_set.
+void plat_addr_set(PlatAddr *a, const uint8_t ip[16], uint16_t port, uint32_t scope);
+void plat_addr_get(const PlatAddr *a, uint8_t ip[16], uint32_t *scope);
+uint16_t plat_addr_port(const PlatAddr *a);
+int plat_addr_eq(const PlatAddr *a, const PlatAddr *b);
+// "1.2.3.4:5" or "[::1]:5" ("%scope" after a link-local address) into out; its length, 0 when it does not fit cap.
+int plat_addr_str(const PlatAddr *a, char *out, size_t cap);
 
 // ---- restart: this program again, in a new process that starts once this one is gone
 // Starts this executable again with the same command line, environment and working folder, and no handle of this

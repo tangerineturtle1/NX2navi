@@ -1,0 +1,28 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -83,6 +83,7 @@
+         public bool IsMainFunction { get; private set; }
+         public bool MayHaveReturned { get; set; }
+         public bool WasNonUniformAccessDeclared { get; set; }
++        public bool WasReadWithoutFormatDeclared { get; set; }
+ 
+         public CodeGenContext(
+             StructuredProgramInfo info,
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -743,6 +743,15 @@
+             SpvInstruction imageComponentType = context.GetType(componentType);
+             AggregateType swizzledResultType = texOp.GetVectorType(componentType);
+ 
++            // NX2NAVI: an image declared without a format (ShaderProperties.GetTextureFormat) is read with OpImageRead,
++            // which SPIR-V allows only when the module declares StorageImageReadWithoutFormat; Vulkan 1.3, which the
++            // runtime requires, allows that capability on every device.
++            if (texOp.Format == TextureFormat.Unknown && !context.WasReadWithoutFormatDeclared)
++            {
++                context.AddCapability(Capability.StorageImageReadWithoutFormat);
++                context.WasReadWithoutFormatDeclared = true;
++            }
++
+             SpvInstruction texel = context.ImageRead(context.TypeVector(imageComponentType, 4), image, pCoords, ImageOperandsMask.MaskNone);
+             SpvInstruction result = GetSwizzledResult(context, texel, swizzledResultType, texOp.Index);
+ 

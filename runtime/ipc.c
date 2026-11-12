@@ -196,6 +196,32 @@ static void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     rt_fatal("aud:u: command %u is not implemented (1 is GetAudioOutManager: no audout service here)", rq->cmd);
 }
 
+static void csrng_fill(uint64_t addr, uint64_t size) {
+    if (!size) return;
+    if (!plat_random(ipc_guest(addr, size), (size_t)size)) {
+        ipc_backtrace();
+        rt_fatal("csrng: no random bytes from the system");
+    }
+}
+
+// csrng: the SDK's cryptographic random source. GenerateRandomBytes (0) is its one command; the host's generator fills
+// the output buffer. The SDK sends it as a B buffer (a contributor's trace: one B buffer, no others); a C buffer is
+// filled too, with its reply entry, for a caller that lets the buffer type be chosen. No start or session logged on
+// our own PCs opens the service, but the game imports the call, and without the service a request for it ended the
+// game ("sm: service csrng is not implemented").
+static void csrng_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    if (rt_trace & RT_TRACE_IPC)
+        rt_log("csrng: command %u (x%u a%u b%u w%u c%u)", rq->cmd, rq->nx, rq->na, rq->nb, rq->nw, rq->nc);
+    if (rq->cmd != 0) ipc_unimplemented(s, rq);
+    for (unsigned i = 0; i < rq->nb; i++) csrng_fill(rq->b[i].addr, rq->b[i].size);
+    for (unsigned i = 0; i < rq->nc; i++)
+        if (rq->c[i].size && (i >= rq->nb || !rq->b[i].size)) {
+            csrng_fill(rq->c[i].addr, rq->c[i].size);
+            rs->xout[rs->nxout++] = (IpcBuffer){rq->c[i].addr, rq->c[i].size, i};
+        }
+    rs->result = 0;
+}
+
 // Services sm: hands out. Anything else is a named fatal.
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
@@ -204,6 +230,7 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"aud:u", aud_user_handler},
     {"auddmg:u", audio_dmg_handler},
     {"audsmx:u", audio_sysmix_handler},
+    {"csrng", csrng_handler},
 };
 
 static volatile int32_t g_live;
@@ -243,7 +270,7 @@ void ipc_handle_closed(int kind, void *obj) {
 }
 
 // ---- helpers for services
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
+static int readable(uint64_t a, uint64_t n) { return mem_host_readable(a, n); }
 
 void ipc_backtrace(void) {
     const Cpu *c = t_req;
@@ -695,7 +722,7 @@ static void update_build(Update *u, int first) {
     memcpy(w, &h, sizeof h);
     w += sizeof h + h.behavior + h.memory_pools + h.voice_resources;
     for (int i = 0; i < p->voice_count; i++) {
-        AudrenVoiceIn v = {.id = (uint32_t)i};
+        AudrenVoiceIn v = {0};   // the client leaves the id of an unused slot zero
         if (i == 0) {   // one PCM16 voice with a 100 ms buffer: consumed after 20 frames
             v = (AudrenVoiceIn){.id = 0, .is_new = (uint8_t)first, .in_use = 1, .play_state = PLAY_STARTED,
                                 .sample_format = FMT_PCM16, .sample_rate = 48000, .channel_count = 1, .pitch = 1,
@@ -850,6 +877,21 @@ static void probe_main(Cpu *c) {
     CHECK(pbs == POINTER_BUFFER_SIZE, "QueryPointerBufferSize %#x", pbs);
     CHECK(sv(c, 0x21, 0x0fff, 0, 0, 0) == IPC_R_BAD_HANDLE, "SendSyncRequest on a bad handle");
     if (audren) probe_renderer(c, audren);
+    // csrng: GenerateRandomBytes into a B buffer, as the SDK sends it; two requests give different bytes
+    uint32_t csrng = get_service(c, sm, "csrng", 0);
+    uint8_t *rnd = mem_kernel_alloc(64, 16);
+    memset(rnd, 0, 64);
+    for (int i = 0; csrng && i < 2; i++) {
+        Msg q = {.type = T_REQUEST, .cmd = 0, .nb = 1, .b[0] = {(uint64_t)(uintptr_t)(rnd + 32 * i), 32, 0}};
+        k = call(c, csrng, &q, &r);
+        CHECK(!k && !r.result, "csrng GenerateRandomBytes: kernel %#x result %#x", k, r.result);
+    }
+    static const uint8_t zero[32];
+    CHECK(memcmp(rnd, zero, 32) && memcmp(rnd + 32, zero, 32) && memcmp(rnd, rnd + 32, 32),
+          "csrng: the buffers were not filled with random bytes");
+    printf("csrng: GenerateRandomBytes filled two buffers of 32 bytes, each differently\n");
+    mem_kernel_free(rnd, 64);
+    CHECK(!csrng || !close_handle(c, csrng), "close csrng");
     CHECK(!close_handle(c, audren) && !close_handle(c, sm), "close audren:u and sm:");
     printf("sessions alive at the end: %ld, released %llu\n", ipc_sessions_live(),
            (unsigned long long)ipc_sessions_released());

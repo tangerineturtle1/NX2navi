@@ -13,6 +13,16 @@ DEFAULTS = {
     'hide_while_playing': True,   # hide the window while the game runs, show it again when it exits
     'keep_cache': True,           # keep build-cache/ (the lift and objects) so an update recompiles only changes
     'desktop_shortcut': True,
+    'save_export_dir': '',        # where Saves > Export Save writes its zip; empty: the Downloads folder
+    'export_with_log': True,      # Export Save adds the game's latest log and nx2navi.ini (for a bug report)
+    'theme': 'forest',            # the colour scheme (launcher/ui/art.py THEMES)
+    'custom_background': '',      # the Custom scheme's backdrop colour, #rrggbb; empty: the first scheme's
+    'custom_panel': '',           # the Custom scheme's colour of the panels and the title band
+    'custom_buttons': '',         # the Custom scheme's colour of the buttons
+    'background': '',             # the picture the player chose as the background; its fitted copy is data/background.npy
+    'background_dim': 40,         # how much that picture is darkened, in percent
+    'animations': True,           # the cursor glides, screens slide in, sparks drift, Navi bobs
+    'sounds': 'low',              # the game's select and back sounds: off, low (sound.py DEFAULT_LEVEL), medium, high
     'feed_repo': '',              # owner/name overriding feed.json, for testing a fork's releases
     'github_token': '',           # only for a private release repository; stored as plain text
     'last_check': 0.0,

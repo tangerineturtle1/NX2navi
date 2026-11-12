@@ -1,9 +1,11 @@
 // NX2NAVI_FLIGHT=1 flight recorder: a ring of the last NX2NAVI_FLIGHT_FRAMES (600) presents, one record each (interval,
-// render-thread blocked time per perf kind, event counts) and a 320x180 thumbnail each (gfx_present.c, blitted on the
-// GPU by the present thread). A dump goes to <dir>/<YYYYMMDD-HHMMSS>-f<frame>/: frames.tsv and f<frame>.png per
-// thumbnail, written by a background thread. Triggers: F8 while the game window has focus, a frame interval over
-// NX2NAVI_FLIGHT_SPIKE_MS (100; 0 off; at most one dump per 10 s), and NX2NAVI_FLIGHT_AT=<frame>[,<frame>...]. A dump holds
-// the frames up to FLIGHT_POST presents after the trigger, so the aftermath is in it too. tools/flight_view.py reads it.
+// render-thread blocked time per perf kind, event counts, the game's time step) and a 320x180 thumbnail each (gfx_present.c, blitted on the
+// GPU by the present thread). A dump goes to <dir>/<YYYYMMDD-HHMMSS>-f<frame>/: events.tsv (the texture events of its
+// frames, flight_tex), f<frame>.png per thumbnail and frames.tsv, written in that order by a background thread. Triggers: F8 while the game window has focus, a frame interval over
+// NX2NAVI_FLIGHT_SPIKE_MS (100; 0 off; at most one dump per 10 s), NX2NAVI_FLIGHT_AT=<frame>[,<frame>...] and
+// NX2NAVI_FLIGHT_EVERY=<n> (every n-th frame: with n under the ring's length the dumps of a run hold every frame of it
+// but the last n). A dump holds the frames up to FLIGHT_POST presents after the trigger, so the aftermath is in it
+// too. tools/flight_view.py reads it.
 //
 // Records come from perf_present (prof_win.c) on the render thread; the counts are differences of the NX2NAVI_TRACE=perf
 // running totals and of vk_exec_frame. Off, the only cost is the flight_on branch in perf_present and vk_backend.c.
@@ -36,13 +38,26 @@ _Static_assert(PERF_CNT_N == 12, "count_names follows the PERF_CNT_* list");
 typedef struct {
     uint64_t frame, t_ns;
     uint32_t interval_us, blocked_us[PERF_N], n[C_N];
+    float step_page, step_game;   // frame_step_flight: the step in 60 Hz frames on the patch page and in the game
+    uint64_t guest_presents;      // the game's presents so far, which the two steps belong to
 } Rec;
+
+// A texture event (flight_tex). seq is the event's index + 1 once it is written, 0 while a writer fills the slot, so
+// the copy start_dump takes leaves out a slot that is being written or was reused meanwhile.
+typedef struct {
+    uint64_t seq, frame, addr;
+    uint32_t kind, format, w, h, layers, flags, detail, us;
+} TexEv;
+#define TEX_RING (1u << 18)            // events kept: 14 MiB; an area load makes a few thousand in one frame
 
 typedef struct {
     int n;                      // records, oldest first
     uint64_t trig_frame, trig_interval_us;
     const char *why;
     char dir[PLAT_PATH_MAX];
+    TexEv *ev;                  // the texture events of the records' frames, oldest first
+    size_t nev;
+    uint64_t ev_from;           // the first frame with all its events kept, when the ring had dropped earlier ones; 0 all
     Rec r[];
 } DumpJob;
 
@@ -53,12 +68,14 @@ static uint64_t recorded;          // records written so far
 static uint64_t spike_ns, t0_ns;
 static uint64_t dump_at, trig_frame, trig_interval_us, last_spike_ns;
 static const char *trig_why;
-static uint64_t at_frames[16];
+static uint64_t at_frames[16], every;
 static int n_at;
 static char base_dir[PLAT_PATH_MAX];
 static uint64_t prev_cnt[PERF_CNT_N], prev_xlated;
 static VkExecFrame prev_exec;
 static volatile uint64_t cost_ns, cost_max_ns;   // render-thread time in flight_frame, for the dump log line
+static TexEv *tex_ring;
+static volatile uint64_t tex_n;    // texture events written so far
 
 static unsigned env_u(const char *name, unsigned def) {
     const char *e = cfg_get(name);
@@ -79,6 +96,7 @@ void flight_init(void) {
         at_frames[n_at++] = f;
         p = *end == ',' ? end + 1 : end;
     }
+    every = env_u("NX2NAVI_FLIGHT_EVERY", 0);
     const char *d = cfg_get("NX2NAVI_FLIGHT_DIR");
     char tmp[PLAT_PATH_MAX];
     if (d && *d) snprintf(tmp, sizeof tmp, "%s", d);
@@ -90,6 +108,7 @@ void flight_init(void) {
     if (!plat_full_path(tmp, base_dir, sizeof base_dir)) snprintf(base_dir, sizeof base_dir, "%s", tmp);
     thumbs_on = env_u("NX2NAVI_FLIGHT_THUMBS", 1) != 0;
     if (thumbs_on) vk_thumbs_enable(ring_n);
+    if (!(tex_ring = calloc(TEX_RING, sizeof *tex_ring))) rt_log("flight: no memory for the texture events, none kept");
     flight_on = 1;
     rt_log("flight: on: last %d frames, %s; dump on F8, on a frame over %llu ms (one per 10 s)%s, to %s", ring_n,
            thumbs_on ? "thumbnails 320x180" : "no thumbnails", (unsigned long long)(spike_ns / 1000000),
@@ -98,6 +117,80 @@ void flight_init(void) {
         rt_log("flight: memory: records %llu KB, thumbnail ring %llu MB (host-visible)",
                (unsigned long long)((size_t)ring_n * sizeof *ring >> 10),
                (unsigned long long)((uint64_t)ring_n * FLIGHT_THUMB_W * FLIGHT_THUMB_H * 4 >> 20));
+}
+
+void flight_tex(int kind, uint64_t addr, uint32_t format, uint32_t w, uint32_t h, uint32_t layers, uint32_t flags,
+                uint32_t detail, uint32_t us) {
+    if (!tex_ring) return;
+    uint64_t i = __atomic_fetch_add(&tex_n, 1, __ATOMIC_RELAXED);
+    TexEv *v = &tex_ring[i % TEX_RING];
+    __atomic_store_n(&v->seq, 0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   // a reader that sees the fields below being written sees seq 0 first
+    // The frame flight_frame records next: gfx_counters.frames counts the presents so far, and the counts of this
+    // present's record (frames.tsv) gather until the next one.
+    v->frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    v->addr = addr;
+    v->kind = (uint32_t)kind, v->format = format, v->w = w, v->h = h, v->layers = layers, v->flags = flags;
+    v->detail = detail, v->us = us;
+    __atomic_store_n(&v->seq, i + 1, __ATOMIC_RELEASE);
+}
+
+// The texture events from frame `first` on, oldest first, into j (render thread, at the dump's start).
+static void copy_events(DumpJob *j, uint64_t first) {
+    j->ev = NULL, j->nev = 0, j->ev_from = 0;
+    if (!tex_ring) return;
+    uint64_t end = __atomic_load_n(&tex_n, __ATOMIC_ACQUIRE), beg = end > TEX_RING ? end - TEX_RING : 0;
+    if (end == beg || !(j->ev = malloc(sizeof *j->ev * (size_t)(end - beg)))) return;
+    int dropped = beg > 0;   // the ring has wrapped: events older than the oldest kept one are gone
+    for (uint64_t i = beg; i < end; i++) {
+        const TexEv *v = &tex_ring[i % TEX_RING];
+        if (__atomic_load_n(&v->seq, __ATOMIC_ACQUIRE) != i + 1) continue;
+        TexEv c = *v;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&v->seq, __ATOMIC_RELAXED) != i + 1) continue;   // reused while it was copied
+        if (dropped) {   // the oldest kept event's frame may have lost earlier events of its own: from the next one on
+            if (c.frame >= first) j->ev_from = c.frame + 1;
+            dropped = 0;
+        }
+        if (c.frame >= first) j->ev[j->nev++] = c;
+    }
+}
+
+static const char *const tex_kind_names[FLIGHT_TEX_N] = {"new", "up", "reup", "release", "takeback", "drop"};
+
+// <dir>/events.tsv: one line per texture event of the dump's frames (flight_tex).
+static void write_events(const DumpJob *j) {
+    char path[PLAT_PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s/events.tsv", j->dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        rt_log("flight: cannot write %s", path);
+        return;
+    }
+    fprintf(f, "# nx2navi flight dump texture events: frames %llu-%llu",
+            (unsigned long long)j->r[0].frame, (unsigned long long)j->r[j->n - 1].frame);
+    if (j->ev_from) fprintf(f, "; the ring kept all events from frame %llu on only", (unsigned long long)j->ev_from);
+    fprintf(f, "\nframe\tevent\taddr\tformat\twidth\theight\tlayers\tflags\tdetail\tus\n");
+    for (size_t i = 0; i < j->nev; i++) {
+        const TexEv *e = &j->ev[i];
+        if (e->frame > j->r[j->n - 1].frame) break;
+        char fl[64];
+        int k = 0;
+        fl[0] = 0;
+        static const char *const flag_names[] = {"depth", "stencil", "mirrored", "bound", "astc", "gpu"};
+        for (int b = 0; b < 6; b++)
+            if (e->flags & 1u << b) k += snprintf(fl + k, sizeof fl - (size_t)k, "%s%s", k ? "," : "", flag_names[b]);
+        char detail[160];
+        if (e->kind == FLIGHT_TEX_NEW) snprintf(detail, sizeof detail, "%s", vk_texture_start_name((int)e->detail));
+        else if (e->kind == FLIGHT_TEX_DROP) snprintf(detail, sizeof detail, "%s", vk_texture_drop_name((int)e->detail));
+        else if (e->kind == FLIGHT_TEX_UP || e->kind == FLIGHT_TEX_REUP)
+            snprintf(detail, sizeof detail, "%u WriteTexels", e->detail);
+        else detail[0] = 0;
+        fprintf(f, "%llu\t%s\t%#llx\t%#x\t%u\t%u\t%u\t%s\t%s\t%u\n", (unsigned long long)e->frame,
+                e->kind < FLIGHT_TEX_N ? tex_kind_names[e->kind] : "?", (unsigned long long)e->addr, e->format, e->w,
+                e->h, e->layers, fl, detail, e->us);
+    }
+    fclose(f);
 }
 
 // ---------------------------------------------------------------- PNG (RGB, Paeth rows, fixed-Huffman deflate)
@@ -232,9 +325,10 @@ static void dump_main(void *arg) {
     plat_file_mkdir_p(j->dir);
     if (!plat_dir_exists(j->dir)) {
         rt_log("flight: cannot create %s", j->dir);
-        free(j);
+        free(j->ev), free(j);
         return;
     }
+    write_events(j);   // first: it takes a moment, the thumbnails seconds, and a game closed meanwhile keeps it
     uint8_t *have = calloc((size_t)j->n, 1);
     int n_thumbs = 0;
     if (thumbs_on && have) {
@@ -265,7 +359,7 @@ static void dump_main(void *arg) {
     FILE *f = fopen(path, "w");
     if (!f) {
         rt_log("flight: cannot write %s", path);
-        free(have), free(j);
+        free(have), free(j->ev), free(j);
         return;
     }
     fprintf(f, "# nx2navi flight dump: %s at frame %llu, interval %.1f ms\n", j->why, (unsigned long long)j->trig_frame,
@@ -273,21 +367,23 @@ static void dump_main(void *arg) {
     fprintf(f, "frame\tt_ms\tinterval_ms");
     for (int k = 0; k < PERF_N; k++) fprintf(f, "\t%s", blocked_names[k]);
     for (int k = 0; k < C_N; k++) fprintf(f, "\t%s", count_names[k]);
-    fprintf(f, "\tthumb\n");
+    fprintf(f, "\tstep_frames\tgame_step_frames\tguest_presents\tthumb\n");
     for (int i = 0; i < j->n; i++) {
         const Rec *r = &j->r[i];
         fprintf(f, "%llu\t%.1f\t%.2f", (unsigned long long)r->frame, r->t_ns / 1e6, r->interval_us / 1000.0);
         for (int k = 0; k < PERF_N; k++) fprintf(f, "\t%.2f", r->blocked_us[k] / 1000.0);
         for (int k = 0; k < C_N; k++) fprintf(f, "\t%u", r->n[k]);
+        fprintf(f, "\t%.4f\t%.4f\t%llu", r->step_page, r->step_game, (unsigned long long)r->guest_presents);
         fprintf(f, "\t%d\n", have ? have[i] : 0);
     }
     fclose(f);
-    rt_log("flight: dump %s: %s at frame %llu (%.1f ms), frames %llu-%llu, %d thumbnails, written in %llu ms; "
-           "recorder %.1f us per frame (max %.0f us)", j->dir,
+    rt_log("flight: dump %s: %s at frame %llu (%.1f ms), frames %llu-%llu, %d thumbnails, %zu texture events, written "
+           "in %llu ms; recorder %.1f us per frame (max %.0f us)", j->dir,
            j->why, (unsigned long long)j->trig_frame, j->trig_interval_us / 1000.0, (unsigned long long)j->r[0].frame,
-           (unsigned long long)j->r[j->n - 1].frame, n_thumbs, (unsigned long long)(plat_now_ms() - t_start),
+           (unsigned long long)j->r[j->n - 1].frame, n_thumbs, j->nev, (unsigned long long)(plat_now_ms() - t_start),
            recorded ? cost_ns / 1e3 / (double)recorded : 0.0, cost_max_ns / 1e3);
     free(have);
+    free(j->ev);
     free(j);
     return;
 }
@@ -301,11 +397,12 @@ static void start_dump(void) {
     j->trig_interval_us = trig_interval_us;
     j->why = trig_why;
     for (int i = 0; i < n; i++) j->r[i] = ring[(recorded - (uint64_t)n + (uint64_t)i) % (uint64_t)ring_n];
+    copy_events(j, j->r[0].frame);
     struct tm st;
     plat_local_time(&st);
     snprintf(j->dir, sizeof j->dir, "%s/%04d%02d%02d-%02d%02d%02d-f%llu", base_dir, st.tm_year + 1900, st.tm_mon + 1,
              st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec, (unsigned long long)trig_frame);
-    if (!plat_thread_spawn(dump_main, j, "flight dump", 0)) rt_log("flight: cannot start the dump thread"), free(j);
+    if (!plat_thread_spawn(dump_main, j, "flight dump", 0)) rt_log("flight: cannot start the dump thread"), free(j->ev), free(j);
 }
 
 static void trigger(uint64_t frame, uint64_t interval_ns, const char *why) {
@@ -346,6 +443,7 @@ void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const u
         r->n[C_PERF0 + k] = (uint32_t)(v - prev_cnt[k]);
         prev_cnt[k] = v;
     }
+    frame_step_flight(&r->step_page, &r->step_game, &r->guest_presents);
     recorded++;
 
     static int key_was;
@@ -354,6 +452,7 @@ void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const u
     key_was = key;
     for (int i = 0; i < n_at; i++)
         if (at_frames[i] == frame) trigger(frame, interval_ns, "NX2NAVI_FLIGHT_AT");
+    if (every && frame && frame % every == 0) trigger(frame, interval_ns, "NX2NAVI_FLIGHT_EVERY");
     if (spike_ns && interval_ns > spike_ns && recorded > 30 && (!last_spike_ns || now_ns - last_spike_ns >= FLIGHT_SPIKE_GAP_NS)) {
         if (!dump_at) last_spike_ns = now_ns;
         trigger(frame, interval_ns, "spike");

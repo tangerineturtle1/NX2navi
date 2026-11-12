@@ -24,6 +24,7 @@ __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
 __attribute__((weak)) void prof_commit_census(uint64_t frame) { (void)frame; }
 __attribute__((weak)) void mem_guest_census(uint64_t frame) { (void)frame; }
+__attribute__((weak)) void mem_lazy_heap_report(uint64_t frame) { (void)frame; }
 
 // NX2NAVI_TRACE=perf, NX2NAVI_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
 // (frame-time summary). perf_base: the part fixed at start.
@@ -118,6 +119,236 @@ void perf_count(int kind) {
     if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_inc64(&counts[kind]);
 }
 
+// ---- NX2NAVI_TRACE=perf work marks (host.h PERF_M_*): any thread adds; the present takes the frame's sums (mark_frame),
+// names them on a slow frame's line and adds them to the 60-frame window's line.
+static const char *const mark_name[PERF_M_N] = {"file reads", "zstd decodes", "pipeline creates", "guest memory maps",
+                                                "pool init/finalize", "device memory allocations",
+                                                "DLSS feature creates"};
+static volatile int64_t mk_ns[PERF_M_N], mk_n[PERF_M_N], mk_bytes[PERF_M_N], mk_max[PERF_M_N];   // since the last present
+typedef struct { uint64_t ns[PERF_M_N], n[PERF_M_N], bytes[PERF_M_N], max[PERF_M_N]; } MarkSums;
+static MarkSums mk_win;   // the 60-frame window's, present thread only
+
+uint64_t perf_mark_begin(void) { return (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0; }
+
+void perf_mark_add(int kind, uint64_t ns, uint64_t bytes) {
+    if (!(rt_trace & RT_TRACE_PERF) || (unsigned)kind >= PERF_M_N) return;
+    plat_add64(&mk_ns[kind], (int64_t)ns);
+    plat_inc64(&mk_n[kind]);
+    plat_add64(&mk_bytes[kind], (int64_t)bytes);
+    int64_t m = __atomic_load_n(&mk_max[kind], __ATOMIC_RELAXED);
+    while ((int64_t)ns > m && !__atomic_compare_exchange_n(&mk_max[kind], &m, (int64_t)ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+void perf_mark_end(int kind, uint64_t t0, uint64_t bytes) {
+    if (t0) perf_mark_add(kind, kern_now_ns() - t0, bytes);
+}
+
+// Takes the sums since the last present into *f and adds them to the window.
+static void mark_frame(MarkSums *f) {
+    for (int k = 0; k < PERF_M_N; k++) {
+        f->ns[k] = (uint64_t)plat_xchg64(&mk_ns[k], 0), f->n[k] = (uint64_t)plat_xchg64(&mk_n[k], 0);
+        f->bytes[k] = (uint64_t)plat_xchg64(&mk_bytes[k], 0), f->max[k] = (uint64_t)plat_xchg64(&mk_max[k], 0);
+        mk_win.ns[k] += f->ns[k], mk_win.n[k] += f->n[k], mk_win.bytes[k] += f->bytes[k];
+        if (f->max[k] > mk_win.max[k]) mk_win.max[k] = f->max[k];
+    }
+}
+
+// "; on any thread: file reads 12.3 ms (40, 5.1 MiB, longest 2.0 ms), ..." for the kinds with work, appended at line + n.
+// Device memory allocations carry no time.
+static int mark_text(const MarkSums *s, char *line, int n, size_t cap) {
+    int any = 0;
+    for (int k = 0; k < PERF_M_N && n >= 0 && n < (int)cap - 100; k++) {
+        if (!s->n[k]) continue;
+        n += snprintf(line + n, cap - (size_t)n, "%s %s", any ? "," : "; on any thread:", mark_name[k]);
+        if (k == PERF_M_DEVMEM)
+            n += snprintf(line + n, cap - (size_t)n, " %llu (%.1f MiB)", (unsigned long long)s->n[k], s->bytes[k] / 1048576.0);
+        else
+            n += snprintf(line + n, cap - (size_t)n, " %.1f ms (%llu, %.1f MiB, longest %.1f ms)", s->ns[k] / 1e6,
+                          (unsigned long long)s->n[k], s->bytes[k] / 1048576.0, s->max[k] / 1e6);
+        any = 1;
+    }
+    return n;
+}
+
+// ---- NX2NAVI_TRACE=perf segments (host.h perf_segment) and scenes (perf_scene). The present thread keeps the running
+// segment's frame times in 50 us bins (SEG_BINS, up to 204.8 ms; slower frames land in the last bin, the worst is kept
+// apart), so a segment's 1% low is exact to 50 us at any frame rate. perf_segment and perf_scene come from any thread
+// (the input script's guest thread, the game's loading threads) and leave a request under seg_lock for the present.
+#define SEG_BINS 4096
+#define SEG_BIN_NS 50000ull
+#define SCENE_SETTLE_NS 10000000000ull
+static PlatMutex seg_lock = PLAT_MUTEX_INIT;
+static char seg_next[96], scene_name[256];   // seg_lock: the requested segment's name; the areas loaded since the last snapshot
+static int seg_asked;                          // seg_lock: a segment was asked for
+static uint64_t scene_at;                      // seg_lock: the last area load (plat_now_ns), 0 none since the last snapshot
+static struct {
+    char name[96];
+    uint64_t f0, t0, frames, sum, max, max_frame, over25, over50, over100;
+    int64_t w0;
+    uint32_t hist[SEG_BINS];
+    MarkSums marks;
+    int on;
+} seg;
+
+__attribute__((weak)) void vk_mem_snapshot(uint64_t frame) { (void)frame; }
+
+// ---- "mem: sizes" lines (host.h PerfSizes): one line per group; a line that grows past the log's line size goes out
+// and the group goes on in the next.
+#define SIZES_WEAK(f) __attribute__((weak)) void f(PerfSizes *s) { (void)s; }
+SIZES_WEAK(mem_sizes) SIZES_WEAK(kern_sizes) SIZES_WEAK(setjmp_sizes) SIZES_WEAK(fs_host_sizes) SIZES_WEAK(romfs_sizes)
+SIZES_WEAK(zstd_sizes) SIZES_WEAK(cfg_sizes) SIZES_WEAK(vk_mem_sizes) SIZES_WEAK(vk_gpa_sizes) SIZES_WEAK(vk_texture_sizes)
+SIZES_WEAK(vk_exec_sizes) SIZES_WEAK(vk_sync_sizes) SIZES_WEAK(vk_usnap_sizes) SIZES_WEAK(nvn_cmd_sizes)
+SIZES_WEAK(vk_pipeline_sizes) SIZES_WEAK(gfx_shader_sizes)
+
+static void sizes_flush(PerfSizes *s) {
+    if (s->n > 0) rt_log("mem: sizes frame %llu, %s:%s", (unsigned long long)s->frame, s->group, s->line);
+    s->n = 0, s->line[0] = 0;
+}
+
+void perf_size(PerfSizes *s, const char *name, uint64_t count, uint64_t limit, uint64_t bytes) {
+    if (s->n > (int)sizeof s->line - 120) sizes_flush(s);
+    int n = snprintf(s->line + s->n, sizeof s->line - (size_t)s->n, " %s", name);
+    if (count != PERF_SIZE_NONE) n += snprintf(s->line + s->n + n, sizeof s->line - (size_t)(s->n + n), " %llu", (unsigned long long)count);
+    if (limit) n += snprintf(s->line + s->n + n, sizeof s->line - (size_t)(s->n + n), "/%llu", (unsigned long long)limit);
+    if (bytes != PERF_SIZE_NONE)
+        n += snprintf(s->line + s->n + n, sizeof s->line - (size_t)(s->n + n), "%s%.1f MiB", count != PERF_SIZE_NONE ? ", " : " ",
+                      bytes / 1048576.0);
+    n += snprintf(s->line + s->n + n, sizeof s->line - (size_t)(s->n + n), ";");
+    if (n > 0 && s->n + n < (int)sizeof s->line) s->n += n;
+    else s->line[s->n] = 0;
+}
+
+static void sizes_log(uint64_t frame) {
+    static const struct { const char *group; void (*fn[7])(PerfSizes *); } groups[] = {
+        {"guest memory, kernel, files and settings", {mem_sizes, kern_sizes, setjmp_sizes, fs_host_sizes, romfs_sizes, zstd_sizes, cfg_sizes}},
+        {"GPU memory and textures", {vk_mem_sizes, vk_gpa_sizes, vk_texture_sizes}},
+        {"replay and submission", {vk_exec_sizes, vk_sync_sizes, vk_usnap_sizes, nvn_cmd_sizes}},
+        {"pipelines and shaders", {vk_pipeline_sizes, gfx_shader_sizes}},
+    };
+    PerfSizes s;
+    for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {
+        s.n = 0, s.line[0] = 0, s.frame = frame, s.group = groups[g].group;
+        for (int i = 0; i < 7 && groups[g].fn[i]; i++) groups[g].fn[i](&s);
+        sizes_flush(&s);
+    }
+}
+
+// The memory lines of a segment's end or a settled scene: the back end's (vk_mem_snapshot), then the sizes.
+static void mem_snapshot(uint64_t frame) {
+    vk_mem_snapshot(frame);
+    sizes_log(frame);
+}
+__attribute__((weak)) int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
+    (void)used, (void)budget, (void)exact;
+    return 0;
+}
+
+// The world clock as the segment and scene lines give it: seconds, or "-" before the loaded save's first frame.
+static const char *wtxt(int64_t w, char *b) {
+    if (w < 0) return "-";
+    snprintf(b, 24, "%.1f", w / 1e6);
+    return b;
+}
+
+void perf_segment(const char *name) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    plat_mutex_lock(&seg_lock);
+    snprintf(seg_next, sizeof seg_next, "%s", name && *name ? name : "(unnamed)");
+    seg_asked = 1;
+    plat_mutex_unlock(&seg_lock);
+}
+
+void perf_scene(const char *name) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    char wb[24];
+    rt_log("scene: %s loads (frame %llu, world %s s)", name,
+           (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), wtxt(frame_step_world_us(), wb));
+    plat_mutex_lock(&seg_lock);
+    size_t n = strlen(scene_name);
+    if (n + strlen(name) + 2 < sizeof scene_name) snprintf(scene_name + n, sizeof scene_name - n, "%s%s", n ? ", " : "", name);
+    scene_at = plat_now_ns();
+    plat_mutex_unlock(&seg_lock);
+}
+
+// The process's memory and the VRAM in use, for the segment and scene lines.
+static void mem_text(char *out, size_t cap, int vram) {
+    uint64_t res, prv, used, budget;
+    int exact;
+    plat_process_memory(&res, &prv);
+    int n = snprintf(out, cap, "ram working set %.0f MiB, private %.0f MiB", res / 1048576.0, prv / 1048576.0);
+    if (vram && vk_mem_vram(&used, &budget, &exact) && n > 0 && (size_t)n < cap)
+        snprintf(out + n, cap - (size_t)n, "; vram %.0f of %.0f MiB", used / 1048576.0, budget / 1048576.0);
+}
+
+static void seg_close(uint64_t frame, uint64_t now, int at_exit) {
+    if (!seg.on) return;
+    seg.on = 0;
+    char mem[160], marks[700];
+    mem_text(mem, sizeof mem, !at_exit);
+    marks[0] = 0;
+    mark_text(&seg.marks, marks, 0, sizeof marks);
+    if (!seg.frames || !seg.sum) {
+        rt_log("segment: '%s' ended at frame %llu with no frames timed; %s", seg.name, (unsigned long long)frame, mem);
+        return;
+    }
+    uint64_t cut = (seg.frames + 99) / 100, acc = 0, low = 0;   // the slowest 1% of frames: the upper edge of its bin
+    for (int b = SEG_BINS - 1; b >= 0; b--)
+        if ((acc += seg.hist[b]) >= cut) { low = (uint64_t)(b + 1) * SEG_BIN_NS; break; }
+    if (low > seg.max) low = seg.max;
+    char w0[24], w1[24];
+    rt_log("segment: '%s' frames %llu-%llu, world %s to %s s: %llu frames in %.1f s, mean %.2f ms (%.1f fps), 1%% low %.1f "
+           "fps (%.2f ms), worst %.1f ms at frame %llu; over 25 ms %llu, 50 ms %llu, 100 ms %llu; %s%s",
+           seg.name, (unsigned long long)seg.f0, (unsigned long long)frame, wtxt(seg.w0, w0), wtxt(frame_step_world_us(), w1),
+           (unsigned long long)seg.frames, (now - seg.t0) / 1e9, seg.sum / 1e6 / seg.frames, seg.frames * 1e9 / seg.sum,
+           low ? 1e9 / low : 0.0, low / 1e6, seg.max / 1e6, (unsigned long long)seg.max_frame,
+           (unsigned long long)seg.over25, (unsigned long long)seg.over50, (unsigned long long)seg.over100, mem, marks);
+    if (!at_exit) mem_snapshot(frame);
+}
+
+static void seg_open(const char *name, uint64_t frame, uint64_t now) {
+    memset(&seg, 0, sizeof seg);
+    snprintf(seg.name, sizeof seg.name, "%s", name);
+    seg.f0 = frame, seg.t0 = now, seg.w0 = frame_step_world_us(), seg.on = 1;
+}
+
+// Each present while the trace is on: the frame into the running segment (d 0: the first present), then a requested
+// segment change and a settled scene's snapshot.
+static void seg_frame(uint64_t frame, uint64_t now, uint64_t d, const MarkSums *fm) {
+    if (!seg.on && seg.f0 == 0) seg_open("boot", frame, now);   // the first present opens the boot segment
+    if (seg.on && d) {
+        seg.frames++, seg.sum += d;
+        uint64_t b = d / SEG_BIN_NS;
+        seg.hist[b < SEG_BINS ? b : SEG_BINS - 1]++;
+        if (d > seg.max) seg.max = d, seg.max_frame = frame;
+        seg.over25 += d > 25000000ull, seg.over50 += d > 50000000ull, seg.over100 += d > 100000000ull;
+        for (int k = 0; k < PERF_M_N; k++) {
+            seg.marks.ns[k] += fm->ns[k], seg.marks.n[k] += fm->n[k], seg.marks.bytes[k] += fm->bytes[k];
+            if (fm->max[k] > seg.marks.max[k]) seg.marks.max[k] = fm->max[k];
+        }
+    }
+    char name[96], scenes[256];
+    int asked = 0, settled = 0;
+    plat_mutex_lock(&seg_lock);
+    if (seg_asked) asked = 1, seg_asked = 0, memcpy(name, seg_next, sizeof name);
+    if (scene_at && now - scene_at >= SCENE_SETTLE_NS)
+        settled = 1, scene_at = 0, memcpy(scenes, scene_name, sizeof scenes), scene_name[0] = 0;
+    plat_mutex_unlock(&seg_lock);
+    if (asked) {
+        seg_close(frame, now, 0);
+        seg_open(name, frame, now);
+        char wb[24];
+        rt_log("segment: '%s' starts at frame %llu, world %s s", name, (unsigned long long)frame, wtxt(seg.w0, wb));
+    }
+    if (settled) {
+        char mem[160];
+        mem_text(mem, sizeof mem, 1);
+        char wb[24];
+        rt_log("scene: %s settled (no area loaded for 10 s) at frame %llu, world %s s; %s", scenes,
+               (unsigned long long)frame, wtxt(frame_step_world_us(), wb), mem);
+        mem_snapshot(frame);
+    }
+}
+
 // ---- Frame-time summary, always on: every 60 s of play and at exit one line of frame count, mean fps, 1% low and the
 // frames over 25/50/100 ms, then the worst frames of the period with the render thread's waits in them. Per frame: a
 // histogram increment, the compare against the worst list, a memset of the wait array. No allocation.
@@ -133,6 +364,9 @@ typedef struct {
 // What a frame over 25 ms spent its time on, so a count of slow frames says where to look instead of only that they
 // happened. A frame is charged to the largest part when that part is at least a quarter of it, and to "unattributed"
 // otherwise - the part of a slow frame none of the recorded waits explains (the GPU, or a stall outside them).
+// The replay's part is its time without the pipeline, translation and texture waits, which all happen inside it: with
+// them in, every frame that waited 900 ms for a pipeline was charged to "replay", the larger number, and a log
+// could not tell a pipeline stall from a slow replay.
 enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_REPLAY, FT_C_OTHER, FT_C_N };
 static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "replay",
                                                    "unattributed" };
@@ -344,6 +578,7 @@ __attribute__((weak)) void gfx_exit_log(void) {}
 __attribute__((weak)) void vk_texstat_frame(uint64_t frame, uint64_t d) { (void)frame, (void)d; }
 
 void perf_summary_flush(void) {   // at exit (prof_write)
+    if (rt_trace & RT_TRACE_PERF) seg_close(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), kern_now_ns(), 1);
     if (summary_t0) {
         ft_report(kern_now_ns(), "exit");
         gfx_exit_log();
@@ -380,7 +615,9 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         part[FT_C_TEX] = frame_ns[PERF_TEX];
         part[FT_C_FENCE] = frame_ns[PERF_FENCE] + frame_ns[PERF_DRAIN];
         part[FT_C_PACE] = frame_ns[PERF_PACE];
-        part[FT_C_REPLAY] = (uint64_t)rep > 0 ? (uint64_t)rep : 0;
+        part[FT_C_REPLAY] = rep > 0 ? (uint64_t)rep : 0;
+        uint64_t inside = part[FT_C_PIPE] + part[FT_C_XLATE] + part[FT_C_TEX];   // waits on the replay thread
+        part[FT_C_REPLAY] = part[FT_C_REPLAY] > inside ? part[FT_C_REPLAY] - inside : 0;
         uint64_t known = 0;
         for (int c = 0; c < FT_C_OTHER; c++) known += part[c];
         part[FT_C_OTHER] = d > known ? d - known : 0;
@@ -451,6 +688,7 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
     if (census_on && (frame % 3600 == 0 || prv >= census_prv + (1ull << 30)))
         prof_commit_census(frame), mem_guest_census(frame), census_prv = prv;
+    mem_lazy_heap_report(frame);
     if (g.have_gpu && g.have_idle)
         rt_log("perf: frame %llu: gpu idle per frame %.2f ms between timed parts: %.2f ms waiting for the next submission, "
                "%.2f ms with it queued (untimed work or waits); %.1f gaps over 0.5 ms, longest %.2f ms; submit to start avg %.2f ms",
@@ -482,23 +720,60 @@ int rt_knob(const char *name, const char *def) {
 // render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
 // it with the A/B blocks. Off by default until measured here; the same rule
 // is reported to give +4-10% on an 8-core SMT CPU.
+//
+// NX2NAVI_CACHE_DIE=1, the default: on a processor whose dies have L3 caches of different sizes (AMD's two-die
+// X3D processors, 3D V-Cache on one die) the process runs on the die with the larger cache, so the guest cores, the
+// render thread and the recorder share one L3 and never cross dies. Windows' own placement of games on that die
+// (game mode with AMD's driver) depends on recognizing the exe as a game. 0 leaves the placement to the OS; "ab"
+// switches it with the A/B blocks. No change on one-die and Intel processors.
+//
+// The placement is set at start (perf_cpu_start, before the thread pools count the usable processors) and checked at
+// every present for the A/B switches. The rules narrow the processors the process was given (start /affinity, a
+// launcher's or a benchmark's pin), never widen them; with both off nothing is set.
+static int one_mode = -1, die_mode;
+static uint64_t cpu_all, cpu_one, cpu_die, cpu_applied;   // cpu_applied: the mask set last, 0 none
+
 static void cpu_placement(void) {
-    static int mode = -1, applied = -1;
-    static uint64_t all, one;
-    if (mode < 0) {
-        mode = rt_knob("ONE_PER_CORE", "0");
-        int cores = plat_cpu_cores(&all, &one);
-        if (mode && one && one != all)
-            rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(all),
-                   mode == 2 ? " in the B blocks" : "");
+    if (one_mode < 0) {
+        one_mode = rt_knob("ONE_PER_CORE", "0");
+        die_mode = rt_knob("CACHE_DIE", "1");
+        int cores = plat_cpu_cores(&cpu_all, &cpu_one);
+        uint32_t kb = 0;
+        cpu_die = plat_cpu_cache_die(&kb);
+        if (one_mode && cpu_one && cpu_one != cpu_all)
+            rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(cpu_all),
+                   one_mode == 2 ? " in the B blocks" : "");
         else
-            mode = 0;
+            one_mode = 0;
+        // The largest L3 is a reason to stay on its processors only where it serves enough cores to run the game: two
+        // dies of one design, one of them with stacked cache (a two-die X3D desktop part, 8 cores a die). A die of
+        // fewer cores holds the game to them: the 4 large cores of a mobile part whose 8 small cores share a smaller
+        // L3, or the 6 of a 12-core X3D part, where the recording thread's own core (vk_exec.c rec_claim) left 5.
+        int die_cores = __builtin_popcountll(cpu_die & cpu_one);
+        if (cpu_die && cpu_die != cpu_all && die_cores < 8) {
+            rt_log("cpu: logical processors %#llx of %#llx share the largest L3 cache (%u MiB), but only %d cores: not "
+                   "used", (unsigned long long)cpu_die, (unsigned long long)cpu_all, kb >> 10, die_cores);
+            cpu_die = 0;
+        }
+        if (cpu_die && cpu_die != cpu_all)
+            rt_log("cpu: logical processors %#llx of %#llx share the largest L3 cache (%u MiB)%s",
+                   (unsigned long long)cpu_die, (unsigned long long)cpu_all, kb >> 10,
+                   !die_mode ? "; cache_die = 0: not used" : die_mode == 2 ? ": the process runs there in the B blocks"
+                                                                          : ": the process runs there");
+        if (!cpu_die || cpu_die == cpu_all) die_mode = 0;
     }
-    int on = RT_KNOB_ON(mode);
-    if (on == applied) return;
-    applied = on;
-    plat_process_affinity(on ? one : all);
+    uint64_t want = cpu_all;
+    if (RT_KNOB_ON(die_mode)) want &= cpu_die;
+    if (RT_KNOB_ON(one_mode)) want &= cpu_one;
+    if (!want) want = cpu_all;
+    if (want == (cpu_applied ? cpu_applied : cpu_all)) return;   // nothing new; never restricted: as it was given
+    cpu_applied = want;
+    if (!plat_process_affinity(want)) rt_log("cpu: could not move the process to logical processors %#llx", (unsigned long long)want);
 }
+
+void perf_cpu_start(void) { cpu_placement(); }
+
+int perf_cpu_on_cache_die(void) { return cpu_applied && cpu_die && (cpu_applied & ~cpu_die) == 0; }
 
 // NX2NAVI_CRASH_FILTER_GUARD (default 1; 0 off): once a second, the crash report's last-chance exception filter is put
 // back if a DLL loaded after the start (a GPU driver, an overlay) set its own in its place. Without it, a fault in such
@@ -515,6 +790,21 @@ static void crash_filter_guard(uint64_t frame) {
     }
 }
 
+// A thread the recording thread starts through a library inherits its reserved core, and the core would stay reserved
+// after the recording thread ended (plat_cpu_reserve_sweep): every RESERVE_SWEEP presents both are put right.
+#define RESERVE_SWEEP 300
+static void reserve_sweep(uint64_t frame) {
+    static int logged;
+    if (frame % RESERVE_SWEEP) return;
+    int n = plat_cpu_reserve_sweep();
+    if (!n || logged >= 8) return;
+    logged++;
+    if (n < 0) rt_log("cpu: frame %llu: the recording thread has ended; its core is open to every thread again",
+                      (unsigned long long)frame);
+    else rt_log("cpu: frame %llu: %d thread%s started from the recording thread had its core alone; now on the other "
+                "processors", (unsigned long long)frame, n, n > 1 ? "s" : "");
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     crash_filter_guard(frame);
@@ -526,6 +816,7 @@ void perf_present(uint64_t frame) {
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     ab_b += rt_ab();
     cpu_placement();
+    reserve_sweep(frame);
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
@@ -540,15 +831,25 @@ void perf_present(uint64_t frame) {
         const char *e = cfg_get("NX2NAVI_PERF_SLOW_MS");
         slow_ns = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 50) * 1000000ull;
     }
+    MarkSums fm;
+    mark_frame(&fm);
+    seg_frame(frame, now, last ? d : 0, &fm);
     if (last) {
         sum += d;
         n++;
         if (d > max) max = d, memcpy(worst_ns, frame_ns, sizeof worst_ns);
-        if (d >= slow_ns)
-            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f",
+        if (d >= slow_ns) {
+            char marks[700];
+            marks[0] = 0;
+            mark_text(&fm, marks, 0, sizeof marks);
+            // drain: the wait for the present thread's previous job; replay: the replays since the last present, the
+            // pipeline, translation and texture waits above included (the rest of a slow frame is the game's own work)
+            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f "
+                   "drain %.1f; replay %.1f%s",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6, frame_ns[PERF_XLATE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6);
+                   frame_ns[PERF_PACE] / 1e6, frame_ns[PERF_DRAIN] / 1e6, rep / 1e6, marks);
+        }
     }
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;
@@ -564,10 +865,14 @@ void perf_present(uint64_t frame) {
     int64_t async = win[PERF_CNT_PIPE_ASYNC], skips = win[PERF_CNT_PIPE_SKIP], up = win[PERF_CNT_TEX_UP];
     int64_t reup = win[PERF_CNT_TEX_REUP], sskip = win[PERF_CNT_SHADER_SKIP], waited = win[PERF_CNT_PIPE_WAIT];
     int64_t oneshot = win[PERF_CNT_ONESHOT_WAIT];
-    uint64_t shader_keys, shader_xlated;
+    uint64_t shader_keys, shader_xlated, disk[3];
+    static uint64_t disk_prev[3];
     gfx_shader_counts(&shader_keys, &shader_xlated);
+    gfx_shader_disk_counts(&disk[0], &disk[1], &disk[2]);
+    uint64_t dwin[3];
+    for (int i = 0; i < 3; i++) dwin[i] = disk[i] - disk_prev[i], disk_prev[i] = disk[i];
     if (n && span)
-        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s",
+        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s; shader disk reads: %llu on the render thread (%.1f ms), %llu by the loaders",
                (unsigned long long)frame, sum / 1e6 / n, max / 1e6, n * 1e9 / sum, 100.0 * wait_ns[PERF_PACE] / span,
                100.0 * wait_ns[PERF_FENCE] / span, 100.0 * wait_ns[PERF_DRAIN] / span,
                100.0 * wait_ns[PERF_PIPE] / span, 100.0 * wait_ns[PERF_XLATE] / span,
@@ -576,9 +881,14 @@ void perf_present(uint64_t frame) {
                worst_ns[PERF_ASTC] / 1e6, worst_ns[PERF_PIPE] / 1e6, worst_ns[PERF_FENCE] / 1e6,
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
-               plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6);
+               plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6,
+               (unsigned long long)dwin[0], dwin[1] / 1e6, (unsigned long long)dwin[2]);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
+    char marks[700];
+    if (mark_text(&mk_win, marks, 0, sizeof marks) > 0) rt_log("perf: frame %llu: work in the window%s", (unsigned long long)frame, marks);
+    memset(&mk_win, 0, sizeof mk_win);
     sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
+    if (frame % 600 == 0) sizes_log(frame);   // beside vk_memory.c's 600-frame memory lines
 }

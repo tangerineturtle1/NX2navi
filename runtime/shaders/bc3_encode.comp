@@ -12,17 +12,23 @@
 // texel that is fully transparent or fully opaque keeps 0 or 255, wherever the source's own block edges fall inside
 // the 4x4 block, and an alpha test keeps the outline of cut-out foliage. Through unpackUnorm4x8 an opaque 255 could
 // come back as 254.99 on a GPU whose division is not exact and be cut to 254 by the conversion to uint.
+//
+// With the specialization constant BC1 true (a pipeline of its own, vk_astc.c bc1_on) the blocks are BC1, for a
+// texture whose every texel is opaque (vk_texture.c "ASTC as BC1"): the colour half alone, as BC1 reads the same
+// four-colour block when c0 > c1, and when c0 == c1 every index is 0 (c0 in BC1's three-colour mode too). The texels
+// are the same as the BC3 block's, at half the size.
 // Compiled to runtime/bc3_encode_spv.h by tools/build_shaders.py; vk_astc.c records the dispatch.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(constant_id = 0) const bool BC1 = false;
 
 layout(std430, set = 0, binding = 0) readonly buffer Texels { uint px[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer Blocks { uvec4 blk[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Blocks { uint blk[]; };   // 4 words a BC3 block, 2 a BC1 one
 
 layout(push_constant) uniform Params {
     uint in_base;    // first texel of slice 0 (index into px)
-    uint out_base;   // first block of slice 0 (uvec4 index into blk)
+    uint out_base;   // first block of slice 0
     uint width, height;
     uint bx;         // blocks per row
     uint bslice;     // blocks per slice
@@ -91,5 +97,12 @@ void main() {
             idx |= code << (2u * i);
         }
     }
-    blk[pc.out_base + id.z * pc.bslice + id.y * pc.bx + id.x] = uvec4(ab.x, ab.y, c0 | c1 << 16, idx);
+    uint o = (pc.out_base + id.z * pc.bslice + id.y * pc.bx + id.x) * (BC1 ? 2u : 4u);
+    if (!BC1) {
+        blk[o] = ab.x;
+        blk[o + 1u] = ab.y;
+        o += 2u;
+    }
+    blk[o] = c0 | c1 << 16;
+    blk[o + 1u] = idx;
 }

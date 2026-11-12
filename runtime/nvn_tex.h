@@ -14,9 +14,11 @@ void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, 
 /* LINEAR_RENDER_TARGET (0x40) uses pitch storage even without LINEAR (0x10).
    NX2NAVI's CPU-loaded water height/mask textures use that flag alone. */
 static inline int nvn_tex_is_linear(const nvn_texdesc *d) { return (d->flags & 0x50) != 0; }
+// computed in 64 bits; a stride past 32 bits (a garbled descriptor) saturates instead of wrapping to a small one
 static inline uint32_t nvn_tex_linear_stride(const nvn_texdesc *d) {
     if (d->stride) return d->stride;
     int bw, bh; int bpb = nvn_fmt_bpb(d->format, &bw, &bh);
-    uint32_t align = (d->flags & 0x40) ? 128 : 32;
-    return (((d->width + bw - 1) / bw) * bpb + align - 1) & ~(align - 1);
+    uint64_t align = (d->flags & 0x40) ? 128 : 32;
+    uint64_t s = ((((uint64_t)d->width + bw - 1) / bw) * bpb + align - 1) & ~(align - 1);
+    return s > UINT32_MAX ? UINT32_MAX : (uint32_t)s;
 }

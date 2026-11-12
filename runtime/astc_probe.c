@@ -7,6 +7,9 @@
 // the BC3 encoder (NX2NAVI_ASTC_BC) into a BC3 image, whose blocks are decoded here and held to error bounds (bc_check).
 // Then cut-out foliage at every footprint (cutout_case): full mip chains of transparent and opaque patches with sharp
 // alpha edges, through the encoder, where alpha 0 and 255 must stay exact and alpha tests keep their outline (cut_check).
+// Every block of both is also put to tex_astc.c astc_block_opaque, which must say what a decode says (opaque_check),
+// and with NX2NAVI_ASTC_BC1 the regions are encoded to BC1 as well: each BC1 block must be the colour half of the BC3
+// block made from the same texels (bc1_check), the four-colour block BC1 decodes alike.
 // Also times one 2048x2048 texture on the CPU (astc_decode_ldr_mt) and on the GPU (wall time of the upload batch).
 #include <math.h>
 #include <stdio.h>
@@ -150,7 +153,7 @@ static int gpu_decode_ar(VkCtx *c, const uint8_t *src, size_t src_bytes, const V
     vmaDestroyBuffer(c->vma, rb, ra), vmaDestroyBuffer(c->vma, ib, ia);
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
-    return ok;
+    return ok > 0;
 }
 
 // The two regions as tight blocks: n0 blocks of level 0, then n1 of level 1.
@@ -205,14 +208,14 @@ enum { MAX_LEVELS = 13 };   // a mip chain of up to 4096 texels a side
 static size_t bc_bytes(uint32_t w, uint32_t h) { return (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16; }
 
 // Mip levels 0 .. levels-1 (w[i] x h[i] texels from the n[i] blocks that follow the previous level's in blk) decoded and
-// encoded to BC3 (NX2NAVI_ASTC_BC) by one vk_astc_record call into a BC3 image; out: its blocks read back level after
-// level, rows of 4x4 blocks. 0 on a Vulkan failure or when nothing was recorded.
+// encoded to BC3 (bc 1, NX2NAVI_ASTC_BC) or BC1 (bc 2) by one vk_astc_record call into an image of that format; out:
+// its blocks read back level after level, rows of 4x4 blocks. 0 on a Vulkan failure or when nothing was recorded.
 static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t *w, const uint32_t *h, int levels,
-                  uint32_t bw, uint32_t bh, int srgb, uint8_t *out) {
+                  uint32_t bw, uint32_t bh, int srgb, int bc, uint8_t *out) {
     Img im;
-    if (levels > MAX_LEVELS ||
-        !make_image(c, w[0], h[0], (uint32_t)levels, srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, &im))
-        return 0;
+    VkFormat f = bc == 2 ? (srgb ? VK_FORMAT_BC1_RGB_SRGB_BLOCK : VK_FORMAT_BC1_RGB_UNORM_BLOCK)
+                         : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
+    if (levels > MAX_LEVELS || !make_image(c, w[0], h[0], (uint32_t)levels, f, &im)) return 0;
     VkAstcRegion ar[MAX_LEVELS];
     VkBufferImageCopy cp[MAX_LEVELS];
     size_t nb = 0, ob = 0;
@@ -220,7 +223,7 @@ static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t 
         ar[i] = (VkAstcRegion){.src = nb * 16, .w = w[i], .h = h[i], .slices = 1, .level = (uint32_t)i};
         cp[i] = (VkBufferImageCopy){.bufferOffset = ob, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)i, 0, 1},
                                     .imageExtent = {w[i], h[i], 1}};
-        nb += n[i], ob += bc_bytes(w[i], h[i]);
+        nb += n[i], ob += bc_bytes(w[i], h[i]) / (bc == 2 ? 2 : 1);
     }
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, ib;
@@ -229,7 +232,7 @@ static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t 
     memcpy(stg, blk, nb * 16);
     to_general(cb, im.img);
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    int ok = vk_astc_record(cb, sb, nb * 16, ar, levels, bw, bh, srgb, 1, im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE);
+    int ok = vk_astc_record(cb, sb, nb * 16, ar, levels, bw, bh, srgb, bc, im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vkCmdCopyImageToBuffer(cb, im.img, VK_IMAGE_LAYOUT_GENERAL, ib, (uint32_t)levels, cp);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
@@ -240,7 +243,7 @@ static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t 
     vmaDestroyBuffer(c->vma, ib, ia);
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
-    return ok;
+    return ok > 0;
 }
 
 // One BC3 block to 16 RGBA8 texels, as the format defines it (565 endpoints widened by bit replication; the colour
@@ -334,6 +337,104 @@ static int first_diff(const uint8_t *a, const uint8_t *b, size_t texels, size_t 
     return 0;
 }
 
+// astc_block_opaque against a decode of each of the n blocks: opaque exactly when every texel has alpha 255. Then the
+// loop over them (astc_blocks_opaque, also copying) and the worker-pool scan (astc_blocks_opaque_mt) must give the
+// first block that is not opaque, the same bytes, and the same answer. Opaque 4x4 blocks are kept for opaque_mt_case.
+enum { OP_POOL = 4096 };
+static uint64_t g_op_blocks, g_op_opaque, g_op_decoded, g_bc1_blocks;
+static uint8_t g_op_pool[OP_POOL * 16], g_alpha_block[16];
+static size_t g_op_pool_n;
+static int g_have_alpha;
+static int opaque_check(const uint8_t *blk, size_t n, uint32_t bw, uint32_t bh, int srgb, const char *what) {
+    uint8_t t[12 * 12 * 4];
+    size_t first = n;
+    for (size_t k = 0; k < n; k++) {
+        const uint8_t *b = blk + 16 * k;
+        astc_decode_block(b, bw, bh, srgb, t);
+        int want = 1;
+        for (uint32_t i = 0; i < bw * bh && want; i++) want = t[4 * i + 3] == 255;
+        uint32_t decoded = 0;
+        if ((int)astc_block_opaque(b, bw, bh, srgb, &decoded) != want) {
+            printf("probe-astc: FAIL opaque check %s block %zu: the decode says %s\n", what, k, want ? "opaque" : "alpha");
+            return 1;
+        }
+        if (!want && first == n) first = k;
+        if (bw == 4 && bh == 4 && !srgb && want && g_op_pool_n < OP_POOL) memcpy(g_op_pool + 16 * g_op_pool_n++, b, 16);
+        if (bw == 4 && bh == 4 && !srgb && !want && !g_have_alpha) memcpy(g_alpha_block, b, 16), g_have_alpha = 1;
+        g_op_blocks++, g_op_opaque += want, g_op_decoded += decoded;
+    }
+    uint32_t d1 = 0, d2 = 0;
+    uint8_t *cp = malloc(16 * n);
+    uint64_t got = astc_blocks_opaque(blk, n, bw, bh, srgb, UINT32_MAX, &d1, cp);
+    uint8_t *cp2 = malloc(16 * n);
+    int bad = got != first || memcmp(cp, blk, 16 * n) ||
+              astc_blocks_opaque_mt(blk, n, bw, bh, srgb, UINT32_MAX, &d2, cp2) != (first == n) || memcmp(cp2, blk, 16 * n);
+    free(cp2);
+    if (bad)
+        printf("probe-astc: FAIL opaque check %s: the loop gives block %llu (want %zu), or its copy or the worker pool "
+               "differs\n", what, (unsigned long long)got, first);
+    free(cp);
+    return bad;
+}
+
+// The worker-pool scan of a texture of 300,000 opaque 4x4 blocks (opaque blocks of the cases, repeated), alone and
+// copying: opaque, every byte copied; then with one block that is not opaque at 250,000: not opaque, every byte still
+// copied, and the loop names that block.
+static int opaque_mt_case(void) {
+    if (g_op_pool_n < 64 || !g_have_alpha) {
+        printf("probe-astc: FAIL opaque check: too few opaque (%zu) or no alpha 4x4 blocks to build the large case\n",
+               g_op_pool_n);
+        return 1;
+    }
+    size_t n = 300000;
+    uint8_t *blk = malloc(16 * n);
+    for (size_t k = 0; k < n; k++) memcpy(blk + 16 * k, g_op_pool + 16 * (k % g_op_pool_n), 16);
+    uint32_t d = 0;
+    uint8_t *cp = malloc(16 * n);
+    int bad = !astc_blocks_opaque_mt(blk, n, 4, 4, false, UINT32_MAX, &d, NULL) ||
+              !astc_blocks_opaque_mt(blk, n, 4, 4, false, UINT32_MAX, &d, cp) || memcmp(cp, blk, 16 * n);
+    memcpy(blk + 16 * 250000, g_alpha_block, 16);
+    memset(cp, 0, 16 * n);
+    d = 0;
+    bad = bad || astc_blocks_opaque_mt(blk, n, 4, 4, false, UINT32_MAX, &d, NULL) ||
+          astc_blocks_opaque_mt(blk, n, 4, 4, false, UINT32_MAX, &d, cp) || memcmp(cp, blk, 16 * n) ||
+          astc_blocks_opaque(blk, n, 4, 4, false, UINT32_MAX, &d, NULL) != 250000;
+    if (bad) printf("probe-astc: FAIL opaque check (and copy) of %zu blocks on the worker pool\n", n);
+    free(blk), free(cp);
+    return bad;
+}
+
+// The BC1 blocks (8 bytes each) of a level against its BC3 blocks: each the second half of its BC3 block.
+static int bc1_check(const uint8_t *bc3, const uint8_t *bc1, uint32_t w, uint32_t h, const char *what) {
+    size_t n = bc_bytes(w, h) / 16;
+    for (size_t k = 0; k < n; k++)
+        if (memcmp(bc3 + 16 * k + 8, bc1 + 8 * k, 8)) {
+            printf("probe-astc: FAIL BC1 %s: block %zu is not the colour half of its BC3 block\n", what, k);
+            return 1;
+        }
+    g_bc1_blocks += n;
+    return 0;
+}
+
+// The regions of one case encoded to BC1 too (vk_astc_bc1), held to bc1_check against their BC3 blocks.
+static int bc1_case(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t *w, const uint32_t *h, int levels,
+                    uint32_t bw, uint32_t bh, int srgb, const uint8_t *bc3, const char *what) {
+    if (!vk_astc_bc1()) return 0;
+    size_t total = 0;
+    for (int i = 0; i < levels; i++) total += bc_bytes(w[i], h[i]) / 2;
+    uint8_t *bc1 = malloc(total);
+    int bad = !gpu_bc(c, blk, n, w, h, levels, bw, bh, srgb, 2, bc1);
+    if (bad) printf("probe-astc: FAIL BC1 %s: the encode was not recorded\n", what);
+    size_t o3 = 0, o1 = 0;
+    for (int i = 0; i < levels && !bad; o3 += bc_bytes(w[i], h[i]), o1 += bc_bytes(w[i], h[i]) / 2, i++) {
+        char lv[96];
+        snprintf(lv, sizeof lv, "%s level %d", what, i);
+        bad = bc1_check(bc3 + o3, bc1 + o1, w[i], h[i], lv);
+    }
+    free(bc1);
+    return bad;
+}
+
 static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
     // level 0: 37 x 23 blocks, cropped by 1-3 texels; level 1 half of that, other blocks
     uint32_t w0 = 37 * bw - 1 - (bw > 5), h0 = 23 * bh - 2, w1 = w0 > 1 ? w0 >> 1 : 1, h1 = h0 > 1 ? h0 >> 1 : 1;
@@ -346,8 +447,10 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
     memset(rb, 0x5A, (t0 + t1) * 4), memset(im, 0xA5, (t0 + t1) * 4);
     astc_decode_ldr(blk, w0, h0, bw, bh, srgb, want);
     astc_decode_ldr(blk + n0 * 16, w1, h1, bw, bh, srgb, want + t0 * 4);
-    int bad = 0;
-    if (!gpu_decode(c, blk, n0, n1, w0, h0, w1, h1, bw, bh, srgb, rb, im, NULL)) {
+    char name[48];
+    snprintf(name, sizeof name, "%ux%u %s", bw, bh, srgb ? "sRGB" : "linear");
+    int bad = opaque_check(blk, n0 + n1, bw, bh, srgb, name);
+    if (!bad && !gpu_decode(c, blk, n0, n1, w0, h0, w1, h1, bw, bh, srgb, rb, im, NULL)) {
         printf("probe-astc: FAIL %ux%u %s: the GPU decode was not recorded\n", bw, bh, srgb ? "sRGB" : "linear");
         bad = 1;
     }
@@ -374,11 +477,12 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
         for (int lv = 0; lv < 2; lv++) snprintf(what[lv], sizeof what[lv], "%ux%u %s level %d", bw, bh, srgb ? "sRGB" : "linear", lv);
         size_t nn[2] = {n0, n1};
         uint32_t ww[2] = {w0, w1}, hh[2] = {h0, h1};
-        if (!gpu_bc(c, blk, nn, ww, hh, 2, bw, bh, srgb, bc)) {
+        if (!gpu_bc(c, blk, nn, ww, hh, 2, bw, bh, srgb, 1, bc)) {
             printf("probe-astc: FAIL BC3 %s: the encode was not recorded\n", what[0]);
             bad = 1;
         }
         bad = bad || bc_check(want, bc, w0, h0, what[0], &db[0]) || bc_check(want + t0 * 4, bc + b0, w1, h1, what[1], &db[1]);
+        bad = bad || bc1_case(c, blk, nn, ww, hh, 2, bw, bh, srgb, bc, name);
         for (int lv = 0; lv < 2 && !bad; lv++)
             if (db[lv] < g_bc_db) g_bc_db = db[lv];
         g_bc_cases += !bad;
@@ -512,8 +616,12 @@ static int cutout_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb, uint32_t w0
         cut_blocks(blk + ob * 16, n[i], (w[i] + bw - 1) / bw, i, pool, npool);
         astc_decode_ldr(blk + ob * 16, w[i], h[i], bw, bh, srgb, want + ot * 4);
     }
-    int bad = !gpu_bc(c, blk, n, w, h, levels, bw, bh, srgb, bc);
-    if (bad) printf("probe-astc: FAIL BC3 cut-out %s: the encode was not recorded\n", what);
+    int bad = opaque_check(blk, nb, bw, bh, srgb, what);
+    if (!bad && !gpu_bc(c, blk, n, w, h, levels, bw, bh, srgb, 1, bc)) {
+        printf("probe-astc: FAIL BC3 cut-out %s: the encode was not recorded\n", what);
+        bad = 1;
+    }
+    if (!bad) bad = bc1_case(c, blk, n, w, h, levels, bw, bh, srgb, bc, what);
     uint64_t edges = 0;
     ot = ob = 0;
     for (int i = 0; i < levels && !bad; ot += (size_t)w[i] * h[i], ob += bc_bytes(w[i], h[i]), i++) {
@@ -590,7 +698,16 @@ int probe_astc(void) {
                    "1/2 and 3/4 kept outside the block's alpha step; lowest PSNR %.1f dB\n",
                    (unsigned long long)g_cut_cases, (double)g_cut_texels / 1e6, (unsigned long long)g_cut_edges,
                    (unsigned long long)g_cut_sharp, g_cut_db);
+        if (!bad && vk_astc_bc1())
+            printf("probe-astc: BC1 encode: %llu blocks, each the colour half of its BC3 block\n",
+                   (unsigned long long)g_bc1_blocks);
+        else if (!bad) printf("probe-astc: BC1 encoder not on (NX2NAVI_ASTC_BC1 or the device's BC1 features): not checked\n");
     }
+    if (!bad) bad = opaque_mt_case();
+    if (!bad)
+        printf("probe-astc: opaque check: %llu blocks agree with their decode, %llu of them opaque, %llu decoded to tell; "
+               "the loop, its copy and the worker pool agree, also on 300,000 blocks\n",
+               (unsigned long long)g_op_blocks, (unsigned long long)g_op_opaque, (unsigned long long)g_op_decoded);
     if (!bad) {
         timing(c, 4, 4);
         timing(c, 6, 6);

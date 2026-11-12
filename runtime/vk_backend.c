@@ -26,11 +26,13 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "perfmon.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "vk_fg.h"
 
 #define WEAK __attribute__((weak))
 
@@ -46,6 +48,28 @@ static void wait_until(uint64_t at) {
     uint64_t now = kern_now_ns();
     if (at > now + 1500000) plat_wait_ns(at - now - 1000000);
     while (kern_now_ns() < at) plat_yield();
+}
+
+// NX2NAVI_PACE_SMOOTH (default 1; 0 = off): a picture goes out no sooner than seven eighths of the recent interval
+// after the one before it. The game's frames reach the present thread in uneven steps although each costs about the
+// same: with the replay on the submitting thread, work held for an event is replayed with the next frame, so pictures
+// came 13 to 31 ms apart around a mean of 22 ms in a village (5th to 95th percentile), which shows as judder at a
+// frame rate that would look even. Only the early ones wait, a few milliseconds each, so the rate stays what it was;
+// the recent interval is a moving average over about four pictures of intervals under 100 ms, so the floor follows
+// a scene that gets lighter within a second. Not with frame generation, which paces its own presents.
+static uint64_t pace_avg_ns;   // the present thread's
+
+static uint64_t pace_smooth(uint64_t at, uint64_t last, uint64_t now) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_PACE_SMOOTH");
+    if (!on || !last || !pace_avg_ns || vk_fg_active() || vk_dlssg_active()) return at;
+    uint64_t floor = last + pace_avg_ns / 8 * 7;
+    return floor > at && floor < now + 50000000ull ? floor : at;
+}
+
+static void pace_shown(uint64_t interval_ns) {
+    if (interval_ns >= 100000000ull) return;   // a load or a hitch is not the rate
+    pace_avg_ns = pace_avg_ns ? pace_avg_ns + (uint64_t)(((int64_t)interval_ns - (int64_t)pace_avg_ns) / 4) : interval_ns;
 }
 
 static void present_main(void *arg) {
@@ -71,9 +95,11 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
-        wait_until(j.at);
+        wait_until(pace_smooth(j.at, last, t0));
         uint64_t t1 = kern_now_ns();
+        if (last) pace_shown(t1 - last);
         vk_present_flip();
+        perfmon_shown(t1);   // the overlay's frame times: the pictures as shown
         // NX2NAVI_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)
@@ -97,14 +123,105 @@ void vk_present_drain(void) {
     perf_end(PERF_DRAIN, p0);
 }
 
+// NX2NAVI_FRAME_HOLD_MS (default 120; 0 = off): a frame whose draws were skipped because a shader or pipeline was
+// still building (vk_exec_draw.c pending_draws) is not shown: the previous picture stays on screen until a frame is
+// complete again. Such a frame lacks what was skipped, which showed for a frame or two as a black or unlit picture with
+// the interface intact (a lighting pass), a light going out, or ground and walls missing and then back. The game runs
+// on meanwhile, so nothing waits. The hold comes from an allowance of this many milliseconds, used up by the time
+// held and filled again at an eighth of the clock's rate: a pipeline that takes longer, or a run of them on a first
+// visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. Not with DLSS
+// Frame Generation, which is told about every frame.
+// The same hold covers a change of the scene's size (a DLSS or FSR 3.1 mode picked in the menu, vk_dlaa.c
+// vk_dlaa_resized_take): the first frames drawn into the game's new, empty scene targets come out dark or black, so the
+// previous picture stays for RESIZE_HOLD presents from the first frame of the new size. That is once per change of a
+// setting and does not use the allowance. It holds with DLSS Frame Generation too: a present left out is a longer gap
+// between two rendered frames to it (its constants and tags are set at the host present, gfx_present.c), and a dark
+// frame it is given comes out as several generated ones.
+// And it covers an area load (vk_exec_draw.c vk_exec_pool_loading): while the texture pool still makes the area's
+// textures, the frames show the ground and the walls as black stand-ins, so the picture before the load stays for up
+// to LOAD_HOLD_NS, also beside the allowance.
+#define RESIZE_HOLD 6
+#define LOAD_HOLD_NS 2000000000ull
+static struct {
+    int64_t limit_ns, left_ns;
+    uint64_t last_ns, held, runs, shown, load_t0, load_held;
+    int holding, resize_left;
+} FH = {.limit_ns = -1};
+
+static void frame_hold_refill(uint64_t now) {
+    if (FH.limit_ns < 0) {
+        long long ms = cfg_int("NX2NAVI_FRAME_HOLD_MS");
+        FH.limit_ns = (int64_t)(ms < 0 ? 0 : ms > 500 ? 500 : ms) * 1000000;
+        FH.left_ns = FH.limit_ns, FH.last_ns = now;
+        if (FH.limit_ns)
+            rt_log("vk: a frame with draws skipped for a pipeline is not shown, the previous picture stays up to %lld ms "
+                   "(NX2NAVI_FRAME_HOLD_MS)", (long long)(FH.limit_ns / 1000000));
+    }
+    if (!FH.holding) FH.left_ns += (int64_t)(now - FH.last_ns) / 8;
+    else FH.left_ns -= (int64_t)(now - FH.last_ns);
+    if (FH.left_ns > FH.limit_ns) FH.left_ns = FH.limit_ns;
+    FH.last_ns = now;
+}
+
+// Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then).
+int vk_frame_hold_left(void) {
+    frame_hold_refill(kern_now_ns());
+    return FH.left_ns > 0 && !vk_dlssg_active();
+}
+
+// 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
+static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
+    frame_hold_refill(kern_now_ns());
+    if (resized && FH.limit_ns > 0) {
+        FH.resize_left = RESIZE_HOLD;
+        rt_log("vk: frame %llu: the scene has a new size after a setting changed; the previous picture stays for %d "
+               "frames", (unsigned long long)frame, RESIZE_HOLD);
+    }
+    if (FH.resize_left) {   // beside the allowance: nothing below counts these frames
+        FH.resize_left--;
+        return 1;
+    }
+    if (FH.limit_ns > 0 && vk_exec_pool_loading()) {
+        uint64_t now = kern_now_ns();
+        if (!FH.load_t0) FH.load_t0 = now, FH.load_held = 0;
+        if (now - FH.load_t0 < LOAD_HOLD_NS) {
+            FH.load_held++;
+            return 1;
+        }
+    } else if (FH.load_t0) {
+        rt_log("vk: frame %llu: the previous picture stayed for %llu frames, %.0f ms, while an area's textures were made",
+               (unsigned long long)frame, (unsigned long long)FH.load_held, (double)(kern_now_ns() - FH.load_t0) / 1e6);
+        FH.load_t0 = 0;
+    }
+    int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
+    if (hold && !FH.holding) FH.runs++;
+    if (skipped && !hold) FH.shown++;
+    FH.holding = hold;
+    if (hold) FH.held++;
+    static uint64_t logged_at, logged_held, logged_shown;
+    if (!hold && FH.held + FH.shown != logged_held + logged_shown && frame - logged_at >= 600) {
+        rt_log("vk: frame %llu: %llu frames with skipped draws held back so far in %llu runs, %llu shown incomplete "
+               "(allowance used up)", (unsigned long long)frame, (unsigned long long)FH.held,
+               (unsigned long long)FH.runs, (unsigned long long)FH.shown);
+        logged_at = frame, logged_held = FH.held, logged_shown = FH.shown;
+    }
+    if (hold && (rt_trace & RT_TRACE_PRESENT))
+        rt_log("present: frame %llu held back, %u draws skipped", (unsigned long long)frame, skipped);
+    return hold;
+}
+
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
                           uint64_t value) {
     static volatile int32_t n_skipped;
+    static int vram_probe;
+    if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
+    vk_exec_barrier_log(frame);
     vk_dlaa_frame();
+    vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);
@@ -112,8 +229,9 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
-    if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
-        if (plat_inc32(&n_skipped) <= 8)
+    int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
+    if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order
             vk_present_drain();
@@ -183,8 +301,19 @@ int vk_replay_async(void) {
     return on;
 }
 
+// With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
+static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
+    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
+}
+
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
+
+// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
+void gfx_event_signalling(const void *value, uint32_t to) {
+    vk_exec_event_cpu(value);
+    vk_exec_evt('c', value, to);
+}
 
 // The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
 uint64_t gfx_replayed_submits(void) {
@@ -258,8 +387,13 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
     }
     vk_present_drain();
+    vk_exec_gate_wait(handles, n);   // a submission that begins with a wait for the CPU's signal: before its copies
     vk_texture_new_submit();
     uint64_t f = vk_sync_submit(handles, n);
+    // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
+    // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
+    // submission's value is the one the game's fence stands for.
+    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
@@ -267,8 +401,11 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     return f;
 }
 
+int vk_sub_in_frame;
+
 static void replay_main(void *arg) {
     (void)arg;
+    int sub_idx = 0;   // submissions since the last present, in queue order
     perf_replay_thread();
     plat_mutex_lock(&rl);
     for (;;) {
@@ -280,6 +417,7 @@ static void replay_main(void *arg) {
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
+            vk_sub_in_frame = sub_idx++;
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -293,6 +431,7 @@ static void replay_main(void *arg) {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -397,10 +536,12 @@ void gfx_exit_log(void) {
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
+    gfx_tl_present();
     vk_dlssg_game_present();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
+        vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
         if (present_held_on()) {   // present_held
@@ -475,7 +616,10 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
-    if (!gfx_replay_async()) return submit_sync(handles, n);
+    if (!gfx_replay_async()) {
+        vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
+        return submit_sync(handles, n);
+    }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
@@ -483,6 +627,7 @@ static uint64_t vk_be_submit(const uint64_t *handles, int n) {
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
         memcpy(it.h, handles, sizeof *it.h * (size_t)n);
     }
+    vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
     return replay_enqueue(&it);
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
@@ -588,7 +733,24 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 }
 // After a fence wait: the value is done, so its replay is too; a later submission the replay records meanwhile marks
 // its targets with a later fence, which write_back_small leaves alone. No drain.
+// The count of such waits that came back while event-ordered work was still held (vk_exec.c): a submission stopped at an
+// event wait returns its value with its remainder held for a later replay, so the game may take a wait for that value
+// as the whole submission done and reuse what the held part still reads. How often that happens decides whether the
+// value should be signalled only after the remainder (audit finding F-2-05). The count is unlocked: a diagnostic.
+static uint64_t synced_n, synced_held;
+static void synced_held_count(uint64_t fence) {
+    synced_n++;
+    int held = vk_exec_held();
+    if (!held) return;
+    synced_held++;
+    if (synced_held <= 10 || synced_held % 600 == 0)
+        rt_log("vk: a game's wait for %llu returned with %d event-ordered submission(s) still held (%llu of %llu such "
+               "waits so far)", (unsigned long long)fence, held, (unsigned long long)synced_held,
+               (unsigned long long)synced_n);
+}
+
 static void vk_be_cpu_synced(uint64_t fence) {
+    synced_held_count(fence);
     if (!vk_texture_small_dirty()) return;
     vk_sync_start();
     vk_present_drain();
@@ -606,6 +768,7 @@ const GfxBackend gfx_vulkan_backend = {
     .program_release = vk_be_program_release,
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
+    .exec_wait = vk_be_exec_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
     .frame_start = vk_dlssg_frame_start,

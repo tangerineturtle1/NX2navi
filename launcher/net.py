@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import timezone
+from http.client import IncompleteRead
 from pathlib import Path
 
 from . import NAME
@@ -194,6 +195,13 @@ def certificate_problem(url, refused, version='dev'):
             'may be replacing the certificate: let NX2navi through it or turn that scanning off, then try again.')
 
 
+def _check_eof(response):
+    # HTTPResponse.read(n) accepts an early EOF on a Content-Length body and leaves the missing byte count in length.
+    remaining = getattr(response, 'length', None)
+    if remaining:
+        raise ConnectionError(f'connection closed with {remaining} response bytes still expected')
+
+
 def get_bytes(url, headers=None, timeout=30, version='dev', limit=64 << 20, retries=3):
     """The body of a GET of url, at most limit bytes. A cut connection, a timeout or a server error (5xx, 429) is tried
     again after 1, then 2 seconds, as download's are: one connection reset during Gather Build Tools (the package
@@ -203,19 +211,20 @@ def get_bytes(url, headers=None, timeout=30, version='dev', limit=64 << 20, retr
         try:
             with request(url, headers, timeout, version) as r:
                 data = r.read(limit + 1)
+                if len(data) > limit:
+                    raise DownloadError(f'{url}: more than {limit >> 20} MB')
+                _check_eof(r)
             break
         except urllib.error.HTTPError as e:
             if e.code != 429 and e.code < 500:
                 raise
             last_error = e
-        except (urllib.error.URLError, OSError, TimeoutError) as e:   # not DownloadError or CertificateError
+        except (urllib.error.URLError, OSError, IncompleteRead) as e:   # not DownloadError or CertificateError
             last_error = e
         if attempt + 1 < retries:
             time.sleep(min(2 ** attempt, 8))
     else:
         raise last_error
-    if len(data) > limit:
-        raise DownloadError(f'{url}: more than {limit >> 20} MB')
     return data
 
 
@@ -261,6 +270,7 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
                             raise Cancelled()
                         b = r.read(CHUNK)
                         if not b:
+                            _check_eof(r)
                             break
                         f.write(b)
                         done += len(b)
@@ -282,7 +292,7 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
             if e.code in (401, 403, 404, 410) or 300 <= e.code < 400:   # 3xx: a redirect _Redirect refused
                 raise DownloadError(f'{url}: HTTP {e.code}') from e
             last_error = e
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except (urllib.error.URLError, OSError, IncompleteRead) as e:
             last_error = e
         time.sleep(min(2 ** attempt, 16))
     else:

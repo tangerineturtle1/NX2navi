@@ -14,6 +14,14 @@ int input_kbm_last(void);
 // separately: a persistent radial cursor for the ability wheel, discrete steps for horizontal quick lists.
 int input_direct_mouse_active(void);
 int input_direct_mouse_enabled(void);
+int input_direct_mouse_available(void);   // the game version has the patch set and it is on: the mode can be chosen
+// Ocarina 1.1.1's camera input update (mouse_direct.c camera_input_oot; recomp/patches-v111.txt). Measured with a
+// scripted stick, its processed stick at one turns the camera 1 degree up or down and 1.78 degrees sideways
+// (StickSensitivityLat2LngRatio) per 60 Hz frame; the game's own camera sensitivity option scales both.
+// INPUT_OOT_COUNT_X and _Y, what one mouse count adds to the processed stick per frame at sensitivity 1, make a count
+// 0.08 degrees on either axis.
+#define INPUT_OOT_COUNT_X (0.08 / 1.78)
+#define INPUT_OOT_COUNT_Y 0.08
 // A radial selector uses a persistent virtual cursor while its opening button is held.
 void input_direct_mouse_radial(int32_t dx, int32_t dy, float sensitivity, float cursor[2], int32_t out[2]);
 // Horizontal quick selectors receive short, separated steps instead of a latched radial-cursor direction.

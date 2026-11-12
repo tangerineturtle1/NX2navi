@@ -13,6 +13,16 @@ RECHECK = 3600   # seconds between update checks while the launcher stays open, 
 
 PENDING, RUNNING, DONE, SKIPPED, FAILED = 'pending', 'running', 'done', 'skipped', 'failed'
 
+# Failures whose message says all there is to say: the log gets one line for them (failure_line), not a traceback.
+# A refused update check wrote 22 lines of two tracebacks into launcher.log each time.
+PLAIN_FAILURES = (feed.FeedError, build.BuildError)
+
+
+def failure_line(e):
+    """A failure in one line for the log: its kind, its message and what it came from."""
+    cause = e.__cause__
+    return f'{type(e).__name__}: {e}' + (f' ({type(cause).__name__}: {cause})' if cause else '')
+
 STEPS = {
     'tools': ('Gather Build Tools', 'Downloading the compiler and libraries the build uses. This happens once and '
                                     'takes about 170 MB.'),
@@ -27,15 +37,47 @@ STEPS = {
                                                  'change are kept from the last build.'),
     'shaders': ('Prepare the Shaders', "Building the game's known shaders for your graphics card ahead of time, so "
                                        'play stops for them far less often.'),
-    'prompts': ('Draw the Button Prompts', 'Drawing the Xbox, PlayStation and keyboard and mouse button prompts the '
+    'prompts': ('Draw the Button Prompts', 'Drawing the Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts the '
                                            "game's Controls menu offers under Button prompts."),
+    'scan': ('Check the Game Files', 'Decompressing every game file once to find damage, and standing in for damaged '
+                                     'textures so the world still loads.'),
     'ready': ('Ready to Play', 'The game is built.'),
     'download': ('Download {ver}', 'Downloading the new version of NX2navi.'),
     'verify': ('Verify the Download', 'Checking the download against its checksum.'),
     'swap': ('Swap In the New Build', 'Linking the new build. It replaces the old one only once it is complete.'),
 }
 WEIGHTS = {'tools': 12, 'tools_update': 4, 'check': 1, 'exefs': 2, 'romfs': 14, 'lift': 14, 'compile': 55,
-           'compile_changed': 55, 'shaders': 18, 'prompts': 4, 'ready': 0, 'download': 8, 'verify': 1, 'swap': 6}
+           'compile_changed': 55, 'shaders': 18, 'prompts': 4, 'scan': 5, 'ready': 0, 'download': 8, 'verify': 1, 'swap': 6}
+
+
+# The game files tools/romfs_check.py reports as damaged on every copy of the game looked at so far: they are that
+# way in the game's own data, not through a player's dump, so a new dump does not change them. The three textures
+# get a stand-in; the game does without the fourth file.
+SCAN_EXPECTED = frozenset((
+    'Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx.zs',
+    'Tex/RBake_Scene_GanonStage_G_2_1_d0_t0.bntx.zs',
+    'Tex/Rock_WaterTemple_Gate_M_01_Nrm.bntx.zs',
+    'gsys/EnvObjSetMgrParam/Artwork.gsys__EnvObjSetMgrParam.bgyml',
+))
+
+
+def scan_summary(damaged, stood_in):
+    """(the scan row's value, a sentence for the home screen) for what the check of the game files found
+    (build.scan_report); ('', '') when nothing is damaged. The files of SCAN_EXPECTED are told as what they are, the
+    same ones as on every copy: the player learns what the check did and that nothing needs doing. Other files are
+    counted and pointed to, without advice the check cannot back."""
+    n = len(damaged)
+    if not n:
+        return '', ''
+    files = '1 game file' if n == 1 else f'{n} game files'
+    stand = ('none got a stand-in' if not stood_in else '1 texture got a stand-in' if stood_in == 1 else
+             f'{stood_in} textures got a stand-in')
+    value = f'{n} Flagged, {stood_in} Stand-In' + ('' if stood_in == 1 else 's')
+    if set(damaged) <= SCAN_EXPECTED:
+        return value, (f'The file check flagged {files}, the same as in every copy of the game: {stand}, and nothing '
+                       'needs doing.')
+    return value, (f'The file check flagged {files} as damaged: {stand}, so what uses them still loads. '
+                   'romfs-check.json in the game folder lists them.')
 
 
 def prompt_rows(ctx):
@@ -73,6 +115,7 @@ class Job:
         self.started = time.time()
         self.finished = None
         self.after = None           # what the window does next ('restart', ...)
+        self.note = ''              # a sentence for the home screen after the job (note_scan)
         self._lock = threading.Lock()
 
     # ---- state the window reads
@@ -197,7 +240,7 @@ class Job:
                 self.result = 'cancelled'
             else:
                 self.result, self.error = 'failed', str(e) or type(e).__name__
-                self.ctx.log(traceback.format_exc())
+                self.ctx.log(failure_line(e) if isinstance(e, PLAIN_FAILURES) else traceback.format_exc())
         finally:
             for s in self.steps:
                 if s.state == RUNNING:
@@ -210,9 +253,32 @@ class Job:
         raise NotImplementedError
 
     # ---- shared pieces
+    def note_scan(self, game_dir):
+        """After a build: what the check of the game files found goes into its row, and when the check ran in this
+        job, into the note the home screen shows and into the log. The check itself only printed its counts into
+        the build's lines, which scroll away, so a player never learned that files were flagged or that stand-ins
+        are in use. A check kept from an earlier build shows its count in the row only."""
+        s = self.step('scan')
+        found = build.scan_report(game_dir)
+        if not s or s.state not in (DONE, SKIPPED) or not found:
+            return
+        value, note = scan_summary(*found)
+        if not value:
+            return
+        if s.state == DONE:
+            s.value = value
+            self.note = note
+            self.ctx.log(f'file check: {note}')
+        elif s.value == 'Unchanged':
+            s.value = f'Unchanged · {value}'
+        self._touch()
+
     def ensure_tools(self, sid):
         layout = self.ctx.layout
         self.begin(sid)
+        missing = toolchain.zstd_missing(layout)
+        if missing:
+            raise toolchain.ToolchainError(missing)
         lock = toolchain.load_lock(layout, self.ctx.version)
         if toolchain.is_current(layout, lock):
             have_tools = True
@@ -296,16 +362,26 @@ class InstallJob(Job):
 
     def __init__(self, ctx, dump, game_dir):
         super().__init__(ctx, ['tools', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', *prompt_rows(ctx),
-                               'ready'])
+                               'scan', 'ready'])
         self.dump, self.game_dir = str(dump), str(game_dir)
+
+    def args(self):
+        """make_game.py's arguments. A game folder whose game files an earlier run already unpacked and checked
+        (build.can_rebuild, build.unpacked) is built on from those, for this processor's level as a first build is:
+        the dump is not read again, so an install that stopped after the RomFS image goes on although the dump
+        was moved or deleted since, and the 26 GB image is not packed a second time."""
+        if build.can_rebuild(self.game_dir) and build.unpacked(self.game_dir):
+            return build.rebuild_args(self.ctx.layout, self.game_dir, retune=True)
+        return build.install_args(self.ctx.layout, self.dump, self.game_dir)
 
     def run(self):
         self.ensure_tools('tools')
-        self.make_game(build.install_args(self.ctx.layout, self.dump, self.game_dir),
-                       {s: s for s in ('check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts')})
-        for sid in ('shaders', 'prompts'):
+        self.make_game(self.args(),
+                       {s: s for s in ('check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'scan')})
+        for sid in ('shaders', 'prompts', 'scan'):
             if self.step(sid) and self.step(sid).state == PENDING:
                 self.skip(sid)
+        self.note_scan(self.game_dir)
         self.finish('ready', 'Ready')
         try:
             gamefiles.extract_fonts(self.ctx.layout, self.game_dir)
@@ -319,7 +395,7 @@ class RebuildJob(Job):
     retune = True   # Rebuild the Game: the game's code for this processor's level (build.rebuild_args)
 
     def __init__(self, ctx, game_dir, dump=''):
-        super().__init__(ctx, ['tools_update', 'lift', 'compile_changed', 'swap', 'shaders', *prompt_rows(ctx)])
+        super().__init__(ctx, ['tools_update', 'lift', 'compile_changed', 'swap', 'shaders', *prompt_rows(ctx), 'scan'])
         self.game_dir, self.dump = str(game_dir), dump
 
     def run(self):
@@ -333,11 +409,23 @@ class RebuildJob(Job):
             args = build.install_args(layout, self.dump, self.game_dir)
         else:
             raise build.BuildError('the game folder has no earlier build: install the game again')
-        self.make_game(args, {'lift': 'lift', 'compile': 'compile_changed', 'shaders': 'shaders', 'prompts': 'prompts'},
+        self.make_game(args, {'lift': 'lift', 'compile': 'compile_changed', 'shaders': 'shaders', 'prompts': 'prompts', 'scan': 'scan'},
                        link_step='swap')
-        for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts'):
+        for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
             if self.step(sid) and self.step(sid).state == PENDING:
                 self.skip(sid)
+        self.note_scan(self.game_dir)
+
+
+class ModsRebuildJob(RebuildJob):
+    """Play with a mod whose code cheats or ExeFS patches the game was not built with (launcher/mods.py
+    code_waiting): the game is built again with them, compiling only what they change, and then starts (App.play)."""
+    title = 'Building Your Mods In'
+    retune = False
+
+    def __init__(self, ctx, game_dir):
+        super().__init__(ctx, game_dir)
+        self.after = 'play'
 
 
 class UpdateDownloadJob(Job):
@@ -378,7 +466,7 @@ class ContinueUpdateJob(RebuildJob):
 
     def __init__(self, ctx, game_dir, old, dump=''):
         Job.__init__(self, ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders',
-                                 *prompt_rows(ctx)], ctx.layout.version)
+                                 *prompt_rows(ctx), 'scan'], ctx.layout.version)
         self.game_dir, self.dump, self.old = str(game_dir), dump, old
         self.title = f'Updating to {versions.display(ctx.layout.version)}'
         for sid, value in (('download', 'Done'), ('verify', 'Checksum OK')):
@@ -389,7 +477,7 @@ class ContinueUpdateJob(RebuildJob):
             RebuildJob.run(self)
         else:
             self.ensure_tools('tools_update')
-            for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts'):
+            for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
                 self.skip(sid, 'No game yet')
         updater.prune(self.ctx.layout)
 

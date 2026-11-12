@@ -196,6 +196,13 @@ static class AmpereLowering
                     uint k16 = i.Bits(75, 1), cd = i.Bit(76) ? 3u : 1u;
                     see(i.Bits(16, 8) + cd); see(i.Bits(24, 8) + 1 + 2 * k16); see(i.Bits(32, 8) + k16); see(i.Bits(64, 8) + cd);
                 }
+                // 64- and 128-bit loads write Rd..Rd+1 or Rd..Rd+3, the stores read Rb..Rb+1 or Rb..Rb+3 (size 73-75: 5, 6).
+                // A program that names only Rd of its highest quad would otherwise put UR0 and UR1 in its top registers.
+                if (op is 0x381 or 0x981 or 0x984 or 0x983 or 0x386 or 0x986 or 0x388 or 0x988 or 0x387 or 0x987)
+                {
+                    uint size = i.Bits(73, 3), reg = op is 0x381 or 0x981 or 0x984 or 0x983 ? i.Bits(16, 8) : i.Bits(32, 8);
+                    if (size is 5 or 6 && reg < RZ) see(reg + (size == 6 ? 3u : 1u));
+                }
                 if (op == 0x3a9) see(i.Bits(64, 8));                                // ATOMG.CAS: the new value
                 if (op == 0x593 || (op == 0xb66 && i.Bit(78))) see(i.Bits(32, 8));   // SUATOM data, TLD.MS sample index
                 if (b < 0x080 || b is >= 0x160 and <= 0x16f) see(i.Bits(64, 8));   // C of ALU forms, TEX second destinations
@@ -2536,7 +2543,10 @@ static class AmpereLowering
     // localBytes: the local memory size the lowered program needs when that changed (spill mode), else 0. Graphics
     // programs carry it in their header already; compute and task/mesh programs need it from the translator's host
     // (job "local_mem").
-    public static byte[] Lower(byte[] code, int size, bool graphics, out int localBytes, int[] table = null, MeshInfo mesh = null)
+    // computeLocal: a compute program's own local memory in bytes, where its spill area starts (0: the translator's
+    // compute default of 0x1000).
+    public static byte[] Lower(byte[] code, int size, bool graphics, out int localBytes, int[] table = null, MeshInfo mesh = null,
+                               int computeLocal = 0)
     {
         localBytes = 0;
         int header = graphics || mesh != null ? 0x80 : 0;
@@ -2555,9 +2565,9 @@ static class AmpereLowering
         try { lowered = new Lowerer(insns, sph, !graphics, table, mesh) { C1 = C1Bytes }.Run(out branches, out first); }
         catch (RegisterPressureException)
         {
-            // Local memory after the program's own: the header's sizes (translator: low + high + CRS / 32), or the
-            // translator's compute default (0x1000) for compute programs.
-            spillAt = 0x1000;
+            // Local memory after the program's own: the header's sizes (translator: low + high + CRS / 32), or for a
+            // compute program its own size (computeLocal), the translator's compute default (0x1000) when not given.
+            spillAt = computeLocal > 0 ? computeLocal : 0x1000;
             if (header != 0)
                 spillAt = ((int)(BitConverter.ToUInt32(code, 4) & 0xffffff) + (int)(BitConverter.ToUInt32(code, 8) & 0xffffff)
                            + (int)(BitConverter.ToUInt32(code, 12) & 0xffffff) / 32 + 15) & ~15;

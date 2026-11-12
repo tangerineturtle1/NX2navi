@@ -25,9 +25,23 @@
 // the new one, never half of each. The CPU keeps a copy (shadow) for its reads: the GPU copy is often device memory
 // behind the PCIe BAR, slow to read back.
 //
+// An L2 block whose last page is unmapped leaves its L1 entry at once (blocks_release) and serves another 16 MiB range
+// once the GPU finished every submission issued while a shader could still have read the old L1 entry: until then it
+// holds only zeros, which read as unmapped. The game's allocator hands out pool addresses that climb through the 64 GiB
+// alias region, so blocks kept for good ran out after 16 GiB of ranges ever mapped (39 minutes of play, six areas), and
+// every pool created after that stayed out of the table: its pointers read zeros, as before the table existed. A range
+// mapped again while its block still waits takes that block back (block_take), so a pool freed and made again at its
+// address within a frame holds no second block.
+//
 // NX2NAVI_GPA=0 turns the table off: the translator is told the host has no device addresses (those accesses read 0).
 // NX2NAVI_GPA_EMPTY=1 keeps it empty, so every access through it reads the zero buffer (diagnosis).
-// Mirrored pools are not synced for the table's readers (vk_exec_draw.c ssbo_info says why).
+// Mirrored pools are not synced for the table's readers (vk_exec_draw.c ssbo_info says why). With shadow storage the
+// pools are copies of guest memory, which a guest submission that binds the table (vk_exec_draw.c ssbo_info) brings up
+// to date with the pages the CPU wrote, once, before the part is submitted (vk_memory.c vk_mem_shadow_sync). There
+// the twin of a mirrored pool is its shadow copy, not guest memory, and what a shader stores through the table is not
+// noted as a GPU write: it does not come back to guest memory, and the next whole copy-in of its page overwrites it.
+// vk_memory.c "Pages a shader stores into through the device address table" has the sequence, what was measured, and
+// the switch that keeps the stores (NX2NAVI_SHADOW_TABLE_STORES).
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,7 +68,14 @@ static struct {
     VmaAllocation alloc, dummy_alloc, scratch_alloc;
     volatile uint32_t *gpu;            // the mapped table
     uint32_t *cpu;                     // its shadow
-    uint32_t nblocks;                  // L2 blocks handed out (block 0 is the zero block)
+    uint32_t nblocks;                  // L2 blocks ever handed out (block 0 is the zero block)
+    uint16_t blk_pages[BLOCKS];        // pages each block maps
+    uint16_t blk_l1[BLOCKS];           // the L1 entry that names it, or named it while it waits
+    uint8_t blk_wait[BLOCKS];          // off L1, waiting for the GPU (blocks_release)
+    uint32_t blk_gen[BLOCKS];          // releases so far: a block taken back and released again has two callbacks
+    uint16_t free_blks[BLOCKS];        // empty blocks whose fence completed
+    uint32_t nfree_blk, blk_waiting;
+    uint64_t blk_returned;             // blocks taken off L1 so far
     uint32_t nrec;                     // records handed out, free ones aside
     uint32_t *free_recs, nfree;        // records whose fence completed
     uint64_t mapped_pages, maps, unmaps, refused;
@@ -133,17 +154,76 @@ VkDescriptorBufferInfo vk_gpa_info(void) {
     return (VkDescriptorBufferInfo){G.buf, 0, VK_WHOLE_SIZE};
 }
 
+// A block for L1 entry l1, 0 when none is left: the one the entry gave up and that still waits for the GPU (it maps
+// nothing, and a shader that read the old entry finds the new pages in it), else a free one, else one never used.
+static uint32_t block_take(uint32_t l1) {
+    uint32_t blk = 0;
+    for (uint32_t b = 1; G.blk_waiting && b < G.nblocks && !blk; b++)
+        if (G.blk_wait[b] && G.blk_l1[b] == l1) blk = b;
+    if (blk) G.blk_wait[blk] = 0, G.blk_waiting--;   // its callback finds it in use (blk_free_cb)
+    else if (G.nfree_blk) blk = G.free_blks[--G.nfree_blk];
+    else if (G.nblocks < BLOCKS) blk = G.nblocks++;
+    else return 0;
+    G.blk_l1[blk] = (uint16_t)l1;
+    return blk;
+}
+
 // The L2 entry word of a page; 0 when its block does not exist and alloc is 0 or no block is left.
 static uint32_t page_word(uint64_t page, int alloc) {
     uint64_t l1 = page >> 12;   // 4096 pages of 4 KiB per 16 MiB
     if (l1 >= L1_N) return 0;
     uint32_t blk = G.cpu[L1_WORD + l1];
     if (!blk) {
-        if (!alloc || G.nblocks == BLOCKS) return 0;
-        blk = G.nblocks++;
+        if (!alloc || !(blk = block_take((uint32_t)l1))) return 0;
         put(L1_WORD + (uint32_t)l1, blk);
     }
     return L2_WORD + blk * L2_N + (uint32_t)(page & (L2_N - 1));
+}
+
+// Stores record r (0: none) in the L2 entry word w and keeps the page counts of its block and of the table.
+static void page_put(uint32_t w, uint32_t r) {
+    uint32_t blk = (w - L2_WORD) / L2_N, old = G.cpu[w];
+    if (!old && r) G.blk_pages[blk]++, G.mapped_pages++;
+    else if (old && !r) G.blk_pages[blk]--, G.mapped_pages--;
+    put(w, r);
+}
+
+static void blk_free_cb(void *arg) {
+    uint32_t blk = (uint32_t)((uintptr_t)arg & 0xffff), gen = (uint32_t)((uintptr_t)arg >> 16);
+    plat_mutex_lock(&gpa_lock);
+    if (G.state > 0 && G.blk_wait[blk] && G.blk_gen[blk] == gen) {   // not taken back since (block_take)
+        G.blk_wait[blk] = 0, G.blk_waiting--;
+        G.free_blks[G.nfree_blk++] = (uint16_t)blk;
+    }
+    plat_mutex_unlock(&gpa_lock);
+}
+
+// After pages of [p0, p1) were unmapped: the blocks of that range that map nothing leave L1, and go back to the free
+// list once the GPU finished the submissions issued until now and the one being recorded, as a record does.
+static void blocks_release(uint64_t p0, uint64_t p1) {
+    if (p1 <= p0) return;
+    for (uint64_t l1 = p0 >> 12; l1 <= (p1 - 1) >> 12 && l1 < L1_N; l1++) {
+        plat_mutex_lock(&gpa_lock);
+        uint32_t blk = G.cpu[L1_WORD + l1], gen = 0;
+        if (blk && !G.blk_pages[blk]) {
+            put(L1_WORD + (uint32_t)l1, 0);
+            G.blk_wait[blk] = 1, G.blk_waiting++, G.blk_returned++;
+            gen = ++G.blk_gen[blk];
+        } else {
+            blk = 0;
+        }
+        plat_mutex_unlock(&gpa_lock);
+        if (blk)
+            vk_completion_add(vk_sync_issued() + 1, blk_free_cb, (void *)((uintptr_t)blk | (uintptr_t)gen << 16));
+    }
+}
+
+// gpa_lock held: a page found no block. Pointers into it read the zero buffer until its buffer is mapped again.
+static void out_of_blocks(uint64_t page) {
+    if (!G.refused++)
+        rt_log("vk_gpa: out of L2 blocks at %#llx (%u in use, %u waiting for the GPU): shaders read zeros through "
+               "pointers into the pages left out", (unsigned long long)(page << PAGE_SHIFT),
+               G.nblocks - 1 - G.nfree_blk - G.blk_waiting, G.blk_waiting);
 }
 
 static uint32_t rec_alloc(uint64_t delta, uint64_t twin) {
@@ -185,17 +265,16 @@ uint32_t vk_gpa_map(uint64_t lo, uint64_t hi, VkBuffer buf, uint64_t buf_lo) {
         if (G.refused == 1) rt_log("vk_gpa: out of records: a buffer at %#llx is not in the table", (unsigned long long)lo);
         return 0;
     }
-    uint64_t n = 0;
     for (uint64_t p = p0; p < p1; p++) {
         uint32_t w = page_word(p, 1);
         if (!w) {
-            if (!G.refused++) rt_log("vk_gpa: out of L2 blocks at %#llx", (unsigned long long)(p << PAGE_SHIFT));
-            break;
+            out_of_blocks(p);
+            p |= L2_N - 1;   // the rest of this 16 MiB has no block either; the next range may have one
+            continue;
         }
-        put(w, r);
-        n++;
+        page_put(w, r);
     }
-    G.mapped_pages += n, G.maps++;
+    G.maps++;
     plat_mutex_unlock(&gpa_lock);
     return r;
 }
@@ -206,7 +285,7 @@ void vk_gpa_unmap(uint64_t lo, uint64_t hi, uint32_t rec, uint32_t (*cover)(uint
     plat_mutex_lock(&gpa_lock);
     for (uint64_t p = p0; p < p1; p++) {
         uint32_t w = page_word(p, 0);
-        if (w && G.cpu[w] == rec) put(w, 0), G.mapped_pages--;
+        if (w && G.cpu[w] == rec) page_put(w, 0);
     }
     G.unmaps++;
     plat_mutex_unlock(&gpa_lock);
@@ -220,10 +299,11 @@ void vk_gpa_unmap(uint64_t lo, uint64_t hi, uint32_t rec, uint32_t (*cover)(uint
             uint32_t other = cover(p << PAGE_SHIFT);
             if (!other || other == rec) continue;
             plat_mutex_lock(&gpa_lock);
-            if (!G.cpu[w]) put(w, other), G.mapped_pages++;
+            if (!G.cpu[w]) page_put(w, other);
             plat_mutex_unlock(&gpa_lock);
         }
     }
+    blocks_release(p0, p1);   // after the cover: a block another buffer's pages went back into stays
     vk_completion_add(vk_sync_issued() + 1, rec_free_cb, (void *)(uintptr_t)rec);
 }
 
@@ -233,9 +313,10 @@ void vk_gpa_clear(uint64_t lo, uint64_t hi) {
     plat_mutex_lock(&gpa_lock);
     for (uint64_t p = p0; p < p1; p++) {
         uint32_t w = page_word(p, 0);
-        if (w && G.cpu[w]) put(w, 0), G.mapped_pages--;
+        if (w && G.cpu[w]) page_put(w, 0);
     }
     plat_mutex_unlock(&gpa_lock);
+    blocks_release(p0, p1);
 }
 
 static uint32_t remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo, int keep_twin) {
@@ -254,10 +335,12 @@ static uint32_t remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, 
     if (!r) { plat_mutex_unlock(&gpa_lock); return old_rec; }
     for (uint64_t p = p0; p < p1; p++) {
         uint32_t w = page_word(p, 1);
-        if (w && (!G.cpu[w] || G.cpu[w] == old_rec)) {
-            if (!G.cpu[w]) G.mapped_pages++;
-            put(w, r);
+        if (!w) {
+            out_of_blocks(p);
+            p |= L2_N - 1;
+            continue;
         }
+        if (!G.cpu[w] || G.cpu[w] == old_rec) page_put(w, r);
     }
     plat_mutex_unlock(&gpa_lock);
     if (old_rec) vk_completion_add(vk_sync_issued() + 1, rec_free_cb, (void *)(uintptr_t)old_rec);
@@ -274,9 +357,14 @@ uint32_t vk_gpa_remap_plain(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer
 
 void vk_gpa_report(void) {
     if (G.state <= 0) return;
-    rt_log("vk_gpa: %llu pages (%.0f MiB) mapped, %u of %u blocks, %u records in use, %llu maps, %llu unmaps, %llu refused",
-           (unsigned long long)G.mapped_pages, G.mapped_pages * 4096.0 / 1048576.0, G.nblocks, BLOCKS, G.nrec - 1 - G.nfree,
-           (unsigned long long)G.maps, (unsigned long long)G.unmaps, (unsigned long long)G.refused);
+    plat_mutex_lock(&gpa_lock);
+    rt_log("vk_gpa: %llu pages (%.0f MiB) mapped, %u of %u blocks in use (%u ever, %u waiting for the GPU, %llu given "
+           "back), %u records in use, %llu maps, %llu unmaps, %llu refused",
+           (unsigned long long)G.mapped_pages, G.mapped_pages * 4096.0 / 1048576.0,
+           G.nblocks - 1 - G.nfree_blk - G.blk_waiting, BLOCKS - 1, G.nblocks - 1, G.blk_waiting,
+           (unsigned long long)G.blk_returned, G.nrec - 1 - G.nfree, (unsigned long long)G.maps,
+           (unsigned long long)G.unmaps, (unsigned long long)G.refused);
+    plat_mutex_unlock(&gpa_lock);
 }
 
 void vk_gpa_shutdown(void) {
@@ -288,4 +376,15 @@ void vk_gpa_shutdown(void) {
     free(G.cpu), free(G.free_recs);
     memset(&G, 0, sizeof G);
     G.state = -1;
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): device address table records and L2 blocks in use (those waiting for a
+// fence included), against their fixed sizes (when they run out, shaders read zeros).
+void vk_gpa_sizes(PerfSizes *s) {
+    plat_mutex_lock(&gpa_lock);
+    uint64_t recs = G.nrec > 1 + G.nfree ? G.nrec - 1 - G.nfree : 0;
+    uint64_t blks = G.nblocks > 1 + G.nfree_blk + G.blk_waiting ? G.nblocks - 1 - G.nfree_blk - G.blk_waiting : 0;
+    plat_mutex_unlock(&gpa_lock);
+    perf_size(s, "device address records", recs, RECS, PERF_SIZE_NONE);
+    perf_size(s, "device address blocks", blks, BLOCKS, PERF_SIZE_NONE);
 }

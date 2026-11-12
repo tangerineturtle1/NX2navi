@@ -87,7 +87,11 @@ struct RtThread {
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
+    const uint32_t *whs;       // a WaitSynchronization that blocks: its handles, in the waiter's own memory (holding G)
+    int wn;
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
+    uint64_t blk_since;        // when the current blocking wait began, 0 while not blocked (holding G; wait_watch)
+    int blk_told;              // wait_watch logged the current wait
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
@@ -153,6 +157,7 @@ typedef struct { int st; uint32_t waker; uint64_t obj, ns; } WaitRec;
 static WaitRec g_rw[RW_N], g_mw[RW_N];                   // the render and main thread's waits by object and waker
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
+static uint64_t g_sync_woken, g_sync_spared;              // such waits a signal woke, and those it left asleep
 
 static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t ns) {
     for (int i = 0; i < RW_N; i++)
@@ -246,10 +251,31 @@ static void wake(RtThread *t, uint32_t res) {
     plat_cond_signal(&t->cv);
 }
 
-static void wake_sync_waiters(void) {
+// 1 when one of the handles w waits on names obj, an event (either a readable handle of it) or a thread.
+static int sync_watches(const RtThread *w, const void *obj) {
+    for (int i = 0; i < w->wn; i++) {
+        unsigned k = w->whs[i] - 0x1000;
+        if (k > 0 && k < MAX_H && g_h[k].obj == obj && (g_h[k].type == O_EVENT_R || g_h[k].type == O_THREAD)) return 1;
+    }
+    return 0;
+}
+
+// obj became signalled: an event (its Event) or a thread that exited. The WaitSynchronization waits that hold a handle
+// of it are woken to look again. Every other such wait stays asleep: woken, it took a virtual core (block: core_take,
+// which asks a running thread of lower priority for its core when every core is held), found nothing signalled and
+// blocked again, and the audio renderer alone signals its event 200 times a second, each time waking every thread
+// that waits for a message, a timer or the end of another thread. NX2NAVI_SYNC_WAKE_ALL=1 wakes them all, as before
+// ("ab": in the B blocks of NX2NAVI_AB); the sched line counts the waits woken and left asleep.
+static void wake_sync_waiters(const void *obj) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("SYNC_WAKE_ALL", "0");
+    int all = RT_KNOB_ON(mode);
     for (RtThread *w = g_wait; w;) {
         RtThread *n = w->next;
-        if (w->wkind == W_SYNC) wake(w, (uint32_t)-1);
+        if (w->wkind == W_SYNC) {
+            if (all || sync_watches(w, obj)) g_sync_woken++, wake(w, (uint32_t)-1);
+            else g_sync_spared++;
+        }
         w = n;
     }
 }
@@ -267,7 +293,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
         t->wkind = W_NONE;
         return R_TIMEOUT;
     }
-    uint64_t now = kern_now_ns();
+    uint64_t now = ns < 0 ? 0 : kern_now_ns();   // a wait without a timeout reads no clock (G is held here)
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
     while (!t->woke) {
@@ -340,12 +366,27 @@ void kern_free_cores_note(void) {
 
 // NX2NAVI_CORES = 1..NCORE: how many virtual cores run threads (default all NCORE). A core at or above the count is
 // folded onto core (c mod count): a thread pinned to core 5 with NX2NAVI_CORES=3 runs on core 2, one thread per core
-// at a time as always (diagnosis of races that more parallel cores expose).
+// at a time as always (diagnosis of races that more parallel cores expose; the Steam Deck profile's four).
 static int core_allowed(const RtThread *t, int c) {
     if (c >= g_active_cores) return 0;
     for (int j = c; j < NCORE; j += g_active_cores)
         if ((t->mask >> j) & 1) return 1;
     return 0;
+}
+
+// The core number a thread sees (GetCurrentProcessorNumber) while it holds virtual core c. With all NCORE cores that
+// is c. With fewer it is one of the thread's own cores that fold onto c, its ideal core first: the game keys per-core
+// data by this number without locks, so a thread pinned to core 5 must go on using core 5's data when it takes
+// turns with core 1's threads on one virtual core. Seeing 1 there, it used core 1's data in turn with core 1's own
+// threads, and the game died in its draw set-up within seconds of the first frame in play (issue #445; with
+// NX2NAVI_CORES=4 on any machine). No two threads that run guest code see the same number: they hold different
+// virtual cores, and the numbers that fold onto different virtual cores differ.
+static int core_seen(const RtThread *t, int c) {
+    if (g_active_cores >= NCORE) return c;
+    if (t->core >= 0 && t->core < NCORE && t->core % g_active_cores == c && ((t->mask >> t->core) & 1)) return t->core;
+    for (int j = c; j < NCORE; j += g_active_cores)
+        if ((t->mask >> j) & 1) return j;
+    return c;
 }
 
 // ---- asynchronous preemption (NX2NAVI_ASYNC_PREEMPT, on unless 0)
@@ -376,7 +417,18 @@ static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
-void kern_ap_stub(void);
+void kern_ap_stub_ymm(void), kern_ap_stub_xmm(void);
+static void (*ap_stub)(void) = kern_ap_stub_xmm;   // the stub for this processor (ap_init)
+
+// The processor has AVX and the system saves YMM state across thread switches (OSXSAVE, XCR0 bits 1 and 2).
+static int cpu_keeps_ymm(void) {
+    unsigned a = 1, b, c = 0, d;
+    __asm__("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    if ((c & 0x18000000u) != 0x18000000u) return 0;
+    unsigned lo, hi;
+    __asm__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;
+}
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
@@ -393,8 +445,9 @@ static void ap_init(void) {
                 if (f < lo) lo = f;
                 if (f > hi) hi = f;
             }
-        const uintptr_t host[] = {(uintptr_t)kern_ap_stub, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
-                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
+        ap_stub = cpu_keeps_ymm() ? kern_ap_stub_ymm : kern_ap_stub_xmm;
+        const uintptr_t host[] = {(uintptr_t)kern_ap_stub_ymm, (uintptr_t)kern_ap_stub_xmm, (uintptr_t)kern_checkpoint,
+                                  (uintptr_t)rt_svc, (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
         int bad = !n || lo >= hi;
         for (unsigned i = 0; i < sizeof host / sizeof *host; i++) bad |= host[i] >= lo && host[i] <= hi;
         if (bad) {
@@ -408,9 +461,10 @@ static void ap_init(void) {
         }
     }
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
-           "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (NX2NAVI_ASYNC_PREEMPT=0 turns all off)" : "off",
+           "code exe+%#llx-exe+%#llx; an interrupted core's %s registers are kept", g_ap_int ? "on" : "off",
+           g_ap ? "on (NX2NAVI_ASYNC_PREEMPT=0 turns all off)" : "off",
            (unsigned long long)(g_gen_lo ? g_gen_lo - plat_exe_base() : 0),
-           (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0));
+           (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0), ap_stub == kern_ap_stub_ymm ? "YMM" : "XMM");
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -437,187 +491,25 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // in kern_ap_yield and jumps back to kern_ap_rip(), whose value it first stores in the return slot it reserved at
 // entry, so a stack walk sees the interrupted function as its caller. No ret: the jump keeps call/return pairs
 // balanced. The waiter never writes the owner's stack.
-// An x86-64-v2 build (no __AVX__) saves XMM0-15 with SSE moves into the same 32-byte slots instead: its game code
-// keeps nothing in the upper YMM halves, and the CPUs it is for have no VEX encoding, so a vmovdqa there faults with
-// an illegal instruction the first time a core is interrupted.
-#ifdef __AVX__
+// Two bodies of the stub (kernel_ap_stub.h): kern_ap_stub_ymm saves YMM0-15 and is the one used wherever the processor
+// and the system keep YMM state (ap_stub, chosen by ap_init). The lifted code of such a PC is compiled with AVX2 and
+// keeps data in the upper halves, which every function the stub calls is free to clear, whatever the runtime itself was
+// compiled for. kern_ap_stub_xmm saves XMM0-15 with SSE moves: code on a processor without AVX has nothing in the upper
+// halves, and a VEX move there is an illegal instruction.
+#define AP_NAME "kern_ap_stub_ymm"
 #define AP_VMOV "vmovdqa"
 #define AP_V "%ymm"
 #define AP_VZEROUPPER "    vzeroupper\n"
-#else
+#include "kernel_ap_stub.h"
+#undef AP_NAME
+#undef AP_VMOV
+#undef AP_V
+#undef AP_VZEROUPPER
+#define AP_NAME "kern_ap_stub_xmm"
 #define AP_VMOV "movdqa"
 #define AP_V "%xmm"
 #define AP_VZEROUPPER ""
-#endif
-#ifdef _WIN32
-__asm__(".text\n"
-        ".globl kern_ap_stub\n"
-        ".def kern_ap_stub; .scl 2; .type 32; .endef\n"
-        ".p2align 4\n"
-        "kern_ap_stub:\n"
-        ".seh_proc kern_ap_stub\n"
-        "    leaq -8(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
-        ".seh_stackalloc 8\n"
-        "    pushfq\n"
-        ".seh_stackalloc 8\n"
-        "    pushq %rax\n"
-        ".seh_pushreg %rax\n"
-        "    pushq %rcx\n"
-        ".seh_pushreg %rcx\n"
-        "    pushq %rdx\n"
-        ".seh_pushreg %rdx\n"
-        "    pushq %r8\n"
-        ".seh_pushreg %r8\n"
-        "    pushq %r9\n"
-        ".seh_pushreg %r9\n"
-        "    pushq %r10\n"
-        ".seh_pushreg %r10\n"
-        "    pushq %r11\n"
-        ".seh_pushreg %r11\n"
-        "    pushq %rbp\n"
-        ".seh_pushreg %rbp\n"
-        "    movq %rsp, %rbp\n"
-        ".seh_setframe %rbp, 0\n"
-        ".seh_endprologue\n"
-        "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 0: shadow space, 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
-        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
-        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
-        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
-        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
-        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
-        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
-        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
-        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
-        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
-        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
-        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
-        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
-        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
-        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
-        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
-        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
-        "    stmxcsr 32(%rsp)\n"
-        "    movl $0x1f80, 36(%rsp)\n"
-        "    ldmxcsr 36(%rsp)\n"
-        "    cld\n"
-        AP_VZEROUPPER
-        "    call kern_ap_rip\n"
-        "    movq %rax, 72(%rbp)\n"   // the return slot: rbp + 8 pushes + pushfq
-        "    call kern_ap_yield\n"
-        "    ldmxcsr 32(%rsp)\n"
-        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
-        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
-        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
-        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
-        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
-        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
-        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
-        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
-        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
-        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
-        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
-        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
-        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
-        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
-        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
-        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
-        "    movq %rbp, %rsp\n"
-        "    popq %rbp\n"
-        "    popq %r11\n"
-        "    popq %r10\n"
-        "    popq %r9\n"
-        "    popq %r8\n"
-        "    popq %rdx\n"
-        "    popq %rcx\n"
-        "    popq %rax\n"
-        "    popfq\n"
-        "    leaq 8(%rsp), %rsp\n"
-        "    jmpq *-8(%rsp)\n"
-        ".seh_endproc\n");
-#else
-// The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
-// below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
-// way the slot is at entry - 136; the exit restores rsp to the entry value and jumps through the slot.
-__asm__(".text\n"
-        ".globl kern_ap_stub\n"
-        ".type kern_ap_stub, @function\n"
-        ".p2align 4\n"
-        "kern_ap_stub:\n"
-        "    .cfi_startproc\n"
-        "    leaq -136(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
-        "    pushfq\n"
-        "    pushq %rax\n"
-        "    pushq %rcx\n"
-        "    pushq %rdx\n"
-        "    pushq %rsi\n"
-        "    pushq %rdi\n"
-        "    pushq %r8\n"
-        "    pushq %r9\n"
-        "    pushq %r10\n"
-        "    pushq %r11\n"
-        "    pushq %rbp\n"
-        "    movq %rsp, %rbp\n"
-        "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
-        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
-        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
-        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
-        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
-        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
-        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
-        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
-        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
-        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
-        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
-        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
-        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
-        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
-        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
-        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
-        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
-        "    stmxcsr 32(%rsp)\n"
-        "    movl $0x1f80, 36(%rsp)\n"
-        "    ldmxcsr 36(%rsp)\n"
-        "    cld\n"
-        AP_VZEROUPPER
-        "    call kern_ap_rip\n"
-        "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
-        "    call kern_ap_yield\n"
-        "    ldmxcsr 32(%rsp)\n"
-        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
-        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
-        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
-        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
-        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
-        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
-        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
-        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
-        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
-        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
-        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
-        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
-        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
-        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
-        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
-        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
-        "    movq %rbp, %rsp\n"
-        "    popq %rbp\n"
-        "    popq %r11\n"
-        "    popq %r10\n"
-        "    popq %r9\n"
-        "    popq %r8\n"
-        "    popq %rdi\n"
-        "    popq %rsi\n"
-        "    popq %rdx\n"
-        "    popq %rcx\n"
-        "    popq %rax\n"
-        "    popfq\n"
-        "    leaq 136(%rsp), %rsp\n"
-        "    jmpq *-136(%rsp)\n"
-        "    .cfi_endproc\n"
-        ".size kern_ap_stub, .-kern_ap_stub\n");
-#endif
+#include "kernel_ap_stub.h"
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
 
@@ -657,7 +549,7 @@ static int ap_try(RtThread *w) {
     } else {
         o->ap_rip = rip;
         o->ap_pending = 1;
-        to = (uint64_t)(uintptr_t)kern_ap_stub;
+        to = (uint64_t)(uintptr_t)ap_stub;
     }
     if (!plat_intr_resume(o->hthr, to)) {
         o->ap_pending = 0;
@@ -1049,9 +941,61 @@ static uint32_t block(RtThread *t, int kind, int64_t ns) {
     core_put(t);
     acct(t, st_of(kind));
     t->nblk++;
+    t->blk_since = kern_now_ns(), t->blk_told = 0;
     uint32_t r = block_inner(t, kind, ns);
+    t->blk_since = 0;
     core_take(t);
     return r;
+}
+
+// ---- long waits (a freeze's first clue)
+// A guest thread that waits NX2NAVI_WAIT_WATCH_S seconds for a lock, or for another thread to end, is logged once per
+// wait with the thread it waits for and what that one is doing: a game that stops with nothing in its log then names
+// the chain. Waits on condition variables, events and addresses are left out: idle worker threads wait on them for
+// good. Off by default (0), as its thread takes the kernel lock every 2 s; 10 is a good value for a hang report.
+#define WAIT_WATCH_LINES 24
+
+static void wait_watch_holder(char *out, size_t cap, const RtThread *h) {
+    if (!h) { snprintf(out, cap, "no such thread"); return; }
+    if (h->exited) { snprintf(out, cap, "thread %#x, which has ended", h->handle); return; }
+    if (!h->blk_since) { snprintf(out, cap, "thread %#x (priority %d), not waiting", h->handle, h->prio); return; }
+    static const char *const kinds[] = {"nothing", "a lock", "a condition variable", "an address", "a handle"};
+    int k = h->wkind >= 0 && h->wkind <= W_SYNC ? h->wkind : 0;
+    snprintf(out, cap, "thread %#x (priority %d), itself waiting %.1f s for %s (%#llx)", h->handle, h->prio,
+             (kern_now_ns() - h->blk_since) / 1e9, kinds[k], (unsigned long long)h->wobj);
+}
+
+static void wait_watch(void *arg) {
+    (void)arg;
+    uint64_t limit = (uint64_t)atoi(cfg_value("NX2NAVI_WAIT_WATCH_S")) * 1000000000ull;
+    if (!limit) return;
+    int lines = 0;
+    while (lines < WAIT_WATCH_LINES) {
+        plat_wait_ns(2000000000ull);
+        lock();
+        uint64_t now = kern_now_ns();
+        for (RtThread *t = g_all; t && lines < WAIT_WATCH_LINES; t = t->all) {
+            if (!t->blk_since || t->blk_told || now - t->blk_since < limit) continue;
+            char who[160];
+            if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
+                wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
+                       t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
+            } else if (t->wkind == W_SYNC && t->whs) {
+                const RtThread *end = NULL;
+                for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
+                if (!end) continue;
+                wait_watch_holder(who, sizeof who, end);
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
+                       (now - t->blk_since) / 1e9, who);
+            } else {
+                continue;
+            }
+            t->blk_told = 1, lines++;
+        }
+        unlock();
+    }
+    rt_log("kernel: %d long waits logged: no more", lines);
 }
 
 int kern_core_away(void) {
@@ -1186,6 +1130,8 @@ void kern_core_stats(int *held_now, int *held_max) {
     *held_max = g_held_max;
     unlock();
 }
+
+int kern_cores(void) { return g_active_cores; }
 
 void kern_core_stats_reset(void) {
     lock();
@@ -1331,7 +1277,7 @@ void kern_sched_report(uint64_t frame) {
                 }
     }
     uint64_t pre_stale = g_pre_stale, pre_req = g_pre_req, pre_n = g_pre_n, pre_ns = g_pre_ns, pre_max = g_pre_max;
-    uint64_t sc = g_sync_calls, sb = g_sync_blocks;
+    uint64_t sc = g_sync_calls, sb = g_sync_blocks, sw = g_sync_woken, ss = g_sync_spared;
     for (RtThread *t = g_all; t; t = t->all) {
         memset(t->st_ns, 0, sizeof t->st_ns);
         t->nblk = t->npre = 0;
@@ -1341,14 +1287,16 @@ void kern_sched_report(uint64_t frame) {
     memset(g_rw, 0, sizeof g_rw);
     memset(g_mw, 0, sizeof g_mw);
     g_pre_req = g_pre_n = g_pre_ns = g_pre_max = g_pre_stale = 0;
-    g_sync_calls = g_sync_blocks = 0;
+    g_sync_calls = g_sync_blocks = g_sync_woken = g_sync_spared = 0;
     unlock();
     if (!span) return;
     rt_log("sched: frame %llu: %.2f s, cores busy %.2f of %d, core wait %.2f thread-s, preempt req %llu released %llu "
-           "avg %.2f ms max %.2f ms, WaitSynchronization %llu calls %llu blocks, stale preempt %llu%s",
+           "avg %.2f ms max %.2f ms, WaitSynchronization %llu calls %llu blocks (signals woke %llu, left %llu asleep), "
+           "stale preempt %llu%s",
            (unsigned long long)frame, span / 1e9, (double)all_run / span, NCORE, all_core / 1e9,
            (unsigned long long)pre_req, (unsigned long long)pre_n, pre_n ? pre_ns / 1e6 / pre_n : 0.0, pre_max / 1e6,
-           (unsigned long long)sc, (unsigned long long)sb, (unsigned long long)pre_stale, self ? "" : " (render thread is not a guest thread)");
+           (unsigned long long)sc, (unsigned long long)sb, (unsigned long long)sw, (unsigned long long)ss,
+           (unsigned long long)pre_stale, self ? "" : " (render thread is not a guest thread)");
     for (int i = 0; i < nr; i++) {
         Row *r = &rows[i];
         char d[128], s[256];
@@ -1438,8 +1386,8 @@ static RtThread *thr_new(int prio, int core, uint64_t mask) {
     // TLR (0x200) and the "current thread object" the SDK reads through TLR+0x1F8, in one guest-visible block.
     t->tlr = mem_kernel_alloc(TLR_SIZE + THREAD_OBJ_SIZE, TLR_SIZE);
     *(uint64_t *)(t->tlr + 0x1F8) = (uint64_t)(uintptr_t)(t->tlr + TLR_SIZE);
-    *(uint64_t *)(t->tlr + 0x1F0) = (uint64_t)(uintptr_t)t->tls;   // the SDK reads the TLS pointer here and makes it TPIDR_EL0
     t->tls = mem_kernel_alloc(TLS_SIZE, 16);
+    *(uint64_t *)(t->tlr + 0x1F0) = (uint64_t)(uintptr_t)t->tls;   // the SDK reads the TLS pointer here and makes it TPIDR_EL0
     c->tpidrro = (uint64_t)(uintptr_t)t->tlr;
     c->tpidr = (uint64_t)(uintptr_t)t->tls;
     c->excl_addr = ~0ull;
@@ -1483,7 +1431,7 @@ static void thread_finish(RtThread *t) {
     if (t->hthr) plat_intr_free(t->hthr);   // no waiter interrupts a thread without a core
     t->hthr = NULL;
     t->exited = 1;
-    wake_sync_waiters();
+    wake_sync_waiters(t);
     if (t->closed) thr_free(t);
     unlock();
 }
@@ -1588,6 +1536,11 @@ static void guest_main(void *p) {
 }
 
 void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
+    static int watching;
+    if (!watching++) {
+        PlatThread *w = plat_thread_new(wait_watch, NULL, "wait watch");
+        if (w) plat_thread_detach(w);
+    }
     PlatThread *h = plat_thread_new_ex(guest_main, (void *)fn, "guest main", HOST_STACK);
     if (!h) rt_fatal("kernel: cannot start the guest main thread");
     plat_thread_join(h);
@@ -1747,12 +1700,21 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             unlock();
             return 1;
         }
-        // Yield: hand the core to a waiting thread of equal or better priority.
+        // Yield: hand the core to a waiting thread of equal or better priority. Most yields find nobody waiting for a
+        // core: those take neither G nor the priority scan over every blocked thread (prio_of), which the game's yield
+        // loops paid thousands of times a second. The look is as racy as rt_spin_gate's: a thread that queues for a
+        // core right after it is found by the next yield, and kicks the owner itself in core_take meanwhile.
+        if (!__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) {
+            plat_yield();
+            return 1;
+        }
         lock();
-        int give = 0;
-        int tp = prio_of(t);
+        int give = 0, tp = -1;
         for (RtThread *w = g_core_wait; w && !give; w = w->cnext)
-            give = t->cur_core >= 0 && core_allowed(w, t->cur_core) && prio_of(w) <= tp;
+            if (t->cur_core >= 0 && core_allowed(w, t->cur_core)) {
+                if (tp < 0) tp = prio_of(t);   // only once a waiter may run on this core
+                give = prio_of(w) <= tp;
+            }
         if (give) {
             core_put(t);
             core_take(t);
@@ -1819,9 +1781,9 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
         unlock();
         return 1;
     }
-    case 0x10: {   // GetCurrentProcessorNumber: the virtual core held
+    case 0x10: {   // GetCurrentProcessorNumber: the core seen on the virtual core held (core_seen)
         RtThread *t = cur(imm);
-        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core);
+        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? core_seen(t, t->cur_core) : t->core);
         return 1;
     }
     case 0x36: {   // SynchronizePreemptionState: the SDK's spin locks call it after clearing TLR+0x100 (disable_count)
@@ -1996,7 +1958,7 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             if (r == R_BAD_HANDLE) rt_log("kernel: event svc %#x: invalid handle %#x", imm, h);
         } else if (imm == 0x11) {
             e->signaled = 1;
-            wake_sync_waiters();
+            wake_sync_waiters(e);
         } else if (imm == 0x17 && !e->signaled) {
             r = R_BAD_STATE;
         } else {
@@ -2077,7 +2039,9 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             }
             t->wobj = n ? hs[0] | (uint64_t)n << 32 : 0;
             g_sync_blocks++;
+            t->whs = hs, t->wn = n;
             woke = block(t, W_SYNC, left);
+            t->whs = NULL, t->wn = 0;
             if (woke == R_TIMEOUT) {
                 r = R_TIMEOUT;
                 break;
@@ -2148,7 +2112,7 @@ void kern_event_signal(uint32_t hw) {
     Event *e = h_peek(hw, O_EVENT_W);
     if (!e) rt_fatal("kern_event_signal: %#x is not a writable event handle", hw);
     e->signaled = 1;
-    wake_sync_waiters();
+    wake_sync_waiters(e);
     unlock();
 }
 
@@ -2200,8 +2164,14 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     plat_mutex_lock(&g_se_lock);
     int i = 0;
     while (i < g_nse && g_se[i].ev != ev) i++;
-    if (i == g_nse) {
-        if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
+    if (i == g_nse && g_nse == (int)(sizeof g_se / sizeof *g_se)) {
+        // Full: entries are never removed, and a long session binds events at new addresses (two per reload of a
+        // save). An entry whose event the guest destroyed (its state byte is 0, or its memory is gone) gives its slot.
+        i = 0;
+        while (i < g_nse && mem_readable(g_se[i].ev + SE_STATE, 1) && se_live(g_se[i].ev)) i++;
+        if (i == g_nse) rt_fatal("kern_bind_system_event: table full (%d live system events)", g_nse);
+        g_se[i].ev = ev;
+    } else if (i == g_nse) {
         g_se[g_nse++].ev = ev;
     }
     g_se[i].wh = wh;
@@ -2415,4 +2385,24 @@ int kern_svc(Cpu *c, uint32_t imm) {
                tid == prof_replay_tid ? " (the replay thread)" : "");
     }
     return r;
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): guest threads, the handle table, the system-event table and fibers, each
+// against its fixed size (the tables are fatal when full).
+void kern_sizes(PerfSizes *s) {
+    uint64_t threads = 0, handles = 0, fibers = 0, ses;
+    plat_mutex_lock_shared(&G);
+    for (RtThread *t = g_all; t; t = t->all) threads++;
+    for (int i = 0; i < MAX_H; i++) handles += g_h[i].type != 0;
+    plat_mutex_unlock_shared(&G);
+    plat_mutex_lock_shared(&g_se_lock);
+    ses = (uint64_t)g_nse;
+    plat_mutex_unlock_shared(&g_se_lock);
+    plat_mutex_lock_shared(&g_fiber_lock);
+    for (int i = 0; i < FIBER_MAX; i++) fibers += g_fibers[i] != NULL;
+    plat_mutex_unlock_shared(&g_fiber_lock);
+    perf_size(s, "guest threads", threads, 0, PERF_SIZE_NONE);
+    perf_size(s, "handles", handles, MAX_H, PERF_SIZE_NONE);
+    perf_size(s, "system events", ses, sizeof g_se / sizeof *g_se, PERF_SIZE_NONE);
+    perf_size(s, "fibers", fibers, FIBER_MAX, PERF_SIZE_NONE);
 }

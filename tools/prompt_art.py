@@ -63,6 +63,19 @@ STYLES = {
                  'west': f'{PL}Square_Color_Light.png', 'north': f'{PL}Triangle_Color_Light.png',
                  'L': f'{PL}L1_Light.png', 'R': f'{PL}R1_Light.png'},
     },
+    # The Steam Deck's own labels, from the two pads' pictures (the packs have no Deck style): A B X Y where an Xbox pad
+    # has them, in white as the Deck prints them; L1 R1 L2 R2 and L3 R3 as a PlayStation pad names them; Menu (three
+    # bars) and View.
+    'steamdeck': {
+        'glyph': {'south': f'{X}A_White.png', 'east': f'{X}B_White.png', 'west': f'{X}X_White.png',
+                  'north': f'{X}Y_White.png', 'L': f'{P}L1.png', 'R': f'{P}R1.png', 'ZL': f'{P}L2.png',
+                  'ZR': f'{P}R2.png', 'PLUS': f'{X}X.png', 'MINUS': f'{X}Share.png',
+                  **_dpad(X, 'Dpad', 'Up'), **_sticks(X, ('L', 'R'), ('Left_Stick_Click.png', 'Right_Stick_Click.png'),
+                                                      'R_2D.png'),
+                  'LSTICK_PRESS': f'{P}L3.png', 'RSTICK_PRESS': f'{P}R3.png'},
+        'note': {'south': f'{XL}A_White_Light.png', 'east': f'{XL}B_White_Light.png', 'west': f'{XL}X_White_Light.png',
+                 'north': f'{XL}Y_White_Light.png', 'L': f'{PL}L1_Light.png', 'R': f'{PL}R1_Light.png'},
+    },
 }
 
 # The keyboard and mouse: a key in each shade (Dark: a dark key with a white label, the button font and the action

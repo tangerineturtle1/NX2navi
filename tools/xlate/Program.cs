@@ -199,8 +199,13 @@ static class SwshXlate
                     }
                     else
                     {
-                        code = AmpereLowering.Lower(code, size, (string)job["stage"] != "cs", out int local, table);
+                        // A compute program's own local memory: "local_mem" from its control section, at least the
+                        // translator's default of 0x1000 bytes; the lowering's spill area goes after it.
+                        bool cs = (string)job["stage"] == "cs";
+                        int own = cs ? (Math.Max(job["local_mem"] is JsonNode lm ? (int)lm : 0, 0x1000) + 15) & ~15 : 0;
+                        code = AmpereLowering.Lower(code, size, !cs, out int local, table, null, own);
                         if (local != 0) job["local_mem"] = local;
+                        else if (cs) job["local_mem"] = own;
                     }
                     if (job["lowered_out"] is JsonNode lo) File.WriteAllBytes((string)lo, code);
                 }

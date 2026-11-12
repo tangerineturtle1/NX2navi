@@ -66,9 +66,20 @@ extern "C" void menu_art_start(void) {
     if (!plat_thread_spawn(decode_all, nullptr, "menu-art", 0)) decode_all(nullptr);
 }
 
-static int upload(Art &a) {
+// Frees what upload_rgba made for a (none of it in use: the caller waited for the queue or never drew with it).
+static void art_free(Art &a) {
     VkCtx *c = vk_ctx();
-    if (!c || !a.rgba) return 0;
+    if (a.ds) ImGui_ImplVulkan_RemoveTexture(a.ds);
+    if (c && a.view) vkDestroyImageView(c->device, a.view, nullptr);
+    if (c && a.img) vmaDestroyImage(c->vma, a.img, a.alloc);
+    a.ds = VK_NULL_HANDLE, a.view = VK_NULL_HANDLE, a.img = VK_NULL_HANDLE, a.alloc = nullptr;
+}
+
+// rgba (w x h) as a sampled image of up to max_levels levels, each halved from the one before, with its view and Dear
+// ImGui descriptor set in a; 1 when all of it is there, else 0 with nothing left allocated.
+static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t max_levels) {
+    VkCtx *c = vk_ctx();
+    if (!c || !rgba) return 0;
     if (!g_sampler) {
         VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -77,9 +88,9 @@ static int upload(Art &a) {
         si.maxLod = MAX_LEVELS;
         if (vkCreateSampler(c->device, &si, nullptr, &g_sampler) != VK_SUCCESS) return 0;
     }
-    uint32_t lw[MAX_LEVELS] = {a.w}, lh[MAX_LEVELS] = {a.h}, levels = 1;
-    VkDeviceSize bytes = (VkDeviceSize)a.w * a.h * 4;
-    while (levels < MAX_LEVELS && (lw[levels - 1] > 1 || lh[levels - 1] > 1)) {
+    uint32_t lw[MAX_LEVELS] = {w}, lh[MAX_LEVELS] = {h}, levels = 1;
+    VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+    while (levels < max_levels && levels < MAX_LEVELS && (lw[levels - 1] > 1 || lh[levels - 1] > 1)) {
         lw[levels] = lw[levels - 1] > 1 ? lw[levels - 1] / 2 : 1;
         lh[levels] = lh[levels - 1] > 1 ? lh[levels - 1] / 2 : 1;
         bytes += (VkDeviceSize)lw[levels] * lh[levels] * 4;
@@ -88,7 +99,7 @@ static int upload(Art &a) {
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ii.extent = {a.w, a.h, 1};
+    ii.extent = {w, h, 1};
     ii.mipLevels = levels;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -96,19 +107,22 @@ static int upload(Art &a) {
     ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     VmaAllocationCreateInfo ai = {};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(c->vma, &ii, &ai, &a.img, &a.alloc, nullptr) != VK_SUCCESS) return 0;
+    if (vmaCreateImage(c->vma, &ii, &ai, &a.img, &a.alloc, nullptr) != VK_SUCCESS) {
+        a.img = VK_NULL_HANDLE, a.alloc = nullptr;
+        return 0;
+    }
     VkBuffer sb;
     VmaAllocation sa;
     uint8_t *map = (uint8_t *)vk_staging(bytes, &sb, &sa);
-    if (!map) return 0;
+    if (!map) return art_free(a), 0;
     // the levels one after the other in a plain allocation, each halved from the one before (the staging memory may be
     // slow to read back)
     uint8_t *chain = (uint8_t *)malloc((size_t)bytes);
     if (!chain) {
         vmaDestroyBuffer(c->vma, sb, sa);
-        return 0;
+        return art_free(a), 0;
     }
-    memcpy(chain, a.rgba, (size_t)a.w * a.h * 4);
+    memcpy(chain, rgba, (size_t)w * h * 4);
     VkBufferImageCopy regions[MAX_LEVELS] = {};
     VkDeviceSize at = 0;
     for (uint32_t l = 0; l < levels; l++) {
@@ -120,6 +134,11 @@ static int upload(Art &a) {
     }
     memcpy(map, chain, (size_t)bytes);
     free(chain);
+    // The batch flushes its own staging buffers. This one is caller-owned and can be noncoherent.
+    if (vmaFlushAllocation(c->vma, sa, 0, bytes) != VK_SUCCESS) {
+        vmaDestroyBuffer(c->vma, sb, sa);
+        return art_free(a), 0;
+    }
     VkCommandBuffer cb = vk_upload_begin();
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -150,9 +169,46 @@ static int upload(Art &a) {
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = VK_FORMAT_R8G8B8A8_UNORM;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
-    if (vkCreateImageView(c->device, &vi, nullptr, &a.view) != VK_SUCCESS) return 0;
+    if (vkCreateImageView(c->device, &vi, nullptr, &a.view) != VK_SUCCESS) {
+        a.view = VK_NULL_HANDLE;
+        return art_free(a), 0;
+    }
+    int errs = menu_vk_errors();
     a.ds = ImGui_ImplVulkan_AddTexture(g_sampler, a.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return a.ds != VK_NULL_HANDLE;   // the pixels stay (a few MB): the back end may start again on another format
+    if (menu_vk_errors() != errs) a.ds = VK_NULL_HANDLE;   // the descriptor set was not allocated (menu_vk_check logged it)
+    if (!a.ds) return art_free(a), 0;
+    return 1;
+}
+
+static int upload(Art &a) {
+    return upload_rgba(a, a.rgba, a.w, a.h, MAX_LEVELS);   // the pixels stay (a few MB): the back end may start again
+}
+
+// The menu's font atlas (ui/menu.cpp fonts_up), uploaded as the art is: through the runtime's upload batch, which
+// submits under the queue lock, into memory VMA picks (device-local, else what is left), every step checked. Dear
+// ImGui's own upload (ImGui_ImplVulkan_CreateFontsTexture) checked no result, so with the video memory full its copy
+// went to an image without memory and the GPU wrote to address 0 (issue #165); and run from ImGui_ImplVulkan_NewFrame,
+// its submit and queue wait took no lock and could meet the game's submissions on the same queue. The previous atlas
+// goes once the new one is on the GPU and the queue has finished the frames that drew with it.
+static Art g_font;
+
+extern "C" int menu_font_upload(const unsigned char *rgba, int w, int h, ImTextureID *tex) {
+    VkCtx *c = vk_ctx();
+    if (!c || !rgba || w <= 0 || h <= 0) return 0;
+    Art n = {};
+    if (!upload_rgba(n, rgba, (uint32_t)w, (uint32_t)h, 1)) {
+        rt_log("menu: the %dx%d font atlas could not be put on the GPU", w, h);
+        return 0;
+    }
+    if (g_font.ds) {
+        vk_queue_lock();
+        vkQueueWaitIdle(c->gfx_queue);
+        vk_queue_unlock();
+        art_free(g_font);
+    }
+    g_font = n;
+    *tex = (ImTextureID)n.ds;
+    return 1;
 }
 
 extern "C" int menu_art(MenuArt id, ImTextureID *tex, float *w, float *h) {
@@ -170,11 +226,10 @@ extern "C" void menu_art_release(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     for (Art &a : g_art) {
-        if (a.ds) ImGui_ImplVulkan_RemoveTexture(a.ds);
-        if (a.view) vkDestroyImageView(c->device, a.view, nullptr);
-        if (a.img) vmaDestroyImage(c->vma, a.img, a.alloc);
-        a.ds = VK_NULL_HANDLE, a.view = VK_NULL_HANDLE, a.img = VK_NULL_HANDLE, a.alloc = nullptr;
+        art_free(a);
         a.failed = 0;   // uploaded again at the next use
     }
+    art_free(g_font);   // the menu makes its atlas again after the back end starts again (fonts_up)
+    ImGui::GetIO().Fonts->SetTexID(0);
     if (g_sampler) vkDestroySampler(c->device, g_sampler, nullptr), g_sampler = VK_NULL_HANDLE;
 }

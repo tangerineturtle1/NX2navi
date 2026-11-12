@@ -1,7 +1,7 @@
 // The SDL3 back end of the window (gfx_wsys.h), for hosts without Win32: the window on a thread of its own that also
-// runs SDL's event loop, F11 fullscreen (borderless, the desktop's mode), the settings NX2NAVI_WINDOW_SIZE and
-// NX2NAVI_FULLSCREEN, the display's refresh rate, focus, the Vulkan surface. The swapchain and the present are
-// gfx_present.c's. Keyboard and mouse events go to input_sdl.c and to the menu (ui/menu_sdl.cpp).
+// runs SDL's event loop, F11 fullscreen (borderless, the desktop's mode), the settings NX2NAVI_WINDOW_SIZE,
+// NX2NAVI_FULLSCREEN and NX2NAVI_MONITOR, the display's refresh rate, focus, the Vulkan surface. The swapchain and the
+// present are gfx_present.c's. Keyboard and mouse events go to input_sdl.c and to the menu (ui/menu_sdl.cpp).
 //
 // SDL wants its video calls on the thread that initialised video, so this thread does them all: the others hand it
 // work through run_on_window (a user event and a wait) or post a user event. Video is initialised before the window
@@ -29,7 +29,7 @@
 
 static SDL_Window *g_win;
 static uint32_t g_ev_base;               // SDL_RegisterEvents: the user events below
-enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_COUNT };
+enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_TEXT_ON, EV_TEXT_OFF, EV_PASTE, EV_COUNT };
 static PlatEvent g_video_ready;          // manual-reset: SDL video is up (or failed)
 static int g_video_ok;
 static PlatOnce g_thread_once = PLAT_ONCE_INIT;
@@ -121,7 +121,18 @@ void gfx_window_request_close(void) {
     if (g_win) post(EV_CLOSE);
 }
 
-// ---- the display's refresh rate and size
+// SDL sends SDL_EVENT_TEXT_INPUT between SDL_StartTextInput and SDL_StopTextInput only (and shows an on-screen keyboard
+// there where the system has one, as Steam's on a handheld); the window thread makes the calls.
+void gfx_window_text_input(int on) {
+    if (g_win) post(on ? EV_TEXT_ON : EV_TEXT_OFF);
+}
+
+// SDL's clipboard belongs to the window thread: the text is read there and handed to the menu.
+void gfx_window_paste(void) {
+    if (g_win) post(EV_PASTE);
+}
+
+// ---- the display's refresh rate
 static void refresh_rate_update(void) {
     const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
     double hz = 0;
@@ -130,21 +141,23 @@ static void refresh_rate_update(void) {
     gfx_window_set_refresh(hz);
 }
 
-int gfx_window_monitor_size(int *w, int *h) {
-    if (!g_win) return 0;
-    const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
-    if (!m) return 0;
-    *w = (int)(m->w * m->pixel_density + 0.5f);
-    *h = (int)(m->h * m->pixel_density + 0.5f);
-    return 1;
-}
-
 static void density_update(void) {
     float d = SDL_GetWindowPixelDensity(g_win);
     __atomic_store_n(&g_density_milli, (int32_t)((d > 0 ? d : 1) * 1000 + 0.5f), __ATOMIC_RELAXED);
 }
 
 // ---- the window thread
+// NX2NAVI_MONITOR's display while a Wayland compositor has yet to place the fullscreen window (open_window): SDL learns
+// the output a Wayland window is on later, with a display, scale or mode change (Hyprland sends only the latter two).
+static SDL_DisplayID g_place_pending;
+
+static void report_placement(SDL_DisplayID want) {
+    SDL_DisplayID at = SDL_GetDisplayForWindow(g_win);
+    const char *name = SDL_GetDisplayName(at);
+    if (at == want) rt_log("gfx: the window is on the chosen monitor \"%s\"", name ? name : "an unknown monitor");
+    else rt_log("gfx: the window is not on the chosen monitor; it is on \"%s\"", name ? name : "an unknown monitor");
+}
+
 static void handle(const SDL_Event *e) {
     if (e->type == g_ev_base + EV_RUN) {
         RunReq *r = e->user.data1;
@@ -156,13 +169,26 @@ static void handle(const SDL_Event *e) {
         if (g_win) apply_settings();
         return;
     }
+    if (e->type == g_ev_base + EV_TEXT_ON || e->type == g_ev_base + EV_TEXT_OFF) {
+        if (g_win && e->type == g_ev_base + EV_TEXT_ON) SDL_StartTextInput(g_win);
+        else if (g_win) SDL_StopTextInput(g_win);
+        return;
+    }
+    if (e->type == g_ev_base + EV_PASTE) {
+        char text[256];
+        plat_clipboard_get(text, sizeof text);
+        menu_event_paste(text);
+        return;
+    }
     if (e->type == g_ev_base + EV_CLOSE) gfx_window_closed();
     if (!g_win) return;
     input_sdl_event(e);
     menu_sdl_event(e);
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
-        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat) {
+        // not with a modifier held: overlays and capture tools take Ctrl, Shift or Alt+F11 for their own
+        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat &&
+            !(e->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
             set_fullscreen(!is_fullscreen());
             cfg_set("NX2NAVI_FULLSCREEN", is_fullscreen() ? "1" : "0");   // the menu shows it; the next start keeps it
             cfg_save();
@@ -181,6 +207,10 @@ static void handle(const SDL_Event *e) {
         density_update();
         refresh_rate_update();
         gfx_window_mark_dirty();
+        if (g_place_pending && SDL_GetDisplayForWindow(g_win) == g_place_pending) {
+            report_placement(g_place_pending);
+            g_place_pending = 0;
+        }
         break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
     case SDL_EVENT_WINDOW_FOCUS_LOST:
@@ -248,6 +278,187 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
     return video_up() && SDL_Vulkan_GetPresentationSupport(inst, pd, family);
 }
 
+// ---- monitor choice (NX2NAVI_MONITOR, --monitor, --list-monitors)
+// The monitors in SDL_GetDisplays order, which is the index the setting counts in (1-based) and --list-monitors prints.
+// The video driver sets that order, which need not match the desktop's own list of monitors: it holds while the same
+// monitors stay connected, but a monitor that appears or goes away can move the ones after it. SDL has one name per
+// monitor: make and model, with the connector (such as DP-2) on Wayland and X11. The name pins one monitor more firmly
+// than its index. These calls belong to the thread that initialised video: the window thread, or the main thread in
+// --list-monitors.
+#define MON_MAX 32
+
+typedef struct {
+    SDL_DisplayID id;
+    SDL_Rect rc;        // the monitor's pixels, at its position in the desktop's coordinates
+    int primary;
+    unsigned dpi;       // the display scale as a DPI, 96 at 100%
+    char name[128];     // SDL_GetDisplayName; empty when SDL has none
+} MonInfo;
+
+typedef struct { MonInfo m[MON_MAX]; int n; } MonList;
+
+static int enum_monitors(MonList *l) {
+    *l = (MonList){0};
+    int n = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&n);
+    if (!ids) return 0;
+    SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    for (int i = 0; i < n && l->n < MON_MAX; i++) {
+        SDL_Rect rc;
+        if (!SDL_GetDisplayBounds(ids[i], &rc)) continue;
+        // A scaled desktop (Wayland at 125%) counts its coordinates in scaled units: the pixel density turns the size
+        // back into the monitor's pixels, and the content scale and the density together are the display scale
+        // (SDL_GetWindowDisplayScale gives a window the same product). The position stays in the desktop's units.
+        const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(ids[i]);
+        float density = mode && mode->pixel_density > 0 ? mode->pixel_density : 1, scale = SDL_GetDisplayContentScale(ids[i]);
+        if (!(scale > 0)) scale = 1;
+        const char *name = SDL_GetDisplayName(ids[i]);
+        MonInfo *m = &l->m[l->n++];
+        *m = (MonInfo){.id = ids[i], .rc = {rc.x, rc.y, (int)(rc.w * density + 0.5f), (int)(rc.h * density + 0.5f)},
+                       .primary = ids[i] == primary, .dpi = (unsigned)(96 * scale * density + 0.5f)};
+        snprintf(m->name, sizeof m->name, "%s", name ? name : "");
+    }
+    SDL_free(ids);
+    return l->n;
+}
+
+// `2  "HP Inc. HP E243 CNK0161ZY2 (DP-3)"  1920x1080 at 3456,756  dpi 120 (125%)`: one monitor, for the log and
+// --list-monitors, with "  primary" after the rectangle on the primary one.
+static void monitor_line(const MonList *l, int i, char *out, size_t cap) {
+    const MonInfo *m = &l->m[i];
+    snprintf(out, cap, "%d  \"%s\"  %dx%d at %d,%d%s  dpi %u (%u%%)", i + 1, m->name, m->rc.w, m->rc.h, m->rc.x, m->rc.y,
+             m->primary ? "  primary" : "", m->dpi, m->dpi * 100 / 96);
+}
+
+static int monitor_unset(const char *v) { return !v || !*v || !SDL_strcasecmp(v, "auto"); }
+
+// Which monitor of the list a NX2NAVI_MONITOR value (not empty, not auto) names, as a 0-based index; -1 when none.
+// Rules, in this order: "primary"; all digits, a 1-based index; any other text, a case-insensitive substring of a
+// monitor's name (the first monitor in list order when several match). why gets the rule that matched, or the reason
+// nothing did. The same rules as gfx_window_win.c resolve_monitor, which also matches the GDI device name.
+static int resolve_monitor(const MonList *l, const char *want, char *why, size_t cap) {
+    if (!SDL_strcasecmp(want, "primary")) {
+        for (int i = 0; i < l->n; i++)
+            if (l->m[i].primary) {
+                snprintf(why, cap, "the primary monitor");
+                return i;
+            }
+        snprintf(why, cap, "no monitor is marked primary");
+        return -1;
+    }
+    if (want[strspn(want, "0123456789")] == 0) {
+        long idx = strtol(want, NULL, 10);
+        if (idx >= 1 && idx <= l->n) {
+            snprintf(why, cap, "index %ld of %d", idx, l->n);
+            return (int)idx - 1;
+        }
+        snprintf(why, cap, "index %s is outside 1..%d", want, l->n);
+        return -1;
+    }
+    int first = -1, hits = 0;
+    for (int i = 0; i < l->n; i++)
+        if (SDL_strcasestr(l->m[i].name, want)) {
+            if (first < 0) first = i;
+            hits++;
+        }
+    if (first < 0) {
+        snprintf(why, cap, "no monitor name contains it");
+        return -1;
+    }
+    if (hits > 1) snprintf(why, cap, "monitor name contains it; the first of %d matches", hits);
+    else snprintf(why, cap, "monitor name contains it");
+    return first;
+}
+
+// The monitor NX2NAVI_MONITOR picks, copied to *out; 0 when it is unset or auto (the system places the window), or when
+// it matches nothing now (the monitors present are logged, and the default placement applies). log: say what was decided
+// and why. The window thread asks with log set; the size query below, which widescreen.c makes before the window
+// exists, stays quiet. Window thread.
+static int chosen_monitor(MonInfo *out, int log) {
+    const char *want = cfg_get("NX2NAVI_MONITOR");
+    if (monitor_unset(want)) return 0;
+    MonList l;
+    char why[256], line[512];
+    int n = enum_monitors(&l), pick = -1;
+    if (n) pick = resolve_monitor(&l, want, why, sizeof why);
+    else snprintf(why, sizeof why, "no monitor was found");
+    if (pick < 0) {
+        if (log) {
+            rt_log("gfx: NX2NAVI_MONITOR=%s picks no monitor (%s); the window gets the default placement. Monitors present:",
+                   want, why);
+            for (int i = 0; i < n; i++) {
+                monitor_line(&l, i, line, sizeof line);
+                rt_log("gfx:   %s", line);
+            }
+        }
+        return 0;
+    }
+    if (log) {
+        monitor_line(&l, pick, line, sizeof line);
+        rt_log("gfx: NX2NAVI_MONITOR=%s picks monitor %s (%s)", want, line, why);
+    }
+    *out = l.m[pick];
+    return 1;
+}
+
+// --list-monitors (main.c): one line per monitor, then what the current NX2NAVI_MONITOR would pick. No game files. It
+// runs on the main thread before any window thread exists, so that thread initialises video here and shuts it down again.
+int list_monitors(void) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "list-monitors: SDL video init failed (%s)\n", SDL_GetError());
+        return 1;
+    }
+    MonList l;
+    char line[512], why[256];
+    int n = enum_monitors(&l);
+    if (!n) {
+        fprintf(stderr, "list-monitors: no monitor found\n");
+        SDL_Quit();
+        return 1;
+    }
+    printf("index  name  desktop rectangle  primary  dpi\n");
+    for (int i = 0; i < n; i++) {
+        monitor_line(&l, i, line, sizeof line);
+        printf("%s\n", line);
+    }
+    const char *want = cfg_get("NX2NAVI_MONITOR");
+    if (monitor_unset(want)) {
+        printf("NX2NAVI_MONITOR is not set (auto): the system places the window\n");
+    } else {
+        int pick = resolve_monitor(&l, want, why, sizeof why);
+        if (pick >= 0) printf("NX2NAVI_MONITOR=%s picks monitor %d (%s)\n", want, pick + 1, why);
+        else printf("NX2NAVI_MONITOR=%s picks no monitor (%s)\n", want, why);
+    }
+    SDL_Quit();
+    return 0;
+}
+
+typedef struct { int w, h, ok; } SizeReq;
+
+static void chosen_size(void *arg) {
+    SizeReq *r = arg;
+    MonInfo mon;
+    if (chosen_monitor(&mon, 0)) r->w = mon.rc.w, r->h = mon.rc.h, r->ok = 1;
+}
+
+// Pixels of the monitor the window is on; 0 when unknown. Before the window exists (widescreen.c wide_init at start) a
+// fullscreen window opens on the monitor NX2NAVI_MONITOR picks, so that one's size; without a choice the system decides
+// where the window goes, which is not known yet.
+int gfx_window_monitor_size(int *w, int *h) {
+    if (g_win) {
+        const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
+        if (!m) return 0;
+        *w = (int)(m->w * m->pixel_density + 0.5f);
+        *h = (int)(m->h * m->pixel_density + 0.5f);
+        return 1;
+    }
+    SizeReq r = {0};
+    if (monitor_unset(cfg_get("NX2NAVI_MONITOR")) || !video_up()) return 0;
+    run_on_window(chosen_size, &r);
+    *w = r.w, *h = r.h;
+    return r.ok;
+}
+
 // ---- gfx_wsys.h
 static int open_ok;
 
@@ -255,21 +466,47 @@ static void open_window(void *arg) {
     (void)arg;
     int w, h;
     gfx_cfg_window_size(&w, &h);
-    g_win = SDL_CreateWindow("NX2navi", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    // NX2NAVI_MONITOR: the window is created centred on the chosen monitor; without a choice the system places it.
+    MonInfo mon;
+    int on_mon = chosen_monitor(&mon, 1);
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "NX2navi");
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true);
+    if (on_mon) {
+        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(mon.id));
+        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(mon.id));
+    }
+    g_win = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
     if (!g_win) {
         rt_log("gfx: SDL_CreateWindow failed (%s)", SDL_GetError());
         return;
     }
     set_pixel_size(w, h);   // w x h were window units; the setting is in pixels
+    // Centred again at the size it ended up with. SDL also takes this position as the display the fullscreen below
+    // covers: a Wayland window cannot be moved, and this is how its fullscreen still opens on the chosen output.
+    if (on_mon) SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED_DISPLAY(mon.id), SDL_WINDOWPOS_CENTERED_DISPLAY(mon.id));
     density_update();
     note_applied();
     refresh_rate_update();
     if (cfg_get("NX2NAVI_BACKGROUND_WINDOW")) rt_log("gfx: NX2NAVI_BACKGROUND_WINDOW has no effect with SDL windows");
-    const char *monitor = cfg_get("NX2NAVI_MONITOR");   // open_window runs once, so this is logged once
-    if (monitor && *monitor && strcasecmp(monitor, "auto"))
-        rt_log("gfx: NX2NAVI_MONITOR=%s has no effect with SDL windows: monitor selection is Win32-only (gfx_window_win.c)", monitor);
+    int wayland = !SDL_strcmp(SDL_GetCurrentVideoDriver(), "wayland");
+    // open_window runs once, so this is logged once
+    if (on_mon && wayland)
+        rt_log("gfx: Wayland leaves the placement of a windowed window to the compositor, so NX2NAVI_MONITOR only decides "
+               "where the game opens in fullscreen");
     if (gfx_cfg_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
     SDL_SyncWindow(g_win);
+    // A Wayland compositor places the fullscreen window after SDL_SyncWindow returns; handle reports it once the window
+    // is on the chosen monitor.
+    if (on_mon && (gfx_cfg_fullscreen() || !wayland)) {
+        if (wayland && SDL_GetDisplayForWindow(g_win) != mon.id) g_place_pending = mon.id;
+        else report_placement(mon.id);
+    }
     input_sdl_window(g_win);
     open_ok = 1;
 }
@@ -278,12 +515,6 @@ int wsys_open(void) {
     if (!video_up()) return 0;
     if (!g_win) run_on_window(open_window, NULL);
     return open_ok;
-}
-
-// --list-monitors (main.c) lists Win32 monitors only; see open_window for the setting.
-int list_monitors(void) {
-    fprintf(stderr, "list-monitors: monitor selection is Win32-only; this build uses SDL windows\n");
-    return 1;
 }
 
 typedef struct { VkInstance inst; VkSurfaceKHR surface; } SurfaceReq;

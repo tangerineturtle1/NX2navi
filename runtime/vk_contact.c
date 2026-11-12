@@ -112,7 +112,16 @@ static void mem_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &d);
 }
 
+int vk_contact_pending(void) { return C.pending; }
+
 void vk_contact_flush(VkExec *ex) {
+    // The submitting thread past a group (vk_exec.c NX2NAVI_REPLAY_PIPE): the group's first chunk may have made the
+    // pass due and a later one records it where the replay would; only one still due after the group is this one's.
+    if (vk_exec_behind()) {
+        vk_exec_hooks_wait();
+        if (!C.pending) return;
+        vk_exec_turn();
+    }
     if (!C.pending) return;
     C.pending = 0;
     if (ex->in_pass) return;
@@ -164,13 +173,15 @@ void vk_contact_pass_begin(VkExec *ex) {
     // The camera block: c4 of the fragment stage, 0x940 bytes. The composite binds it only after its pass begins, so
     // the newest one seen at any pass start serves.
     const p_bind_buf *b = &ex->ubo[1][1];
-    if (b->addr && b->size == 0x940) C.c4 = b->addr;
+    if (b->addr && b->size == 0x940 && C.c4 != b->addr) vk_exec_hook_turn(), C.c4 = b->addr;
     if (is_gbuffer(ex, &scene, &depth)) {
+        vk_exec_hook_turn();
         C.pending = 0;
         C.scene = scene, C.depth = depth, C.w = ex->pass_w, C.h = ex->pass_h;
         return;
     }
     if (is_composite(ex)) {
+        vk_exec_hook_turn();
         C.pending = C.c4 != 0;
         return;
     }

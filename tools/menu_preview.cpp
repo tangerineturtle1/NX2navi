@@ -73,6 +73,7 @@ int cfg_from_env(const char *) { return 0; }
 void cfg_set(const char *, const char *) {}
 int cfg_save(void) { return 1; }
 int cfg_reset(const char *const *, int) { return 0; }
+int cfg_pending(const char *) { return 0; }   // nothing changed since the start: no "after restart" notes
 unsigned cfg_version(void) { return 1; }
 void menu_sound_play(MenuSound) {}
 const char *ov_language(void) { return "en-US"; }

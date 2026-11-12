@@ -1,7 +1,8 @@
-"""Xbox, PlayStation and keyboard-and-mouse button prompts for Ocarina of Time (Switch 2), drawn from button art on the
-player's machine.
+"""Xbox, PlayStation, Steam Deck and keyboard-and-mouse button prompts for Ocarina of Time (Switch 2), drawn from button
+art on the player's machine.
 
-    python tools/pad_prompts.py --art FOLDER --game FOLDER [--style xbox|playstation|pc] [--layout position|label]
+    python tools/pad_prompts.py --art FOLDER --game FOLDER [--style xbox|playstation|steamdeck|pc]
+                                [--layout position|label]
                                 [--binds nx2navi.ini]
 
 --art is a folder of button art with the file names of STYLES (tools/prompt_art.py) and KEY_ART below: the Source
@@ -14,7 +15,9 @@ romfs.bin, as the setup writes them); --romfs names another, which may also be a
 style and layout becomes the overlay folder <game>/romfs-patches-<style> (layout position) or
 <game>/romfs-patches-<style>-label (layout label), and the keyboard and mouse <game>/romfs-patches-pc, each with a
 manifest.tsv: runtime/romfs.c overlay_init loads it in place of the game's files when nx2navi.ini has prompts = xbox,
-playstation or pc (runtime/input_map.c input_prompts_folder). Without --style or --layout, every style or layout.
+playstation, steamdeck or pc (runtime/input_map.c input_prompts_folder). Without --style or --layout, every style or
+layout. The Steam Deck style has no art of its own: its buttons are named as an Xbox pad's face buttons and a
+PlayStation pad's shoulders and stick clicks, so it is drawn from those two pads' pictures (prompt_art.py STYLES).
 --out writes a single style and layout elsewhere.
 
 The two pad layouts follow pad_layout (runtime/input_map.c). position, for pad_layout = nintendo: a pad is played by
@@ -202,7 +205,7 @@ class Romfs:
     def dictionary(self, dict_id):
         if self.dicts is None:
             self.dicts = {}
-            pack = zstandard.ZstdDecompressor().decompressobj().decompress(self.raw(DICTIONARIES))
+            pack = unpack(self.raw(DICTIONARIES))
             for lo, hi in sarc_members(pack).values():
                 d = zstandard.ZstdCompressionDict(pack[lo:hi])
                 self.dicts[d.dict_id()] = d
@@ -215,7 +218,27 @@ class Romfs:
             return raw, None
         dict_id = zstandard.get_frame_parameters(raw).dict_id
         d = self.dictionary(dict_id) if dict_id else None
-        return zstandard.ZstdDecompressor(dict_data=d).decompressobj().decompress(raw), d
+        return unpack(raw, d), d
+
+
+# How much of a packed file unpack gives the decompressor at a time.
+PIECE = 1 << 16
+
+
+def unpack(raw, dictionary=None):
+    """The contents of a zstd frame, with the dictionary it was packed with; bytes after the frame are left out.
+
+    The file goes to the decompressor in pieces of PIECE bytes and the pieces' outputs are joined once. Given the
+    whole file in one call, the library returns one bytes object that it grows by copying as the output comes: made-up
+    data of the size of the interface texture archive, 69 MB packed and 244 MB unpacked, took 21 s that way on a
+    fast PC against 0.3 s in pieces. Players' builds waited 44 to 52 s before this tool's first folder, most of
+    its minute."""
+    out, parts = zstandard.ZstdDecompressor(dict_data=dictionary).decompressobj(), []
+    for at in range(0, len(raw), PIECE):
+        parts.append(out.decompress(raw[at:at + PIECE]))
+        if out.eof:
+            break
+    return b''.join(parts)
 
 
 def sarc_members(data):
@@ -724,6 +747,11 @@ def mask_of(img, rel):
     return out
 
 
+def note_texture(art, rel, box):
+    pic = fit(load_art(art, rel), box, (93, 93))
+    return astc_encode(bleed(pic))
+
+
 def draw_textures(data, glyph, note, art, cache):
     """Paints the action prompt's letters (from glyph) and the ocarina's note buttons (from note; both Switch button ->
     picture) into the BNTX data (a bytearray) in place. A new letter takes the height and centre of the game's own
@@ -749,8 +777,9 @@ def draw_textures(data, glyph, note, art, cache):
             assert t['fmt'] == ASTC_4X4_SRGB and (t['w'], t['h']) == (93, 93), f'{name}: format {t["fmt"]:#x}, ' \
                 f'{t["w"]}x{t["h"]}'
             box = NOTE_BOXES['shoulder' if button in 'LR' else 'disc']
-            pic = fit(load_art(art, note[button]), box, (t['w'], t['h']))
-            write_level(data, t, astc_encode(bleed(pic)), wb * 16, hb)
+            rel = note[button]
+            encoded = cache(('note', rel, box), lambda: note_texture(art, rel, box))
+            write_level(data, t, encoded, wb * 16, hb)
 
 
 # Where the game's own note buttons are opaque in their 93x93 textures (1.1.1), which the new ones fill: the face

@@ -1,7 +1,9 @@
 // Settings pages in two panes (ui/option_rows.cpp): option rows on the left, the selected (controller) or hovered (mouse)
-// row's description on the right. Each row shows a setting of the cfg table (cfg.h) and changes it through cfg_set: A or
-// a click steps it (toggle, next value), left and right step it. A row marks the default value, says "after restart" when
-// the setting is read at start, and is greyed out with a note when an environment variable fixes it.
+// row's description on the right. Each row shows a setting of the cfg table (cfg.h) and changes it through cfg_set: A
+// steps it (toggle, next value), left and right step it, and the mouse steps it on the two framed arrows beside its
+// value and nowhere else on the row (a click on the row selects it; held on an arrow it repeats). A row marks the
+// default value, says "after restart" while a setting read at start differs from the value the game started with
+// (cfg_pending), and is greyed out with a note when an environment variable fixes it.
 //
 //   opt_begin("##screen", scale);
 //   opt_toggle("NX2NAVI_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);

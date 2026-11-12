@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-int vk_fg_wanted(void);                      // NX2NAVI_FRAMEGEN = fsr3 with DLSS or FSR 3.1 upscaling on (live)
+int vk_fg_wanted(void);                      // NX2NAVI_FRAMEGEN = fsr3 with DLSS or FSR 3.1 upscaling on (live), where FSR 3.1 loads
 uint32_t vk_fg_queue_count(void);            // graphics-family queues the device creates
 void vk_fg_queues(VkQueue present, VkQueue acquire);   // vk_device.c, after the device exists
 int vk_fg_active(void);                      // the frame generation swapchain exists
@@ -26,3 +26,21 @@ void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D
 uint64_t vk_fg_presents(VkSwapchainKHR sc);   // frames the swapchain presented, generated ones included (0: off)
 PFN_vkSetHdrMetadataEXT vk_fg_hdr_metadata_fn(void);   // AMD's replacement for vkSetHdrMetadataEXT while active, else NULL
 void vk_fg_release(void);
+
+// The same through AMD's FSR SDK 2.4 (vk_fg4.cpp), for vk_fg.cpp alone: it takes this path while FSR 4 is the upscaler,
+// and every call above goes to these while this path holds the swapchain.
+int vk_fg4_available(void);                  // its libraries are beside the executable and list a frame generation for the device
+int vk_fg4_failed(void);                     // it failed in this run: FSR 3.1's library generates the frames
+const char *vk_fg4_name(void);               // the frame generation version the loader lists first for the device ("3.1.6"), "" unknown
+int vk_fg4_active(void);
+int vk_fg4_generating(void);
+void vk_fg4_queues(VkQueue present, VkQueue acquire);
+VkResult vk_fg4_create_swapchain(const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc);
+void vk_fg4_destroy_swapchain(VkSwapchainKHR sc);
+VkResult vk_fg4_get_images(VkSwapchainKHR sc, uint32_t *n, VkImage *img);
+VkResult vk_fg4_acquire(VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
+VkResult vk_fg4_present(const VkPresentInfoKHR *pi);
+void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D ext, VkImage hudless, const int pic[4]);
+uint64_t vk_fg4_presents(VkSwapchainKHR sc);
+PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void);
+void vk_fg4_release(void);

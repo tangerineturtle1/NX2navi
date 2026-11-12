@@ -365,7 +365,17 @@ static void relocate_table(Mod *m, const Elf64Rela *r, uint64_t n) {
             if (sym_defined(m, si)) m->sym_own++;
             else m->sym_import++;
             Res s = resolve(m, si, type == R_JUMP_SLOT);
-            v = s.kind == RES_WEAK ? 0 : s.value + (type == R_JUMP_SLOT ? 0 : (uint64_t)r[i].addend);
+            // S + A for every symbolic type (the AArch64 ELF ABI), JUMP_SLOT included where the symbol is a guest
+            // function; linkers write 0 there. A host function's address takes no addend (an offset into a host
+            // trampoline means nothing), so such an addend is logged and dropped, as is one on an unresolved weak symbol
+            // (address 0, the guest's own test for an absent function).
+            int64_t a = r[i].addend;
+            if (type == R_JUMP_SLOT && a && s.kind != RES_GUEST) {
+                rt_log("loader: %s JUMP_SLOT relocation %llu for %s carries addend %lld on a host function: left out",
+                       m->pub.name, (unsigned long long)i, sym_name(m, si), (long long)a);
+                a = 0;
+            }
+            v = s.kind == RES_WEAK ? 0 : s.value + (uint64_t)a;
         }
         ST64(base + r[i].off, v);
     }

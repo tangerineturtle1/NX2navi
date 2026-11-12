@@ -1,0 +1,19 @@
+#version 450
+// SMAA pass 3 (runtime/vk_aa.c): neighbourhood blending of the game's composite by the weights, in linear light (as SMAA
+// asks of a picture read through an sRGB view), stored into the game's scene target as its raw RGB9E5 words of the
+// square root (aa_common.glsl).
+#include "smaa_setup.glsl"
+#include "aa_common.glsl"
+layout(binding = 0) uniform sampler2D color;     // the game's composite, linear filtering
+layout(binding = 1) uniform sampler2D weights;   // linear filtering
+layout(binding = 2, r32ui) uniform writeonly uimage2D dst;
+
+void main() {
+    ivec2 p;
+    vec2 uv;
+    if (!smaa_pixel(p, uv)) return;
+    vec4 offset;
+    SMAANeighborhoodBlendingVS(uv, offset);
+    vec3 c = SMAANeighborhoodBlendingPS(uv, offset, color, weights).rgb;
+    imageStore(dst, p, uvec4(aa_pack_rgb9e5(aa_encode(c)), 0u, 0u, 0u));
+}

@@ -99,13 +99,12 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 37:
-        sys.exit(f"expected 37 patches, found {len(patches)}")
+    if len(patches) != 40:
+        sys.exit(f"expected 40 patches, found {len(patches)}")
     # build/xlate is inside this checkout, and git inside a repository reads a "diff --git" patch's paths from the
     # repository's top: those hunks fall outside the directory handed to --directory, git skips every file of the patch
-    # and still exits 0. 0021-prmt-byte-permute.patch is the only one written in that form, so it used to be skipped in
-    # silence and every byte permute stayed a no-op. GIT_CEILING_DIRECTORIES stops git from walking up to the checkout,
-    # so it reads the patch as it would outside a repository, and a "Skipped patch" line fails the build.
+    # and still exits 0. GIT_CEILING_DIRECTORIES stops git from walking up to the checkout, so it reads each patch as it
+    # would outside a repository, and a "Skipped patch" line fails the build (including 0021's PRMT implementation).
     env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(BUILD.parent), LC_ALL="C")
     for patch in patches:
         for extra in (["--check"], []):

@@ -1,0 +1,100 @@
+#version 450
+// The game's SMAA composition replaced (runtime/vk_aa.c): mode 0 stores the composite as it is (anti-aliasing off),
+// mode 1 runs a fast approximate edge smoothing (FXAA) over it first. Input: the game's composite, linear, already
+// tonemapped. Output: the scene target's raw RGB9E5 words of the square root of each channel (aa_common.glsl).
+//
+// The smoothing works on the square-rooted luma: where the local contrast is high enough, it finds whether the edge
+// runs across or along the pixel, walks along the edge both ways until the luma pair it follows changes, and moves the
+// sample point toward the neighbour across the edge by how far the pixel sits from the nearer end of the edge. A
+// blur of the 3x3 neighbourhood's contrast handles edges thinner than a pixel. The sample at the moved point is
+// bilinear, so the move blends the two sides.
+#extension GL_GOOGLE_include_directive : require
+#include "aa_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r32ui) uniform writeonly uimage2D dst;
+layout(push_constant) uniform Push {
+    vec2 inv;     // 1 / size
+    ivec2 size;   // the scene target's size
+    int mode;     // 0 copy, 1 FXAA
+} pc;
+
+vec3 at(vec2 uv) { return aa_encode(textureLod(src, uv, 0.0).rgb); }
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float luma_at(vec2 uv) { return luma(at(uv)); }
+
+const float EDGE_MIN = 0.0312;      // no smoothing below this contrast (dark areas)
+const float EDGE_REL = 0.125;       // nor below this share of the brightest neighbour
+const float SUBPIXEL = 0.75;        // how much a thin feature is blurred
+const int STEPS = 12;
+const float STEP_LEN[STEPS] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+vec3 fxaa(vec2 uv) {
+    vec3 cM = at(uv);
+    float lM = luma(cM);
+    vec2 d = pc.inv;
+    float lN = luma_at(uv + vec2(0.0, -d.y)), lS = luma_at(uv + vec2(0.0, d.y));
+    float lW = luma_at(uv + vec2(-d.x, 0.0)), lE = luma_at(uv + vec2(d.x, 0.0));
+    float lo = min(lM, min(min(lN, lS), min(lW, lE)));
+    float hi = max(lM, max(max(lN, lS), max(lW, lE)));
+    float range = hi - lo;
+    if (range < max(EDGE_MIN, hi * EDGE_REL)) return cM;
+    float lNW = luma_at(uv + vec2(-d.x, -d.y)), lNE = luma_at(uv + vec2(d.x, -d.y));
+    float lSW = luma_at(uv + vec2(-d.x, d.y)), lSE = luma_at(uv + vec2(d.x, d.y));
+
+    // thin features: how far the centre stands out from the neighbourhood's weighted mean
+    float mean = (2.0 * (lN + lS + lW + lE) + lNW + lNE + lSW + lSE) / 12.0;
+    float sub = clamp(abs(mean - lM) / range, 0.0, 1.0);
+    sub = smoothstep(0.0, 1.0, sub);
+    sub = sub * sub * SUBPIXEL;
+
+    // the edge's direction: horizontal when the luma changes more from row to row than from column to column
+    float across_rows = abs(0.25 * lNW - 0.5 * lN + 0.25 * lNE) + abs(0.5 * lW - lM + 0.5 * lE) +
+                        abs(0.25 * lSW - 0.5 * lS + 0.25 * lSE);
+    float across_cols = abs(0.25 * lNW - 0.5 * lW + 0.25 * lSW) + abs(0.5 * lN - lM + 0.5 * lS) +
+                        abs(0.25 * lNE - 0.5 * lE + 0.25 * lSE);
+    bool horizontal = across_cols >= across_rows;
+
+    // which side of the pixel the edge is on: the neighbour across it with the larger step
+    float l1 = horizontal ? lN : lW, l2 = horizontal ? lS : lE;
+    float g1 = abs(l1 - lM), g2 = abs(l2 - lM);
+    bool first = g1 >= g2;
+    float grad = 0.25 * max(g1, g2);
+    float step_len = horizontal ? d.y : d.x;
+    float pair;   // the mean luma of the pixel and its neighbour across the edge, which the walk follows
+    if (first) step_len = -step_len, pair = 0.5 * (l1 + lM);
+    else pair = 0.5 * (l2 + lM);
+    vec2 edge = uv;
+    if (horizontal) edge.y += 0.5 * step_len;
+    else edge.x += 0.5 * step_len;
+
+    // walk along the edge both ways until the pair's luma changes by more than a quarter of the step across it
+    vec2 dir = horizontal ? vec2(d.x, 0.0) : vec2(0.0, d.y);
+    vec2 uv1 = edge - dir * STEP_LEN[0], uv2 = edge + dir * STEP_LEN[0];
+    float e1 = luma_at(uv1) - pair, e2 = luma_at(uv2) - pair;
+    bool done1 = abs(e1) >= grad, done2 = abs(e2) >= grad;
+    for (int i = 1; i < STEPS && !(done1 && done2); i++) {
+        if (!done1) uv1 -= dir * STEP_LEN[i], e1 = luma_at(uv1) - pair, done1 = abs(e1) >= grad;
+        if (!done2) uv2 += dir * STEP_LEN[i], e2 = luma_at(uv2) - pair, done2 = abs(e2) >= grad;
+    }
+    float dist1 = horizontal ? uv.x - uv1.x : uv.y - uv1.y;
+    float dist2 = horizontal ? uv2.x - uv.x : uv2.y - uv.y;
+    bool nearer1 = dist1 < dist2;
+    float offset = 0.5 - min(dist1, dist2) / (dist1 + dist2);
+    // only when the luma at the nearer end moves the way the centre's does: else the pixel is outside the edge's span
+    if (((nearer1 ? e1 : e2) < 0.0) == (lM < pair)) offset = 0.0;
+    offset = max(offset, sub);
+    vec2 moved = uv;
+    if (horizontal) moved.y += offset * step_len;
+    else moved.x += offset * step_len;
+    return at(moved);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    vec2 uv = (vec2(p) + 0.5) * pc.inv;
+    vec3 c = pc.mode == 1 ? fxaa(uv) : aa_encode(texelFetch(src, p, 0).rgb);
+    imageStore(dst, p, uvec4(aa_pack_rgb9e5(c), 0u, 0u, 0u));
+}

@@ -4,6 +4,8 @@
 
 Nothing that came out of the game goes into the repository: no game files, keys, extracted data, recompiled C, compiled binaries, shaders, shader caches, fonts, audio or movies. Not in commits, not in issues, not in pull requests. Only information about the game goes in: addresses, hashes, patch code we wrote, shader and bind-state identifiers.
 
+Our own shaders go in as source only (`runtime/shaders/`, `tools/make_dlaa_mask.py`, `tools/make_mvobj_fs.py`); the build compiles them (`tools/build_shaders.py`), and the same checks refuse a compiled one.
+
 Two checks enforce this:
 
 - CI runs `tools/check_content.py` on every push and pull request.

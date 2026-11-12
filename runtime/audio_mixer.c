@@ -71,6 +71,7 @@ typedef struct Mixer {
     unsigned reported;                             // one-time reports
     float voice_scratch[6][MAX_FRAME], filter_scratch[MAX_FRAME], output_scratch[MAX_FRAME * OUT_MAX];
     double level_sum, level_peak; uint64_t level_count, level_frames; int first_sound_logged;
+    double input_sum[6];                           // NX2NAVI_TRACE=audio: the device sink's inputs, squared and summed
     int prefill;                                   // render blocks
     uint64_t trace_pass, trace_seen[1024];         // NX2NAVI_TRACE=audio: render passes; the pass each voice was last mixed in
     uint64_t trace_buf[1024];                      // and the wave buffer address it read in that pass
@@ -225,12 +226,13 @@ int list_audio_devices(void) {
     return 0;
 }
 
-// NX2NAVI_AUDIO_CHANNELS: the output channels of this run, decided once. stereo gives 2; 5.1 gives 6 (FL FR C LFE RL RR,
+// NX2NAVI_AUDIO_CHANNELS: the output channels, decided at the first call and again when the setting changes
+// (audio_channels_live). stereo gives 2; 5.1 gives 6 (FL FR C LFE RL RR,
 // the device sink's order and SDL's); auto gives 6 when the chosen playback device (NX2NAVI_AUDIO_DEVICE; the system default unless set) has at least six channels (a 5.1
 // or 7.1 speaker setup in Windows; SDL places 5.1 on 7.1) and 2 otherwise. IAudioDevice reports the same count to the
 // game (GetActiveChannelCount), which picks its sink layout from it. NX2NAVI_AUDIO=none: 2, without touching SDL.
+static _Atomic int decided;   // 0: output_channels decides at its next call
 static int output_channels(void) {
-    static _Atomic int decided;
     int n = atomic_load(&decided);
     if (n) return n;
     const char *want = cfg_value("NX2NAVI_AUDIO_CHANNELS"), *mode = cfg_get("NX2NAVI_AUDIO");
@@ -402,6 +404,29 @@ static void output_timing(Mixer *m, int rate) {
            dev.channels, m->prefill * 5, period, m->target * 1000.0 / rate);
 }
 
+// Render thread (audio_mixer_render): the output takes another channel count after NX2NAVI_AUDIO_CHANNELS changed
+// (audio_channels_live). The stream is made again with the new count on the device it was on: destroying it waits
+// for the SDL callback, the only other reader of the ring and of m->channels, and what was queued in the old layout
+// is dropped.
+static void channels_switch(Mixer *m, int channels) {
+    if (m->stream) SDL_DestroyAudioStream(m->stream);
+    m->stream = NULL;
+    atomic_store_explicit(&m->rd, atomic_load(&m->wr), memory_order_release);
+    m->channels = channels;
+    m->ready = 0;
+    m->reported &= ~(1u << 6);   // the device sink's line again, with the new output
+    atomic_store_explicit(&m->pulled_ns, 0, memory_order_release);
+    rt_log("audio: the output is now %s", channels == 6 ? "5.1" : "stereo");
+    if (!m->device_ok) return;   // mixing without a device
+    char err[256];
+    if (stream_open(m, m->rate, m->device ? m->device : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, err, sizeof err)) {
+        output_timing(m, m->rate);
+    } else {
+        m->device_ok = 0;
+        rt_log("audio: no output device (%s): mixing without sound", err);
+    }
+}
+
 // Render thread, from audio_mixer_pace_ns while the device takes nothing. An explicitly chosen device (NX2NAVI_AUDIO_DEVICE)
 // can disappear (a virtual sink removed, a USB headset unplugged); SDL keeps only the system default device alive across
 // that, so the stream of a chosen one just stops being pulled, and nothing in this file polls SDL's event queue for the
@@ -523,6 +548,11 @@ static void level_note(AudioRenderer *r, Mixer *m, const float *out, int frames)
                (unsigned long long)atomic_load(&m->overruns), (unsigned long long)atomic_load(&m->missing_frames),
                (unsigned long long)atomic_load(&m->callback_frames), (unsigned long long)atomic_load(&m->callback_nonzero),
                queued * 1000.0 / r->param.sample_rate, (unsigned long long)atomic_load(&m->skipped_frames));
+        double f = (double)m->level_frames;
+        rt_log("audio: device sink inputs rms FL %.4f FR %.4f C %.4f LFE %.4f RL %.4f RR %.4f, output %s",
+               sqrt(m->input_sum[0] / f), sqrt(m->input_sum[1] / f), sqrt(m->input_sum[2] / f), sqrt(m->input_sum[3] / f),
+               sqrt(m->input_sum[4] / f), sqrt(m->input_sum[5] / f), m->channels == 6 ? "5.1" : "stereo");
+        memset(m->input_sum, 0, sizeof m->input_sum);
         m->level_sum = m->level_peak = 0;
         m->level_count = m->level_frames = 0;
     }
@@ -1128,6 +1158,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         if (r->sinks[i].type == SINK_DEVICE && !sink) sink = &r->sinks[i];
         else if (r->sinks[i].type == SINK_CIRCULAR){mix_circular_sink(r,i);circular=1;}
     } else {m->sink_address[i]=0;m->sink_size[i]=m->sink_offset[i]=m->sink_old[i]=m->sink_written[i]=0;}
+    if (m->channels != output_channels()) channels_switch(m, output_channels());
     const int oc = m->channels;
     float *out=m->output_scratch;
     memset(out, 0, sizeof(float) * (size_t)oc * (size_t)frames);
@@ -1143,6 +1174,9 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         const float *ch[6] = {0};
         float raw[2 * MAX_FRAME];
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
+        if (rt_trace & RT_TRACE_AUDIO)   // what the game puts on each input: shows whether it mixes for 5.1 (level_note)
+            for (int c = 0; c < 6; c++)
+                for (int k = 0; ch[c] && k < frames; k++) m->input_sum[c] += (double)ch[c][k] * ch[c][k];
         for (int k = 0; k < frames; k++) {
             float s[OUT_MAX] = {0};   /* FL FR C LFE RL RR */
             if (sink->input_count >= 6 && oc == 6) {
@@ -1170,6 +1204,41 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
 // ---- IAudioDevice: one output device, stereo or 5.1 (output_channels)
 static const char device_name[] = "AudioTvOutput";
 
+// The events the game took to hear of a change of the output device (IAudioDevice's, its notifications' and the
+// virtual device manager's). audio_channels_live signals them all: the game then asks for the channel count again, as
+// it does on a console whose output moves from the TV to headphones.
+static uint32_t change_events[16];
+static _Atomic int n_change_events;
+
+static uint32_t change_event_new(void) {
+    uint32_t ev = kern_event_new();
+    int i = atomic_fetch_add(&n_change_events, 1);
+    if (i < 16) change_events[i] = ev;
+    return ev;
+}
+
+// Present path, after a settings change (gfx_present.c window_settings_live): a changed NX2NAVI_AUDIO_CHANNELS is
+// decided again, and when it gives another channel count the game is told its output device changed. The game asks
+// GetActiveChannelCount again and mixes for the new count; the mixer moves its device to that count at its next
+// render (channels_switch). Measured on Ocarina 1.1.1: one event held, and the game asked within the same second.
+void audio_channels_live(void) {
+    static char seen[16];
+    const char *want = cfg_value("NX2NAVI_AUDIO_CHANNELS");
+    if (!strncmp(want, seen, sizeof seen - 1)) return;
+    int first = !seen[0];
+    snprintf(seen, sizeof seen, "%s", want);
+    int was = atomic_load(&decided);
+    if (first || !was) return;   // nothing has asked yet: the first call decides
+    atomic_store(&decided, 0);
+    int now = output_channels();
+    if (now == was) return;
+    int n = atomic_load(&n_change_events);
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) kern_event_signal(change_events[i]);
+    rt_log("audio: NX2NAVI_AUDIO_CHANNELS=%s: the output goes from %s to %s; the game is told the device changed "
+           "(%d events)", want, was == 6 ? "5.1" : "stereo", now == 6 ? "5.1" : "stereo", n);
+}
+
 static void put_name(const IpcBuffer *b, IpcResponse *rs, int pointer) {
     if (!b->size) return;
     char *dst = ipc_guest(b->addr, b->size);
@@ -1185,7 +1254,7 @@ static IpcBuffer out_buffer(const IpcRequest *rq, int *pointer) {
 }
 
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    static uint32_t change_event;   // device change events: never signalled, the device does not change
+    static uint32_t change_event;   // the device change event: signalled when the output's channels change (audio_channels_live)
     int pointer;
     switch (rq->cmd) {
     case 0: case 6: case 14: {   // ListAudioDeviceName(Auto), ListAudioOutputDeviceName [13.0.0+]
@@ -1210,7 +1279,7 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     case 4: case 11: case 12: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
         uint32_t ev = __atomic_load_n(&change_event, __ATOMIC_ACQUIRE);
         if (!ev) {
-            uint32_t mine = kern_event_new(), expected = 0;
+            uint32_t mine = change_event_new(), expected = 0;
             if (__atomic_compare_exchange_n(&change_event, &expected, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
                 ev = mine;
             else
@@ -1222,9 +1291,9 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     // 17.0.0+: Acquire/Release Audio{Input,Output}DeviceNotification (15-18), 18.0.0+: SetAudioDeviceOutputVolume-
     // AutoTuneEnabled (19) / IsAudioDeviceOutputVolumeAutoTuneEnabled (20), 21.0.0+:
     // IsActiveOutputDeviceEstimatedLowLatency (21). Command ids as the system answers them. The
-    // device never changes and the host applies no auto-tuned volume, so the answers are "off" / "no".
-    case 15: case 17: {   // Acquire...Notification -> a readable event that is never signalled
-        uint32_t ev = kern_event_new();
+    // host applies no auto-tuned volume, so the answers are "off" / "no".
+    case 15: case 17: {   // Acquire...Notification -> a readable event, signalled with the others
+        uint32_t ev = change_event_new();
         rs->copy[rs->ncopy++] = kern_event_readable(ev);
         return;
     }
@@ -1293,7 +1362,7 @@ static void virtual_device_manager_handler(IpcSession *s, const IpcRequest *rq, 
         put_block(rq, rs, block, sizeof block);
         return;
     }
-    case 500: rs->copy[rs->ncopy++] = kern_event_readable(kern_event_new()); return;   // state change event
+    case 500: rs->copy[rs->ncopy++] = kern_event_readable(change_event_new()); return;   // state change event
     case 700: case 800: return;   // AttachStream / DetachStream
     default: {
         static volatile int32_t seen[64];

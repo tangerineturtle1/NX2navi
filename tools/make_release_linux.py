@@ -40,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_game  # noqa: E402
 import make_release as mr  # noqa: E402
+import vulkan_pin  # noqa: E402
 
 ROOT = mr.ROOT
 MAIN_ROOT = mr.MAIN_ROOT
@@ -69,8 +70,7 @@ PINS = {
                     '5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6'),
     'zstd-src': ('https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz',
                  'eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3'),
-    'vulkan-headers-src': ('https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.363.tar.gz',
-                           'cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68'),
+    'vulkan-headers-src': vulkan_pin.SOURCE,   # the release a build with the system's headers takes too
     'vma-header': build_game.VMA_FETCH,
     # appimagetool and the type-2 runtime from release tags, not "continuous", whose uploads change under the same
     # URL and would stop the build at the hash check
@@ -169,8 +169,8 @@ def build_deps(out, llvm, sysroot):
     d = out / 'runtime' / 'deps'
     (d / 'include' / 'vma').mkdir(parents=True, exist_ok=True)
     (d / 'lib').mkdir(parents=True, exist_ok=True)
-    vk = tar_extract('vulkan-headers-src', WORK / 'vulkan-headers', ['Vulkan-Headers-1.4.363/include',
-                                                                     'Vulkan-Headers-1.4.363/LICENSE.md'], strip=1)
+    vk = tar_extract('vulkan-headers-src', WORK / 'vulkan-headers', [f'{vulkan_pin.TOP}include',
+                                                                     f'{vulkan_pin.TOP}LICENSE.md'], strip=1)
     for sub in ('vulkan', 'vk_video'):
         shutil.copytree(vk / 'include' / sub, d / 'include' / sub)
     shutil.copy2(mr.fetch('vma-header'), d / 'include' / 'vma' / 'vk_mem_alloc.h')

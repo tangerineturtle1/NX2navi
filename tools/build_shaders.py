@@ -1,35 +1,93 @@
-"""Compile the runtime's own GLSL shaders (runtime/shaders/*.comp, *.vert, *.frag) into C headers of SPIR-V words.
+"""Build the runtime's own shaders into C headers of SPIR-V words, and the files it embeds into headers of bytes.
 
-Each runtime/shaders/<name>.comp (or .vert, .frag: one name per shader) becomes runtime/<name>_spv.h, which declares `static const uint32_t <name>_spv[]`
-and records the SHA-256 of the source it came from. The headers are committed, so building nx2navi.exe needs no shader
-compiler; tools/build_game.py refuses to build when a header no longer matches its source. Run this after editing a
-shader. Needs glslc and spirv-val from MSYS2 UCRT64 (package mingw-w64-ucrt-x86_64-shaderc, spirv-tools).
+The repository holds the shaders as source only. Each becomes runtime/<name>_spv.h, which declares
+`static const uint32_t <name>_spv[]`; the headers are build outputs (ignored by git) and tools/build_game.py builds the
+missing and the stale ones before it compiles the runtime. Three kinds of source:
 
-    python tools/build_shaders.py [--check]
+    runtime/shaders/<name>.comp, .vert, .frag   GLSL, compiled with glslc (one name per shader) and checked with spirv-val
+    runtime/shaders/<name>.mesh, .task          the same for the mesh fallback probe's mesh and task shaders (SPIR-V 1.5)
+    runtime/shaders/<name>.spvasm               SPIR-V assembly, assembled with spirv-as and checked with spirv-val
+    tools/make_dlaa_mask.py, make_mvobj_fs.py   shaders assembled in Python (ASSEMBLED); they need no other tool
+
+One more kind of header is no shader: a file the runtime embeds (EMBEDDED: the menu's font, the SMAA lookup textures) as
+a list of its bytes, for a compiler without #embed (runtime/ui/menu.cpp, runtime/vk_aa.c include them). It needs no tool.
+
+A compiled or assembled header records the SHA-256 of its source (with the files a GLSL source includes from its folder)
+and is stale when that no longer matches; a Python one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
+Windows (packages mingw-w64-ucrt-x86_64-shaderc and mingw-w64-ucrt-x86_64-spirv-tools) and from PATH elsewhere
+(shaderc, spirv-tools). A folder that carries its headers ready-made (the build kit, tools/make_kit.py) needs none of
+them: nothing there is stale.
+
+    python tools/build_shaders.py [--check] [--all] [--runtime DIR]
 """
 
 import argparse
 import hashlib
+import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-BIN = Path(r'C:\msys64\ucrt64\bin')   # Windows; elsewhere glslc and spirv-val come from PATH
-WIN = os.name == 'nt'
+TOOLS = Path(__file__).resolve().parent
+ROOT = TOOLS.parent
+BIN = Path(r'C:\msys64\ucrt64\bin')   # Windows; elsewhere, and without MSYS2 there, the tools come from PATH
 TARGET = 'vulkan1.1'
-STAGES = {'.comp': 'compute', '.vert': 'vertex', '.frag': 'fragment'}
+STAGES = {'.comp': 'compute', '.vert': 'vertex', '.frag': 'fragment', '.mesh': 'mesh', '.task': 'task'}
+MESH_TARGET = 'vulkan1.2'   # mesh and task shaders need SPIR-V 1.4 or later
+ASM = '.spvasm'
+ASM_TARGET = 'vulkan1.3'
+# header name -> the script beside this one that assembles it; the script's HEADER is the header's text
+ASSEMBLED = {'dlaa_mask': 'make_dlaa_mask.py', 'mvobj_fs': 'make_mvobj_fs.py'}
+# a file below runtime/ the runtime embeds -> the header of its bytes, below runtime/ too (git ignores it)
+EMBEDDED = {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
+            'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h', 'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'}
+
+
+def embedded(src):
+    """True for a file of EMBEDDED: a binary file, read as it is."""
+    return src.suffix not in STAGES and src.suffix not in (ASM, '.py')
+
+
+def included(src, seen=None):
+    """The files a GLSL source includes from its own folder (#include "name"), and theirs, in order of first use."""
+    seen = [] if seen is None else seen
+    for line in src.read_bytes().decode('latin-1').splitlines():   # the SMAA source is not UTF-8
+        words = line.strip().split('"')
+        if line.strip().startswith('#include') and len(words) >= 2:
+            inc = src.parent / words[1]
+            if inc.is_file() and inc not in seen:
+                seen.append(inc)
+                included(inc, seen)
+    return seen
 
 
 def source_hash(src):
-    return hashlib.sha256(src.read_bytes().replace(b'\r\n', b'\n')).hexdigest()   # the same on a CRLF checkout
+    data = src.read_bytes()
+    if embedded(src):
+        return hashlib.sha256(data).hexdigest()
+    if src.suffix in STAGES:   # a header goes stale with the files its source includes too
+        data += b''.join(inc.read_bytes() for inc in included(src))
+    return hashlib.sha256(data.replace(b'\r\n', b'\n')).hexdigest()   # text: the same on a CRLF checkout
+
+
+def bytes_header(src, runtime):
+    """The header of an embedded file: its bytes as decimal numbers, to include inside an array's braces."""
+    data = src.read_bytes()
+    lines = [f'// Generated by tools/build_shaders.py from runtime/{src.relative_to(runtime).as_posix()}; do not edit.',
+             f'// source sha256 {source_hash(src)}',
+             f'// The file\'s {len(data)} bytes, for a compiler without #embed.']
+    lines += [','.join(map(str, data[i:i + 32])) + ',' for i in range(0, len(data), 32)]
+    return '\n'.join(lines) + '\n'
 
 
 def header_of(src, words):
     name = src.stem
-    lines = [f'// Generated by tools/build_shaders.py from runtime/shaders/{src.name}; do not edit.',
+    how = (f'Generated from runtime/shaders/{src.name} (spirv-as --target-env {ASM_TARGET})' if src.suffix == ASM
+           else f'Generated by tools/build_shaders.py from runtime/shaders/{src.name}')
+    lines = [f'// {how}; do not edit.',
              f'// source sha256 {source_hash(src)}',
              '#pragma once',
              '#include <stdint.h>',
@@ -40,51 +98,107 @@ def header_of(src, words):
     return '\n'.join(lines) + '\n'
 
 
-def header_path(src):
-    return src.parent.parent / f'{src.stem}_spv.h'
-
-
 def sources(runtime):
-    return sorted(p for p in (runtime / 'shaders').iterdir() if p.suffix in STAGES)
+    """Every shader source with the header it becomes: the files of runtime/shaders and the scripts of ASSEMBLED that
+    are there (a folder without them carries the headers ready-made)."""
+    shaders = runtime / 'shaders'
+    found = sorted(p for p in shaders.iterdir() if p.suffix in STAGES or p.suffix == ASM) if shaders.is_dir() else []
+    out = [(p, runtime / f'{p.stem}_spv.h') for p in found]
+    out += [(TOOLS / script, runtime / f'{name}_spv.h') for name, script in ASSEMBLED.items() if (TOOLS / script).is_file()]
+    out += [(runtime / src, runtime / header) for src, header in EMBEDDED.items() if (runtime / src).is_file()]
+    return out
+
+
+def assembled_text(script):
+    spec = importlib.util.spec_from_file_location(script.stem, script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.HEADER
+
+
+def read_text(header):
+    return header.read_bytes().decode('utf-8').replace('\r\n', '\n') if header.is_file() else None
 
 
 def stale(runtime):
-    """Shader sources under runtime/shaders whose header is missing or records another source hash."""
+    """The shader sources whose header is missing or no longer comes from them."""
     out = []
-    for src in sources(runtime):
-        h = header_path(src)
-        if not h.exists() or f'// source sha256 {source_hash(src)}' not in h.read_text(encoding='utf-8'):
+    for src, header in sources(runtime):
+        text = read_text(header)
+        if text is None:
+            out.append(src)
+        elif src.suffix == '.py':
+            if text != assembled_text(src):
+                out.append(src)
+        elif f'// source sha256 {source_hash(src)}' not in text:
             out.append(src)
     return out
 
 
-def compile_one(src):
-    # "// build_shaders: keep functions" in a source: no optimisation, so its functions stay functions (the HDR tonemap,
-    # which runtime/vk_hdr.c splices into the game's shader by function)
-    opt = [] if '// build_shaders: keep functions' in src.read_text(encoding='utf-8') else ['-O']
+def tool(name):
+    """The path of glslc, spirv-as or spirv-val; ends the run with the packages to install when it is not there."""
+    exe = BIN / f'{name}.exe' if os.name == 'nt' else None
+    if exe and exe.is_file():
+        return str(exe)
+    found = shutil.which(name)
+    if found:
+        return found
+    where = (f'MSYS2 UCRT64 ({BIN}): pacman -S mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-spirv-tools'
+             if os.name == 'nt' else "PATH: install your distribution's shaderc and spirv-tools packages")
+    sys.exit(f'build_shaders: {name} not found. The runtime\'s shaders are compiled when the game is built '
+             f'(docs/building.md); {name} comes from {where}')
+
+
+def words_of(src):
     with tempfile.TemporaryDirectory() as tmp:
         spv = Path(tmp) / 'out.spv'
-        subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', *opt, f'--target-env={TARGET}', f'-fshader-stage={STAGES[src.suffix]}',
-                        '-o', str(spv), str(src)], check=True)
-        subprocess.run([str(BIN / 'spirv-val.exe') if WIN else 'spirv-val', f'--target-env', TARGET, str(spv)], check=True)
+        if src.suffix == ASM:
+            target = ASM_TARGET
+            subprocess.run([tool('spirv-as'), '--target-env', target, '-o', str(spv), str(src)], check=True)
+        else:
+            # "// build_shaders: keep functions" in a source: no optimisation, so its functions stay functions (the HDR
+            # tonemap, which runtime/vk_hdr.c splices into the game's shader by function)
+            target = MESH_TARGET if src.suffix in ('.mesh', '.task') else TARGET
+            opt = [] if '// build_shaders: keep functions' in src.read_text(encoding='utf-8') else ['-O']
+            subprocess.run([tool('glslc'), *opt, f'--target-env={target}', f'-fshader-stage={STAGES[src.suffix]}',
+                            '-o', str(spv), str(src)], check=True)
+        subprocess.run([tool('spirv-val'), '--target-env', target, str(spv)], check=True)
         data = spv.read_bytes()
-    words = [int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
-    header_path(src).write_text(header_of(src, words), encoding='utf-8', newline='\n')
-    print(f'{header_path(src).relative_to(ROOT)}: {len(words)} words')
+    return [int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
+
+
+def build(runtime, only=None):
+    """Writes the headers of the sources in only (default: the stale ones) and returns how many it wrote."""
+    todo = stale(runtime) if only is None else list(only)
+    headers = dict(sources(runtime))
+    for src in todo:
+        text = (assembled_text(src) if src.suffix == '.py' else bytes_header(src, runtime) if embedded(src)
+                else header_of(src, words_of(src)))
+        header = headers[src]
+        part = header.with_name(header.name + '.part')   # whole or not at all: another build may be reading the folder
+        part.write_text(text, encoding='utf-8', newline='\n')
+        part.replace(header)
+        print(f'{header.name}: {src.stat().st_size} bytes of {src.name}' if embedded(src)
+              else f'{header.name}: {text.count("0x")} words from {src.name}')
+    return len(todo)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--check', action='store_true', help='only report headers that do not match their source')
+    ap.add_argument('--check', action='store_true', help='only report headers that are missing or do not match their source')
+    ap.add_argument('--all', action='store_true', help='build every header, not only the missing and the stale ones')
     ap.add_argument('--runtime', type=Path, default=ROOT / 'runtime')
     args = ap.parse_args()
+    runtime = args.runtime.resolve()
     if args.check:
-        bad = stale(args.runtime)
+        bad = stale(runtime)
+        headers = dict(sources(runtime))
         for s in bad:
-            print(f'{header_path(s)}: stale, run tools/build_shaders.py')
+            print(f'{headers[s]}: missing or stale, run tools/build_shaders.py')
         return 1 if bad else 0
-    for src in sources(args.runtime):
-        compile_one(src)
+    n = build(runtime, [s for s, _ in sources(runtime)] if args.all else None)
+    if not n:
+        print('build_shaders: every header matches its source')
     return 0
 
 

@@ -82,8 +82,19 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
 
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } EventWrite;
 
+// The side effects below that ran after a waiter on the executed timeline had gone on (vk_sync.c vk_sync_effect_late):
+// the game was already past the wait after its submit when these reached its memory.
+static volatile uint64_t late_events, late_counters, late_counts;
+
+void vk_exec_late_stats(uint64_t *events, uint64_t *counters, uint64_t *counts) {
+    *events = __atomic_exchange_n(&late_events, 0, __ATOMIC_RELAXED);
+    *counters = __atomic_exchange_n(&late_counters, 0, __ATOMIC_RELAXED);
+    *counts = __atomic_exchange_n(&late_counts, 0, __ATOMIC_RELAXED);
+}
+
 static void event_cb(void *arg) {
     EventWrite *e = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_events, 1, __ATOMIC_RELAXED);
     if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);
     else __atomic_store_n(e->val, e->value, __ATOMIC_RELEASE);
     free(e);
@@ -104,6 +115,7 @@ typedef struct { uint64_t addr, seq; } CounterWrite;
 
 static void counter_cb(void *arg) {
     CounterWrite *w = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_counters, 1, __ATOMIC_RELAXED);
     write_counter(w->addr, 0);
     pending_written(w->addr, w->seq);
     free(w);
@@ -192,7 +204,10 @@ static Pending *pending_slot(uint64_t addr, int insert) {
 // report into guest memory. Slots come from one ring; the completion thread reads and host-resets them
 // (hostQueryReset, Vulkan 1.2), so the replay records no reset commands. A full ring (no slot read back yet) leaves the
 // draw uncounted and the segment's count at least 1, as does a query still unavailable after its fence. Without hostQueryReset the counts stay 0.
-#define OQ_N 4096
+// The ring holds about four frames of Hyrule Field's queries (about 3,500 a frame): the replay workers' chunks take
+// blocks of slots sized to their draws (vk_exec_xfer_slots), more than they use, and with 4096 the ring came round to
+// slots the completion thread had not reset yet, leaving draws uncounted.
+#define OQ_N 16384
 #define LOG_ONCE(...) do { static volatile char once_; if (!__atomic_exchange_n(&once_, 1, __ATOMIC_RELAXED)) rt_log(__VA_ARGS__); } while (0)
 static VkQueryPool oq_pool;
 static int oq_state;                     // 0 not set up, 1 counting available, -1 unavailable
@@ -208,7 +223,109 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr, seq; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
+typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
+
+// The replay workers (vk_exec.c "parallel groups") record the draws of one group at once. The front pass replays a
+// group's samples-passed resets and reports in the order of the stream before the workers record (vk_exec_xfer_front):
+// each makes its segment, queued for the completion thread in that order, and they are listed in GS. A worker follows
+// the counting as the stream does from its chunk's first op (vk_exec_xfer_chunk_state): XW.counting and the segment its
+// closed queries belong to, the next one at or after its position in the stream (XW.seg; past the group's last, the
+// pending list oq_seg, which a later reset or report takes). It keeps the query open in its own pass (XW.open), takes
+// ring slots from its chunk's block and keeps the slots it closes with their segment in its chunk's list (CP), which
+// vk_exec_xfer_group_merge puts into the segments once the group is done, chunk after chunk: under a lock per slot, the
+// workers waited for each other at every query. XW.cond: the decisions of its chunk's render conditions, made by the
+// front pass in the order of the stream.
+// The blocks (vk_exec_xfer_slots): the front pass gives each chunk as many slots as it has draws that count samples and
+// render, one after the other, so the slots follow the stream as the replay's own do and the completion thread reads
+// and resets them in long runs (oq_take). Taken from the ring at once, the slots of a group's chunks interleaved: four
+// times the result calls and a reset per slot, 3.5 ms more of the wait after a frame's first submission (RX 7900 XT,
+// Hyrule Field, 3 workers). A chunk that needs more than its block takes them from the ring.
+static _Thread_local struct {
+    int on, open, counting, reported, keep, chunk, g;
+    uint32_t seg, qnext, qend;
+    const uint8_t *cond;
+    uint32_t ncond, i;
+} XW = {.open = -1};
+// GS: per group slot (vk_exec.c LIVE_GROUPS), the front pass's segments of the group. tail: with NX2NAVI_REPLAY_PIPE
+// the submitting thread replays on past the group before its chunks are done: the first segment made after the
+// group's front pass (tail_wait), by the next group's front pass or the replay, takes the queries the chunks close
+// after the group's last report or reset, which in the stream come before that one's own.
+#define GS_GROUPS 4
+static struct { int tail_wait; OqSegment **s, *tail; uint32_t n, cap; } GS[GS_GROUPS];
+static int gs_on = -1;                   // the group slot whose front pass runs
+#define CP_CHUNKS 32
+static struct { uint32_t *seg, *q, n, cap; } CP[GS_GROUPS][CP_CHUNKS];   // per chunk: closed slots and their segment
+
+void vk_exec_xfer_group(int group) {   // a group's front pass begins (its slot), or it ended (-1): the list stays
+    if (group >= GS_GROUPS) rt_fatal("vk: parallel group slot %d of %d", group, GS_GROUPS);
+    if (group >= 0) GS[group].n = 0, GS[group].tail_wait = 0, GS[group].tail = NULL;
+    else if (gs_on >= 0) GS[gs_on].tail_wait = 1;   // until vk_exec_xfer_group_merge
+    gs_on = group;
+}
+
+int vk_exec_xfer_counting(void) { return oq_counting; }
+
+uint32_t vk_exec_xfer_slots(uint32_t n) {   // the workers of a group the submitting thread went on past take some too
+    return __atomic_fetch_add(&oq_next, n, __ATOMIC_RELAXED);
+}
+
+uint64_t vk_exec_xfer_chunk_state(void) {
+    return (uint64_t)GS[gs_on].n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
+}
+
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
+                         int chunk, int group) {
+    if (chunk < 0 || chunk >= CP_CHUNKS) rt_fatal("vk: replay worker chunk %d of at most %d", chunk, CP_CHUNKS);
+    if (group < 0 || group >= GS_GROUPS) rt_fatal("vk: parallel group slot %d of %d", group, GS_GROUPS);
+    XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0, XW.chunk = chunk, XW.g = group;
+    XW.qnext = slot0, XW.qend = slot0 + nslots;
+    XW.counting = (int)(state & 1), XW.reported = (int)(state >> 1 & 1), XW.keep = (int)(state >> 2 & 1);
+    XW.seg = (uint32_t)(state >> 8);
+}
+
+// Adds closed slot q to the segment a worker's queries belong to now, or the pending list.
+static void seg_add(uint32_t q) {
+    __typeof__(CP[0][0]) *l = &CP[XW.g][XW.chunk];
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 256;
+        if (!(l->seg = realloc(l->seg, sizeof *l->seg * l->cap)) || !(l->q = realloc(l->q, sizeof *l->q * l->cap)))
+            rt_fatal("vk: out of memory");
+    }
+    l->seg[l->n] = XW.seg, l->q[l->n++] = q;
+}
+
+void vk_exec_xfer_group_merge(int group, int nchunks) {
+    __typeof__(GS[0]) *gs = &GS[group];
+    for (int c = 0; c < nchunks && c < CP_CHUNKS; c++) {
+        __typeof__(CP[0][0]) *l = &CP[group][c];
+        for (uint32_t i = 0; i < l->n; i++) {
+            uint32_t q = l->q[i];
+            if (l->seg[i] < gs->n) {
+                OqSegment *s = gs->s[l->seg[i]];
+                if (s->n == s->cap) {
+                    s->cap = s->cap ? s->cap * 2 : 16;
+                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
+                }
+                s->q[s->n++] = q;
+            } else if (gs->tail) {
+                OqSegment *s = gs->tail;
+                if (s->n == s->cap) {
+                    s->cap = s->cap ? s->cap * 2 : 16;
+                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
+                }
+                s->q[s->n++] = q;
+            } else {
+                if (oq_nseg == oq_capseg) {
+                    oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
+                    if (!(oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg))) rt_fatal("vk: out of memory");
+                }
+                oq_seg[oq_nseg++] = q;
+            }
+        }
+        l->n = 0;
+    }
+    gs->tail_wait = 0, gs->tail = NULL;
+}
 
 static int oq_ready(void) {
     if (oq_state) return oq_state > 0;
@@ -236,86 +353,180 @@ static int oq_ready(void) {
 }
 
 static void oq_close(VkExec *ex) {
-    if (oq_open < 0) return;
-    vkCmdEndQuery(ex->cb, oq_pool, (uint32_t)oq_open);
+    int *open = XW.on ? &XW.open : &oq_open;
+    if (*open < 0) return;
+    vkCmdEndQuery(ex->cb, oq_pool, (uint32_t)*open);
     ex->recorded++;
-    if (oq_nseg == oq_capseg) {
-        oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
-        oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg);
-        if (!oq_seg) rt_fatal("vk: out of memory");
+    if (XW.on) seg_add((uint32_t)*open);
+    else {
+        if (oq_nseg == oq_capseg) {
+            oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
+            oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg);
+            if (!oq_seg) rt_fatal("vk: out of memory");
+        }
+        oq_seg[oq_nseg++] = (uint32_t)*open;
     }
-    oq_seg[oq_nseg++] = (uint32_t)oq_open;
-    oq_open = -1;
+    *open = -1;
 }
 
 void vk_exec_oq_draw(VkExec *ex) {
-    if (!oq_counting || oq_open >= 0) return;
-    uint32_t q = oq_next % OQ_N;
+    int *open = XW.on ? &XW.open : &oq_open;
+    if (!(XW.on ? XW.counting : oq_counting) || *open >= 0) return;
+    // a worker takes the next slot of its chunk's block, past it one from the ring at once (as the replay does, while
+    // a group's workers may still take some); a busy one is lost, not tried again
+    uint32_t q = (XW.on && XW.qnext != XW.qend ? XW.qnext++ : __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED)) % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");
-        oq_lost = 1;
+        if (XW.on && XW.seg < GS[XW.g].n) __atomic_store_n(&GS[XW.g].s[XW.seg]->lost, 1, __ATOMIC_RELAXED);
+        else __atomic_store_n(&oq_lost, 1, __ATOMIC_RELAXED);
         return;
     }
-    oq_busy[q] = 1;
-    oq_next++;
+    __atomic_store_n(&oq_busy[q], 1, __ATOMIC_RELAXED);
     vkCmdBeginQuery(ex->cb, oq_pool, q, oq_flags);
     ex->recorded++;
-    oq_open = (int)q;
+    *open = (int)q;
 }
 
 void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
+
+static void oq_batch_drop(void);   // the results kept by the completion thread (oq_take)
 
 void vk_exec_xfer_shutdown(void) {
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
+    oq_batch_drop();
+}
+
+// The completion thread reads the results in batches (NX2NAVI_OQ_BATCH, default 1; 0: every segment by itself, as
+// before). The game tests one proxy per report, so a segment holds one query, and a frame of Hyrule Field has about a
+// hundred of them: one vkGetQueryPoolResults and one vkResetQueryPool each. On an RX 7900 XT (26.10.1) each of those
+// calls goes into the kernel, and the two hundred took 3.9 ms of every frame on the completion thread, which runs a
+// submission's callbacks before it lets the submission's waiters go: the game's main thread waits for the previous
+// frame's fence before it lets the next frame's GPU work start, so the frame after one replayed inside its submit
+// call began 4 to 6 ms late with every thread idle. Slots come from the ring in order, so the slots of the segments
+// that follow lie behind the one asked for: one call reads OQ_BATCH slots from there on with their availability, the
+// available ones are kept (the results stay in the pool until the reset), and the segments after it take theirs from
+// what is kept. A slot not available in the batch (its part had not run yet) is read again when its segment comes.
+// The slots taken are reset in runs, one vkResetQueryPool for each: a run ends when a slot that does not continue it
+// is taken or a new batch is read. Until then its slots stay busy for the replay, at most OQ_BATCH of the ring's
+// OQ_N, also while the game reports nothing.
+#define OQ_BATCH 256
+static struct {
+    uint32_t first, n;               // the slots kept: [first, first + n)
+    uint64_t v[OQ_BATCH * 2];        // per slot: samples, available
+    uint8_t taken[OQ_BATCH];
+    uint32_t r0, rn;                 // the run of taken slots still to be reset
+    uint64_t calls, slots, segs;     // since the last perf line: result calls, slots they read, segments served
+} OQB;
+static int oq_batch_mode = -1;
+
+static void oq_batch_drop(void) { OQB.n = OQB.rn = 0; }
+
+static void oq_reset_flush(VkDevice dev) {
+    if (!OQB.rn) return;
+    vkResetQueryPool(dev, oq_pool, OQB.r0, OQB.rn);
+    for (uint32_t k = 0; k < OQB.rn; k++) __atomic_store_n(&oq_busy[OQB.r0 + k], 0, __ATOMIC_RELEASE);
+    OQB.rn = 0;
+}
+
+static void oq_read(VkDevice dev, uint32_t first, uint32_t n) {
+    VkResult r = vkGetQueryPoolResults(dev, oq_pool, first, n, sizeof OQB.v[0] * 2 * n, OQB.v, 2 * sizeof OQB.v[0],
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS && r != VK_NOT_READY) {
+        vk_device_lost_check(r, "the read of occlusion query results");
+        rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+    }
+    OQB.first = first, OQB.n = n;
+    memset(OQB.taken, 0, n);
+    OQB.calls++, OQB.slots += n;
+}
+
+// The samples of slot q, whose submission has completed; *avail 0 when the query has no result.
+static uint64_t oq_take(VkDevice dev, uint32_t q, int *avail) {
+    uint32_t k = q - OQB.first;
+    if (!(q >= OQB.first && k < OQB.n && !OQB.taken[k] && OQB.v[2 * k + 1])) {
+        // not kept, or kept as unavailable (read before its part ran): from this slot on, up to the replay's next slot
+        oq_reset_flush(dev);   // before the kept results go: the run's slots are among them
+        uint32_t next = __atomic_load_n(&oq_next, __ATOMIC_RELAXED) % OQ_N, n = OQ_N - q;
+        if (next > q && next - q < n) n = next - q;
+        if (n > OQ_BATCH) n = OQ_BATCH;
+        if (oq_batch_mode == 0) n = 1;
+        oq_read(dev, q, n);
+        k = 0;
+    }
+    OQB.taken[k] = 1;
+    if (OQB.rn && q != OQB.r0 + OQB.rn) oq_reset_flush(dev);
+    if (!OQB.rn) OQB.r0 = q;
+    OQB.rn++;
+    *avail = OQB.v[2 * k + 1] != 0;
+    return OQB.v[2 * k];
 }
 
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
-    uint64_t sum = 0, v[64 * 2];
-    for (uint32_t i = 0; i < s->n;) {
-        uint32_t j = i + 1;
-        while (j < s->n && j - i < 64 && s->q[j] == s->q[j - 1] + 1) j++;
+    if (oq_batch_mode < 0) oq_batch_mode = cfg_bool("NX2NAVI_OQ_BATCH");
+    // a segment the replay workers filled lists its slots in the order the chunks closed them: in ring order, they are
+    // taken in runs (oq_take)
+    for (uint32_t i = 1; i < s->n; i++) {
+        uint32_t v = s->q[i], j = i;
+        for (; j && s->q[j - 1] > v; j--) s->q[j] = s->q[j - 1];
+        s->q[j] = v;
+    }
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < s->n; i++) {
         // The fence has passed, so a query that is still unavailable will not become available: waiting would block the
         // completion thread, and with it every later callback, for good. It counts as visible (one sample).
-        VkResult r = vkGetQueryPoolResults(dev, oq_pool, s->q[i], j - i, sizeof v, v, 2 * sizeof v[0],
-                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (r != VK_SUCCESS && r != VK_NOT_READY) {
-            vk_device_fault_report(r);
-            rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+        int avail;
+        uint64_t v = oq_take(dev, s->q[i], &avail);
+        if (avail) sum += v;
+        else {
+            sum += 1;
+            vk_device_lost_poll();   // a query its submission never wrote: on a lost device the run ends here
+            LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
         }
-        vkResetQueryPool(dev, oq_pool, s->q[i], j - i);
-        for (uint32_t k = i; k < j; k++) {
-            if (v[2 * (k - i) + 1]) sum += v[2 * (k - i)];
-            else {
-                sum += 1;
-                LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[k]);
-            }
-            __atomic_store_n(&oq_busy[s->q[k]], 0, __ATOMIC_RELEASE);
-        }
-        i = j;
+    }
+    if (s->n && ++OQB.segs >= 12000) {
+        if (rt_trace & RT_TRACE_PERF)
+            rt_log("perf: occlusion queries: %llu segments read with %llu result calls of %.1f slots on average",
+                   (unsigned long long)OQB.segs, (unsigned long long)OQB.calls,
+                   OQB.calls ? (double)OQB.slots / (double)OQB.calls : 0.0);
+        OQB.calls = OQB.slots = OQB.segs = 0;
     }
     if (s->reset) oq_count = 0;
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        if (s->addr) {
+            if (vk_sync_effect_late()) __atomic_fetch_add(&late_counts, 1, __ATOMIC_RELAXED);
+            write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        }
     }
-    free(s);
+    free(s->q), free(s);
 }
 
 // Hands the segment to the completion thread with a report (addr; 0: no CPU-visible memory) or a reset.
 static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     oq_close(ex);
-    OqSegment *s = malloc(sizeof *s + sizeof *s->q * oq_nseg);
-    if (!s) rt_fatal("vk: out of memory");
+    OqSegment *s = calloc(1, sizeof *s);
+    if (!s || (oq_nseg && !(s->q = malloc(sizeof *s->q * oq_nseg)))) rt_fatal("vk: out of memory");
+    s->cap = oq_nseg;
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
-    memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
+    if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
+    if (gs_on >= 0) {   // the front pass: the workers add the queries of the group's ops before it
+        __typeof__(GS[0]) *gs = &GS[gs_on];
+        if (gs->n == gs->cap) {
+            gs->cap = gs->cap ? gs->cap * 2 : 64;
+            if (!(gs->s = realloc(gs->s, sizeof *gs->s * gs->cap))) rt_fatal("vk: out of memory");
+        }
+        gs->s[gs->n++] = s;
+    }
+    for (int g = 0; g < GS_GROUPS; g++)   // the first made after a group's front pass
+        if (GS[g].tail_wait && !GS[g].tail) GS[g].tail = s;
     oq_nseg = 0, oq_lost = 0;
-    vk_completion_add(ex->fence, oq_cb, s);
+    vk_completion_add_result(ex->fence, oq_cb, s);
 }
 
 static void reset_counter(VkExec *ex, const p_reset_counter *p) {
@@ -366,11 +577,115 @@ static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
     return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
 }
 
-int vk_exec_event_met(const void *payload) {
+// ---- events the CPU signals
+// Ocarina gates its main queue on the CPU: each frame the game sets one of two events to 0 (they take turns frame by
+// frame), submits the worker queues' command buffers and the main queue's, whose first command waits for the event
+// to be 1, and signals 1 from the CPU (nvnEventSignal) once it has finished writing what the frame's commands read.
+// The signal comes before the main queue's submit call, after it, or while that call is replaying. On the console
+// the GPU starts the queue at the signal and reads memory from then on.
+// Here a submission's recording begins with the copies of what it reads: the VRAM mirrors' sync and the uniform
+// snapshot (vk_exec_record), and the wait is tested when the walk reaches it, some hundred microseconds later. A
+// signal that came in between passed the wait, and the frame was drawn from copies taken before the game had
+// finished writing: single frames with the scene's shadowing missing or the whole scene black, the interface as it
+// was, most of them when other work keeps the CPU busy, since the game's threads then finish later and the signal
+// falls into the replay more often.
+// So a wait is tested against the value the event had when the submission took its copies: every nvnEventSignal is
+// numbered and keeps the value it replaced (vk_exec_event_cpu, before the write), vk_exec_record notes the number at
+// its start (vk_exec_event_sync), and a signal with a later number does not count for that submission. The wait then
+// stops the submission like any wait reached before its signal, and vk_backend.c submit_sync lets it go on at once
+// in a submission of its own, whose copies are taken after the signal.
+// NX2NAVI_EVENT_AT_SYNC=0: the value in memory when the walk reaches the wait, as before.
+#define CPU_EV 16
+#define CPU_EV_HIST 8
+static struct { const void *val; uint64_t seq[CPU_EV_HIST]; uint32_t before[CPU_EV_HIST]; unsigned n; } cpu_ev[CPU_EV];
+static int cpu_ev_n;                             // cpu_ev_lock
+static uint64_t cpu_ev_seq;                      // cpu_ev_lock: nvnEventSignal calls so far
+static uint64_t ev_sync_seq = UINT64_MAX;        // cpu_ev_lock: cpu_ev_seq at the recording's start; UINT64_MAX outside one
+static PlatMutex cpu_ev_lock = PLAT_MUTEX_INIT;
+static uint64_t ev_after_sync;                   // replay: waits only a signal after the copies would have passed
+
+int vk_exec_event_at_sync(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("EVENT_AT_SYNC", "1");
+    return on;
+}
+
+void vk_exec_event_cpu(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0;
+    cpu_ev_seq++;
+    if (i < cpu_ev_n) {
+        unsigned k = cpu_ev[i].n++ % CPU_EV_HIST;
+        cpu_ev[i].seq[k] = cpu_ev_seq, cpu_ev[i].before[k] = __atomic_load_n((const volatile uint32_t *)event, __ATOMIC_ACQUIRE);
+    }
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+// 1 when the CPU has signalled this event before (nvnEventSignal): its waits are gates the game opens from the CPU.
+int vk_exec_event_cpu_known(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    int known = i < cpu_ev_n;
+    plat_mutex_unlock(&cpu_ev_lock);
+    return known;
+}
+
+// The wait's condition on the value in memory now, whatever the replay has seen. Any thread.
+int vk_exec_event_holds_now(const void *payload) {
     const p_wait_event *p = payload;
-    const uint32_t *seen = ev_slot(p->val, 0);
-    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value) ||
-           (seen && ev_holds(*seen, p->mode, p->value));
+    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+}
+
+void vk_exec_event_sync(int begin) {
+    plat_mutex_lock(&cpu_ev_lock);
+    ev_sync_seq = begin ? cpu_ev_seq : UINT64_MAX;
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+uint64_t vk_exec_event_late_take(void) {
+    uint64_t n = ev_after_sync;
+    ev_after_sync = 0;
+    return n;
+}
+
+// The event's value in memory, and in *at_sync the value it had when the submission being recorded took its copies
+// (the same outside a recording, and for an event the CPU has not signalled since).
+static uint32_t ev_mem(volatile uint32_t *val, uint32_t *at_sync) {
+    uint32_t mem = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    *at_sync = mem;
+    plat_mutex_lock(&cpu_ev_lock);
+    if (ev_sync_seq != UINT64_MAX)
+        for (int i = 0; i < cpu_ev_n; i++) {
+            if (cpu_ev[i].val != (const void *)val) continue;
+            uint64_t first = UINT64_MAX;
+            unsigned n = cpu_ev[i].n < CPU_EV_HIST ? cpu_ev[i].n : CPU_EV_HIST;
+            for (unsigned k = 0; k < n; k++)   // the earliest signal after the copies replaced the value they saw
+                if (cpu_ev[i].seq[k] > ev_sync_seq && cpu_ev[i].seq[k] < first) first = cpu_ev[i].seq[k], *at_sync = cpu_ev[i].before[k];
+            break;
+        }
+    plat_mutex_unlock(&cpu_ev_lock);
+    return mem;
+}
+
+// Whether the wait holds. *late: it holds only by a CPU signal that came after the submission's copies.
+static int ev_met(const p_wait_event *p, uint32_t *mem, const uint32_t **seen, int *late) {
+    uint32_t at_sync;
+    *mem = ev_mem(p->val, &at_sync);
+    *seen = ev_slot(p->val, 0);
+    int by_seen = *seen && ev_holds(**seen, p->mode, p->value);
+    int now = ev_holds(*mem, p->mode, p->value) || by_seen, then = ev_holds(at_sync, p->mode, p->value) || by_seen;
+    *late = now && !then;
+    return vk_exec_event_at_sync() ? then : now;
+}
+
+int vk_exec_event_met(const void *payload) {
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    return ev_met(payload, &mem, &seen, &late);
 }
 
 int vk_exec_signalled;
@@ -378,9 +693,15 @@ int vk_exec_signalled;
 int vk_exec_wait_event(const void *payload) {
     const p_wait_event *p = payload;
     ev_waits++;
-    uint32_t mem = __atomic_load_n(p->val, __ATOMIC_ACQUIRE);
-    const uint32_t *seen = ev_slot(p->val, 0);
-    if (ev_holds(mem, p->mode, p->value) || (seen && ev_holds(*seen, p->mode, p->value))) return 1;
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    int met = ev_met(p, &mem, &seen, &late);
+    if (late) {
+        ev_after_sync++;
+        vk_exec_evt('L', (const void *)p->val, 0);
+    }
+    if (met) return 1;
     ev_unmet++;
     if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
     ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
@@ -400,6 +721,7 @@ void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint6
 static void signal_event(VkExec *ex, const p_signal_event *p) {
     uint32_t *seen = ev_slot(p->val, 1);
     *seen = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? *seen + p->value : p->value;
+    vk_exec_evt('s', (const void *)p->val, *seen);
     vk_exec_signalled = 1;
     for (int i = 0; i < ev_open_n;)
         if (ev_open[i].val == p->val && ev_holds(*seen, ev_open[i].mode, ev_open[i].value)) {
@@ -409,7 +731,7 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};
-    vk_completion_add(ex->fence, event_cb, e);
+    vk_completion_add_result(ex->fence, event_cb, e);
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {
@@ -428,7 +750,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         CounterWrite *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
         *a = (CounterWrite){p->addr, report_seq};
-        vk_completion_add(ex->fence, counter_cb, a);
+        vk_completion_add_result(ex->fence, counter_cb, a);
     }
     Pending *e = pending_slot(p->addr, 1);
     if (e) e->seq = report_seq, e->frame = cond_frame, e->unknown = samples, e->type = (int)p->type;
@@ -596,6 +918,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    vk_gpu_gap_note(to_image ? VK_GAP_COPY_B2T : VK_GAP_COPY_T2B, (uint64_t)s.w * s.h);
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by NX2NAVI_SHADOW_SCALE: skipped");
         return;
@@ -619,6 +942,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
     if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
     d.nz = s.nz;
+    vk_gpu_gap_note(VK_GAP_COPY_T2T, (uint64_t)s.w * s.h);
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
@@ -661,6 +985,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
     uint64_t src = p->src, dst = p->dst, left = p->size;
+    vk_gpu_gap_note(VK_GAP_COPY_B2B, p->size);
     int started = 0;
     while (left) {
         VkMemSpan s, d;
@@ -701,6 +1026,7 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         return;
     }
     uint64_t dst = p->addr, left = p->size;
+    vk_gpu_gap_note(VK_GAP_CLEAR_BUF, p->size);
     int started = 0;
     while (left) {
         VkMemSpan d;
@@ -751,6 +1077,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
+    vk_gpu_gap_note(VK_GAP_CLEAR_TEX, (uint64_t)lw * lh);
     int reformat = p->has_view && p->view.set_format && p->view.format != t->d.format;
     if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat ||
         (is3d && (s.z || s.nz != max1(img->depth >> s.level)))) {
@@ -789,7 +1116,58 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     vk_texture_gpu_written(t);
 }
 
+// ---- parallel groups (vk_exec.c): the CPU side in the front pass, the rest in the workers
+
+// The front pass, in the order of the stream, before the workers record (vk_exec_xfer_group on): a counter report or
+// reset (completion callbacks, pending entries, the occlusion segments and counting), a render enable and a render
+// condition (decided here, on the reports replayed so far). Returns the condition's decision: 1 renders.
+int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload) {
+    switch (op) {
+    case OP_REPORT_COUNTER: report_counter(fx, payload); return 1;
+    case OP_RESET_COUNTER: reset_counter(fx, payload); return 1;
+    case OP_RENDER_ENABLE: fx->render_disabled = !((const p_flag *)payload)->value; return 1;
+    case OP_RENDER_COND:
+        fx->render_cond = *(const p_render_cond *)payload;
+        fx->has_render_cond = 1;
+        fx->render_disabled = !cond_enabled(payload);
+        return !fx->render_disabled;
+    default: rt_fatal("vk: op %s has no front pass", nvn_op_name(op));
+    }
+    return 1;
+}
+
+// A worker: what the front pass left, in its chunk. The contact shadows' pass (vk_contact_flush) is recorded where
+// the replay would, once every earlier chunk of the group is done.
+static void xfer_worker(VkExec *ex, uint32_t op, const void *payload) {
+    if (op != OP_RENDER_ENABLE && vk_contact_pending()) vk_exec_turn(), vk_contact_flush(ex);
+    switch (op) {
+    case OP_REPORT_COUNTER: case OP_RESET_COUNTER: {
+        int type = op == OP_REPORT_COUNTER ? (int)((const p_report_counter *)payload)->type
+                                           : (int)((const p_reset_counter *)payload)->type;
+        if (type != NVN_COUNTER_TYPE_SAMPLES_PASSED || !oq_ready()) break;
+        oq_close(ex);   // into the segment this op ends; the next queries go to the next one
+        XW.seg++;
+        if (op == OP_RESET_COUNTER) XW.counting = 1, XW.reported = 0;
+        else {
+            if (XW.reported) XW.keep = 1;   // as oq_report
+            XW.reported = 1;
+            if (!XW.keep) XW.counting = 0;
+        }
+        break;
+    }
+    case OP_RENDER_ENABLE: ex->render_disabled = !((const p_flag *)payload)->value; break;
+    case OP_RENDER_COND:
+        ex->render_cond = *(const p_render_cond *)payload;
+        ex->has_render_cond = 1;
+        if (XW.i >= XW.ncond) rt_fatal("vk: a replay worker met more render conditions than its front pass decided");
+        ex->render_disabled = !XW.cond[XW.i++];
+        break;
+    default: rt_fatal("vk: op %s in a parallel group", nvn_op_name(op));
+    }
+}
+
 static void op_xfer_impl(VkExec *ex, uint32_t op, const void *payload) {
+    if (XW.on) return xfer_worker(ex, op, payload);
     if (op != OP_RENDER_ENABLE && op != OP_SIGNAL_EVENT) vk_contact_flush(ex);
     switch (op) {
     case OP_COPY_B2B: copy_b2b(ex, payload); break;

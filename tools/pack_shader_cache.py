@@ -19,6 +19,8 @@ import os
 import re
 import struct
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MAGIC = b'TKSPACK1'
@@ -26,6 +28,11 @@ PACK = 'shader-cache.pack'
 KINDS = {'.spv': 1, '.res.json': 2, '.use': 3, '.in': 4}
 NAME = re.compile(r'([0-9a-f]{64})(\.spv|\.res\.json|\.use|\.in)')
 USE_SIZE = 20   # gfx_shader.c use_store: magic, version, three masks
+# Loose files are read on READERS threads, at most WINDOW ahead of the one being written. On Windows the time goes into
+# opening each file (about 3 ms the first time, against 0.04 ms once the system has seen it), which threads overlap:
+# read one at a time, the 175,000 files of a launcher's cache took minutes.
+READERS = 16
+WINDOW = 1024
 
 
 def loose_files(cache):
@@ -74,6 +81,13 @@ def valid(kind, data):
     return len(data) == USE_SIZE if kind == 3 else len(data) > 0
 
 
+def read_loose(path):
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def pack(cache, keep=False):
     cache = Path(cache)
     out = cache / PACK
@@ -89,15 +103,23 @@ def pack(cache, keep=False):
     index, written, skipped, offset = [], [], 0, 16 + 48 * len(keys)
     old = open(out, 'rb') if packed else None
     try:
-        with open(tmp, 'wb') as f:
+        with open(tmp, 'wb') as f, ThreadPoolExecutor(READERS) as pool:
             f.write(bytes(offset))   # header and index, written once the offsets are known
-            for key in keys:
+            ahead, todo = deque(), iter(keys)
+
+            def submit():
+                key = next(todo, None)
+                if key is not None:
+                    ahead.append((key, pool.submit(read_loose, loose[key]) if key in loose else None))
+
+            for _ in range(WINDOW):
+                submit()
+            while ahead:
+                key, reading = ahead.popleft()
+                submit()
                 data = None
-                if key in loose:   # a valid loose file, else the packed copy, else nothing
-                    try:
-                        data = loose[key].read_bytes()
-                    except OSError:
-                        pass
+                if reading:   # a valid loose file, else the packed copy, else nothing
+                    data = reading.result()
                     if data is not None and valid(key[0], data):
                         written.append(loose[key])
                     else:

@@ -1,12 +1,18 @@
-// nx2navi.exe --probe-movie: the host movie::Decoder (ov_movie.c) on one NX2navi movie from the RomFS.
-// A small Matroska/WebM demuxer reads the VP9 frames of Event/Movie/<name>.webm (the smallest one, or the first whose
+// nx2navi.exe --probe-movie: the host movie decoder on one NX2navi movie from the RomFS.
+// A small Matroska/WebM demuxer reads the video frames of Event/Movie/<name>.webm (the smallest one, or the first whose
 // path contains NX2NAVI_PROBE_MOVIE). The probe then drives the decoder through the same HOST_OVERRIDE entries the game
 // calls, with a Cpu of its own; the guest functions the decoder calls (nn::os::SignalEvent, movie::Buffer,
 // movie::MediaData) are host stand-ins registered as host functions, so rt_call reaches them as it reaches the SDK's.
+// VP9 (movie::Decoder, ov_movie.c):
 //   1. unpaced: every frame in, every frame out: frame count, size, output format, PTS order, events, decode cost;
 //   2. paced at 60 presents per second (fake clock): at most one frame per present, one frame per 2 presents, no drops;
 //   3. paced at 15 presents per second: late frames are dropped, the frame handed over is the one due.
-// Without the RomFS (no game data) it prints why and exits 0. NX2NAVI_PROBE_MOVIE_SHOT=<file.ppm> saves the middle frame.
+// AV1 (movie::VideoDecoder, ov_movie2.c), in real time, played as the game plays a movie (av1_paced):
+//   1. 30 updates a second: every picture is shown, one per update, in time-stamp order, the end of stream after the
+//      last, and the picture ends seconds behind real time (the slow motion of a slow game);
+//   2. 60 updates a second: every picture is shown within 50 ms of real time.
+// Without the RomFS (no game data) it prints why and exits 0. NX2NAVI_PROBE_MOVIE_SHOT=<file.ppm> saves the middle frame
+// of a VP9 movie.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,6 +273,168 @@ static int paced(uint64_t obj, const uint8_t *data, const Track *t, int limit, u
     return 0;
 }
 
+// ---- AV1: this title's movies (ov_movie2.c), played as the game plays them. The game's VideoFrame (0x90 bytes: +0x08
+// its buffer, +0x48 the buffer's capacity, +0x78 time stamp, +0x88 end of stream) and its samples (nn::movie::Buffer:
+// +0x00 data, +0x10 size, +0x18 time stamp in ns, +0x20 flags, 8 = end of stream).
+#define AV1(n) "_ZN5movie12VideoDecoder" n
+enum { A_CTOR, A_DTOR, A_INIT, A_FINALIZE, A_REGISTER, A_FLUSH, A_DECODE, A_ACQUIRE, A_RELEASE, A_ENTRIES };
+static const char *const av1_symbols[A_ENTRIES] = {
+    AV1("C1Ev"), AV1("D1Ev"),
+    AV1("10InitializeEPvmN2nn5movie13MediaMimeTypeENS_24VideoDecoderOutputFormatENS_14VideoCodecModeE"),
+    AV1("8FinalizeEv"), AV1("18RegisterVideoFrameEPPNS_10VideoFrameEi"), AV1("5FlushEv"),
+    AV1("11DecodeAsyncEPKN2nn5movie6BufferE"), AV1("17AcquireVideoFrameEPPNS_10VideoFrameE"),
+    AV1("17ReleaseVideoFrameEPNS_10VideoFrameE")};
+#undef AV1
+// AV1_HELD: the frames the probe registers, so the pictures it holds at most, two as the game registers for its movies
+enum { AV1_NO_FRAME = 0x7b, AV1_BUSY = 0x7d, AV1_HELD = 2 };
+static GuestFn A[A_ENTRIES];
+static uint64_t acall(int which, int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++) C->x[i] = va_arg(ap, uint64_t);
+    va_end(ap);
+    A[which](C);
+    return C->x[0];
+}
+
+typedef struct {
+    int shown, updates, late;   // pictures shown; updates; updates that began more than 4 ms after their time
+    int64_t last_lag_us, worst_lag_us, last_ts;   // how far behind real time the last and the worst picture shown
+} Av1Run;                                         // were; the last one's time stamp (ns)
+
+// Samples until the decoder answers busy, then the end of stream after the first `limit` frames
+static int av1_feed(uint64_t obj, const uint8_t *data, const Track *t, int limit, int *sent, int *eos_sent) {
+    while (!*eos_sent) {
+        int end = *sent == limit;
+        uint8_t b[0x28] = {0};
+        uint64_t p = end ? 0 : U(data + t->f[*sent].off), size = end ? 0 : t->f[*sent].size;
+        int64_t ts = (end ? t->f[limit - 1].pts : t->f[*sent].pts) * 1000;
+        uint32_t flags = end ? 8 : 0;
+        memcpy(b, &p, 8), memcpy(b + 0x10, &size, 8), memcpy(b + 0x18, &ts, 8), memcpy(b + 0x20, &flags, 4);
+        uint32_t r = (uint32_t)acall(A_DECODE, 2, obj, U(b));
+        if (r == AV1_BUSY) return 0;
+        CHECK(r == 0, "AV1: DecodeAsync of frame %d answered %#x", *sent, r);
+        if (end) *eos_sent = 1;
+        else ++*sent;
+    }
+    return 0;
+}
+
+// The first `limit` frames played as the game plays a movie (its decode step main+0x3b5e600, its update
+// main+0x3b5ca60): samples go in whenever the decoder takes them; an update every `period` ns of real time takes every
+// picture there is a free frame for, shows the oldest picture it holds and gives that frame back. The movie's time
+// starts with its first picture; the run ends with the end-of-stream marker.
+static int av1_paced(uint64_t obj, const uint8_t *data, const Track *t, int limit, uint64_t period, Av1Run *r) {
+    CHECK((uint32_t)acall(A_FLUSH, 1, obj) == 0, "AV1: Flush");
+    memset(r, 0, sizeof *r);
+    int sent = 0, eos_sent = 0, held = 0, eos = 0, waited = 0;
+    uint64_t hold[AV1_HELD], t0 = 0, next = 0;
+    int64_t ts0 = 0;
+    while (!eos) {
+        if (av1_feed(obj, data, t, limit, &sent, &eos_sent)) return 1;
+        uint64_t now = plat_now_ns();
+        if (next && now < next) {   // the movie plays: the decoder is fed until the next update is due
+            plat_sleep_ms(1);
+            continue;
+        }
+        if (next) {
+            r->late += now > next + 4000000;
+            next += period;
+            r->updates++;
+            // a decoder that loses a picture or the end-of-stream marker must fail the probe, not hang it
+            CHECK(r->updates < 100000, "AV1: no end of stream after %d updates (%d samples in, %d pictures shown)",
+                  r->updates, sent, r->shown);
+        }
+        while (held < AV1_HELD) {
+            uint64_t fr = 0;
+            uint32_t res = (uint32_t)acall(A_ACQUIRE, 2, obj, U(&fr));
+            if (res == AV1_NO_FRAME) break;
+            CHECK(res == 0 && fr, "AV1: AcquireVideoFrame answered %#x", res);
+            hold[held++] = fr;
+        }
+        if (!held) {   // nothing decoded yet: before the first picture, the probe waits for it
+            CHECK(next || ++waited < 5000, "AV1: no picture within 5 s of the start (%d samples in)", sent);
+            if (!next) plat_sleep_ms(1);
+            continue;
+        }
+        const uint8_t *f = (const uint8_t *)(uintptr_t)hold[0];
+        int64_t ts;
+        memcpy(&ts, f + 0x78, 8);
+        if (f[0x88]) eos = 1;
+        else {
+            now = plat_now_ns();
+            if (!next) next = now + period, t0 = now, ts0 = ts;
+            CHECK(!r->shown || ts > r->last_ts, "AV1: picture at %lld ns shown after %lld ns", (long long)ts,
+                  (long long)r->last_ts);
+            int64_t lag = ((int64_t)(now - t0) - (ts - ts0)) / 1000;
+            r->last_lag_us = lag;
+            if (lag > r->worst_lag_us) r->worst_lag_us = lag;
+            r->last_ts = ts;
+            r->shown++;
+        }
+        CHECK((uint32_t)acall(A_RELEASE, 2, obj, hold[0]) == 0, "AV1: ReleaseVideoFrame");
+        memmove(hold, hold + 1, (size_t)--held * sizeof *hold);
+    }
+    CHECK(held == 0, "AV1: %d pictures came after the end of stream", held);
+    return 0;
+}
+
+static void av1_print(const char *what, int limit, const Av1Run *r) {
+    printf("probe-movie: AV1 %s: %d of %d pictures shown in %d updates (%d late); the last picture %.0f ms behind real "
+           "time, at worst %.0f ms\n", what, r->shown, limit, r->updates, r->late, r->last_lag_us / 1000.0,
+           r->worst_lag_us / 1000.0);
+}
+
+static int probe_av1(const uint8_t *data, const Track *t) {
+    for (int i = 0; i < A_ENTRIES; i++) CHECK((A[i] = hostfn_override(av1_symbols[i])), "no override for %s", av1_symbols[i]);
+    C = plat_aligned_alloc(sizeof(Cpu), 64);
+    CHECK(C, "Cpu allocation");
+    memset(C, 0, sizeof *C);
+    uint64_t obj_mem = 0, obj = U(&obj_mem);
+    acall(A_CTOR, 1, obj);
+    CHECK((uint32_t)acall(A_INIT, 6, obj, (uint64_t)0, (uint64_t)0, (uint64_t)3, (uint64_t)3, (uint64_t)1) == 0 && obj_mem,
+          "AV1: Initialize");
+    static uint8_t vf[AV1_HELD][0x90];
+    uint64_t frames[AV1_HELD], fb = (uint64_t)t->w * t->h * 3 / 2;
+    uint8_t *bufs[AV1_HELD];
+    for (int i = 0; i < AV1_HELD; i++) {
+        CHECK((bufs[i] = malloc((size_t)fb)), "frame buffer");
+        uint64_t p = U(bufs[i]);
+        memcpy(vf[i] + 0x08, &p, 8), memcpy(vf[i] + 0x48, &fb, 8);
+        frames[i] = U(vf[i]);
+    }
+    CHECK((uint32_t)acall(A_REGISTER, 3, obj, U(frames), (uint64_t)AV1_HELD) == 0, "AV1: RegisterVideoFrame");
+
+    // 1. a game at 30 updates a second: every picture, one per update, in order, the end of stream last; slow motion
+    int limit = t->n < 240 ? t->n : 240;
+    double movie_s = (t->f[limit - 1].pts - t->f[0].pts) / 1e6;
+    Av1Run r;
+    if (av1_paced(obj, data, t, limit, 1000000000ull / 30, &r)) return 1;
+    av1_print("at 30 updates a second", limit, &r);
+    CHECK(r.shown == limit && r.last_ts == t->f[limit - 1].pts * 1000 && r.last_lag_us > movie_s * 1e6 / 4,
+          "AV1 at 30 Hz: %d of %d shown, the last at %lld ns and %.0f ms behind (a %.1f s movie)", r.shown, limit,
+          (long long)r.last_ts, r.last_lag_us / 1000.0, movie_s);
+
+    // 2. a game at 60 updates a second: every picture in time
+    limit = t->n < 180 ? t->n : 180;
+    if (av1_paced(obj, data, t, limit, 1000000000ull / 60, &r)) return 1;
+    av1_print("at 60 updates a second", limit, &r);
+    CHECK(r.shown == limit, "AV1 at 60 Hz: %d of %d shown", r.shown, limit);
+    if (r.late > 2)
+        printf("probe-movie: AV1 at 60 Hz: %d updates began late (a busy machine), so the timing is not checked\n",
+               r.late);
+    else
+        CHECK(r.worst_lag_us <= 50000, "AV1 at 60 Hz: a picture %.0f ms behind real time", r.worst_lag_us / 1000.0);
+
+    CHECK((uint32_t)acall(A_FINALIZE, 1, obj) == 0, "AV1: Finalize");
+    acall(A_DTOR, 1, obj);
+    CHECK(obj_mem == 0, "AV1: the destructor left the host decoder");
+    for (int i = 0; i < AV1_HELD; i++) free(bufs[i]);
+    plat_aligned_free(C);
+    printf("probe-movie: passed\n");
+    return 0;
+}
+
 int probe_movie(void) {
     const char *dir = rt_config()->romfs;
     char image[PLAT_PATH_MAX];
@@ -309,10 +477,16 @@ int probe_movie(void) {
     Track t = {0};
     const char *err = demux(data, (size_t)size, &t);
     CHECK(!err, "WebM: %s", err);
-    CHECK(!strcmp(t.codec, "V_VP9") && t.n > 0 && t.w > 0 && t.h > 0, "WebM: codec %s, %d frames, %dx%d", t.codec, t.n,
-          t.w, t.h);
+    CHECK((!strcmp(t.codec, "V_VP9") || !strcmp(t.codec, "V_AV1")) && t.n > 0 && t.w > 0 && t.h > 0,
+          "WebM: codec %s, %d frames, %dx%d", t.codec, t.n, t.w, t.h);
     printf("probe-movie: WebM %s %dx%d, %d frames, %.2f s, first PTS %lld us\n", t.codec, t.w, t.h, t.n,
            (t.f[t.n - 1].pts - t.f[0].pts) / 1e6, (long long)t.f[0].pts);
+    if (!strcmp(t.codec, "V_AV1")) {
+        int rc = probe_av1(data, &t);
+        free(data);
+        free(t.f);
+        return rc;
+    }
 
     // Stand-ins and entries. The vtable the constructor stores is a host address nothing calls.
     MovieGuest g = {

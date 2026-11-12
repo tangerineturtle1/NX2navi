@@ -33,8 +33,8 @@ static class MeshSpirv
         OpFunction = 54, OpFunctionEnd = 56, OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62,
         OpAccessChain = 65, OpInBoundsAccessChain = 66, OpPtrAccessChain = 67, OpInBoundsPtrAccessChain = 70,
         OpDecorate = 71, OpCompositeConstruct = 80, OpIAdd = 128, OpIMul = 132, OpULessThan = 176,
-        OpShiftRightLogical = 194, OpBitwiseAnd = 199, OpBitcast = 124, OpControlBarrier = 224, OpSelectionMerge = 247,
-        OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253,
+        OpShiftRightLogical = 194, OpBitwiseAnd = 199, OpBitcast = 124, OpControlBarrier = 224, OpPhi = 245,
+        OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253,
         OpEmitMeshTasksEXT = 5294, OpSetMeshOutputsEXT = 5295;
     const int ScUniform = 2, ScOutput = 3, ScWorkgroup = 4, ScInput = 1, ScFunction = 7, ScStorageBuffer = 12, ScTaskPayload = 5402;
     const int DecBlock = 2, DecBufferBlock = 3, DecBuiltIn = 11, DecLocation = 30;
@@ -248,16 +248,46 @@ static class MeshSpirv
             }
         }
 
+        // Shared memory words [0, n) set to 0, word i by thread i mod threads: a loop, as a large stage buffer would
+        // otherwise unroll into hundreds of stores. `from` is the label of the block the loop is entered from.
+        void ZeroShared(uint from, uint tid, uint n)
+        {
+            uint header = Id(), loopBody = Id(), cont = Id(), merge = Id(), i = Id(), next = Id();
+            Do(OpBranch, header);
+            Do(OpLabel, header);
+            body.Add(new Insn(OpPhi, new[] { tUint, i, tid, from, next, cont }));
+            uint more = Emit(OpULessThan, tBool, i, C(n));
+            Do(OpLoopMerge, merge, cont, 0);   // the merge instruction comes right before the block's branch
+            Do(OpBranchConditional, more, loopBody, merge);
+            Do(OpLabel, loopBody);
+            Do(OpStore, Emit(OpAccessChain, pSharedUint, sharedVar, i), C(0));
+            Do(OpBranch, cont);
+            Do(OpLabel, cont);
+            body.Add(new Insn(OpIAdd, new[] { tUint, next, i, C((uint)Math.Max(1, m.Threads)) }));
+            Do(OpBranch, header);
+            Do(OpLabel, merge);
+        }
+
         uint entryFn = Id();
         body.Add(new Insn(OpFunction, new[] { tVoid, entryFn, 0u, tFnVoid }));
-        Label();
+        uint entryLabel = Label();
         uint tid = Emit(OpLoad, tUint, lii);
-        // The counts start at 0: a task that culls everything never writes its mesh count, and the word then held what
-        // the workgroup's shared memory last had, up to tens of thousands of mesh groups and a lost device; a mesh
-        // shader that emits nothing leaves its primitive count the same way.
-        uint countWord = C((uint)(m.Stage == 6 ? (m.Pay + 4) / 4 : m.Map / 4));
-        If(tid, C(1), () => Do(OpStore, Emit(OpAccessChain, pSharedUint, sharedVar, countWord), C(0)));
-        if (m.Stage == 7 && m.HasTask) CopyPayload(tid, true);
+        if (m.Stage == 6)
+        {
+            // The mesh count starts at 0: a task that culls everything never writes it, and the word then held what the
+            // workgroup's shared memory last had, up to tens of thousands of mesh groups and a lost device.
+            If(tid, C(1), () => Do(OpStore, Emit(OpAccessChain, pSharedUint, sharedVar, C((uint)(m.Pay + 4) / 4)), C(0)));
+        }
+        else
+        {
+            // The whole stage buffer below the payload starts at 0: the vertex lines, the primitive count and the vertex
+            // indices. Vulkan leaves workgroup memory undefined, and a mesh program need not write every vertex it has
+            // room for, nor every index byte, nor its count when it emits nothing; the copy below reads all of them, so
+            // whatever an earlier workgroup left there became vertices and primitives (on AMD, long thin triangles
+            // across the foliage's shadow map). Now an unwritten vertex reads as zeros and an unwritten index as vertex 0.
+            ZeroShared(entryLabel, tid, (uint)m.Pay / 4);
+            if (m.HasTask) CopyPayload(tid, true);
+        }
         Barrier();
         Emit(OpFunctionCall, tVoid, mainFn);
         Barrier();
@@ -276,6 +306,9 @@ static class MeshSpirv
             // outputs
             uint tV4 = Ty(OpTypeVector, tFloat, 4);
             uint pOutFloat = Ptr(ScOutput, tFloat);
+            uint fZero = Id(), fOne = Id();
+            globals.Add(new Insn(OpConstant, new[] { tFloat, fZero, 0u }));
+            globals.Add(new Insn(OpConstant, new[] { tFloat, fOne, 0x3f800000u }));
             uint posVar = 0, sizeVar = 0;
             var generic = new Dictionary<int, uint>();
             foreach (int a in m.Lines)
@@ -313,6 +346,16 @@ static class MeshSpirv
                         uint ptr = comp == uint.MaxValue ? Emit(OpAccessChain, pOutFloat, var, v) : Emit(OpAccessChain, pOutFloat, var, v, C(comp));
                         Do(OpStore, ptr, value);
                     }
+                    // A component of an output vector that the program's output map leaves out reads as Maxwell gives an
+                    // unwritten one, (0, 0, 0, 1), instead of whatever the output held.
+                    void Defaults(uint var, int first)
+                    {
+                        for (int k = 0; k < 4; k++)
+                            if (!m.Lines.Contains(first + 4 * k))
+                                Do(OpStore, Emit(OpAccessChain, pOutFloat, var, v, C((uint)k)), k == 3 ? fOne : fZero);
+                    }
+                    if (posVar != 0) Defaults(posVar, 0x70);
+                    foreach (var (g, var) in generic) Defaults(var, 0x80 + 16 * g);
                 });
             }
             for (int k = 0; k * threads < maxP; k++)

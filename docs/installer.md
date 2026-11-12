@@ -148,7 +148,8 @@ llvm/                 llvm-mingw, x86_64-only subset (Apache-2.0 with LLVM excep
 runtime/              libnx2navirt.a, libnx2navirt-v2.a and the headers the generated code and modules.c/romfs.c/patches.c
                       include
 bin/                  nx2navi_xlate.exe, hactool.exe, SDL3.dll, libopus-0.dll, ninja.exe
-data/                 shader_list.tsv (MIT, THIRD_PARTY_NOTICES.md); pgo-<ver>.profdata + .json, the execution profile an
+data/                 shader_list.tsv (MIT, THIRD_PARTY_NOTICES.md); pipeline_list.bin when the release was made with
+                      one (building.md, step 6); pgo-<ver>.profdata + .json, the execution profile an
                       update's code and the runtime libraries compile with (building.md, "Profile-guided build")
 THIRD_PARTY_NOTICES.md
 nx2navi.ini.example, VERSION  the default ini; the release string (the repository's VERSION plus the commit)
@@ -202,7 +203,12 @@ bin/                  nx2navi_xlate, hactool, ninja, libSDL3.so.0
 - The setup's temp folder is `.setup-temp` inside the install folder (`--temp` changes it): the AppImage is mounted
   read-only, and a Steam Deck's `/home` is often too full for the generated C while the game goes to the SD card.
 - The game keeps Mesa's shader cache in `mesa-cache` beside `nx2navi` unless `MESA_SHADER_CACHE_DIR` is set, for the
-  same reason: RADV fills its default folder in `~/.cache` up to 1 GB.
+  same reason: RADV fills its default folder in `~/.cache` up to 1 GB. In that folder the limit is 8 GB unless
+  `MESA_SHADER_CACHE_MAX_SIZE` is set, since the shader preparation and the stage libraries built in play do not fit
+  in 1 GB. With NVIDIA's driver, its cache goes to
+  `nvidia-cache` beside it unless `__GL_SHADER_DISK_CACHE_PATH` is set, with a limit of 8 GiB unless
+  `__GL_SHADER_DISK_CACHE_SIZE` is set: the default limit of 1 GiB is smaller than what the shader preparation builds.
+  When that folder cannot be made or written, the driver keeps its own folder and limit.
 - The window follows `LANG` for English or Russian, cancels through SIGTERM to the CLI's process group (the CLI handles
   it as Ctrl+Break on Windows) and opens the finished folder with `xdg-open`.
 - Requirements beyond Windows': Linux 6.7 or later (the write watch, `docs/building.md`) and glibc 2.34.

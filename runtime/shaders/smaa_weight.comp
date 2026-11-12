@@ -1,0 +1,17 @@
+#version 450
+// SMAA pass 2 (runtime/vk_aa.c): blending weights from the edges, with the area and search lookup textures.
+#include "smaa_setup.glsl"
+layout(binding = 0) uniform sampler2D edges;    // linear filtering
+layout(binding = 1) uniform sampler2D area;     // linear filtering
+layout(binding = 2) uniform sampler2D search;   // nearest
+layout(binding = 3, rgba8) uniform writeonly image2D weights;
+
+void main() {
+    ivec2 p;
+    vec2 uv;
+    if (!smaa_pixel(p, uv)) return;
+    vec2 pix;
+    vec4 offset[3];
+    SMAABlendingWeightCalculationVS(uv, pix, offset);
+    imageStore(weights, p, SMAABlendingWeightCalculationPS(uv, pix, offset, edges, area, search, vec4(0.0)));
+}

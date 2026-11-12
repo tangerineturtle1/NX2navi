@@ -39,6 +39,8 @@ CALLS = [
     "localtime_s", "strtok_s", "GetModuleHandle(Ex)?[AW]?", "ExitProcess", "SetEnvironmentVariable[AW]?", "_putenv(_s)?",
     "GetLastError", "MultiByteToWideChar", "WideCharToMultiByte", "HWND", "LARGE_INTEGER", "FILETIME",
     "MAX_PATH", "GetActiveProcessorCount", "timeBeginPeriod",
+    "WSAStartup", "WSAPoll", "WSAIoctl", "WSAGetLastError", "closesocket", "ioctlsocket", "SOCKET",
+    "sockaddr(_in6?|_storage)?",
 ]
 CALL_RE = re.compile(r"\b(" + "|".join(CALLS) + r")\b")
 

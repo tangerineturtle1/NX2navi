@@ -93,7 +93,9 @@ void machine_and_frames(const PerfPanel *p, float scale) {
     label(UI_MENU_OV_VRAM);
     cell(UI_MENU_OV_FMT_GB, gb(s.vram_used_mb));
     cell(UI_MENU_OV_FMT_GB_OF, gb(s.vram_total_mb));
-    cell(UI_MENU_OV_FMT_MHZ, s.gpu_clock_mhz);
+    // the card's figure counts every program on it: this game's own share beside it, the clock where that is unknown
+    if (s.vram_game_mb >= 0) cell(UI_MENU_OV_GAME_GB, gb(s.vram_game_mb));
+    else cell(UI_MENU_OV_FMT_MHZ, s.gpu_clock_mhz);
     label(UI_MENU_OV_CPU);
     cell(UI_MENU_OV_FMT_PCT, s.cpu_total_pct);
     cell(UI_MENU_OV_FMT_TEMP, s.cpu_temp_c);
@@ -163,14 +165,15 @@ void waits(const PerfStats &s) {
 }
 
 void picture(const PerfPanel *p) {
-    static const UiTextId labels[10] = {UI_MENU_OV_WINDOW, UI_MENU_OV_OUTPUT, UI_MENU_OV_SCENE, UI_MENU_UPSCALING, UI_MENU_OV_LIMIT,
-                                        UI_MENU_PRESENT_VSYNC, UI_MENU_GAME_ASPECT, UI_MENU_GAME_RES, UI_MENU_HDR, UI_MENU_FRAMEGEN};
+    static const UiTextId labels[11] = {UI_MENU_OV_WINDOW, UI_MENU_OV_OUTPUT, UI_MENU_OV_SCENE, UI_MENU_UPSCALING, UI_MENU_AA,
+                                        UI_MENU_OV_LIMIT, UI_MENU_PRESENT_VSYNC, UI_MENU_GAME_ASPECT, UI_MENU_GAME_RES, UI_MENU_HDR,
+                                        UI_MENU_FRAMEGEN};
     if (!ImGui::BeginTable("##perfp", 2, ImGuiTableFlags_SizingFixedFit)) return;
     float vw = 0;
     for (const auto &v : p->picture) vw = fmaxf(vw, ImGui::CalcTextSize(v).x);
     ImGui::TableSetupColumn("##p0", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("##p1", ImGuiTableColumnFlags_WidthFixed, vw);
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 11; i++) {
         if ((i == 2 && !p->scene_known) || !p->picture[i][0]) continue;
         label(labels[i]);
         ImGui::TableNextColumn();

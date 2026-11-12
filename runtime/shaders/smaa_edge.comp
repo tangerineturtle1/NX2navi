@@ -1,0 +1,15 @@
+#version 450
+// SMAA pass 1 (runtime/vk_aa.c): luma edge detection over pass 0's luma into the edges image (red: an edge on the
+// pixel's left, green: on its top).
+#include "smaa_setup.glsl"
+layout(binding = 0) uniform sampler2D luma;   // smaa_encode.comp's, linear filtering
+layout(binding = 1, rgba8) uniform writeonly image2D edges;
+
+void main() {
+    ivec2 p;
+    vec2 uv;
+    if (!smaa_pixel(p, uv)) return;
+    vec4 offset[3];
+    SMAAEdgeDetectionVS(uv, offset);
+    imageStore(edges, p, vec4(SMAALumaEdgeDetectionPS(uv, offset, luma), 0.0, 0.0));
+}

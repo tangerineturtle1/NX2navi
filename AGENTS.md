@@ -24,6 +24,9 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 - Build C with MSYS2 UCRT64 Clang (`C:\msys64\ucrt64\bin`). Generated C uses GNU extensions, so `cl.exe` is out. Call Ninja from that directory by full path or put it first on PATH.
 - Two Python environments: `.venv` (3.12) for the lifter and the build, `.venv-py314` for the extraction and shader scripts, which need `compression.zstd`.
 - Generated C is never edited by hand: change the generator (`recomp/`).
+- The runtime's own shaders are checked in as source only (`runtime/shaders/`, `tools/make_dlaa_mask.py`,
+  `tools/make_mvobj_fs.py`). `tools/build_shaders.py` builds `runtime/<name>_spv.h` from them, `build_game.py` runs it,
+  git ignores the headers and `check_content.py` refuses them in a commit.
 - Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
 - `recomp/layout.py` alone decides module bases.
 - Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match, what goes wrong when it does not, and what our runtime does.

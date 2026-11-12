@@ -30,7 +30,7 @@ hash: the same over the cheat's words, so the runtime sees an edited cheat that 
 A code cheat that calls or jumps into a code cave it writes (words where main has zeros) gets the cave's body inlined
 at the call site; a conditional skip of one store in the body (cbz wN, +8; str wN, ...) is dropped.
 
-Standard library and recomp/ only.
+Standard library, recomp/ and tools/mod_files.py only.
 """
 import argparse
 import struct
@@ -38,9 +38,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'recomp'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flags  # noqa: E402
 from lifter import Lifter, Unsupported  # noqa: E402
 from nso import Nso  # noqa: E402
+from mod_files import cheat_files  # noqa: E402
 
 BASE = 0x7000000000   # main's base in the layout (recomp/layout.py); only pc-relative decoding sees it
 NOP = 0xD503201F
@@ -87,25 +89,6 @@ def parse(text, mod):
     for c in out:
         n = seen[c.name] = seen.get(c.name, 0) + 1
         c.key = fnv((f'{mod}/' + (c.name if n == 1 else f'{c.name}#{n}')).encode())
-    return out
-
-
-TITLE = '0400486024DEC000'   # the game's title id: a mod's Atmosphere folders are named after it
-
-
-def cheat_files(mods, bid):
-    """[(mod folder name, cheat file)] of the folders of mods, by name: <mod>/cheats/<bid>.txt or its Atmosphere places
-    (runtime/mods.c find_root), the file name in any case."""
-    out = []
-    for mod in sorted((d for d in mods.iterdir() if d.is_dir()), key=lambda d: d.name) if mods.is_dir() else []:
-        for where in ('cheats', f'atmosphere/contents/{TITLE}/cheats', f'contents/{TITLE}/cheats', f'{TITLE}/cheats'):
-            folder = mod / where
-            if folder.is_dir():
-                f = next((p for p in sorted(folder.iterdir()) if p.is_file() and p.name.lower() == f'{bid}.txt'.lower()),
-                         None)
-                if f:
-                    out.append((mod.name, f))
-                break
     return out
 
 

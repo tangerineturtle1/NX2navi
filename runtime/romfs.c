@@ -30,7 +30,9 @@
 #include <string.h>
 #include <strings.h>
 
+#include "action_prompt.h"
 #include "cfg.h"
+#include "dispatch.h"
 #include "fs.h"
 #include "host.h"
 #include "input_map.h"
@@ -85,6 +87,8 @@ static uint64_t handles[NH];         // file index + 1; 0 is free
 static uint32_t handle_ovl[NH];      // overlay slot + 1 of an open handle, 0 = original
 static PlatFile *handle_file[NH];    // the handle's open overlay file, when handle_ovl is set
 static Overlay *overlays;            // sorted by RomFS index after overlay_init
+static uint32_t *open_ms;            // open_note: per file, the last open and the opens in a row
+static uint16_t *open_n;
 static size_t noverlay, overlay_cap;
 static char **added;                 // RomFS paths of the added files, sorted; added[k] is index file_count + k
 static size_t nadded;
@@ -767,7 +771,7 @@ static void heapdef_overlay(void) {
 // overlay that replaces the pack (a mod's camera stays), else the RomFS original; the dictionary is the RomFS's own.
 #define CAMPACK "Pack/Actor/PlayerCamera.pack.zs"
 static void camera_overlay(void) {
-    if (cam_speed_wanted() == 1.0f) return;
+    // also at factor 1: cam_pack_build reads the game's own values, which a change during the run needs
     static const char keeps[] = "the camera keeps its own speed";
     Overlay *base, *dic_base;
     size_t n, dn;
@@ -780,12 +784,48 @@ static void camera_overlay(void) {
     if (ok && serve_generated(CAMPACK, base, out, out_n, "camera", "camera speed", keeps)) cam_pack_served();
 }
 
+// The action prompt's diamond of face buttons for the pad layout at start (action_prompt.c). By position (the
+// Switch's places) the game's own layout is right; by label the Common layout archive the game would read (a mod's, else
+// the RomFS's) is served with the diamond laid out again, written to <profile>/action-prompt/. A pad is not open yet
+// this early, so auto counts as by label, as for the prompts' folders (input_map.c input_prompts_folder).
+static int action_prompt_for = -1;   // romfs_action_prompt
+static void action_prompt_overlay(void) {
+    int layout = input_pad_layout_pick(cfg_value("NX2NAVI_PAD_LAYOUT"), 0);
+    if (layout == PAD_LAYOUT_NINTENDO) {
+        action_prompt_for = layout;
+        return;
+    }
+    static const char keeps[] = "the action prompt keeps the Switch places";
+    Overlay *base, *dic_base;
+    size_t n, dn, out_n = 0;
+    void *in = read_served(ACTION_PROMPT_ARCHIVE, &base, &n, keeps), *out = NULL;
+    void *dic = in ? read_served("Pack/ZsDic.pack.zs", &dic_base, &dn, keeps) : NULL;
+    int made = in && dic ? action_prompt_build(in, n, dic, dn, 1, &out, &out_n) : -1;
+    free(in);
+    free(dic);
+    if (made == 0 || (made > 0 && serve_generated(ACTION_PROMPT_ARCHIVE, base, out, out_n, "action-prompt",
+                                                   "face buttons by label", keeps)))
+        action_prompt_for = layout;
+}
+
+int romfs_action_prompt(void) { return action_prompt_for; }
+
 // The button prompts' folders (input_prompts_folder) and whether each had a manifest next to romfs-index.bin at start;
 // the one the settings asked for at start, the one overlay_init loaded (NULL: the game's own prompts) and why the first
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
 // romfs-patches-pc keeps that name, but at a game resolution of another shape than 16:9 its files come from pc_dir,
 // romfs-patches-pc-<w>x<h> (overlay_init).
-#define PROMPTS_FOLDERS 5   // Xbox and PlayStation by position and by label, then PC
+#define PROMPTS_PADS 3      // the pad styles: Xbox, PlayStation, Steam Deck
+#define PROMPTS_FOLDERS (PROMPTS_PADS * 2 + 1)   // each pad style by position and by label, then PC
+// A style's name in the log and its NX2NAVI_PROMPTS value.
+static const char *prompts_style(int pick) {
+    return pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation"
+           : pick == PROMPTS_STEAMDECK ? "Steam Deck" : "Xbox";
+}
+static const char *prompts_value(int pick) {
+    return pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation"
+           : pick == PROMPTS_STEAMDECK ? "steamdeck" : "xbox";
+}
 static struct { const char *name; int ready; } prompts_folders[PROMPTS_FOLDERS];
 static const char *prompts_wanted, *prompts_loaded;
 static int prompts_off;
@@ -828,7 +868,7 @@ static void overlay_init(void) {
     // A game resolution that is not 16:9 takes romfs-patches-<w>x<h> instead when it is there: the same overlay with
     // the UI laid out for that shape (make_romfs_patches.py --aspect), when the game version has the camera aspect patch
     // the layout goes with (res_wants_wide_overlay).
-    // With prompts = xbox or playstation, that pad's prompts folder for the pad layout in its place
+    // With prompts = xbox, playstation or steamdeck, that pad's prompts folder for the pad layout in its place
     // (input_prompts_folder): the game's button font and interface textures with that pad's buttons drawn in
     // (tools/pad_prompts.py). The game reads the font and the archives once at boot, so
     // the prompts stay until restart even though the layout itself changes live. Each folder replaces romfs-patches as
@@ -855,7 +895,7 @@ static void overlay_init(void) {
         }
     }
     static const char *const layouts[2] = {"nintendo", "xbox"};   // each pad's two folders, then the PC one
-    static const int pads[2] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION};
+    static const int pads[PROMPTS_PADS] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION, PROMPTS_STEAMDECK};
     for (int i = 0; i < PROMPTS_FOLDERS; i++) {
         int pc = i == PROMPTS_FOLDERS - 1;
         const char *name = pc ? input_prompts_folder(PROMPTS_PC, 0) : input_prompts_folder(pads[i / 2], layouts[i % 2]);
@@ -871,7 +911,7 @@ static void overlay_init(void) {
     }
     const char *layout = cfg_value("NX2NAVI_PAD_LAYOUT");
     int pick = input_prompts_pick(cfg_get("NX2NAVI_PROMPTS"), layout), shaped = wide && pick == PROMPTS_PC;
-    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation" : "Xbox";
+    const char *style = prompts_style(pick);
     prompts_wanted = input_prompts_folder(pick, layout);
     prompts_off = !prompts_wanted                         ? ROMFS_PROMPTS_OK
                   : wide && !shaped                       ? ROMFS_PROMPTS_SHAPE
@@ -893,7 +933,7 @@ static void overlay_init(void) {
         }
     } else if (prompts_wanted) {
         rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay",
-               pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation" : "xbox",
+               prompts_value(pick),
                prompts_off == ROMFS_PROMPTS_SHAPE     ? (shaped ? "the game resolution has no romfs-patches-pc-<w>x<h> "
                                                                   "(tools/make_romfs_patches.py --prompts pc --aspect)"
                                                              : "the game resolution takes its own UI layout")
@@ -926,6 +966,7 @@ static void overlay_init(void) {
     restbl_overlay();
     heapdef_overlay();
     camera_overlay();
+    action_prompt_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)   // overlay_contest left one per file; the generated ones replace in place
@@ -1017,6 +1058,7 @@ static void init_once(void *param) {
         }
     }
     overlay_init();
+    open_ms = calloc(file_count, sizeof *open_ms), open_n = calloc(file_count, sizeof *open_n);   // open_note
     rt_log("RomFS ready: %llu files, %zu overlays, %zu added, %.2f s", (unsigned long long)file_count, noverlay,
            nadded, now_s() - t0);
 #endif
@@ -1124,6 +1166,64 @@ static int movie_skipped(const char *p) {
     return 1;
 }
 
+// A file the game cannot load, damaged or refused for any other reason: its loader opens it again and again and in the
+// end does without it, and whatever needs it stays out of the world. tools/romfs_check.py finds damaged files before
+// play; this names the ones that still fail, in the log. One timestamp and one count per file, read and written only
+// here, where a file is opened (a few thousand times a session), without a lock: a race at worst logs a line twice.
+#define RETRY_OPENS 24             // opens each less than RETRY_GAP_MS after the last; a file reloaded in play stays far below
+#define RETRY_GAP_MS 3000
+
+static void open_note(uint64_t i, const char *path) {
+    if (!open_n || i >= file_count) return;
+    uint32_t now = (uint32_t)(plat_now_ns() / 1000000);
+    if (now - open_ms[i] > RETRY_GAP_MS) open_n[i] = 0;
+    open_ms[i] = now;
+    if (open_n[i] < RETRY_OPENS && ++open_n[i] == RETRY_OPENS)
+        rt_log("RomFS: the game keeps opening %s and cannot load it; what needs it stays out of the world "
+               "(romfs-check.json lists the files found damaged)", path);
+}
+
+// NX2NAVI_TRACE=perf: an area's static placement, Banc/<area>/<area>_<age>_Static.bcett.byml.zs, is read once when the
+// area loads (the game streams a neighbouring area the same way): perf_scene names it.
+static int area_name(const char *p, char *name, size_t cap) {
+    static const char tail[] = "_Static.bcett.byml";
+    if (strncmp(p, "Banc/", 5)) return 0;
+    const char *leaf = strrchr(p, '/'), *t = leaf ? strstr(leaf, tail) : NULL;
+    if (!t || (t[sizeof tail - 1] && strcmp(t + sizeof tail - 1, ".zs"))) return 0;
+    snprintf(name, cap, "%.*s", (int)(t - leaf - 1), leaf + 1);
+    return 1;
+}
+
+static void scene_note(const char *p) {
+    char name[96];
+    if (area_name(p, name, sizeof name)) perf_scene(name);
+}
+
+// The game asked for an area's static placement and the RomFS has none: the save being loaded (or the game's own
+// state) names an area this game version does not have. The game does not check for that and reads through a null
+// area object a moment later (a child save naming HyruleCastle_Child on 1.1.1, whose castle has one placement for both
+// ages). The log names the area once, and the crash report that follows repeats it, so the report explains itself.
+static char area_missing_name[96];   // the first such area, written once under lock; the fatal note reads it
+
+static void area_missing_fatal_note(void) {
+    if (area_missing_name[0])
+        rt_log("fatal: the game asked for the area %s, which this game version does not have; a save that names it "
+               "cannot be loaded", area_missing_name);
+}
+
+static void area_missing(const char *p) {
+    char name[96];
+    if (!area_name(p, name, sizeof name)) return;
+    plat_mutex_lock(&lock);
+    int first = !area_missing_name[0];
+    if (first) snprintf(area_missing_name, sizeof area_missing_name, "%s", name);
+    plat_mutex_unlock(&lock);
+    if (!first) return;
+    rt_log("RomFS: the game asked for the area %s (%s), which this game version does not have; the save being loaded "
+           "names it and cannot be loaded here", name, p);
+    rt_fatal_note_add(area_missing_fatal_note);
+}
+
 uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     fs_trace("rom", path);
     if (!out || mode != FS_OPEN_READ) return FS_R_UNSUPPORTED_OPEN;
@@ -1136,7 +1236,13 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
         return FS_R_PATH_NOT_FOUND;
     }
     uint64_t i = file_index(p);
-    if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
+    if (i == UINT64_MAX) {
+        area_missing(p);
+        return FS_R_PATH_NOT_FOUND;
+    }
+    open_note(i, p);
+    if (rt_trace & RT_TRACE_PERF) scene_note(p);
+    if (!strcasecmp(p, CAMPACK)) cam_pack_opened();   // its values come into memory at the start's factor (camera_speed.c)
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {
@@ -1190,7 +1296,7 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
     uint64_t base, fsize;
     if (!out || offset < 0 || !handle_source(h, &f, &base, &fsize)) return FS_R_INVALID;
     if ((uint64_t)offset > fsize || (!buffer && size)) return FS_R_INVALID;
-    uint64_t n = size < fsize - (uint64_t)offset ? size : fsize - (uint64_t)offset, done = 0;
+    uint64_t n = size < fsize - (uint64_t)offset ? size : fsize - (uint64_t)offset, done = 0, t0 = perf_mark_begin();
     if (f == image && image_map) {
         memcpy(buffer, image_map + base + (uint64_t)offset, (size_t)n);
         done = n;
@@ -1201,6 +1307,7 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
         if (r <= 0) rt_fatal("RomFS read failure at %#llx", (unsigned long long)(base + offset + done));
         done += (uint64_t)r;
     }
+    perf_mark_end(PERF_M_FILE, t0, done);
     *out = done;
     return 0;
 }
@@ -1295,3 +1402,12 @@ HOST_OVERRIDE("_ZN2nn2fs8MountRomEPKcPvm", ov_mount_rom);
 HOST_OVERRIDE("_ZN2nn2fs8MountRomEPKc", ov_mount_rom);
 HOST_OVERRIDE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", ov_query_cache);
 HOST_OVERRIDE("_ZN2nn2fs24InitializeForApplicationEv", ov_initialize);
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): open RomFS handles against the table.
+void romfs_sizes(PerfSizes *s) {
+    uint64_t n = 0;
+    plat_mutex_lock_shared(&lock);
+    for (unsigned j = 1; j < NH; j++) n += handles[j] != 0;
+    plat_mutex_unlock_shared(&lock);
+    perf_size(s, "RomFS handles open", n, NH - 1, PERF_SIZE_NONE);
+}

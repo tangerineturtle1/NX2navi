@@ -1,7 +1,21 @@
 /* No game data or physical microphone: exercise conversion, bounded capture and the polling ABI. */
-#include "../runtime/audio_capture.c"
-#include "../runtime/ov_audio_input.c"
+#include <SDL3/SDL.h>
 #include <assert.h>
+
+static bool deny_recording;
+static int device_open_calls;
+static SDL_AudioDeviceID open_test_device(SDL_AudioDeviceID device, const SDL_AudioSpec *spec) {
+    device_open_calls++;
+    if (deny_recording) {
+        SDL_SetError("simulated recording permission denial");
+        return 0;
+    }
+    return SDL_OpenAudioDevice(device, spec);
+}
+#define SDL_OpenAudioDevice open_test_device
+#include "../runtime/audio_capture.c"
+#undef SDL_OpenAudioDevice
+#include "../runtime/ov_audio_input.c"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +34,10 @@ void *ipc_guest(uint64_t addr, uint64_t size) {
     return (void *)(uintptr_t)addr;
 }
 void rt_log(const char *fmt, ...) { (void)fmt; }
+int rt_knob(const char *name, const char *def) {
+    assert(strcmp(name, "MICROPHONE") == 0);
+    return atoi(def);
+}
 
 static void ring_check(void) {
     assert(SDL_InitSubSystem(SDL_INIT_AUDIO));
@@ -59,16 +77,37 @@ static void polling_check(void) {
         c.x[5] = 4800;
         open_input_locked(&c);
         assert(c.x[0] == 0);
+        MicCapture *m = find(key)->mic;
+        assert(SDL_GetAudioStreamDevice(m->stream) == 0);
         c.x[0] = key;
         state_locked(&c);
         assert(c.x[0] == 1);
+        deny_recording = true;
+        c.x[0] = key;
+        start_input_locked(&c);
+        assert(c.x[0] == BAD_INPUT);
+        assert(SDL_GetAudioStreamDevice(m->stream) == 0);
+        c.x[0] = key;
+        state_locked(&c);
+        assert(c.x[0] == 1);
+        deny_recording = false;
         c.x[0] = key;
         start_input_locked(&c);
         assert(c.x[0] == 0);
+        SDL_AudioDeviceID active = SDL_GetAudioStreamDevice(m->stream);
+        assert(active);
+        c.x[0] = key;
+        start_input_locked(&c);
+        assert(c.x[0] == 0 && SDL_GetAudioStreamDevice(m->stream) == active);
         c.x[0] = key;
         state_locked(&c);
         assert(c.x[0] == 2);
         SDL_Delay(350); /* overflow the 100 ms ring, not system memory */
+        c.x[0] = key;
+        stop_input_locked(&c);
+        SDL_AudioSpec spec;
+        assert(!SDL_GetAudioDeviceFormat(active, &spec, NULL));
+        assert(SDL_GetAudioStreamDevice(m->stream) == 0);
         c.x[0] = key;
         filled_locked(&c);
         assert(c.x[0] > 0 && c.x[0] <= 4800);
@@ -77,6 +116,9 @@ static void polling_check(void) {
         c.x[2] = 4800;
         read_input_locked(&c);
         assert(c.x[0] > 0 && c.x[0] <= 4800);
+        c.x[0] = key;
+        start_input_locked(&c);
+        assert(c.x[0] == 0 && SDL_GetAudioStreamDevice(m->stream) != 0);
         c.x[0] = key;
         stop_input_locked(&c);
         c.x[0] = key;
@@ -120,13 +162,34 @@ static void polling_check(void) {
     assert(mic_available(NULL) == 0);
 }
 
+static void independent_streams_check(void) {
+    int previous_calls = device_open_calls;
+    MicCapture *a = mic_open(2, 1, 48000, 4800);
+    MicCapture *b = mic_open(2, 1, 48000, 4800);
+    assert(a && b);
+    assert(device_open_calls == previous_calls);
+    assert(SDL_GetAudioStreamDevice(a->stream) == 0 && SDL_GetAudioStreamDevice(b->stream) == 0);
+    assert(mic_start(a));
+    assert(SDL_GetAudioStreamDevice(b->stream) == 0);
+    assert(mic_start(b));
+    assert(device_open_calls == previous_calls + 2);
+    SDL_AudioDeviceID active = SDL_GetAudioStreamDevice(b->stream);
+    assert(active && active != SDL_GetAudioStreamDevice(a->stream));
+    mic_close(a);
+    assert(SDL_GetAudioStreamDevice(b->stream) == active);
+    mic_stop(b);
+    assert(SDL_GetAudioStreamDevice(b->stream) == 0);
+    mic_close(b);
+}
+
 int main(void) {
     assert(SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy"));
     registry_lock = SDL_CreateMutex();
     assert(registry_lock);
     ring_check();
     polling_check();
+    independent_streams_check();
     SDL_DestroyMutex(registry_lock);
-    puts("PASS: sample order, bounded overflow, polling frame units, reopen, purge and failed-open regression");
+    puts("PASS: bounded capture, idle streams, start/stop, failed start and retry, independent streams and purge");
     return 0;
 }

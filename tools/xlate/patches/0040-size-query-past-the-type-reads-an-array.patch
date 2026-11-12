@@ -1,0 +1,24 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitTexture.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitTexture.cs
+@@ -1116,6 +1116,21 @@
+             else
+             {
+                 type = context.TranslatorContext.GpuAccessor.QuerySamplerType(imm);
++
++                // NX2NAVI: a size query that reads the component after a 1D or 2D type's dimensions asks for the layer
++                // count, so the texture is an array. That holds for any 1D or 2D type here: the accessor's answer, or the 2D
++                // it answers for a handle it has no type for. The game's particle vertex shaders read only the layer count
++                // of such a handle, which their pixel shaders sample as a 2D array, and use it as the frame count of a
++                // flipbook; declared 2D, the binding is a one-layer view and the count reads as 1. A plain texture bound
++                // through an array view still reports one layer. Not handled: a program that samples the same handle as a
++                // plain 2D texture before this query gets an arrayed declaration for that sample (invalid SPIR-V).
++                if (query == TexQuery.TexHeaderDimension &&
++                    ((type & SamplerType.Mask) == SamplerType.Texture1D || (type & SamplerType.Mask) == SamplerType.Texture2D) &&
++                    !type.HasFlag(SamplerType.Array) &&
++                    (componentMask & (1 << type.Dimensions)) != 0)
++                {
++                    type |= SamplerType.Array;
++                }
+             }
+ 
+             TextureFlags flags = isBindless ? TextureFlags.Bindless : TextureFlags.None;

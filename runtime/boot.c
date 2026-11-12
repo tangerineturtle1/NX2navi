@@ -3,11 +3,12 @@
 // The boot driver: the guest main thread runs the game's own nn::init::Start
 // with three host callbacks, the second of which runs DT_INIT of main, subsdk0 and sdk; Start then calls nnMain.
 // --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call, at the return address of
-// each in main (1.1.0, 1.2.1, 1.4.3):
-//   SetFocusHandlingMode   main+0xeb8c14 (1.2.1: +0xe7a954, 1.4.3: +0xbdb48c) in nnMain, every module's constructor
-//                          flag reads 2
-//   nvnBootstrapLoader     main+0xebcdec (1.2.1: +0xe7eb2c, 1.4.3: +0xbe0360) in the graphics bring-up; logs the
-//                          run statistics, exits 0
+// each in main (1.1.1; 1.1.0, 1.2.1, 1.4.3 in brackets):
+//   SetFocusHandlingMode   main+0x1202d44 (+0xeb8c14, +0xe7a954, +0xbdb48c) in nnMain, every module's constructor
+//                          flag reads 2. 1.1.1's SDK calls it first, from nn::oe::InitializeApplet before DT_INIT; a
+//                          call from outside main is not the checkpoint.
+//   nvnBootstrapLoader     main+0x346bf8c (+0xebcdec, +0xe7eb2c, +0xbe0360) in the graphics bring-up; logs the run
+//                          statistics, exits 0
 // With --seconds S the run continues past that call; rt_frame_presented ends it once the world clock passed S.
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 
 #include "cfg.h"
 #include "cheats.h"
+#include "coop.h"
 #include "fs.h"
 #include "kernel.h"
 #include "ipc.h"
@@ -27,19 +29,20 @@
 #include "platform/platform.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
-// main: return addresses of nnMain's SetFocusHandlingMode call (from the analysis of each build's main)
-// and of the first nvnBootstrapLoader call, per game version.
-#define CHECKPOINT_RET (RT_V143 ? 0xbdb48cull : RT_V110 ? 0xeb8c14ull : 0xe7a954ull)
-#define NVN_RET (RT_V143 ? 0xbe0360ull : RT_V110 ? 0xebcdecull : 0xe7eb2cull)
+// main: return addresses of nnMain's SetFocusHandlingMode call and of the first nvnBootstrapLoader call, per game
+// version (from the analysis of each build's main; 1.1.1's are the x30 both host functions see in a normal start).
+#define CHECKPOINT_RET (RT_V111 ? 0x1202d44ull : RT_V143 ? 0xbdb48cull : RT_V110 ? 0xeb8c14ull : 0xe7a954ull)
+#define NVN_RET (RT_V111 ? 0x346bf8cull : RT_V143 ? 0xbe0360ull : RT_V110 ? 0xebcdecull : 0xe7eb2cull)
 #define CTOR_DONE 2                      // a module's constructor flag after its DT_INIT ran the init_array
 
-// The init_array sizes (1.1.0 and 1.2.1: counted in the modules; 1.4.3: DT_INIT_ARRAYSZ).
-// The three tables carry the same rows, so cb_module_inits walks them by the size of one.
+// The init_array sizes (1.1.0 and 1.2.1: counted in the modules; 1.1.1 and 1.4.3: DT_INIT_ARRAYSZ).
+// The four tables carry the same rows, so cb_module_inits walks them by the size of one.
 typedef struct { const char *name; uint64_t entries; } InitCount;
 static const InitCount inits_110[] = {{"main", 10668}, {"subsdk0", 45}, {"sdk", 116}};
+static const InitCount inits_111[] = {{"main", 9783}, {"subsdk0", 0}, {"sdk", 96}};
 static const InitCount inits_121[] = {{"main", 10673}, {"subsdk0", 45}, {"sdk", 116}};
 static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk", 83}};
-#define expected_inits (RT_V143 ? inits_143 : RT_V110 ? inits_110 : inits_121)
+#define expected_inits (RT_V111 ? inits_111 : RT_V143 ? inits_143 : RT_V110 ? inits_110 : inits_121)
 
 static volatile int32_t inits_done, checkpoint_seen;
 uint64_t rt_guest_start_ns;
@@ -123,6 +126,10 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
     uint64_t ret = c->x[30];
     caller(c, at, sizeof at);
     if (!strcmp(what, "checkpoint")) {
+        if (ret - main_mod->base >= main_mod->size) {   // 1.1.1's SDK sets the mode in nn::oe::InitializeApplet
+            rt_logf("boot: %s from %s, outside main: not the checkpoint\n", detail, at);
+            return;
+        }
         if (ret != main_mod->base + CHECKPOINT_RET)
             rt_fatal("boot: checkpoint %s reached from %s, expected main+%#llx", detail, at,
                      (unsigned long long)CHECKPOINT_RET);
@@ -317,8 +324,10 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
+    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();
-    vk_pipeline_save();   // no-op without the Vulkan back end
+    vk_pipeline_prewarm_marker_clear();   // an orderly end, not a driver crash in the boot's builds (vk_pipeline.c pm_skipped)
+    vk_pipeline_save_exit();   // no-op without the Vulkan back end
     prof_write();
     rtss_limit_restore();
     fflush(stderr);
@@ -395,6 +404,7 @@ static void boot_wait(PlatThread *warm, uint64_t cap_ms) {
 
 void rt_boot(void) {
     check_npdm();
+    fs_host_lock_profile();   // a second copy of the game stops here, before the prewarm below
     if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
     // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.
     PlatThread *warm = plat_thread_new(prewarm_main, NULL, "prewarm");

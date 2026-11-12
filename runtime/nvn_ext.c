@@ -14,7 +14,7 @@
 // back end's images) back first. NX2navi invalidates its 260x260 R16 grass maps and 1x1 pick targets this way. A
 // CPU-invisible pool has no storage to read.
 void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
-    if (!p->mem || nvn_gpu_only((uintptr_t)p->mem) || off >= p->size || !size) return;
+    if (!p || !p->mem || nvn_gpu_only((uintptr_t)p->mem) || off >= p->size || !size) return;
     if (size > p->size - off) size = p->size - off;
     gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
 }
@@ -63,7 +63,10 @@ NVN_API(nvnDeviceGetTimestampInNanoseconds) { ret_x(c, ticks_to_ns(((const NVNco
 
 // ---------- memory pools and buffers
 // size_t nvnMemoryPoolGetSize(const NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolGetSize) { ret_x(c, ((const pool_t *)arg_p(c, 0))->size); }
+NVN_API(nvnMemoryPoolGetSize) {
+    if (nvn_no_object(c, "nvnMemoryPoolGetSize")) return;
+    ret_x(c, ((const pool_t *)arg_p(c, 0))->size);
+}
 // void nvnMemoryPoolInvalidateMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size)
 NVN_API(nvnMemoryPoolInvalidateMappedRange) {
     int64_t off = (int64_t)arg_x(c, 1);

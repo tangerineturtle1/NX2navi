@@ -2,12 +2,15 @@
 // NGX core: on Windows _nvngx.dll, found through HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore; on Linux
 // libnvidia-ngx.so.1, which the NVIDIA driver installs on the library path. NGX loads the DLSS model from the folder of
 // the executable: nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.<version> on Linux. No NVIDIA SDK code or header is
-// compiled in: the few NGX types used are declared here from the SDK's documented ABI.
+// compiled in: the few NGX types used are declared here from the SDK ABI and the Linux core's shutdown interface.
 //
 // The core's parameter object is a C++ class whose virtual functions are called through its vtable: the Set overloads
 // in slots 0-7 and the Get overloads in 8-15. MSVC (the Windows core) lays out each group of overloads in reverse
 // declaration order, the Itanium C++ ABI (the Linux core, built with GCC) in declaration order. vtable_ok checks the
 // layout with a set-then-get round trip before anything relies on it.
+//
+// NGX and DLAA's resources live as long as the device: vk_dlaa_init brings NGX up on the new device, and
+// vk_dlaa_release (Linux) frees everything DLAA made and shuts NGX down before the device is destroyed.
 //
 // Where DLAA runs in the frame, the jitter and the motion vectors: see the sections below.
 #ifdef _WIN32
@@ -22,6 +25,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "nvn_api.h"
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
@@ -60,6 +64,11 @@ typedef NgxResult (*PFN_DestroyParams)(NgxParam *);
 typedef NgxResult (*PFN_Create)(VkCommandBuffer, int feature, NgxParam *, NgxHandle **);
 typedef NgxResult (*PFN_Evaluate)(VkCommandBuffer, const NgxHandle *, const NgxParam *, void *callback);
 typedef NgxResult (*PFN_Release)(NgxHandle *);
+#ifndef _WIN32
+// NVSDK_NGX_VULKAN_Shutdown1 as the Linux core exports it: the device and a pointer that receives the devices NGX still
+// serves afterwards (vk_dlaa_release).
+typedef NgxResult (*PFN_Shutdown1)(VkDevice, unsigned *remaining);
+#endif
 
 static struct {
     void *core;   // the NGX core library (an HMODULE on Windows)
@@ -70,10 +79,42 @@ static struct {
     PFN_Create create;
     PFN_Evaluate evaluate;
     PFN_Release release;
+    void *feat_inst_req;   // NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements (vk_ngxfg), NULL when the core lacks it
     int tried, loaded, available;
     int ngx_up;   // vk_dlaa_init brought NGX up: DLSS serves this run
+    NgxParam *capsp;   // the capability parameters (vk_dlaa_init), which DLSS's statistics callback reads and fills
     int wanted;   // -1 not read yet
+#ifndef _WIN32
+    // Linux teardown (vk_dlaa_release)
+    PFN_Shutdown1 shutdown1;   // required: core_load leaves DLAA off without it
+    VkDevice device;           // what NGX was initialised with: set while vk_dlaa_release owes it a shutdown
+    NgxParam *caps_map;        // GetCapabilityParameters' map: allocated for the caller, destroyed by vk_dlaa_release
+#endif
 } N = {.wanted = -1};
+
+// DLSS Frame Generation through NGX itself (vk_ngxfg_*, at the end of this file): NX2NAVI_FRAMEGEN = dlss where
+// Streamline does not run, which is every build but the Windows one.
+static struct {
+    int max;                     // generated frames per rendered one this GPU allows (MultiFrameCountMax), 0: none
+    NgxHandle *feat;
+    NgxParam *p;
+    uint32_t w, h;               // the picture the feature was created for
+    VkFormat fmt;
+    int failed, reset, evals;
+} FG;
+
+// Whether this run can generate frames through NGX: DLSS upscaling on at the start, as NGX comes up only then. The
+// swapchain then gets the presenter's extra images and NGX is asked about frame generation; whether frames are
+// generated is NX2NAVI_FRAMEGEN = dlss, read live (vk_ngxfg_on).
+int vk_ngxfg_wanted(void) {
+#ifdef _WIN32
+    return 0;   // Streamline's path there (vk_dlssg.c)
+#else
+    static int w = -1;
+    if (w < 0) w = cfg_bool("NX2NAVI_DLAA") && strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
+    return w;
+#endif
+}
 
 typedef void (*SetI)(NgxParam *, const char *, int);
 typedef void (*SetU)(NgxParam *, const char *, unsigned);
@@ -83,6 +124,7 @@ typedef NgxResult (*GetI)(const NgxParam *, const char *, int *);
 typedef NgxResult (*GetU)(const NgxParam *, const char *, unsigned *);
 typedef NgxResult (*GetF)(const NgxParam *, const char *, float *);
 typedef NgxResult (*GetP)(const NgxParam *, const char *, void **);
+typedef NgxResult (*GetU64)(const NgxParam *, const char *, unsigned long long *);
 // The SDK declares Set(u64), Set(float), Set(double), Set(u32), Set(int), Set(ID3D11Resource *), Set(ID3D12Resource *),
 // Set(void *), then the Get overloads in the same order, then Reset.
 #ifdef _WIN32
@@ -98,6 +140,9 @@ static int p_geti(const NgxParam *p, const char *n, int *v) { return NGX_OK(((Ge
 static int p_getu(const NgxParam *p, const char *n, unsigned *v) { return NGX_OK(((GetU)p->vt->slot[G_U32])(p, n, v)); }
 static int p_getf(const NgxParam *p, const char *n, float *v) { return NGX_OK(((GetF)p->vt->slot[G_F])(p, n, v)); }
 static int p_getp(const NgxParam *p, const char *n, void **v) { return NGX_OK(((GetP)p->vt->slot[G_P])(p, n, v)); }
+static int p_getull(const NgxParam *p, const char *n, unsigned long long *v) {
+    return NGX_OK(((GetU64)p->vt->slot[G_U64])(p, n, v));
+}
 
 #ifdef _WIN32
 #define DLSS_MODEL "nvngx_dlss.dll"
@@ -118,7 +163,10 @@ int vk_dlaa_wanted(void) {
 // The temporal upscaler behind dlaa: NVIDIA DLSS through NGX, once NGX is up, or else AMD FSR 3.1, which takes the same
 // inputs. The DLSS mode setting (NX2NAVI_DLSS) is the render scale for both.
 static int fsr3(void) { return !N.ngx_up && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3"); }
-int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3(); }
+static int fsr_frame;   // fsr3() as vk_dlaa_init and then vk_dlaa_frame read it: the upscaler this frame runs with
+// FSR 3.1 is the upscaler and its library loads (vk_ffx_available): widescreen.c shrinks the scene only for an upscaler
+// that runs.
+int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3() && vk_ffx_available(); }
 
 // The upscaler the menu has set cannot start in this run: DLSS when NGX was never tried (a device made without its
 // extensions), FSR 3.1 while NGX is up and serves the run. A DLSS this PC could not bring up is not waiting for a restart.
@@ -127,6 +175,35 @@ int vk_dlaa_needs_restart(void) {
     return strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? !N.ngx_up && !N.tried : N.ngx_up;
 }
 
+#ifdef _WIN32
+// The NGX core's folder when the driver has not written NGXCore\FullPath (seen with driver 617.42, whose key held
+// only DLSS override values): the core sits in the driver's own DriverStore folder, the one its Vulkan driver is in.
+// That is the display adapter's VulkanDriverName, where the Vulkan loader itself finds the driver.
+static int ngx_dir_from_adapter(char *dir, DWORD size) {
+    HKEY cls;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                      0, KEY_READ, &cls) != ERROR_SUCCESS)
+        return 0;
+    int found = 0;
+    for (DWORD i = 0; !found; i++) {
+        char sub[64], val[MAX_PATH + 1] = {0}, probe[MAX_PATH + 32];
+        DWORD sn = sizeof sub, vn = MAX_PATH;
+        if (RegEnumKeyExA(cls, i, sub, &sn, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        if (RegGetValueA(cls, sub, "VulkanDriverName", RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ, NULL, val, &vn) != ERROR_SUCCESS)
+            continue;
+        char *slash = strrchr(val, '\\');
+        if (!slash) continue;
+        *slash = 0;
+        snprintf(probe, sizeof probe, "%s\\_nvngx.dll", val);
+        if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) continue;
+        snprintf(dir, size, "%s", val);
+        found = 1;
+    }
+    RegCloseKey(cls);
+    return found;
+}
+#endif
+
 static int core_load(void) {
     if (N.tried) return N.loaded;
     N.tried = 1;
@@ -134,8 +211,8 @@ static int core_load(void) {
     char dir[MAX_PATH] = {0}, path[MAX_PATH + 32];
     DWORD n = sizeof dir;
     if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", "FullPath", RRF_RT_REG_SZ,
-                     NULL, dir, &n) != ERROR_SUCCESS) {
-        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing): DLAA off");
+                     NULL, dir, &n) != ERROR_SUCCESS && !ngx_dir_from_adapter(dir, sizeof dir)) {
+        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing, none beside its Vulkan driver): DLAA off");
         return 0;
     }
     snprintf(path, sizeof path, "%s\\_nvngx.dll", dir);
@@ -156,6 +233,9 @@ static int core_load(void) {
 #define FN(f, name) N.f = plat_lib_sym(N.core, name)
 #endif
     FN(init, "NVSDK_NGX_VULKAN_Init_Ext2");
+#ifndef _WIN32
+    FN(shutdown1, "NVSDK_NGX_VULKAN_Shutdown1");   // Linux: checked below
+#endif
     FN(req_ext, "NVSDK_NGX_VULKAN_RequiredExtensions");
     FN(caps, "NVSDK_NGX_VULKAN_GetCapabilityParameters");
     FN(alloc_params, "NVSDK_NGX_VULKAN_AllocateParameters");
@@ -163,11 +243,22 @@ static int core_load(void) {
     FN(create, "NVSDK_NGX_VULKAN_CreateFeature");
     FN(evaluate, "NVSDK_NGX_VULKAN_EvaluateFeature");
     FN(release, "NVSDK_NGX_VULKAN_ReleaseFeature");
+    FN(feat_inst_req, "NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements");   // optional: frame generation's
 #undef FN
     if (!N.init || !N.req_ext || !N.caps || !N.alloc_params || !N.create || !N.evaluate || !N.release) {
         rt_log("dlaa: the NGX core %s lacks Vulkan entry points: DLAA off", path);
         return 0;
     }
+#ifndef _WIN32
+    // Without Shutdown1 the device cannot be taken back from NGX (vk_dlaa_release), and the process then segfaults after
+    // the Vulkan teardown (NVIDIA 615.78.08): DLAA stays off rather than run with a teardown known to crash. The
+    // parameter maps are destroyed there too.
+    if (!N.shutdown1 || !N.destroy_params) {
+        rt_log("dlaa: the NGX core %s lacks NVSDK_NGX_VULKAN_Shutdown1 or DestroyParameters, which its teardown needs: "
+               "DLAA off", path);
+        return 0;
+    }
+#endif
     N.loaded = 1;
     rt_log("dlaa: NGX core %s", path);
     return 1;
@@ -179,12 +270,51 @@ static int listed(const char *const *list, uint32_t n, const char *s) {
     return 0;
 }
 
+// NVSDK_NGX_FeatureDiscoveryInfo with an application id (the layout of the SDK's struct, 64-bit), for the question
+// which instance extensions frame generation wants.
+typedef struct {
+    int sdk, feature;
+    struct { int type; union { struct { const char *id; int engine; const char *ver; } project; unsigned long long app; } v; } ident;
+    const wchar_t *path;
+    const void *info;
+} NgxDiscovery;
+typedef NgxResult (*PFN_FeatInstReq)(const NgxDiscovery *, uint32_t *, VkExtensionProperties **);
+#define NGX_FEATURE_FRAME_GENERATION 11   // NVSDK_NGX_Feature_FrameGeneration
+// The names NGX lists are copied: its list may not outlive the call, and the device creation keeps the pointers.
+static char fg_names[16][VK_MAX_EXTENSION_NAME_SIZE];
+static int fg_nnames;
+static const char *fg_keep(const char *name) {
+    for (int i = 0; i < fg_nnames; i++)
+        if (!strcmp(fg_names[i], name)) return fg_names[i];
+    if (fg_nnames >= 16) return NULL;
+    snprintf(fg_names[fg_nnames], sizeof fg_names[0], "%s", name);
+    return fg_names[fg_nnames++];
+}
+
 void vk_dlaa_instance_exts(const char **ext, uint32_t *n, uint32_t max) {
     unsigned ni = 0, nd = 0;
     const char **ie = NULL, **de = NULL;
     if (!vk_dlaa_wanted() || fsr3() || !core_load() || !NGX_OK(N.req_ext(&ni, &ie, &nd, &de))) return;
     for (unsigned i = 0; i < ni; i++)
         if (!listed(ext, *n, ie[i]) && *n < max) ext[(*n)++] = ie[i];
+    // Frame generation's own instance extensions (vk_ngxfg_evaluate). Its device extensions are not asked for: the
+    // core's GetFeatureDeviceExtensionRequirements answered "not implemented" (0xBAD00012) with NVIDIA's 615 Linux
+    // driver, and NGX's general list (vk_dlaa_device_exts) served the feature.
+    if (vk_ngxfg_wanted() && N.feat_inst_req) {
+        static const wchar_t here[] = L".";
+        NgxDiscovery d;
+        memset(&d, 0, sizeof d);
+        d.sdk = NGX_VERSION_API, d.feature = NGX_FEATURE_FRAME_GENERATION;
+        d.ident.type = 0, d.ident.v.app = 231313132ull;   // the application id vk_dlaa_init gives NGX
+        d.path = here;
+        uint32_t k = 0;
+        VkExtensionProperties *pr = NULL;
+        if (NGX_OK(((PFN_FeatInstReq)N.feat_inst_req)(&d, &k, &pr)) && pr)
+            for (uint32_t i = 0; i < k; i++) {
+                const char *nm = fg_keep(pr[i].extensionName);
+                if (nm && !listed(ext, *n, nm) && *n < max) ext[(*n)++] = nm, rt_log("ngxfg: instance extension %s", nm);
+            }
+    }
 }
 
 void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n,
@@ -242,8 +372,9 @@ static int utf8_to_wide(const char *in, wchar_t *out, size_t cap) {
 
 void vk_dlaa_init(void) {
     if (vk_dlaa_wanted() && fsr3()) {
+        fsr_frame = 1;
         N.available = vk_ffx_load();
-        rt_log("dlaa: the temporal upscaler is AMD FSR 3.1%s", N.available ? "" : ", which is missing: the game's own scaling");
+        rt_log("dlaa: the temporal upscaler is AMD FSR 3.1%s", N.available ? "" : ", which is not available: the game's own scaling");
         return;
     }
     if (!vk_dlaa_wanted() || !core_load()) return;
@@ -271,17 +402,36 @@ void vk_dlaa_init(void) {
         rt_log("dlaa: NGX init failed (%08x): DLAA off", (unsigned)r);
         return;
     }
+#ifndef _WIN32
+    N.device = c->device;   // NGX holds the device from here, also if the layout check below turns DLAA off
+#endif
     if (!vtable_ok()) return;
     NgxParam *caps = NULL;
     int avail = 0, driver = 0;
     if (NGX_OK(N.caps(&caps)) && caps) {
+#ifndef _WIN32
+        N.caps_map = caps;   // allocated for us (the SDK header: free it with DestroyParameters): vk_dlaa_release does
+#endif
         p_geti(caps, "SuperSampling.Available", &avail);
         p_geti(caps, "SuperSampling.NeedsUpdatedDriver", &driver);
     }
     N.available = avail != 0;
+    N.capsp = caps;
     N.ngx_up = 1;
     rt_log("dlaa: NGX up; DLSS %s%s", avail ? "available" : "NOT available (is " DLSS_MODEL " next to the executable?)",
            driver ? "; the driver needs an update" : "");
+    if (vk_ngxfg_wanted() && caps) {
+        int fga = 0;
+        unsigned mx = 0;
+        p_geti(caps, "FrameGeneration.Available", &fga);
+        if (!p_getu(caps, "DLSSG.MultiFrameCountMax", &mx)) mx = 1;
+        // MultiFrameCountMax said 3 (4x) with the 310.9.16 library on an RTX 5090, yet that library evaluated 5
+        // generated frames without an error on NVIDIA's 615 driver, and NVIDIA ships up to 6x on RTX 50 cards: a GPU
+        // with multi-frame generation gets up to 5 (6x).
+        FG.max = fga ? (mx >= 3 ? 5 : mx < 1 ? 1 : (int)mx) : 0;
+        rt_log("ngxfg: DLSS Frame Generation %s (up to %dx)",
+               fga ? "available" : "NOT available (is libnvidia-ngx-dlssg.so.<version> next to the executable?)", FG.max + 1);
+    }
 }
 
 int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
@@ -309,6 +459,10 @@ int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
 // (vk_dlaa_swap_img, applied by vk_exec_draw.c tex_info): whichever shader scales, it scales DLSS's picture.
 #define OCAM_BLOCK 0x3500u   // Ocarina's scene context block (vk_dlaa_draw)
 #define OCAM_BYTES 0xb0u     // its rows 0-10: the view and the projection
+#define DLSS_SIZES 5         // DLSS features kept, one per scene and output size (D.sizes)
+// A size no evaluation used for this many goes with its feature (stale_sizes): DLSS's history buffers and the work
+// images at the output size held their VRAM after a switch of the DLSS mode, until four more sizes had come and gone.
+#define SIZE_STALE 3600
 static struct {
     VkExecTarget color, depth;   // the armed pair, valid in the frame it was armed
     int armed, done, gbuf;       // this frame: armed on the light target, DLAA ran, the G-buffer was drawn
@@ -328,19 +482,22 @@ static struct {
         int dist_cur, dist_ok;   // as chars_cur and chars_ok
         NgxHandle *feat;
         uint64_t used;           // evals count when it last ran
-    } sizes[5], *last;           // last: the one the previous DLAA frame ran with
+    } sizes[DLSS_SIZES], *last;  // last: the one the previous DLAA frame ran with
     VkImage last_color;          // the target DLAA ran on last frame: another one means a new history
     NgxParam *params;
     int failed, reset;
     uint64_t evals, frames_missed;
     int share_off;   // frames left that pick the output pass without the mode's share (vk_dlaa_pass, vk_dlaa_frame)
+    int shape_logged;   // passes of another shape than the scene's turned down as the output pass (vk_dlaa_pass)
     // jitter (vk_dlaa_viewport)
     VkImage jdepth;              // the scene depth of the last frame DLAA ran on: passes drawing with it are jittered
+    uint32_t jw, jh;             // its size: on Ocarina's frame the camera's draws into any D32F depth of it are (jitter_draw)
     float jx, jy;                // the offset the next scene draws take, render pixels (window x right, y down)
     float ux, uy;                // the offset this frame's scene draws took (DLSS and the motion vectors get these)
     uint32_t jframe;
     int jit_ok, jit_used, hold;  // jitter allowed this frame / a draw used it / frames left without it
-    uint64_t holds;
+    uint64_t holds, jittered;   // jitter holds; evaluations of a jittered scene
+    uint64_t jdraws, jfixed;    // draws into a scene-size depth that took the jitter / that did not (full-screen)
     // camera (vk_dlaa_draw) and motion vectors (mv_pass)
     uint64_t cam_addr;           // this frame's scene camera block (vk_dlaa_draw), 0: none seen
     uint32_t cam_size, cam_vp;   // its size and the offset of its view-projection rows
@@ -366,10 +523,14 @@ static struct {
     int mv_ok;                   // -1 not built, 0 failed, 1 ready
     uint64_t mv_frames, mv_none, masked;   // masked: frames with the characters' bias mask
     uint64_t why[3];             // history resets: scene size changed, no camera, scene target changed
+    uint64_t target_kept;        // scene target changed and the history stayed (target_changed)
     // frames without a camera and what mv_pass did about them (dlaa_cam_keep, cam_note)
     uint64_t cam_none_draw, cam_none_snap;   // no scene-context draw this frame / one, not in the evaluating submission's copy
     uint64_t cam_at_draw;        // camera taken from the bytes the draw read, where the evaluating submission lacks them
     uint64_t cam_kept, cam_kept_max;   // no camera, history kept with zero motion / runs cut short at KEEP_MAX
+    float cut_pos[3], cut_fwd[3];      // last frame's camera position and direction (cam_cut)
+    uint64_t cut_ns, cuts;             // when it was read; camera cuts that started a new history
+    int cut_ok, cut_logged;
     int keep_run;                // frames in a row kept without a camera
     uint64_t gap_logged, miss_logged, target_logged, second_logged;
     uint64_t seq_present;        // vk_exec_submit_seq at the last present (vk_dlaa_frame)
@@ -386,6 +547,8 @@ static struct {
     int fg_cam_ok;
     float fg_jx, fg_jy;
     int fg_fresh, fg_reset;      // fresh: not handed out yet (vk_dlaa_fg_inputs)
+    uint64_t presents;           // vk_dlaa_frame calls so far
+    uint64_t fg_at, hl_at;       // presents when the inputs and the HUD-less picture were made (fg_current)
     // the picture without the HUD for frame generation (vk_dlaa_fg_hudless): DLSS's output encoded to sRGB as the game's
     // last pass encodes its picture, then copied bit for bit into an RGBA8 UNORM image, the format the present reads; with
     // HDR on, DLSS's output as RGBA16F, as the game's float picture the present encodes (hl_srgb unused)
@@ -412,9 +575,20 @@ static struct {
     VkImage second_img;
 } F;
 
+// What an evaluation left for frame generation is for the present of its own frame. Frame generation takes it only
+// while its swapchain is in place, so with frame generation off the last evaluation's images stayed marked fresh for
+// as long as it was off. Among them is the game's own depth target, which the game replaces when the scene's size
+// changes: switching the upscaler off and on again with frame generation set (the menu's Upscaling row passes through
+// its choices without one) handed that destroyed image to frame generation's preparation, and AMD's driver ended the
+// process. Images made more than FG_INPUT_PRESENTS presents ago are therefore never handed out, and vk_dlaa_frame
+// drops them when the upscaler goes off or on.
+#define FG_INPUT_PRESENTS 4   // an evaluation is taken at its own present, or the one after when the present thread is behind
+static int fg_current(uint64_t made) { return D.presents - made <= FG_INPUT_PRESENTS; }
+
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt) {
     if (!D.hl_fresh) return 0;
     D.hl_fresh = 0;
+    if (!fg_current(D.hl_at)) return 0;
     *img = D.hl, *view = D.hl_view, *w = D.hl_w, *h = D.hl_h, *fmt = D.hl_fmt;
     return 1;
 }
@@ -430,10 +604,25 @@ int vk_dlaa_fg_camera(VkDlaaCamera *c) {
     return 1;
 }
 
+// Metres in one unit of Ocarina's view space, for FSR's distance heuristics: one. Measured in Hyrule Field, the camera
+// orbits Link about 4 units behind him (the nearest scene depth, 0.975, is 1 - 0.1 / 4) at about 3 units a second, and
+// travels about 4.7 units a second while he runs; in centimetres (the 0.01 FSR had) he would be 4 cm from the camera.
+#define VIEW_METERS 1.0f
+
+int vk_dlaa_ffx_camera(VkFfxCamera *c) {
+    if (!D.fg_cam_ok) return 0;
+    *c = (VkFfxCamera){D.fg_cam.fov_y, D.fg_cam.znear, D.fg_cam.zfar, VIEW_METERS};
+    return 1;
+}
+
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset) {
     if (!D.fg_fresh || D.failed) return 0;
     D.fg_fresh = 0;
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = 0;
+    if (!fg_current(D.fg_at)) return 0;
+    // reset: DLSS started a new history on this frame (evaluate). Handed out as 0 before, so frame generation was never
+    // told of a camera cut, another scene size or another target, and interpolated across them: an area load
+    // generated frames between two unrelated pictures.
+    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
     return 1;
 }
 
@@ -441,6 +630,10 @@ const VkTexImage *vk_dlaa_swap_img;
 VkImageView vk_dlaa_swap_view;
 
 static int dl_active(void) { return N.available && !D.failed && D.on; }
+// The upscaler this frame runs with, as vk_dlaa_frame read it. The menu can set NX2NAVI_TAA to dlss between that and
+// evaluate; read again there while NGX is not up (DLSS starts only after a restart), it sent evaluate to DLSS's path
+// with NGX's functions not loaded, a call to address 0 (issue #325).
+static int use_fsr(void) { return !N.ngx_up && fsr_frame; }
 
 static void dl_fail(const char *what, NgxResult r) {
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
@@ -462,9 +655,37 @@ static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, 
     return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
 }
 
-static void free_size(struct Size *e) {
+// Which features may stay alive when another is made (NX2NAVI_DLSS_IDLE_FREE). A feature made while one with a larger
+// input size is alive leaves that larger one drawing alternating bands of rows black or noise from then on, for as long
+// as it is used; seen for the pause screen's feature (the picture's size in and out), in two ways:
+// - a pause of 3,600 frames frees the gameplay feature (stale_sizes) and the unpause makes it again: every later pause
+//   was striped, in each of 8 scripted runs of pause, unpause, pause in which it had been freed and in none of 12 in
+//   which it had not, whatever the texture, write-back, HDR and frame generation settings;
+// - a DLSS mode picked in the menu makes a feature of a third size at the unpause, with nothing freed: the next pause
+//   was striped (performance to ultra performance in play).
+// Giving the kept feature its own sizes again at each evaluation changed nothing. A feature made while a smaller one
+// is alive leaves the smaller one as it was (the pause screen's after the gameplay one, at every first pause). So when
+// a feature is made, the alive ones with a larger input are released first, and after a release since the last
+// creation all of them (release_kept); their images stay and each is made again when its size is next evaluated.
+// Scripted on one build, each way with the rule and with 2: the long pause and the mode change were striped without it
+// and clean with it. The input size may not be what matters: in every striped case the feature made was of another
+// model (performance's or ultra performance's) than the pause screen's, and the one run in which balanced's feature,
+// of the pause screen's model, was made again beside it without the rule was clean. The rule covers both readings.
+//   1 (default)  idle features are freed
+//   0            idle features are never freed (about 0.5 GB more video memory after the first pause)
+//   2            idle features are freed and nothing is released when a feature is made (as before; shows the fault)
+static int feat_released;
+
+static int idle_free(void) {
+    static int m = -1;
+    if (m < 0) m = cfg_int("NX2NAVI_DLSS_IDLE_FREE");
+    return m;
+}
+
+// The images and views of a size, then its feature. The device must be idle: free_size waits for it, vk_dlaa_release
+// has. Whatever was not made is skipped, so a half-made size goes the same way.
+static void destroy_size(struct Size *e) {
     const VkCtx *c = vk_ctx();
-    vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
     if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
     if (e->mv_view) vkDestroyImageView(c->device, e->mv_view, NULL);
     if (e->out) vmaDestroyImage(c->vma, e->out, e->out_mem);
@@ -477,8 +698,13 @@ static void free_size(struct Size *e) {
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
         if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
     }
-    if (e->feat && N.release) N.release(e->feat);
+    if (e->feat && N.release) N.release(e->feat), feat_released = 1;
     memset(e, 0, sizeof *e);
+}
+
+static void free_size(struct Size *e) {
+    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
+    destroy_size(e);
 }
 
 // The entry for a scene and output size: its output (RGBA16F at the output size, written by DLSS, then blitted into
@@ -487,7 +713,7 @@ static void free_size(struct Size *e) {
 // goes for a new one.
 static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     struct Size *e = NULL, *lru = &D.sizes[0];
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < DLSS_SIZES; i++) {
         if (D.sizes[i].w == w && D.sizes[i].h == h && D.sizes[i].ow == ow && D.sizes[i].oh == oh) return &D.sizes[i];
         if (!D.sizes[i].out && !e) e = &D.sizes[i];
         if (D.sizes[i].used < lru->used) lru = &D.sizes[i];
@@ -672,9 +898,11 @@ static int mv_init(void) {
                                       .layout = D.mv_layout};
     VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &D.mv_pipe);
     vkDestroyShaderModule(c->device, m, NULL);
+    m = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) goto fail;
     return D.mv_ok = 1;
 fail:
+    if (m) vkDestroyShaderModule(c->device, m, NULL);   // made before a later step failed
     rt_log("dlaa: the motion-vector pass could not be set up: DLAA runs with zero motion");
     return 0;
 }
@@ -729,6 +957,49 @@ static void fg_store(float out[16], const double m[16]) {
     for (int r = 0; r < 4; r++)
         for (int k = 0; k < 4; k++) out[r * 4 + k] = (float)m[k * 4 + r];
 }
+// The view distance in front of the camera at which the projection P (row-major, column vectors, looking down -z) gives
+// clip depth z_ndc = k: (P[10] z + P[11]) / (P[14] z + P[15]) = k, solved for z. INFINITY where no distance gives it.
+static double plane_dist(const double P[16], double k) {
+    double den = P[10] - k * P[14];
+    if (fabs(den) <= 1e-9 * (fabs(P[10]) + fabs(P[14]))) return INFINITY;
+    return -(k * P[15] - P[11]) / den;
+}
+
+// What the depth buffer's 0 and 1 stand for, from the frame's projection and the device's depth mode. With NVN's
+// NEAR_IS_MINUS_W (clip depth -w..w, which the pipelines keep through negativeOneToOne, vk_pipeline.c) a fragment
+// stores z_ndc * 0.5 + 0.5, so 0 is z_ndc = -1; with NEAR_IS_ZERO it stores z_ndc. Both are 0..1 in the D32F target
+// (the viewport's depth range, vk_exec_draw.c), and the -w..w mapping stores exactly what a 0..w projection with the
+// same planes would: (f / (f - n)) (1 - n / distance), the convention DLSS, Streamline and FSR take. Ocarina's planes
+// are not fixed: in Hyrule Field its z row is (-1.00001, -0.200001), near 0.1 and far about 25,000 (the view's units
+// are metres), and the camera before it had far about 1,000. Taken as 0.1 and 1e8 (no far plane), a distance d reads
+// as (f - n) d / (f - d): 1,000 as 1,042, 10,000 as 16,650, and the far plane's neighbourhood without bound. So the
+// planes come from the projection every frame; a projection whose stored 0 is not in front of the camera keeps the last
+// frame's planes.
+static void proj_planes(const double P[16], VkDlaaCamera *c) {
+    int minus_w = nvn_depth_minus_w();
+    double at0 = plane_dist(P, minus_w ? -1.0 : 0.0), at1 = plane_dist(P, 1.0);   // the distances stored as 0 and 1
+    int inverted = !(at0 < at1);   // reversed depth: the near plane is stored as 1
+    double n = inverted ? at1 : at0, f = inverted ? at0 : at1;
+    if (!(n > 0) || !isfinite(n)) return;
+    c->inverted = inverted;
+    c->znear = (float)n;
+    c->infinite = !(f < VK_DLAA_FAR_INFINITE);
+    c->zfar = c->infinite ? VK_DLAA_FAR_INFINITE : (float)f;
+    // one line at the start and whenever the planes change (the first 20 times)
+    static float logged_n, logged_f;
+    static int logged_inv = -1, lines;
+    if (lines < 20 && (inverted != logged_inv || fabsf(c->znear - logged_n) > 1e-4f * logged_n ||
+                       fabsf(c->zfar - logged_f) > 1e-4f * logged_f)) {
+        lines++, logged_inv = inverted, logged_n = c->znear, logged_f = c->zfar;
+        char fz[32];
+        if (c->infinite) snprintf(fz, sizeof fz, "infinite");
+        else snprintf(fz, sizeof fz, "%.6g", c->zfar);
+        rt_log("dlaa: the scene's projection: near %.6g, far %s, depth %s, clip depth %s (z row %.6g %.6g %.6g %.6g, "
+               "w row %.6g %.6g %.6g %.6g)", c->znear, fz, inverted ? "inverted (1 near)" : "0 near, 1 far",
+               minus_w ? "-w..w" : "0..w", P[8], P[9], P[10], P[11], P[12], P[13], P[14], P[15]);
+    }
+}
+
 static void fg_camera(const float *v, const double m[16]) {
     double P[16], Pi[16], mi[16];
     for (int i = 0; i < 16; i++) P[i] = v[28 + i];
@@ -743,7 +1014,18 @@ static void fg_camera(const float *v, const double m[16]) {
     }
     c->fov_y = P[5] != 0 ? 2.0f * (float)atan(1.0 / fabs(P[5])) : 1.0f;
     c->aspect = P[0] != 0 ? (float)fabs(P[5] / P[0]) : 1.777f;
+    if (!(c->znear > 0)) c->znear = 0.1f, c->zfar = VK_DLAA_FAR_INFINITE, c->infinite = 1;   // until a projection gives them
+    proj_planes(P, c);
     D.fg_cam_ok = 1;
+    // NX2NAVI_MOUSE_TRACE=1 (test runs, mouse_direct.c): the camera's direction each frame
+    static int trace = -1;
+    if (trace < 0) {
+        const char *e = cfg_get("NX2NAVI_MOUSE_TRACE");
+        trace = e && *e && strcmp(e, "0");
+    }
+    if (trace)
+        rt_log("mousetrace: cam t=%.3f fwd=%.6f,%.6f,%.6f pos=%.3f,%.3f,%.3f", plat_now_ns() / 1e6, c->fwd[0], c->fwd[1],
+               c->fwd[2], c->pos[0], c->pos[1], c->pos[2]);
 }
 
 // Frames without a camera (dlaa_cam_keep, NX2NAVI_DLAA_CAM_KEEP; 1 by default, 0 restores the old handling). Measured in
@@ -781,6 +1063,49 @@ static void cam_note(int view, int kept) {
            F.ocam_off, (int)F.ocam_off_fmt, F.c3_other, F.c3_size, snap,
            kept == 1 ? "history kept, zero motion" : kept == 2 ? "new history (more than KEEP_MAX in a row)"
                                                  : "new history");
+}
+
+// Camera cuts (NX2NAVI_DLAA_CUT, default 1; 0: off). Only a lost camera (mv_pass), another scene size or another
+// target started a new history, so DLSS and frame generation (vk_dlaa_fg_inputs) carried their history across a camera
+// that jumped: an area load or a spawn moves it 5 to 180 m in one frame. Such a frame now starts a new history, as
+// NVIDIA's DLSS guide asks for a camera cut: a move over 5 m, or a turn over 10 degrees together with a move over 0.5 m,
+// both per 60 Hz frame and scaled by the time since the last camera. Camera traces of play in the Fire Temple
+// (NX2NAVI_MOUSE_TRACE) had a median of 0.05 m and 0.08 degrees a frame. A turn alone (the mouse camera, which orbits
+// about 3 m from Link) does not count, and the turn with a move counts only from CUT_TURN degrees: a quick swing of the
+// orbiting camera turns 11 to 18 degrees and moves 0.9 to 1.4 m a frame, and taken for a cut at 10 degrees it started a
+// new history at every frame of the swing (nine in a row in Hyrule Field), which at FSR's or DLSS's smaller modes showed
+// the scene at its render size for those frames, blocky and flickering. Its motion vectors carry it as well as any other
+// turn. Each cut is logged, up to 24.
+#define CUT_TURN 30.0
+// v: the Ocarina scene context's rows 0-2, the view (fg_camera).
+static void cam_cut(const float *v) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_CUT", "1");
+    float pos[3], fwd[3];
+    for (int i = 0; i < 3; i++) {
+        fwd[i] = -v[8 + i];
+        pos[i] = -(v[i] * v[3] + v[4 + i] * v[7] + v[8 + i] * v[11]);
+    }
+    uint64_t now = plat_now_ns();
+    if (on && D.cut_ok) {
+        double dot = fwd[0] * D.cut_fwd[0] + fwd[1] * D.cut_fwd[1] + fwd[2] * D.cut_fwd[2];
+        double turn = acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * (180.0 / 3.14159265358979);
+        double dx = pos[0] - D.cut_pos[0], dy = pos[1] - D.cut_pos[1], dz = pos[2] - D.cut_pos[2];
+        double move = sqrt(dx * dx + dy * dy + dz * dz);
+        double k = (now - D.cut_ns) / 1e6 / (1000.0 / 60);   // 60 Hz frames since the last camera
+        if (k < 0.25) k = 0.25;
+        if (k > 4) k = 4;
+        if (move > 5.0 * k || (turn > CUT_TURN * k && move > 0.5 * k)) {
+            D.reset = 1, D.cuts++;
+            if (D.cut_logged < 24)
+                D.cut_logged++, rt_log("dlaa: frame %llu: camera cut (moved %.2f m, turned %.1f degrees in %.1f ms): new "
+                                       "history (%llu so far)",
+                                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1,
+                                       move, turn, (now - D.cut_ns) / 1e6, (unsigned long long)D.cuts);
+        }
+    }
+    memcpy(D.cut_pos, pos, sizeof pos), memcpy(D.cut_fwd, fwd, sizeof fwd);
+    D.cut_ns = now, D.cut_ok = 1;
 }
 
 // The pass, recorded through the recorder like the replay's own commands. 0: no camera this frame (the vectors stay
@@ -850,6 +1175,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     }
     D.fg_cam_ok = 0;
     if (cr && have_m && D.cam_size == OCAM_BLOCK) fg_camera(cr, m);
+    if (cr && D.cam_size == OCAM_BLOCK) cam_cut(cr);
     int s = D.cam_slot, had_prev = D.cam_prev_ok;
     if (D.cam_size == CAM_BLOCK) {   // the whole block, for the per-object motion pass (the deferred engine's only)
         VkBufferCopy bc = {cam.offset, (VkDeviceSize)s * CAM_SLOT, CAM_BLOCK};
@@ -1017,21 +1343,28 @@ static int mask_init(void) {
                                       .layout = R.layout};
     VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &R.pipe);
     vkDestroyShaderModule(c->device, m, NULL);
+    m = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) goto fail;
     return R.ok = 1;
 fail:
+    if (m) vkDestroyShaderModule(c->device, m, NULL);   // made before a later step failed
     rt_log("dlaa: the reactive mask pass could not be set up: DLSS runs without it");
     return 0;
 }
 
-static void free_snap(struct Snap *s) {
+// A snapshot's images and views. The device must be idle: free_snap waits for it, vk_dlaa_release has.
+static void destroy_snap(struct Snap *s) {
     const VkCtx *c = vk_ctx();
-    vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
     if (s->before_view) vkDestroyImageView(c->device, s->before_view, NULL);
     if (s->mask_view) vkDestroyImageView(c->device, s->mask_view, NULL);
     if (s->before) vmaDestroyImage(c->vma, s->before, s->before_mem);
     if (s->mask) vmaDestroyImage(c->vma, s->mask, s->mask_mem);
     memset(s, 0, sizeof *s);
+}
+
+static void free_snap(struct Snap *s) {
+    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
+    destroy_snap(s);
 }
 
 static struct Snap *snap_for(VkCommandBuffer cb, uint32_t w, uint32_t h, VkFormat f) {
@@ -1109,6 +1442,108 @@ static struct Snap *mask_pass(VkCommandBuffer cb, VkImageView cv, uint32_t w, ui
     return s;
 }
 
+// ---------------------------------------------------------------- teardown
+// The HUD-less picture's images, a half-made pair too. The device must be idle, or the images not yet used.
+static void hl_destroy(void) {
+    const VkCtx *c = vk_ctx();
+    if (D.hl_view) vkDestroyImageView(c->device, D.hl_view, NULL);
+    if (D.hl) vmaDestroyImage(c->vma, D.hl, D.hl_mem);
+    if (D.hl_srgb) vmaDestroyImage(c->vma, D.hl_srgb, D.hl_srgb_mem);
+    D.hl_view = VK_NULL_HANDLE, D.hl = D.hl_srgb = VK_NULL_HANDLE;
+}
+
+// The device is idle here. Release NGX features and parameters before their Vulkan resources, then shut down NGX even
+// if initialization succeeded but the layout check failed. The Linux core's Shutdown1 takes an extra output pointer
+// compared with the SDK's public wrapper; it reports the number of devices still using NGX.
+// ---- the free camera's view of the ground (debug_tools.c dbg_pad). While it flies, nine of the view distances
+// mv_pass wrote (a grid over the lower part of the view, where the ground is) go back to the host, and the camera rises
+// where the closest is nearer than its clearance: flown through a hill, it showed the void below the map. A slot is
+// read FC_SLOTS evaluations after its copy, when the GPU has long been past it.
+int dbg_freecam_flying(void);                          // debug_tools.c
+void dbg_freecam_ground(const float *dist, int n);
+#define FC_N 9
+#define FC_SLOTS 4
+static VkBuffer fc_buf;
+static VmaAllocation fc_mem;
+static float *fc_map;
+static uint32_t fc_next;
+static uint8_t fc_have[FC_SLOTS];
+
+static void fcam_probe(VkCommandBuffer cb, const struct Size *e, uint32_t w, uint32_t h) {
+    if (!dbg_freecam_flying() || !e->dist_ok) {   // dist_ok: mv_pass wrote this frame's distances (Ocarina's frame)
+        memset(fc_have, 0, sizeof fc_have);
+        return;
+    }
+    const VkCtx *c = vk_ctx();
+    if (!fc_buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = FC_SLOTS * FC_N * sizeof(float),
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(c->vma, &bi, &ai, &fc_buf, &fc_mem, &info) != VK_SUCCESS) {
+            fc_buf = VK_NULL_HANDLE;
+            return;
+        }
+        fc_map = info.pMappedData;
+    }
+    uint32_t s = fc_next++ % FC_SLOTS;
+    if (fc_have[s]) {
+        vmaInvalidateAllocation(c->vma, fc_mem, s * FC_N * sizeof(float), FC_N * sizeof(float));
+        dbg_freecam_ground(fc_map + s * FC_N, FC_N);
+    }
+    // the replay's viewports have negative heights: row 0 is the top of the view
+    static const float fx[3] = {0.2f, 0.5f, 0.8f}, fy[3] = {0.6f, 0.78f, 0.96f};
+    VkBufferImageCopy r[FC_N];
+    for (int i = 0; i < FC_N; i++)
+        r[i] = (VkBufferImageCopy){.bufferOffset = (s * FC_N + i) * sizeof(float),
+                                   .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                   .imageOffset = {(int32_t)(fx[i % 3] * (w - 1)), (int32_t)(fy[i / 3] * (h - 1)), 0},
+                                   .imageExtent = {1, 1, 1}};
+    vkCmdCopyImageToBuffer(cb, e->dist[e->dist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL, fc_buf, FC_N, r);
+    fc_have[s] = 1;
+}
+
+void vk_dlaa_release(void) {
+#ifndef _WIN32
+    const VkCtx *c = vk_ctx();
+    if (!c) return;
+    for (int i = 0; i < 5; i++)
+        if (D.sizes[i].feat) N.release(D.sizes[i].feat), D.sizes[i].feat = NULL;
+    if (FG.feat) N.release(FG.feat);   // frame generation's feature and parameters (vk_ngxfg_evaluate), before NGX goes
+    if (FG.p) N.destroy_params(FG.p);
+    memset(&FG, 0, sizeof FG);
+    if (D.params) N.destroy_params(D.params);
+    if (N.caps_map) N.destroy_params(N.caps_map);
+    for (int i = 0; i < 5; i++) destroy_size(&D.sizes[i]);
+    for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
+    hl_destroy();
+    if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
+    if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
+    if (D.mv_dsl) vkDestroyDescriptorSetLayout(c->device, D.mv_dsl, NULL);
+    if (D.mv_samp) vkDestroySampler(c->device, D.mv_samp, NULL);
+    if (D.camb) vmaDestroyBuffer(c->vma, D.camb, D.camb_mem);
+    if (D.mvm) vmaDestroyBuffer(c->vma, D.mvm, D.mvm_mem);   // mapped for good: the destroy unmaps it
+    if (fc_buf) vmaDestroyBuffer(c->vma, fc_buf, fc_mem), fc_buf = VK_NULL_HANDLE, fc_map = NULL;
+    if (R.pipe) vkDestroyPipeline(c->device, R.pipe, NULL);
+    if (R.layout) vkDestroyPipelineLayout(c->device, R.layout, NULL);
+    if (R.dsl) vkDestroyDescriptorSetLayout(c->device, R.dsl, NULL);
+    if (T.pool) vkDestroyQueryPool(c->device, T.pool, NULL);
+    memset(&D, 0, sizeof D), D.mv_ok = -1, D.cfg_seen = ~0u;
+    memset(&R, 0, sizeof R), R.ok = -1, R.knob = -1;
+    memset(&T, 0, sizeof T), T.on = -1;
+    memset(&F, 0, sizeof F);
+    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
+    if (!N.device) return;   // NGX never came up on this device: DLAA off, FSR 3.1, or its init failed
+    unsigned left = 0;
+    vk_queue_lock();   // NGX may wait for the device itself
+    NgxResult r = N.shutdown1(N.device, &left);
+    vk_queue_unlock();
+    rt_log("dlaa: NGX shut down (%08x, %u devices left)", (unsigned)r, left);
+    N.device = NULL, N.caps_map = NULL, N.ngx_up = 0, N.available = 0;
+#endif
+}
+
 // ---------------------------------------------------------------- jitter
 // The scene's draws (every pass drawing with the scene depth, until the DLAA point) have their viewport moved by a
 // sub-pixel Halton(2,3) offset, which shifts what they rasterise as a jittered projection would; full-screen passes
@@ -1120,16 +1555,54 @@ static float halton(uint32_t i, uint32_t b) {
     return r;
 }
 
+// Whether a draw takes the jitter, before DLSS ran this frame. The deferred frame: every draw into the scene depth.
+// Ocarina's frame: every draw that projects through the camera (it binds the scene context at c3, vk_dlaa_draw) into a
+// D32F depth of the scene's size, whichever image that is. Ocarina draws its depth pre-pass into the scene depth, copies
+// that depth into a second image of the same size, and then shades the same geometry into the light target against
+// the copy with the depth test EQUAL. Jittering only the draws into the first image left the shading draws unjittered
+// against jittered depth: EQUAL failed on nearly every pixel, the light target kept its clear colour, and the ground
+// and characters went white while the sky stayed right. Its full-screen passes drawn with a scene depth
+// attached (the bloom composite DLSS reads) do not take the jitter either: they read the jittered scene through their
+// own texture coordinates, and moving them too would shift the picture DLSS gets by a second offset.
+static int jitter_draw(const VkExec *ex) {
+    const VkExecTarget *z = &ex->depth;
+    if (!D.jit_ok || D.ended || !z->image) return 0;
+    if (D.cam_size != OCAM_BLOCK) return z->image == D.jdepth;
+    return z->format == VK_FORMAT_D32_SFLOAT && z->width == D.jw && z->height == D.jh &&
+           ex->ubo[0][0].size == OCAM_BLOCK && ex->ubo[0][0].addr;
+}
+
 void vk_dlaa_viewport(VkExec *ex, VkViewport *v) {
-    if (!D.jit_ok || D.ended || !ex->depth.image || ex->depth.image != D.jdepth) return;
+    ex->vp_jittered = jitter_draw(ex);
+    if (!ex->vp_jittered) return;
+    ex->pass_jit = 1;
     v->x += D.jx, v->y += D.jy;
     D.ux = D.jx, D.uy = D.jy, D.jit_used = 1;
 }
 
+void vk_dlaa_jitter_check(VkExec *ex) {
+    int j = jitter_draw(ex);
+    if (j != ex->vp_jittered) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+    const VkExecTarget *z = &ex->depth;   // the draws into a scene-size depth, with the jitter or without
+    if (D.jit_ok && !D.ended && z->image && z->format == VK_FORMAT_D32_SFLOAT && z->width == D.jw && z->height == D.jh) {
+        if (j) D.jdraws++;
+        else D.jfixed++;
+    }
+}
+
 static int scene_color(VkFormat f);
 
+static void dlaa_draw_locked(VkExec *ex);
 void vk_dlaa_draw(VkExec *ex) {
     if (!dl_active() || D.ended) return;
+    static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once (vk_exec.c chunks)
+    int lk = vk_exec_shared();
+    if (lk) plat_mutex_lock(&lock);
+    dlaa_draw_locked(ex);
+    if (lk) plat_mutex_unlock(&lock);
+}
+
+static void dlaa_draw_locked(VkExec *ex) {
     static int survey = -1;   // NX2NAVI_DLAA_SURVEY=1 (test): what is drawn into the armed light target
     if (survey < 0) survey = rt_knob("DLAA_SURVEY", "0");
     static uint64_t dfn[16];   // scene draws writing depth, by depth test (reversed depth: GREATER/GEQUAL)
@@ -1197,24 +1670,30 @@ void vk_dlaa_draw(VkExec *ex) {
     }
 }
 
+// NX2NAVI_DLAA_JITTER=0 (test): no jitter. Read once.
+static int jitter_on(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_JITTER", "1");
+    return on;
+}
+
 // The jitter moves on right after DLAA ran, not at the present: the replay can record the next frame's scene before
 // the present of this one is handled, and a step taken there landed in the middle of a frame (worse after an off/on
 // switch, which shifted that order). Jitter needs a frame DLSS ran on; a frame without the DLAA point stops it.
 // The sequence is as long as NVIDIA's DLSS guide asks for the upscaling ratio, 8 x (output / scene)^2 phases (18 in
 // Quality, 24 in Balanced, 32 in Performance, 72 in Ultra Performance), and 16 at least, the length DLAA has used from the start.
 static void next_jitter(uint32_t w, uint32_t ow) {
-    static int nj = -1;
-    if (nj < 0) nj = !rt_knob("DLAA_JITTER", "1");   // NX2NAVI_DLAA_JITTER=0: no jitter (test)
+    int nj = !jitter_on();
     double r = w ? (double)ow / w : 1.0;
     uint32_t phases = (uint32_t)ceil(8.0 * r * r - 1e-6);
     if (phases < 16) phases = 16;
     if (phases > 72) phases = 72;
     uint32_t i = D.jframe++ % phases + 1;
     D.jx = halton(i, 2) - 0.5f, D.jy = halton(i, 3) - 0.5f;
-    // Jitter only where the camera is known (vk_dlaa_draw), and not on Ocarina's frame: with it the picture went white
-    // within seconds (no matter the motion vectors; without it the same frames look right), so DLSS there keeps its
-    // history along the camera's motion but samples the same spot of each pixel.
-    D.jit_ok = !D.hold && !nj && D.cam_size == CAM_BLOCK;
+    // Jitter only where the camera is known (vk_dlaa_draw): the deferred engine's block or Ocarina's scene context. On
+    // Ocarina's frame the draws that take it are the camera's into every scene-size depth (jitter_draw); taking only the
+    // draws into DLSS's own depth image turned the picture white, and jitter was off there until that was found.
+    D.jit_ok = !D.hold && !nj && (D.cam_size == CAM_BLOCK || D.cam_size == OCAM_BLOCK);
 }
 
 // The DLSS model (NX2NAVI_DLSS_PRESET, live): default takes NVIDIA's model per mode (evaluate: K for DLAA, Quality and
@@ -1250,21 +1729,23 @@ static int perf_quality(uint32_t w, uint32_t ow) {
 // Every 300 frames DLSS ran, the history resets and camera gaps of those frames, while there were any (at most 400 lines a
 // run): the measure for dlaa_cam_keep at one spot of the game.
 static void window_line(void) {
-    enum { N_ = 10 };
+    enum { N_ = 11 };
     static uint64_t last[N_];
     static int lines;
     if (D.evals % 300) return;
     uint64_t now[N_] = {D.why[0], D.why[1], D.why[2], D.mv_none, D.cam_none_draw, D.cam_none_snap, D.cam_kept,
-                        D.cam_at_draw, D.frames_missed, D.seconds}, d[N_], any = 0;
+                        D.cam_at_draw, D.frames_missed, D.seconds, D.target_kept}, d[N_], any = 0;
     for (int i = 0; i < N_; i++) d[i] = now[i] - last[i], last[i] = now[i];
     for (int i = 0; i < N_; i++) any |= d[i];
     if (!any || lines >= 400) return;
     lines++;
-    rt_log("dlaa: frames %llu-%llu: resets %llu size, %llu camera, %llu target; %llu without a camera (%llu without a "
+    rt_log("dlaa: frames %llu-%llu: resets %llu size, %llu camera, %llu target (%llu target changes with the history "
+           "kept); %llu without a camera (%llu without a "
            "scene-context draw, %llu not in DLSS's submission), %llu kept with zero motion; %llu cameras read at the draw; "
            "%llu frames without the DLAA point, %llu with a second scene after DLSS ran",
            (unsigned long long)(D.evals - 299), (unsigned long long)D.evals, (unsigned long long)d[0],
-           (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3], (unsigned long long)d[4],
+           (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[10], (unsigned long long)d[3],
+           (unsigned long long)d[4],
            (unsigned long long)d[5], (unsigned long long)d[6], (unsigned long long)d[7], (unsigned long long)d[8],
            (unsigned long long)d[9]);
 }
@@ -1272,15 +1753,144 @@ static void window_line(void) {
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
 static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h);
 
-// Another light target than last frame's: a new history. The first few are logged with the new target's size, to tell a
-// target the game made anew from two it alternates between.
-static void target_changed(const VkExecTarget *t) {
+// Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
+// and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
+// on: 35 times in a walk of a minute through Kokiri Forest, three of them within eight frames on the ladder below
+// the tree house.
+// The history is the upscaler's own and not in the target, so where this frame's motion vectors are valid (cont: the
+// camera of this frame and of the last one, mv_pass 1) the history stays. A new history at each change showed as a few
+// soft, grainy frames every time, a flicker over the whole picture. Without valid vectors, and with
+// NX2NAVI_DLAA_TARGET_KEEP=0 (test), a new history as before. The first few are logged with the new target's size, to
+// tell a target the game made anew from the ones it alternates between.
+static void target_changed(const VkExecTarget *t, int cont) {
+    static int keep = -1;
+    if (keep < 0) keep = rt_knob("DLAA_TARGET_KEEP", "1");
+    int kept = keep && cont && D.last_color;
     if (D.last_color && D.target_logged < 16)
-        D.target_logged++, rt_log("dlaa: frame %llu: the light target changed from %p to %p (%ux%u format %d): new history",
+        D.target_logged++, rt_log("dlaa: frame %llu: the light target changed from %p to %p (%ux%u format %d): %s",
                                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1,
-                                  (void *)D.last_color, (void *)t->image, t->width, t->height, (int)t->format);
-    D.reset = 1, D.why[2]++, D.last_color = t->image;
+                                  (void *)D.last_color, (void *)t->image, t->width, t->height, (int)t->format,
+                                  kept ? "the history stays (the camera carries on)" : "new history");
+    if (kept) D.target_kept++;
+    else D.reset = 1, D.why[2]++;
+    D.last_color = t->image;
 }
+
+// DLSS's own video memory, the features and their history (NGX's DLSS statistics callback with the capability
+// parameters), for the log's VRAM breakdown (vk_dlaa_vram); -1 until known. Asked on the replay thread, which makes every
+// other NGX call, every 600 evaluations.
+static volatile int64_t dlss_vram = -1;
+int64_t vk_dlaa_vram(void) { return __atomic_load_n(&dlss_vram, __ATOMIC_RELAXED); }
+
+static void query_vram(void) {
+    void *cb = NULL;
+    unsigned long long n = 0;
+    if (fsr3() || !N.capsp || !p_getp(N.capsp, "DLSSGetStatsCallback", &cb) || !cb) return;
+    if (NGX_OK(((NgxResult (*)(NgxParam *))cb)(N.capsp)) && p_getull(N.capsp, "SizeInBytes", &n))
+        __atomic_store_n(&dlss_vram, (int64_t)n, __ATOMIC_RELAXED);
+}
+
+// Frees the sizes other than cur that no evaluation used for SIZE_STALE evaluations: the GPU finished with them long
+// ago (the CPU is never that many presents ahead), so their images and feature go at once.
+static void stale_sizes(const struct Size *cur) {
+    if (!idle_free()) return;
+    for (int i = 0; i < DLSS_SIZES; i++) {
+        struct Size *s = &D.sizes[i];
+        if (s == cur || !s->out || D.evals < s->used + SIZE_STALE) continue;
+        rt_log("dlaa: the DLSS feature at %ux%u -> %ux%u went unused for %d frames: freed", s->w, s->h, s->ow, s->oh,
+               SIZE_STALE);
+        if (D.last == s) D.last = NULL;
+        free_size(s);
+    }
+}
+
+// Before a feature is made: the features of the other sizes with a larger input go, or all of them (all: a feature was
+// released since the last creation, feat_released); their images stay. The GPU may still be running an evaluation of
+// theirs, so it finishes first, as in free_size.
+static void release_kept(const struct Size *making, int all) {
+    int n = 0;
+    for (int i = 0; i < DLSS_SIZES; i++) {
+        struct Size *s = &D.sizes[i];
+        if (s == making || !s->feat) continue;
+        if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
+        if (!n++) vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        N.release(s->feat), s->feat = NULL;
+        if (D.last == s) D.last = NULL;
+    }
+    if (n) rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used", n,
+                  making->w, making->h, all ? "after a release" : "larger inputs");
+}
+
+// The outer columns and rows of what a jittered pass draws into. The jitter moves the scene's viewport by under half a
+// pixel (vk_dlaa_viewport), which keeps every pixel centre inside it, yet on an RX 7900 XT (AMD's Windows driver) the draws
+// of a viewport moved left left the last column out, and of one moved up the last row: the driver evidently limits
+// drawing to the whole pixels inside the viewport. Those pixels keep what was there before the pass: in a frame dump
+// (NX2NAVI_DUMP, Hyrule Field) the depth's last row kept its clear value through every scene pass and the light target the
+// sky's colour, and in a village the light target's clear colour, white. With NX2NAVI_DLAA_JITTER=0, and without DLSS or
+// FSR, every row is drawn.
+// So when a pass that took the jitter ends (vk_exec.c vk_exec_pass_end), the outermost row and column on each side of
+// its colour targets and its depth are filled from the ones next to them, before anything reads them. Filling only the
+// armed pair right before the upscaler read it (evaluate, which still does it for a target a dispatch wrote) was too
+// late for whatever reads the scene in between: water reads the scene behind it and showed bright patches along the
+// bottom in a fifth of the shots of a run through a stream (none with the jitter off), and the bloom and the
+// anti-aliasing pass read the row too. (The white line in a player's clips had a second cause, the upscaler's picture
+// never reaching the screen with the HUD hidden: vk_dlaa_upscaler.)
+// A copied edge is one render pixel at the picture's border, which the upscaler blends with its history.
+// NX2NAVI_DLAA_EDGE_FILL: 1 (default) at each jittered pass's end and before the upscaler; 2 only before the upscaler (as
+// 0.9.1 did, for comparison); 0 not at all.
+static int edge_fill_mode(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_EDGE_FILL", "1");
+    return on;
+}
+
+// One image's border from the texels next to it, in one copy: the columns and rows without their ends, then the four
+// corners from their diagonal neighbours. Every source is inside the border and every destination on it, so no region
+// reads what another writes. The image is in GENERAL and nothing is still drawing into it.
+static void edge_copy(VkCommandBuffer cb, const VkExecTarget *g, VkImageAspectFlags aspect) {
+    int32_t w = (int32_t)g->width, h = (int32_t)g->height;
+    if (w < 4 || h < 4) return;
+    const VkImageSubresourceLayers sl = {aspect, g->level, g->base_layer, 1};
+#define EDGE(sx, sy, dx, dy, ew, eh)                                                                                      \
+    {.srcSubresource = sl, .srcOffset = {sx, sy, 0}, .dstSubresource = sl, .dstOffset = {dx, dy, 0},                     \
+     .extent = {(uint32_t)(ew), (uint32_t)(eh), 1}}
+    const VkImageCopy r[8] = {EDGE(1, 1, 0, 1, 1, h - 2),         EDGE(w - 2, 1, w - 1, 1, 1, h - 2),
+                              EDGE(1, 1, 1, 0, w - 2, 1),         EDGE(1, h - 2, 1, h - 1, w - 2, 1),
+                              EDGE(1, 1, 0, 0, 1, 1),             EDGE(w - 2, 1, w - 1, 0, 1, 1),
+                              EDGE(1, h - 2, 0, h - 1, 1, 1),     EDGE(w - 2, h - 2, w - 1, h - 1, 1, 1)};
+#undef EDGE
+    vkCmdCopyImage(cb, g->image, VK_IMAGE_LAYOUT_GENERAL, g->image, VK_IMAGE_LAYOUT_GENERAL, 8, r);
+}
+
+static int edge_target(const VkExecTarget *g) { return g->image && g->samples <= 1 && !g->is3d && !g->blocks; }
+
+void vk_dlaa_pass_end(VkExec *ex) {
+    if (!ex->pass_jit) return;
+    ex->pass_jit = 0;
+    if (edge_fill_mode() != 1) return;
+    int any = edge_target(&ex->depth) && (ex->depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT);
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++) any |= edge_target(&ex->color[i]);
+    if (!any) return;
+    static int told;
+    if (!told++) rt_log("dlaa: the outer rows and columns of each jittered pass's targets are filled from the ones next to them");
+    vk_exec_barrier(ex);   // the pass's draws are done, and its targets are in GENERAL
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
+        if (edge_target(&ex->color[i])) edge_copy(ex->cb, &ex->color[i], VK_IMAGE_ASPECT_COLOR_BIT), ex->recorded++;
+    if (edge_target(&ex->depth) && (ex->depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        edge_copy(ex->cb, &ex->depth, VK_IMAGE_ASPECT_DEPTH_BIT), ex->recorded++;
+}
+
+// Before the upscaler reads the armed pair (evaluate): once more, for a light target a dispatch wrote after its last
+// pass. The pair is at level 0 of the scene's size.
+static void edge_fill(VkCommandBuffer cb, const VkExecTarget *t, const VkExecTarget *z, int jittered) {
+    if (!edge_fill_mode() || !jittered) return;
+    if (edge_target(t)) edge_copy(cb, t, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (edge_target(z) && z->width == t->width && z->height == t->height) edge_copy(cb, z, VK_IMAGE_ASPECT_DEPTH_BIT);
+    full_barrier(cb);
+}
+
+// Set when the scene the upscaler runs on has another size than the last one; vk_dlaa_resized_take reads it.
+static volatile int32_t size_changed;
 
 static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
@@ -1288,19 +1898,28 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
     VkCommandBuffer cb = ex->cb;
     vk_exec_barrier(ex);   // what drew the scene is done (no pass is open here)
+    vk_gpu_gap_note(VK_GAP_UPSCALER, (uint64_t)ow * oh);
     if (D.preset_dirty) {   // another model: features are created with it, so every size gets a new one
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < DLSS_SIZES; i++)
             if (D.sizes[i].out) free_size(&D.sizes[i]);
         D.last = NULL, D.preset_dirty = 0;
     }
     struct Size *e = size_for(cb, w, h, ow, oh);
     if (!e) return dl_fail("work image creation", 0);
-    if (e != D.last) D.reset = 1, D.why[0]++, e->chars_ok = 0;   // another size's history is from another moment
-    if (!fsr3() && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
+    if (e != D.last) {   // another size's history is from another moment
+        D.reset = 1, D.why[0]++, e->chars_ok = 0;
+        __atomic_store_n(&size_changed, 1, __ATOMIC_RELEASE);
+    }
+    // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
+    // checks below, which would send the rest of this function to DLSS's path without NGX after all.
+    const int fsr = use_fsr();
+    if (!fsr && !N.ngx_up) return;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
+    if (!fsr && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
     NgxParam *p = D.params;
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
+    edge_fill(cb, t, z, D.jit_used);   // before the motion vectors read the depth
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // NX2NAVI_DLAA_MV=0: zero motion (test)
     int masked = 0, mv = no_mv ? 0 : mv_pass(ex, e, zv, jx, jy, char_bias(), &masked);
@@ -1320,15 +1939,18 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     uint64_t c0 = timed ? kern_now_ns() : 0;
     rec_drain();   // NGX records into the command buffer itself: the recorder thread must have made every call so far
     if (timed) T.cpu_drain += kern_now_ns() - c0;
-    if (fsr3()) {   // FSR 3.1 (vk_ffx.cpp) in DLSS's place: the same images, then the same blit below
+    if (mv == 1) fcam_probe(cb, e, w, h);   // mv_pass's distances, behind its barrier
+    if (fsr) {   // FSR 3.1 (vk_ffx.cpp) in DLSS's place: the same images, then the same blit below
         if (t->level || t->base_layer || z->level || z->base_layer) return dl_fail("FSR 3.1 on a target that is not level 0, layer 0", 0);
-        if (D.last_color != t->image) target_changed(t);
+        if (D.last_color != t->image) target_changed(t, mv == 1);
         uint64_t now = plat_now_ns();
         double dt = D.last_eval_ns ? (now - D.last_eval_ns) / 1e6 : 0;
         D.last_eval_ns = now;
         VkFfxImage fc = {t->image, t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
                    fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
-        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, 0))
+        VkFfxCamera fcam;
+        if (!vk_dlaa_ffx_camera(&fcam)) memset(&fcam, 0, sizeof fcam);   // no camera this frame: FSR's fixed values
+        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, &fcam))
             return dl_fail("FSR 3.1", 0);
         static int told;
         if (!told++) rt_log("dlaa: FSR 3.1 at %ux%u -> %ux%u (scene format %d, depth format %d)", w, h, ow, oh,
@@ -1336,6 +1958,10 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         goto evaluated;
     }
     if (!e->feat) {
+        // NX2NAVI_TRACE=perf: the release of the kept features (a device idle wait) and the create, as one mark
+        uint64_t t0 = perf_mark_begin();
+        if (idle_free() != 2) release_kept(e, feat_released);
+        feat_released = 0;
         p_setu(p, "CreationNodeMask", 1);
         p_setu(p, "VisibilityNodeMask", 1);
         p_setu(p, "Width", w);
@@ -1358,13 +1984,14 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         p_setu(p, "DLSS.Hint.Render.Preset.Performance", (unsigned)pm);
         p_setu(p, "DLSS.Hint.Render.Preset.UltraPerformance", (unsigned)pl);
         NgxResult r = N.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &e->feat);
+        perf_mark_end(PERF_M_NGX, t0, 0);
         if (!NGX_OK(r) || !e->feat) return dl_fail("DLSS feature creation", r);
         D.reset = 1;
         int q = perf_quality(w, ow), pr = q == 0 ? pm : q == 3 ? pl : pk;
         rt_log("dlaa: DLSS feature created at %ux%u -> %ux%u, quality value %d, preset %c (scene format %d, depth format "
                "%d)", w, h, ow, oh, q, 'A' + pr - 1, (int)t->format, (int)z->format);
     }
-    if (D.last_color != t->image) target_changed(t);
+    if (D.last_color != t->image) target_changed(t, mv == 1);
     NgxResourceVK rc = res_image(cv, t->image, t->format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
     NgxResourceVK ro = res_image(e->out_view, e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 1);
     NgxResourceVK rz = res_image(zv, z->image, z->format, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
@@ -1402,8 +2029,13 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    // Frame generation gets the same new start with this frame's inputs (vk_dlaa_fg_inputs): a frame DLSS starts a
+    // new history on (a camera cut, another scene size or target) has no motion from the frame before that holds.
+    D.fg_reset = D.reset;
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
+    if (D.evals % 600 == 0) query_vram();
+    stale_sizes(e);
     full_barrier(cb);
     vk_mvcheck_output(cb, e->out, ow, oh);   // NX2NAVI_MV_CHECK (test)
     // the result into the scene target (DLAA: the bloom, the post passes and the HUD read it and draw over it) or into
@@ -1427,21 +2059,23 @@ evaluated:
     if (vk_dlaa_hudless_wanted) hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
-    D.jdepth = z->image;
+    D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
     // for frame generation at this frame's present (vk_dlaa_fg_inputs)
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
-    D.fg_jx = jx, D.fg_jy = jy, D.fg_fresh = 1;
+    D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
+    if (D.jit_used) D.jittered++;
     next_jitter(w, ow);
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0)   // 300: one early line with the frames counted
         rt_log("dlaa: %llu frames anti-aliased (scene %ux%u, output %ux%u; %llu frames without the DLAA point, %llu with camera "
-               "motion, %llu with the characters' mask, %llu without a camera, %llu jitter holds; resets: %llu size, %llu "
-               "camera, %llu target; reactive mask %llu, without its copy %llu; no camera: %llu without a scene-context "
-               "draw, %llu not in DLSS's submission; %llu kept with zero motion, %llu runs past %d; %llu cameras read at the "
-               "draw)",
+               "motion, %llu with the characters' mask, %llu without a camera, %llu jittered (%llu draws moved, %llu not), "
+               "%llu jitter holds; resets: %llu size, %llu camera, %llu target; reactive mask %llu, without its copy %llu; "
+               "no camera: %llu without a scene-context draw, %llu not in DLSS's submission; %llu kept with zero motion, "
+               "%llu runs past %d; %llu cameras read at the draw)",
                (unsigned long long)D.evals, w, h, ow, oh, (unsigned long long)D.frames_missed,
                (unsigned long long)D.mv_frames, (unsigned long long)D.masked, (unsigned long long)D.mv_none,
+               (unsigned long long)D.jittered, (unsigned long long)D.jdraws, (unsigned long long)D.jfixed,
                (unsigned long long)D.holds, (unsigned long long)D.why[0], (unsigned long long)D.why[1],
                (unsigned long long)D.why[2], (unsigned long long)R.made, (unsigned long long)R.missed,
                (unsigned long long)D.cam_none_draw, (unsigned long long)D.cam_none_snap, (unsigned long long)D.cam_kept,
@@ -1462,16 +2096,15 @@ static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) 
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
-        vkDestroyImageView(c->device, D.hl_view, NULL);
-        vmaDestroyImage(c->vma, D.hl, D.hl_mem);
-        if (D.hl_srgb) vmaDestroyImage(c->vma, D.hl_srgb, D.hl_srgb_mem);
-        D.hl = D.hl_srgb = VK_NULL_HANDLE;
+        hl_destroy();
     }
     if (!D.hl) {
         VkImageView v2 = VK_NULL_HANDLE;
         VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         if ((!hdr && !image2d(w, h, VK_FORMAT_R8G8B8A8_SRGB, u, &D.hl_srgb, &D.hl_srgb_mem, &v2)) ||
             !image2d(w, h, fmt, u | VK_IMAGE_USAGE_STORAGE_BIT, &D.hl, &D.hl_mem, &D.hl_view)) {
+            if (v2) vkDestroyImageView(c->device, v2, NULL);   // the first image's view, when the second image failed
+            hl_destroy();   // and what of the two images was made
             rt_log("dlaa: the HUD-less picture's images could not be made: frame generation sees the HUD");
             vk_dlaa_hudless_wanted = 0;
             return;
@@ -1500,14 +2133,14 @@ static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) 
                    VK_FILTER_NEAREST);
     full_barrier(cb);
     if (hdr) {
-        D.hl_fresh = 1;
+        D.hl_at = D.presents, D.hl_fresh = 1;
         return;
     }
     VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                       .extent = {w, h, 1}};
     vkCmdCopyImage(cb, D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, D.hl, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     full_barrier(cb);
-    D.hl_fresh = 1;
+    D.hl_at = D.presents, D.hl_fresh = 1;
 }
 
 static int scene_color(VkFormat f) {
@@ -1517,11 +2150,16 @@ static int scene_color(VkFormat f) {
 // Two frame shapes. A deferred frame (the G-buffer, several colour targets at the scene size) arms on the light target
 // drawn after it and ends the scene at the first pass a quarter as wide (the bloom), as described above. Ocarina's
 // frame has no G-buffer: its light target (B10G11R11 at the scene size, with the D32F scene depth) is drawn into from the
-// first opaque pass on, half- and quarter-size effect passes come and go in between, and the scene ends at the pass
-// that tonemaps the light target into the 8-bit output target. So without a G-buffer the frame arms on the first
-// scene-size light pass and ends at that output pass: at the output size and without depth when DLSS scales up
-// (DLSS writes the output and the tonemap samples it through vk_dlaa_swap_img), an sRGB target of the scene size in
-// DLAA (DLSS's picture goes back into the light target, which the tonemap then reads).
+// first opaque pass on, half- and quarter-size effect passes come and go in between. Measured (NX2NAVI_DUMP, Kokiri
+// Forest, DLAA in a 2560x1440 picture): the last pass with the scene depth is the bloom composite into a second light
+// target (each such pass at the scene's size takes over the arming, with its depth); the game's upscaler (its stand-in
+// here, vk_tonemap.c) then fills a light-format target without depth, at the picture's size, which the HUD is drawn
+// into; a last draw copies that target into the 8-bit sRGB output target, encoding only, since the game tonemaps before
+// its post pass (vk_tonemap.c, vk_hdr.c). The scene ends at the start of the pass the HUD is drawn into: DLSS reads the
+// armed pair and its picture goes into that target, which the HUD is drawn over and the last draw reads. With an
+// upscaling share that target is larger than the scene; in DLAA it has the scene's size. A frame without it (the
+// menus) ends at the last draw, at the 8-bit output target of the scene's size, and DLSS's picture goes back into the
+// light target, which that draw reads.
 static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
 
 // The output target DLAA runs at. With the game's own HDR (vk_hdr.c vk_hdr_native) the same pass, at the same point of
@@ -1531,6 +2169,37 @@ static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FO
 static int output_target(VkFormat f) { return srgb8(f) || vk_hdr_native_picture(f); }
 
 double wide_dlss_share(void);   // widescreen.c: the DLSS mode's share of the picture (1 DLAA), 0 off
+
+// Ocarina's own upscaler is the place for DLSS or FSR: its stand-in (vk_exec_draw.c untranslated_dispatch_fallback) has
+// just scaled the scene into the image the rest of the frame shows, and the upscaler's picture goes over it there.
+// Until this hook the upscaler ran at the pass after it (vk_dlaa_pass below), which was taken for the pass the HUD is
+// drawn into, the stand-in's output image as its target. With the HUD hidden the game draws no such pass: the next pass
+// is the frame's last, which encodes the stand-in's image into the 8-bit output. DLSS's or FSR's picture was then
+// written into that 8-bit target and the last draw drew the stand-in's picture over it: the screen showed the
+// jittered scene at its render size, scaled with a plain filter. On a player's save with the HUD off that was every
+// frame: blocks of render pixels, a picture that shook with the jitter by up to one render pixel, the undrawn edge
+// row in white, and the upscaler's cost for nothing; with the HUD on (every test save until then) the same settings
+// gave the upscaler's picture. Found by dumping the same frame of both saves (NX2NAVI_DUMP): three HUD passes before the
+// last one in one, none in the other.
+// The image is the stand-in's output when it has the light target's format and the scene's shape and is no smaller
+// than the scene (the movie network's and other tensor programs' outputs are RGBA8 or smaller). A frame without the
+// dispatch (NX2NAVI_CS_FALLBACK=0, another engine) still ends at vk_dlaa_pass. NX2NAVI_DLAA_AT_UPSCALER=0 (test): as before.
+void vk_dlaa_upscaler(VkExec *ex, VkImage out, VkFormat fmt, uint32_t w, uint32_t h) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_AT_UPSCALER", "1");
+    if (!on || !dl_active() || !D.armed || D.done || D.gbuf || !out || fmt != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
+    uint32_t sw = D.color.width, sh = D.color.height;
+    if (w < sw || h < sh || out == D.color.image) return;
+    if ((double)w * sh > 1.03 * (double)h * sw || (double)h * sw > 1.03 * (double)w * sh) return;   // not the scene's shape
+    static int told;
+    if (!told++)
+        rt_log("dlaa: the upscaler runs where the game's own does: scene %ux%u into its %ux%u output", sw, sh, w, h);
+    VkExecTarget dst = {.image = out, .format = fmt, .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .layers = 1, .width = w,
+                        .height = h, .samples = 1};
+    vk_exec_hook_turn();   // as in vk_dlaa_pass: the replay workers' draws read the jitter and its end
+    D.ended = D.done = D.up = 1;
+    evaluate(ex, &dst);
+}
 
 void vk_dlaa_pass(VkExec *ex) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
@@ -1592,12 +2261,42 @@ void vk_dlaa_pass(VkExec *ex) {
         // resolution step) has no such pass: after a frame that missed DLSS the first pass wider than the scene is
         // taken for 120 frames (D.share_off, vk_dlaa_frame), so a mismatch costs one frame rather than every frame.
         double share = wide_dlss_share();
-        int big = D.share_off || share <= 0 || share >= 1 || c->width >= 0.95 * D.color.width / share;
-        if (one && big && c->width > D.color.width && c->height > D.color.height) {
+        int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
+        int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
+        int same = c->width == D.color.width && c->height == D.color.height;
+        // The output pass has the scene's shape: the game redraws its 2000x2000 area map into an RGBA8 target of its
+        // own on a room change and on the pause menu, one colour target and no depth, larger than the scene both ways.
+        // Taken for the output pass, DLSS wrote the game's picture into the map, and the minimap showed that picture
+        // behind its room shapes until the pause menu drew the map again. A pass whose width over height is more than
+        // 3% from the scene's (sizes round to multiples of 8) is not the output; the ultrawide sets widen the scene
+        // with the picture, so their output pass still matches.
+        int shape = (double)c->width * D.color.height <= 1.03 * (double)c->height * D.color.width &&
+                    (double)c->height * D.color.width <= 1.03 * (double)c->width * D.color.height;
+        if (one && !shape && big && c->width > D.color.width && c->height > D.color.height && D.shape_logged < 8)
+            D.shape_logged++, rt_log("dlaa: a %ux%u pass is not the output pass: its shape is not the scene's %ux%u",
+                                     c->width, c->height, D.color.width, D.color.height);
+        if (one && shape && big && c->width > D.color.width && c->height > D.color.height) {
+            // DLSS runs: the replay workers' draws read the jitter and its end, and list the per-object motion it
+            // takes (vk_exec.c "replay workers"); the G-buffer and the arming above change nothing they read
+            vk_exec_hook_turn();
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
-        } else if (one && output_target(c->format) && c->width == D.color.width &&
-                   c->height == D.color.height) {
+        } else if (one && same && native && scene_color(c->format)) {
+            // DLAA in gameplay: the pass the HUD is drawn into is also at the scene's size, in the light format, and
+            // the game's upscaler (its stand-in here) has just written the picture there. Waiting for the 8-bit output
+            // pass, as in a frame without it, put DLSS's picture back into the armed light target (the bloom
+            // composite's), which nothing reads after the upscaler took it: the frame showed no DLAA at all. With an
+            // upscaling share the HUD's pass is the larger one above, so a pass of this shape is not it and is ignored
+            // there as before.
+            static int told;
+            if (!told++)
+                rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
+                       c->width, c->height, (int)c->format);
+            vk_exec_hook_turn();
+            D.ended = D.done = D.up = 1;
+            evaluate(ex, c);
+        } else if (one && same && output_target(c->format)) {
+            vk_exec_hook_turn();
             D.ended = D.done = 1;
             evaluate(ex, NULL);
         }
@@ -1605,6 +2304,7 @@ void vk_dlaa_pass(VkExec *ex) {
     }
     if (!D.ended) {
         if (!ex->pass_w || ex->pass_w * 4 > D.color.width) return;
+        vk_exec_hook_turn();
         D.ended = 1;
         if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL);   // DLAA in place; else wait for the scaling pass
         return;
@@ -1612,13 +2312,20 @@ void vk_dlaa_pass(VkExec *ex) {
     // the game's scaling pass: one colour target of the output size, no depth
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
+        vk_exec_hook_turn();
         D.done = D.up = 1;
         evaluate(ex, c);
     }
 }
 
 // NX2NAVI_DLSS, read at each present (the menu switches it live): the scene size of the mode (resolution.c) and the
-// texture bias that goes with it while DLSS runs.
+// texture bias that goes with it while DLSS or FSR 3.1 runs. NVIDIA's DLSS guide asks for log2(render / output) - 1 on
+// top of the game's own bias: the render scale's part (res_dlss_lod_bias) samples textures for the output's resolution,
+// and the -1 sharper still, since the jittered frames DLSS accumulates resolve the detail one level finer: -1 at DLAA,
+// -1.58 in Quality (67 %), -2 in Performance. The -1 comes only with the jitter (jitter_on): without it the same pixel
+// samples the same spot every frame, and a sharper level would shimmer instead. The sampler clamps the sum to the
+// device's limit (vk_texture.c make_sampler).
+#define JITTER_LOD_BIAS (-1.0f)
 static void dlss_mode(void) {
     static char mode[32];
     static int bias_on = -1;
@@ -1630,7 +2337,8 @@ static void dlss_mode(void) {
         bias_on = -1;
     }
     int b = dl_active();
-    if (b != bias_on) bias_on = b, vk_sampler_dlss_bias(b ? res_dlss_lod_bias() : 0.0f);
+    if (b != bias_on)
+        bias_on = b, vk_sampler_dlss_bias(b ? res_dlss_lod_bias() + (jitter_on() ? JITTER_LOD_BIAS : 0.0f) : 0.0f);
 }
 
 
@@ -1648,11 +2356,38 @@ static void preset_check(void) {
     D.preset = p, D.preset_dirty = 1, D.reset = 1;
 }
 
+// The scene's size after a setting changed (a DLSS or FSR 3.1 mode picked in the menu). The game makes its scene targets
+// again at the new size and they start empty, so the first frames drawn into them are wrong: the first one is lit
+// without what the frame before it left (a dark scene), and two frames later the scene can be black with the interface
+// intact (Ultra Performance and DLAA). Measured by capturing every present over six mode changes, 2026-11-10: bad
+// frames 3 and 5 presents after the change, with every other setting the same. evaluate notes a scene of another size;
+// vk_dlaa_frame counts the presents since a setting last changed, so a game that draws two sizes in turn holds nothing.
+static int setting_presents;            // vk_dlaa_frame: presents left in which that counts as a mode change
+#define SETTING_PRESENTS 60
+
+// vk_backend.c frame_hold, each present after vk_dlaa_frame: 1 once when the scene took a new size after a setting
+// changed. The previous picture then stays on screen over the frames described above.
+int vk_dlaa_resized_take(void) {
+    if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL) || !setting_presents) return 0;
+    setting_presents = 0;
+    return 1;
+}
+
 void vk_dlaa_frame(void) {
+    static unsigned cfg_seen;
+    static int cfg_known;
+    unsigned v = cfg_version();
+    D.presents++;
+    if (cfg_known && v != cfg_seen) setting_presents = SETTING_PRESENTS;
+    else if (setting_presents) setting_presents--;
+    cfg_seen = v, cfg_known = 1;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
     dlss_mode();
     preset_check();
-    if (!N.ngx_up) N.available = fsr3() && cfg_bool("NX2NAVI_DLAA") && vk_ffx_load();   // FSR 3.1 follows the setting
+    if (!N.ngx_up) {   // FSR 3.1 follows the setting
+        fsr_frame = fsr3();
+        N.available = fsr_frame && cfg_bool("NX2NAVI_DLAA") && vk_ffx_load();
+    }
     int on = N.available && cfg_bool("NX2NAVI_DLAA");
     if (on != D.on) {
         rt_log("dlaa: %s", on ? "on" : "off");
@@ -1660,6 +2395,7 @@ void vk_dlaa_frame(void) {
         // either way the next DLAA frame starts a new history from an unjittered frame
         D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
         D.hold = 0;
+        D.fg_fresh = D.hl_fresh = 0;   // frame generation gets nothing made before the switch (fg_current)
         memset(&F, 0, sizeof F);
         return;
     }
@@ -1767,3 +2503,131 @@ int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) {
     return !fxaa;
 }
 
+
+// ---------------------------------------------------------------- DLSS Frame Generation through NGX (vk_ngxfg)
+// gfx_present.c records this into the present command buffer once the frame's picture, HUD included, is in bb. It
+// generates count frames between the previous call's picture and this one into out[0..count-1] (MultiFrameIndex 1 to
+// count) and a copy of bb into real; gfx_present.c's presenter shows them in that order, then the rendered one. The
+// inputs are the ones the Streamline path gets (vk_dlssg.c): the depth, motion vectors, jitter and camera of the frame
+// DLSS last ran on, and the picture without the HUD.
+int vk_ngxfg_max(void) { return vk_ngxfg_wanted() && N.available && !FG.failed ? FG.max : 0; }
+int vk_ngxfg_on(void) { return vk_ngxfg_max() && !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss"); }
+void vk_ngxfg_reset(void) { FG.reset = 1; }
+
+int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
+                      const VkNgxImage *real) {
+    if (!vk_ngxfg_max() || count < 1) return 0;
+    if (count > FG.max) count = FG.max;
+    VkFfxImage d, m;
+    VkImageView dv, mvv;
+    VkDlaaCamera c;
+    float jx = 0, jy = 0;
+    int reset = 0;
+    if (!vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset) || !vk_dlaa_fg_views(&dv, &mvv) || !vk_dlaa_fg_camera(&c)) {
+        FG.reset = 1;   // a frame without DLSS's inputs: the next generation has no valid previous frame
+        return 0;
+    }
+    if (!FG.p && !NGX_OK(N.alloc_params(&FG.p))) {
+        FG.failed = 1;
+        rt_log("ngxfg: parameter allocation failed: frame generation off");
+        return 0;
+    }
+    NgxParam *p = FG.p;
+    if (FG.feat && (FG.w != bb->w || FG.h != bb->h || FG.fmt != bb->fmt)) {
+        N.release(FG.feat);
+        FG.feat = NULL;
+    }
+    if (!FG.feat) {
+        p_setu(p, "CreationNodeMask", 1);
+        p_setu(p, "VisibilityNodeMask", 1);
+        p_setu(p, "Width", bb->w);
+        p_setu(p, "Height", bb->h);
+        p_setu(p, "DLSSG.BackbufferFormat", (unsigned)bb->fmt);
+        uint64_t t0 = perf_mark_begin();
+        NgxResult r = N.create(cb, NGX_FEATURE_FRAME_GENERATION, p, &FG.feat);
+        perf_mark_end(PERF_M_NGX, t0, 0);
+        if (!NGX_OK(r) || !FG.feat) {
+            FG.failed = 1, FG.feat = NULL;
+            rt_log("ngxfg: DLSS Frame Generation feature creation failed (%08x): frame generation off", (unsigned)r);
+            return 0;
+        }
+        FG.w = bb->w, FG.h = bb->h, FG.fmt = bb->fmt, FG.reset = 1;
+        rt_log("ngxfg: DLSS Frame Generation created at %ux%u (format %d), depth and motion %ux%u", bb->w, bb->h,
+               (int)bb->fmt, d.width, d.height);
+    }
+    NgxResourceVK rb = res_image(bb->view, bb->img, bb->fmt, bb->w, bb->h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    NgxResourceVK rz = res_image(dv, d.image, d.format, d.width, d.height, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+    NgxResourceVK rm = res_image(mvv, m.image, m.format, m.width, m.height, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    NgxResourceVK rh = hudless ? res_image(hudless->view, hudless->img, hudless->fmt, hudless->w, hudless->h,
+                                           VK_IMAGE_ASPECT_COLOR_BIT, 0) : rb;
+    NgxResourceVK rr = res_image(real->view, real->img, real->fmt, real->w, real->h, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    p_setp(p, "DLSSG.Backbuffer", &rb);
+    p_setp(p, "DLSSG.Depth", &rz);
+    p_setp(p, "DLSSG.MVecs", &rm);
+    p_setp(p, "DLSSG.HUDLess", hudless ? &rh : NULL);
+    p_setp(p, "DLSSG.UI", NULL);
+    p_setp(p, "DLSSG.UIAlpha", NULL);
+    p_setp(p, "DLSSG.BidirectionalDistortionField", NULL);
+    p_setp(p, "DLSSG.OutputReal", &rr);
+    p_setp(p, "DLSSG.OutputDisableInterpolation", NULL);
+    p_setp(p, "DLSSG.CameraViewToClip", c.view_to_clip);
+    p_setp(p, "DLSSG.ClipToCameraView", c.clip_to_view);
+    p_setp(p, "DLSSG.ClipToLensClip", NULL);
+    p_setp(p, "DLSSG.ClipToPrevClip", c.clip_to_prev_clip);
+    p_setp(p, "DLSSG.PrevClipToClip", c.prev_clip_to_clip);
+    p_setf(p, "DLSSG.JitterOffsetX", jx);
+    p_setf(p, "DLSSG.JitterOffsetY", jy);
+    p_setf(p, "DLSSG.MvecScaleX", 1.0f / (float)m.width);   // the vectors are in render pixels
+    p_setf(p, "DLSSG.MvecScaleY", 1.0f / (float)m.height);
+    p_setf(p, "DLSSG.CameraPinholeOffsetX", 0.0f);
+    p_setf(p, "DLSSG.CameraPinholeOffsetY", 0.0f);
+    static const char *const pos[] = {"DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ"};
+    static const char *const up[] = {"DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ"};
+    static const char *const rt[] = {"DLSSG.CameraRightX", "DLSSG.CameraRightY", "DLSSG.CameraRightZ"};
+    static const char *const fw[] = {"DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ"};
+    for (int i = 0; i < 3; i++)
+        p_setf(p, pos[i], c.pos[i]), p_setf(p, up[i], c.up[i]), p_setf(p, rt[i], c.right[i]), p_setf(p, fw[i], c.fwd[i]);
+    p_setf(p, "DLSSG.CameraNear", c.znear);   // the frame's own planes (proj_planes), as vk_dlssg.c gives them
+    p_setf(p, "DLSSG.CameraFar", c.zfar);
+    p_setf(p, "DLSSG.CameraFOV", c.fov_y);
+    p_setf(p, "DLSSG.CameraAspectRatio", c.aspect);
+    p_setu(p, "DLSSG.ColorBuffersHDR", 0);
+    p_setu(p, "DLSSG.DepthInverted", (unsigned)c.inverted);
+    p_setu(p, "DLSSG.CameraMotionIncluded", 1);
+    p_setu(p, "DLSSG.Reset", (unsigned)(reset || FG.reset));
+    p_setu(p, "DLSSG.AutomodeOverrideReset", 0);
+    p_setu(p, "DLSSG.NotRenderingGameFrames", 0);
+    p_setu(p, "DLSSG.OrthoProjection", 0);
+    p_setu(p, "DLSSG.MvecDilated", 0);
+    p_setu(p, "DLSSG.MenuDetectionEnabled", 0);
+    struct { const char *base; uint32_t w, h; } rects[] = {
+        {"DLSSG.MVecsSubrect", m.width, m.height}, {"DLSSG.DepthSubrect", d.width, d.height},
+        {"DLSSG.HUDLessSubrect", bb->w, bb->h}, {"DLSSG.InputBackbufferSubrect", bb->w, bb->h},
+        {"DLSSG.OutputInterpolatedSubrect", bb->w, bb->h}, {"DLSSG.OutputRealSubrect", bb->w, bb->h}};
+    for (size_t i = 0; i < sizeof rects / sizeof *rects; i++) {
+        char k[64];
+        snprintf(k, sizeof k, "%sBaseX", rects[i].base), p_setu(p, k, 0);
+        snprintf(k, sizeof k, "%sBaseY", rects[i].base), p_setu(p, k, 0);
+        snprintf(k, sizeof k, "%sWidth", rects[i].base), p_setu(p, k, rects[i].w);
+        snprintf(k, sizeof k, "%sHeight", rects[i].base), p_setu(p, k, rects[i].h);
+    }
+    p_setu(p, "DLSSG.MultiFrameCount", (unsigned)count);
+    int made = 0;
+    for (int i = 0; i < count; i++) {
+        NgxResourceVK ro = res_image(out[i].view, out[i].img, out[i].fmt, out[i].w, out[i].h, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        p_setp(p, "DLSSG.OutputInterpolated", &ro);
+        p_setu(p, "DLSSG.MultiFrameIndex", (unsigned)(i + 1));
+        NgxResult r = N.evaluate(cb, FG.feat, p, NULL);
+        if (!NGX_OK(r)) {
+            static int told;
+            if (told++ < 5) rt_log("ngxfg: evaluation %d of %d failed (%08x)", i + 1, count, (unsigned)r);
+            break;
+        }
+        made++;
+    }
+    full_barrier(cb);
+    FG.reset = 0;
+    if (made && (++FG.evals == 1 || FG.evals % 3600 == 0))
+        rt_log("ngxfg: %d frames with generation (%d generated per rendered frame)", FG.evals, made);
+    return made;
+}

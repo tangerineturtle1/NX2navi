@@ -2,6 +2,11 @@
 // goes through astc_decode_block and lands where astc_decode_ldr puts it, so the output is the same bytes. The caller
 // takes part and returns when every row is done. One image at a time: a second caller while the pool is busy, or an
 // image under MT_MIN_BLOCKS, decodes on its own thread.
+//
+// astc_blocks_opaque_mt: the same pool runs the opaque check of a large texture (vk_texture.c "ASTC as BC1"),
+// SCAN_CHUNK blocks at a time, and with dst also its copy into staging, which the render thread did alone before. Once
+// a worker finds a block that is not opaque, the chunks left are copied without the check, or not read at all without
+// dst.
 #include <string.h>
 
 #include "host.h"
@@ -11,6 +16,8 @@
 
 #define MT_MIN_BLOCKS 1024   // below this, waking the pool costs about as much as the decode
 #define MT_MAX_THREADS 8
+#define SCAN_CHUNK 16384      // blocks a worker checks at a time (256 KiB)
+#define MT_MIN_SCAN (4 * SCAN_CHUNK)
 
 static struct {
     PlatOnce once;
@@ -25,7 +32,12 @@ static struct {
     uint8_t *out;
     uint32_t width, height, bw, bh, bx, by, chunk;
     bool srgb;
-    volatile int32_t next;                      // first block row not yet claimed
+    volatile int32_t next;                      // first block row (a scan: chunk) not yet claimed
+    int scan;                                // the current job: 0 a decode, 1 an opaque check
+    uint64_t sn;                             // a scan: its blocks, where they go, the most decodes, the result
+    uint8_t *sdst;
+    uint32_t smax;
+    volatile int32_t sbad, sdecoded;
 } P = {PLAT_ONCE_INIT, .lock = PLAT_MUTEX_INIT, .work = PLAT_COND_INIT, .done = PLAT_COND_INIT};
 
 // Block rows [j0, j1) of the current image, as astc_decode_ldr's loop does them.
@@ -55,6 +67,25 @@ static void claim_rows(void) {
     }
 }
 
+// Chunks of the current scan, until they run out; without dst, also once a block that is not opaque was found.
+static void claim_scan(void) {
+    for (;;) {
+        int found = __atomic_load_n(&P.sbad, __ATOMIC_RELAXED);
+        if (found && !P.sdst) return;
+        uint64_t i0 = (uint64_t)(uint32_t)plat_xadd32(&P.next, 1) * SCAN_CHUNK;
+        if (i0 >= P.sn) return;
+        uint64_t m = P.sn - i0 < SCAN_CHUNK ? P.sn - i0 : SCAN_CHUNK;
+        if (found) {
+            memcpy(P.sdst + 16 * i0, P.blocks + 16 * i0, 16 * m);
+            continue;
+        }
+        uint32_t d = 0;
+        uint64_t bad = astc_blocks_opaque(P.blocks + 16 * i0, m, P.bw, P.bh, P.srgb, P.smax, &d, P.sdst ? P.sdst + 16 * i0 : NULL);
+        uint32_t total = (uint32_t)plat_xadd32(&P.sdecoded, (int32_t)d) + d;
+        if (bad < m || total > P.smax) plat_xchg32(&P.sbad, 1);
+    }
+}
+
 static void worker(void *arg) {
     (void)arg;
     uint64_t seen = 0;
@@ -63,7 +94,8 @@ static void worker(void *arg) {
         while (P.gen == seen) plat_cond_wait(&P.work, &P.lock);
         seen = P.gen;
         plat_mutex_unlock(&P.lock);
-        claim_rows();
+        if (P.scan) claim_scan();
+        else claim_rows();
         plat_mutex_lock(&P.lock);
         if (!--P.active) plat_cond_broadcast(&P.done);
     }
@@ -98,7 +130,7 @@ void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, 
     }
     plat_mutex_lock(&P.lock);
     P.blocks = blocks, P.out = rgba_out, P.width = width, P.height = height, P.bw = bw, P.bh = bh, P.bx = bx, P.by = by;
-    P.srgb = srgb;
+    P.srgb = srgb, P.scan = 0;
     uint32_t parts = (uint32_t)(P.threads + 1) * 4;   // a few chunks per thread evens out uneven blocks
     P.chunk = by / parts ? by / parts : 1;
     P.next = 0;
@@ -111,4 +143,28 @@ void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, 
     while (P.active) plat_cond_wait(&P.done, &P.lock);
     plat_mutex_unlock(&P.lock);
     plat_mutex_unlock(&P.busy);
+}
+
+bool astc_blocks_opaque_mt(const uint8_t *blocks, uint64_t n, uint32_t bw, uint32_t bh, bool srgb, uint32_t max_decoded,
+                           uint32_t *decoded, uint8_t *dst) {
+    if (n < MT_MIN_SCAN || n / SCAN_CHUNK >= INT32_MAX)
+        return astc_blocks_opaque(blocks, n, bw, bh, srgb, max_decoded, decoded, dst) == n;
+    plat_once(&P.once, pool_init, NULL);
+    if (!P.threads || !plat_mutex_trylock(&P.busy))
+        return astc_blocks_opaque(blocks, n, bw, bh, srgb, max_decoded, decoded, dst) == n;
+    plat_mutex_lock(&P.lock);
+    P.blocks = blocks, P.sn = n, P.bw = bw, P.bh = bh, P.srgb = srgb, P.smax = max_decoded, P.scan = 1, P.sdst = dst;
+    P.sbad = 0, P.sdecoded = 0, P.next = 0;
+    P.active = P.threads;
+    P.gen++;
+    plat_cond_broadcast(&P.work);
+    plat_mutex_unlock(&P.lock);
+    claim_scan();
+    plat_mutex_lock(&P.lock);
+    while (P.active) plat_cond_wait(&P.done, &P.lock);
+    bool ok = !P.sbad;
+    *decoded += (uint32_t)P.sdecoded;
+    plat_mutex_unlock(&P.lock);
+    plat_mutex_unlock(&P.busy);
+    return ok;
 }

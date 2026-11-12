@@ -323,9 +323,19 @@ static void test_arbiter(Cpu *c) {
     uint32_t r = sv(c, 0x34, arb, 2, 5, 5000000);
     double ms = ms_since(t0);
     CHECK(r == KERN_R_TIMEOUT && ms >= 5.0, "wait type 2 with a 5 ms timeout: %#x after %.2f ms", r, ms);
-    CHECK(sv(c, 0x34, arb, 3, 0, 0) == KERN_R_INVALID_ENUM && sig(c, 3, 0, 0) == KERN_R_INVALID_ENUM, "type 3");
-    printf("address arbiter: wait types 0-2 (less, decrement-less, equal), signal types 0-2 (wake, increment, modify by "
-           "waiters), 5 ms timeout after %.2f ms: %s\n", ms, failures == before ? "ok" : "FAIL");
+    // wait type 3: the whole 64-bit word against x2 (kernel.c case 0x34); an address off 8 bytes is refused
+    static volatile uint64_t arb64 = 0x100000005ull;
+    uint64_t a64 = ga(&arb64);
+    t0 = kern_now_ns();
+    r = sv(c, 0x34, a64, 3, 0x100000005ull, 2000000);
+    double ms3 = ms_since(t0);
+    CHECK(r == KERN_R_TIMEOUT && ms3 >= 2.0, "wait type 3 on an equal word with a 2 ms timeout: %#x after %.2f ms", r, ms3);
+    CHECK(sv(c, 0x34, a64, 3, 5, 0) == KERN_R_BAD_STATE, "wait type 3 on a word whose high half differs");
+    CHECK(sv(c, 0x34, a64 + 4, 3, 0, 0) == 0xCC01u, "wait type 3 at an address off 8 bytes");
+    CHECK(sv(c, 0x34, arb, 4, 0, 0) == KERN_R_INVALID_ENUM && sig(c, 3, 0, 0) == KERN_R_INVALID_ENUM,
+          "a wait type past 3 or a signal type past 2");
+    printf("address arbiter: wait types 0-3 (less, decrement-less, equal, equal 64-bit), signal types 0-2 (wake, "
+           "increment, modify by waiters), 5 ms timeout after %.2f ms: %s\n", ms, failures == before ? "ok" : "FAIL");
 }
 
 // ---- events
@@ -423,18 +433,20 @@ static void test_events(Cpu *c) {
 }
 
 // ---- virtual cores: count the threads running guest code at once, and that no two of them share a core number
-static volatile int32_t g_running, g_run_max, g_core_use[3], g_core_clash;
+#define PROBE_CORES 8   // at least kernel.c NCORE
+static volatile int32_t g_running, g_run_max, g_core_use[PROBE_CORES], g_core_clash;
 
 static void core_worker(Cpu *c) {
     for (int i = 0; i < CORE_RUNS; i++) {
         uint32_t core = sv(c, 0x10, 0, 0, 0, 0);
-        if (core > 2 || plat_inc32(&g_core_use[core > 2 ? 0 : core]) != 1) plat_inc32(&g_core_clash);
+        int known = core < (uint32_t)kern_cores() && core < PROBE_CORES;   // a number past the cores is a clash too
+        if (!known || plat_inc32(&g_core_use[core]) != 1) plat_inc32(&g_core_clash);
         long n = plat_inc32(&g_running), m;
         while (n > (m = g_run_max) && plat_cas32(&g_run_max, n, m) != m) {}
         uint64_t until = kern_now_ns() + 20000;
         while (kern_now_ns() < until) {}
         plat_dec32(&g_running);
-        plat_dec32(&g_core_use[core > 2 ? 0 : core]);
+        if (known) plat_dec32(&g_core_use[core]);
         sv(c, 0x0B, i % 8 == 7 ? 50000 : 0, 0, 0, 0);
     }
     exit_thread(c);
@@ -453,11 +465,53 @@ static void test_cores(Cpu *c) {
     kern_core_stats(&now, &held_max);
     uint32_t cpus = plat_cpu_usable();
     int gate = !cfg_bool("NX2NAVI_FREE_CORES");   // the kernel's own switch
-    int ok = g_run_max <= 3 && held_max <= 3 && !g_core_clash && (cpus < 4 || g_run_max == 3);
+    int ncore = kern_cores();   // as many threads run guest code at once as there are virtual cores, where the host
+                                // has more CPUs than that
+    int ok = g_run_max <= ncore && held_max <= ncore && !g_core_clash && ((int)cpus <= ncore || g_run_max == ncore);
     printf("virtual cores: %d threads x %d runs on %u host CPUs: at most %d running guest code at once, at most %d "
            "core holders (kernel count), %d core-number clashes: %s\n", CORE_WORKERS, CORE_RUNS, cpus, g_run_max,
            held_max, g_core_clash, !gate ? "not checked (NX2NAVI_FREE_CORES is set)" : ok ? "ok" : "FAIL");
     CHECK(ok || !gate, "virtual cores");
+}
+
+// ---- pinned threads: each sees the number of the core it is pinned to, also where NX2NAVI_CORES folds that core
+// onto another one (kernel.c core_seen), and no two that run guest code at once see the same number. Run the probe
+// with NX2NAVI_CORES=4 (the Steam Deck profile's value) to check the folded case; with all cores it holds trivially.
+#define PIN_CORES 6   // kernel.c NCORE
+static volatile int32_t g_pin_wrong, g_pin_clash, g_pin_use[PROBE_CORES];
+static uint64_t a_pin_worker;
+
+static void pin_worker(Cpu *c) {
+    uint32_t own = *(uint32_t *)arg_p(c, 0);
+    for (int i = 0; i < CORE_RUNS; i++) {
+        uint32_t core = sv(c, 0x10, 0, 0, 0, 0);
+        if (core != own) plat_inc32(&g_pin_wrong);
+        int known = core < PROBE_CORES;
+        if (!known || plat_inc32(&g_pin_use[core]) != 1) plat_inc32(&g_pin_clash);
+        uint64_t until = kern_now_ns() + 20000;
+        while (kern_now_ns() < until) {}
+        if (known) plat_dec32(&g_pin_use[core]);
+        sv(c, 0x0B, i % 8 == 7 ? 50000 : 0, 0, 0, 0);
+    }
+    exit_thread(c);
+}
+
+static void test_pinned_cores(Cpu *c) {
+    static uint32_t own[2 * PIN_CORES];
+    uint32_t h[2 * PIN_CORES];
+    g_pin_wrong = g_pin_clash = 0;
+    for (int i = 0; i < 2 * PIN_CORES; i++) {   // two threads per core, so each core's own threads take turns too
+        own[i] = (uint32_t)(i % PIN_CORES);
+        h[i] = create(c, a_pin_worker, &own[i], 44, i % PIN_CORES);
+        start(c, h[i]);
+    }
+    for (int i = 0; i < 2 * PIN_CORES; i++) join(c, h[i]);
+    int gate = !cfg_bool("NX2NAVI_FREE_CORES");
+    int ok = !g_pin_wrong && !g_pin_clash;
+    printf("pinned cores: %d threads on %d cores (%d virtual cores run threads) x %d runs: %d saw another core's "
+           "number, %d core-number clashes: %s\n", 2 * PIN_CORES, PIN_CORES, kern_cores(), CORE_RUNS, g_pin_wrong,
+           g_pin_clash, !gate ? "not checked (NX2NAVI_FREE_CORES is set)" : ok ? "ok" : "FAIL");
+    CHECK(ok || !gate, "pinned cores");
 }
 
 // ---- fibers: two fibers switch to each other; each checks its callee-saved registers, sp and tpidr survive
@@ -656,6 +710,7 @@ static void probe_main(Cpu *c) {
     test_arbiter(c);
     test_events(c);
     test_cores(c);
+    test_pinned_cores(c);
     test_fibers(c);
     test_exit(c);
     test_lifted_ticks(c);
@@ -726,6 +781,7 @@ int probe_kernel(void) {
     a_arb_waiter = hostfn_register("probe-kernel arbiter waiter", arb_waiter);
     a_event_waiter = hostfn_register("probe-kernel event waiter", event_waiter);
     a_core_worker = hostfn_register("probe-kernel core worker", core_worker);
+    a_pin_worker = hostfn_register("probe-kernel pin worker", pin_worker);
     a_exit_entry = hostfn_register("probe-kernel exit entry", exit_entry);
     a_exit_nested = hostfn_register("probe-kernel exit nested", exit_nested);
     a_fiber_fn = hostfn_register("probe-kernel fiber", fiber_fn);

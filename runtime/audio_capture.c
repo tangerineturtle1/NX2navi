@@ -6,6 +6,7 @@
 
 struct MicCapture {
     SDL_AudioStream *stream;
+    SDL_AudioDeviceID device;
     unsigned char *ring;
     int cap, head, used, bpf;
 };
@@ -95,24 +96,45 @@ MicCapture *mic_open(int format, int channels, int rate, int frames) {
         return NULL;
     }
     SDL_AudioSpec spec = {.format = sf, .channels = channels, .freq = rate};
-    m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, received, m);
-    if (!m->stream) {
-        free(m->ring);
-        free(m);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    SDL_AudioSpec source;
+    if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &source, NULL))
+        m->stream = SDL_CreateAudioStream(&source, &spec);
+    if (!m->stream || !SDL_SetAudioStreamPutCallback(m->stream, received, m)) {
+        mic_close(m);
         return NULL;
     }
     return m;
 }
-int mic_start(MicCapture *m) { return m && SDL_ResumeAudioStreamDevice(m->stream); }
+int mic_start(MicCapture *m) {
+    if (!m)
+        return 0;
+    if (m->device)
+        return 1;
+    SDL_AudioSpec spec;
+    if (!SDL_GetAudioStreamFormat(m->stream, NULL, &spec))
+        return 0;
+    SDL_AudioDeviceID device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec);
+    if (!device)
+        return 0;
+    if (!SDL_BindAudioStream(device, m->stream)) {
+        SDL_CloseAudioDevice(device);
+        return 0;
+    }
+    m->device = device;
+    return 1;
+}
 void mic_stop(MicCapture *m) {
-    if (m)
-        SDL_PauseAudioStreamDevice(m->stream);
+    if (m && m->device) {
+        SDL_CloseAudioDevice(m->device); /* unbinds the stream; unread frames remain in the ring */
+        m->device = 0;
+    }
 }
 void mic_close(MicCapture *m) {
     if (!m)
         return;
-    SDL_DestroyAudioStream(m->stream); /* joins capture before freeing userdata */
+    mic_stop(m);
+    if (m->stream)
+        SDL_DestroyAudioStream(m->stream);
     free(m->ring);
     free(m);
     SDL_QuitSubSystem(SDL_INIT_AUDIO);

@@ -7,16 +7,20 @@
 // interposer's vkCreateInstance and vkCreateDevice, which add what DLSS-G needs, and calls the interposer's
 // swapchain functions; everything else goes to the Vulkan loader as before. Each frame of the game sleeps in Reflex
 // where it starts and gets the PCL latency markers, the camera constants and the depth and motion vector tags (valid
-// until the present), then the present goes through the interposer, which inserts the generated frame.
+// until the present), then the present goes through the interposer, which inserts the generated frames: one, two or
+// three between two rendered frames (2x, 3x or 4x), up to what the GPU and driver allow (numFramesToGenerateMax).
 #define NX2SL_BUILD
 #include <windows.h>
 
 #include <stdio.h>
 #include <string.h>
 
+#include <atomic>
+
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -40,7 +44,9 @@ PFun_slReflexSetOptions *p_reflex;
 PFun_slReflexSleep *p_sleep;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
-int g_available = -1, g_mode = -1;
+int g_available = -1;
+int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
+std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
 uint64_t g_presented, g_shown;
 
 void say(const char *fmt, ...) {
@@ -141,8 +147,25 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     if (p_feature(sl::kFeatureReflex, "slReflexSetOptions", f) == sl::Result::eOk) p_reflex = (PFun_slReflexSetOptions *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSleep", f) == sl::Result::eOk) p_sleep = (PFun_slReflexSleep *)f;
     if (!p_dlssg_options || !p_marker) g_available = 0;
-    say("dlssg: DLSS Frame Generation %s", g_available ? "available" : "not available on this GPU or driver");
+    // How many frames this GPU and driver generate per rendered frame: known once the device exists (else after the
+    // first presents, nx2sl_present_marker)
+    sl::DLSSGState s{};
+    if (g_available && p_dlssg_state && p_dlssg_state(sl::ViewportHandle(0), s, nullptr) == sl::Result::eOk)
+        g_max.store(s.numFramesToGenerateMax);
+    if (!g_available) say("dlssg: frame generation unavailable (DLSS-G plugin loaded: %d, DLSS-G options: %d, PCL marker: %d)",
+                          loaded, p_dlssg_options != nullptr, p_marker != nullptr);
+    else if (g_max.load()) say("dlssg: DLSS Frame Generation available, up to %ux", g_max.load() + 1);
+    else say("dlssg: DLSS Frame Generation available (its most frames per rendered frame not reported yet)");
     return g_available;
+}
+
+extern "C" NX2SL_API void nx2sl_log_unavailable(VkPhysicalDevice physical) {
+    auto supported = proc<PFun_slIsFeatureSupported>("slIsFeatureSupported");
+    if (!supported) return say("dlssg: Streamline has no adapter support query");
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = physical;
+    sl::Result r = supported(sl::kFeatureDLSS_G, adapter);
+    say("dlssg: Streamline's support check for frame generation: %s (%d)", sl::getResultAsStr(r), (int)r);
 }
 
 // Streamline sets Reflex's mode on the swapchain it was told of last (VK_NV_low_latency2) and drops it while there is
@@ -182,7 +205,11 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
     sl::FrameToken *t = token(frame);
     if (!t) return 0;
     sl::ViewportHandle vp(0);
-    if (enable && depth && mv && cam) {
+    // never more than Streamline allows: one while it has not said
+    uint32_t max = g_max.load();
+    int n = enable > 0 ? enable : 0;
+    if (n > (int)(max ? max : 1)) n = (int)(max ? max : 1);
+    if (n && depth && mv && cam) {
         sl::Constants c{};
         matrix(c.cameraViewToClip, cam->view_to_clip);
         matrix(c.clipToCameraView, cam->clip_to_view);
@@ -212,13 +239,20 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
                                    sl::ResourceTag(&rh, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
         if ((t = token(frame))) p_tag(*t, vp, tags, hudless ? 3 : 2, (sl::CommandBuffer *)cb);
     }
-    if ((enable != 0) != g_mode) {
+    if (n != g_frames) {
         sl::DLSSGOptions o{};
-        o.mode = enable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-        o.numFramesToGenerate = 1;
+        o.mode = n ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        o.numFramesToGenerate = n ? (uint32_t)n : 1;
+        // Generation goes off for every menu, cutscene and frame without depth and motion, and on again after it. Off
+        // frees the generator's resources unless this flag is set, and on allocates them again inside the present, with
+        // the queue lock held: a frame of 100 to 150 ms each time, the submitting thread waiting for that lock. With
+        // the flag, off only suspends. Whether frame generation runs at all is fixed for the run (vk_dlssg.c), so
+        // nothing is held for long that would otherwise be given back; Streamline frees it at shutdown.
+        o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         sl::Result r = p_dlssg_options(vp, o);
-        say("dlssg: frame generation %s (%d), output %ux%u", enable ? "on" : "off", (int)r, out_w, out_h);
-        g_mode = enable != 0;
+        if (n) say("dlssg: frame generation on, %dx (%d generated per rendered frame) (%d), output %ux%u", n + 1, n, (int)r, out_w, out_h);
+        else say("dlssg: frame generation off (%d), output %ux%u", (int)r, out_w, out_h);
+        g_frames = n;
     }
     return 1;
 }
@@ -229,14 +263,21 @@ extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
     p_marker(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t);
     if (!after) return;
     g_presented++;
-    // Asked after each present, numFramesActuallyPresented is what that present showed: 2 with a generated frame.
+    // Asked after each present, numFramesActuallyPresented is what that present showed: 2 with one generated frame, 4
+    // with three.
     sl::DLSSGState s{};
     if (!p_dlssg_state || p_dlssg_state(sl::ViewportHandle(0), s, nullptr) != sl::Result::eOk) return;
     g_shown += s.numFramesActuallyPresented;
+    if (s.numFramesToGenerateMax && s.numFramesToGenerateMax != g_max.load()) {   // a 0 now and then is no news
+        say("dlssg: up to %ux on this GPU and driver", s.numFramesToGenerateMax + 1);
+        g_max.store(s.numFramesToGenerateMax);
+    }
     if (g_presented == 600 || g_presented % 3600 == 0)
         say("dlssg: %llu frames, %u presented per frame, status %u", (unsigned long long)g_presented,
             s.numFramesActuallyPresented, (unsigned)s.status);
 }
+
+extern "C" NX2SL_API uint32_t nx2sl_frames_max(void) { return g_available == 1 ? g_max.load() : 0; }
 
 extern "C" NX2SL_API uint64_t nx2sl_shown(void) { return g_shown; }
 

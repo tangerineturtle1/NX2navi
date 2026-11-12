@@ -7,6 +7,12 @@
 // DLSS-G needs; the present path calls Streamline's swapchain functions (gfx_present.c), and every present records the
 // frame's constants and tags first (vk_dlssg_frame). Generation pauses while the menu is open.
 //
+// Multi frame generation: NX2NAVI_FRAMEGEN_MULTIPLIER (2, 3 or 4, live) is how many frames the display gets per
+// rendered frame, so one, two or three generated ones. Streamline says how many this GPU and driver can generate
+// (numFramesToGenerateMax: one where only 2x runs, three on an RTX 50); a higher setting is clamped to it with a log
+// line. frame_rate.c divides the frame limit by the multiplier in effect (vk_dlssg_multiplier), so the display gets the
+// limit and the game renders a half, a third or a quarter of it.
+//
 // DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
 // game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency
 // markers from that start to the host present, all with the frame's number, the count of the game's presents up to it.
@@ -28,11 +34,15 @@
 
 static struct {
     int wanted, loaded, active;
+    int fail;            // DLSSG_NO_FILES or DLSSG_UNAVAILABLE when it was wanted and does not run (vk_dlssg_status)
     int mode, pending;   // generation as the driver has it, and the frames since the host asked for the other state
+    int shown_mult;      // vk_dlssg_multiplier: the frames per game frame as last handed to the DLL (1 while off)
+    PFN_nx2sl_frames_max frames_max;   // NULL with an older DLL, which generates one frame
     PFN_nx2sl_init init;
     PFN_nx2sl_instance_proc gipa;
     PFN_nx2sl_device_proc gdpa;
     PFN_nx2sl_available available;
+    PFN_nx2sl_log_unavailable log_unavailable;
     PFN_nx2sl_frame frame;
     PFN_nx2sl_present_marker marker;
     PFN_nx2sl_sleep sleep;
@@ -49,7 +59,7 @@ static struct {
     PFN_vkGetSwapchainImagesKHR images;
     PFN_vkAcquireNextImageKHR acquire;
     PFN_vkQueuePresentKHR present;
-} S = {.wanted = -1};
+} S = {.wanted = -1, .fail = DLSSG_NO_FILES, .shown_mult = 1};
 
 static void sl_line(const char *line) { rt_log("%s", line); }
 
@@ -94,6 +104,7 @@ int vk_dlssg_early(void) {
     S.gipa = (PFN_nx2sl_instance_proc)(void *)GetProcAddress(m, "nx2sl_instance_proc");
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
+    S.log_unavailable = (PFN_nx2sl_log_unavailable)(void *)GetProcAddress(m, "nx2sl_log_unavailable");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
     S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
@@ -101,6 +112,8 @@ int vk_dlssg_early(void) {
     S.shown = (PFN_nx2sl_shown)(void *)GetProcAddress(m, "nx2sl_shown");
     S.shutdown = (PFN_nx2sl_shutdown)(void *)GetProcAddress(m, "nx2sl_shutdown");
     S.reflex = (PFN_nx2sl_reflex)(void *)GetProcAddress(m, "nx2sl_reflex");
+    S.frames_max = (PFN_nx2sl_frames_max)(void *)GetProcAddress(m, "nx2sl_frames_max");   // optional: 2x only without
+    if (!S.frames_max) rt_log("dlssg: nx2navi_dlssg.dll is older than multi frame generation: 2x at most");
     if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker ||
         !S.sleep || !S.submit_end || !S.shown || !S.reflex) {
         rt_log("dlssg: nx2navi_dlssg.dll is from another build: DLSS Frame Generation off");
@@ -140,8 +153,13 @@ VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDe
     return f ? f(pd, ci, NULL, out) : vkCreateDevice(pd, ci, NULL, out);
 }
 
-void vk_dlssg_device_ready(VkDevice dev) {
-    if (S.loaded <= 0 || !S.available()) return;
+void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
+    if (S.loaded <= 0) return;
+    if (!S.available()) {
+        S.fail = DLSSG_UNAVAILABLE;
+        if (S.log_unavailable) S.log_unavailable(physical);
+        return;
+    }
     PFN_vkGetDeviceProcAddr g = S.gdpa();
     S.create_sc = (PFN_vkCreateSwapchainKHR)g(dev, "vkCreateSwapchainKHR");
     S.destroy_sc = (PFN_vkDestroySwapchainKHR)g(dev, "vkDestroySwapchainKHR");
@@ -154,6 +172,60 @@ void vk_dlssg_device_ready(VkDevice dev) {
 }
 
 int vk_dlssg_active(void) { return S.active; }
+
+int vk_dlssg_status(void) {
+    if (S.active) return DLSSG_RUNS;
+    return vk_dlssg_wanted() ? S.fail : DLSSG_NOT_WANTED;
+}
+
+int vk_dlssg_multiplier_of(const char *value, int max, const char **why) {
+    const char *w = NULL;
+    long n = 2;
+    if (value && *value) {
+        char *end;
+        n = strtol(value, &end, 10);
+        if (*end == 'x' || *end == 'X') end++;
+        if (*end || end == value || n < 2) w = "is not 2, 3 or 4", n = 2;
+        else if (n > 4) w = "is above 4, the most there is", n = 4;
+    }
+    if (max >= 2 && n > max) w = "is above what this GPU and driver allow", n = max;
+    if (why) *why = w;
+    return (int)n;
+}
+
+// Streamline's limit as a multiplier: 2 to 4, or 0 while it has reported none (the first frames). An older DLL
+// generates one frame: 2.
+static int gpu_multiplier_max(int *old_dll) {
+    if (old_dll) *old_dll = !S.frames_max;
+    if (!S.frames_max) return 2;
+    uint32_t f = S.frames_max();
+    return !f ? 0 : f >= 3 ? 4 : (int)f + 1;
+}
+
+int vk_dlssg_multiplier_max(int *old_dll) {
+    if (old_dll) *old_dll = 0;
+    return S.active ? gpu_multiplier_max(old_dll) : 0;
+}
+
+int vk_dlssg_multiplier(void) { return S.active ? __atomic_load_n(&S.shown_mult, __ATOMIC_RELAXED) : 1; }
+
+// The multiplier the setting gives here (present thread), clamped to the GPU's limit; one log line each time the value
+// or the limit changes and the value is not taken as it is. Until Streamline reports its limit, one generated frame,
+// and no log line about the GPU yet.
+static int multiplier_wanted(void) {
+    static char last[24];
+    static int last_max = -1, m = 2;
+    const char *value = cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER");
+    int max = gpu_multiplier_max(NULL);
+    if (max == last_max && !strncmp(value, last, sizeof last - 1)) return m;
+    snprintf(last, sizeof last, "%s", value);
+    last_max = max;
+    const char *why;
+    int n = vk_dlssg_multiplier_of(value, max, &why);
+    if (why) rt_log("dlssg: framegen_multiplier = %s %s (up to %dx here): %dx", value, why, max ? max : 4, n);
+    m = max ? n : 2;
+    return m;
+}
 
 // vk_device.c: while Streamline is loaded, every device entry point the runtime fetches goes through its interposer, so
 // its plugins see the calls they hook (Reflex's frame timing and DLSS-G's presents). NULL keeps the loader's.
@@ -222,7 +294,8 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
     if (want == S.mode) S.pending = 0;
     else if (++S.pending >= FG_SETTLE_FRAMES) { S.mode = want; S.pending = 0; }
     else want = S.mode;   // hold the state it has until the new one stays
-    int on = want;
+    int on = want, mult = multiplier_wanted();
+    __atomic_store_n(&S.shown_mult, on ? mult : 1, __ATOMIC_RELAXED);   // the pacer's divisor (frame_rate.c)
     Nx2SlImage zd = {d.image, dv, d.format, d.width, d.height, VK_IMAGE_LAYOUT_GENERAL,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
     Nx2SlImage zm = {m.image, mvv, m.format, m.width, m.height, VK_IMAGE_LAYOUT_GENERAL,
@@ -233,12 +306,17 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
         memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
         memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+        // the frame's own near and far planes (vk_dlaa.c proj_planes); nx2navi_dlssg.dll tells Streamline the depth is
+        // not inverted, which holds for every projection the game has shown (0 near, 1 far)
+        k.znear = c.znear, k.zfar = c.zfar, k.fov_y = c.fov_y, k.aspect = c.aspect;
+        static int told;
+        if (c.inverted && !told++) rt_log("dlssg: the scene's depth is inverted, which Streamline is not told");
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
         k.reset = reset;
     }
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on, S.cur);
+    // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off
+    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
 }
 
 void vk_dlssg_release(void) {

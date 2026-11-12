@@ -16,6 +16,7 @@ zbic (GPL-2.0) unpacks the game's compressed program files. The release does not
 wheel for its own Python from PyPI and unpacks it into pydeps/, as `pip install zbic` would.
 """
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -52,6 +53,25 @@ class ToolchainError(Exception):
 
 
 # ---------------------------------------------------------------- the package database
+
+def zstd_missing(layout):
+    """Why this Python cannot read zstd files, or '' when it can. The MSYS2 packages and the game's files are zstd:
+    Python 3.14 reads them with compression.zstd, an older Python needs the zstandard package. The release's Python
+    has both; a checkout runs under whatever Python started it, and without either the build stopped at its first
+    unpack with nothing but "No module named 'zstandard'"."""
+    for name in ('compression.zstd', 'zstandard'):
+        try:
+            importlib.import_module(name)
+            return ''
+        except ImportError:
+            pass
+    ver = '.'.join(map(str, sys.version_info[:3]))
+    if not layout.dev:
+        return f'The launcher\'s Python ({ver}) is missing its zstandard package. Reinstall NX2navi.'
+    req = layout.app / 'tools' / 'requirements-launcher.txt'
+    return (f'This Python ({ver}) cannot unpack the build tools: before 3.14 it needs the zstandard package. '
+            f'Install the launcher\'s packages with: "{sys.executable}" -m pip install -r "{req}"')
+
 
 def _zstd_decompress_stream(data):
     try:

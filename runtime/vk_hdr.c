@@ -1,8 +1,10 @@
 // HDR output (NX2NAVI_HDR=1): an HDR10 swapchain (Rec. 2020 primaries, PQ) and a game picture tone mapped to the
-// display's range. Settings: NX2NAVI_HDR (read at start); the nits NX2NAVI_HDR_PEAK_NITS (the display's peak),
-// NX2NAVI_HDR_GAME_NITS (the picture's white, "paper white") and NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white);
-// NX2NAVI_HDR_GAMMA, NX2NAVI_HDR_TONEMAP and the grading sliders NX2NAVI_HDR_EXPOSURE .. NX2NAVI_HDR_GRADE, all read
-// when the settings change (vk_hdr_support). With NX2NAVI_HDR=0 nothing here runs and the present is what it was.
+// display's range, one fixed look (shaders/hdr_tonemap.frag says which). Settings: NX2NAVI_HDR, on and off following
+// the menu during a run (vk_hdr_wanted), the game's own HDR (native, the menu's other HDR) from the start only; and
+// the nits NX2NAVI_HDR_PEAK_NITS (the display's peak), NX2NAVI_HDR_GAME_NITS (the picture's white, "paper white") and
+// NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white), read when the settings change (vk_hdr_support). With
+// NX2NAVI_HDR=0 the swapchain is SDR, the spliced tonemap gives the game's own SDR picture (vk_hdr_support, p0.w = -1)
+// and the present is what it was.
 //
 // The game's picture (docs/architecture.md, "HDR"). The game tonemaps its scene into an r11g11b10f target, upscales it
 // and draws the HUD into a second one (float, nothing in these passes clamps), and one last draw copies that into the
@@ -10,8 +12,8 @@
 // 1. vk_hdr_shader_swap, on each fragment shader as it loads (in memory only; the cache keeps the translator's): 1.1.1's
 //    tonemap ends in the fitted ACES curve and a clamp to 0..1 per channel. tonemap_splice links the function
 //    nx_tonemap of shaders/hdr_tonemap.frag into that shader and stores its result in place of the three clamped
-//    channels: the game's SDR result upgraded to the HDR range and mapped onto the display (that file says how), with
-//    the settings in four vec4 the support buffer gains at 1440. Recognised by the curve's constants, not by a hash, so
+//    channels: the scene mapped onto the display (that file says how), from the values the curve takes and the scene
+//    before the game's exposure gain, with the settings in a vec4 the support buffer gains at 1440. Recognised by the curve's constants, not by a hash, so
 //    another translator still finds it. The game's FSR 1 upscale after it would clamp the picture to 1 again;
 //    fsr_unclamp drops that clamp in its SPIR-V.
 // 2. vk_hdr_draw / vk_hdr_present_source: a draw into a presented window texture that samples one float texture of
@@ -45,31 +47,70 @@
 
 // ---- settings
 
-static int g_wanted = -1;
+// What the start decides for the whole run (hdr_start, first asked when the Vulkan instance is made):
+// - armed: the HDR path is set up, so the menu can switch HDR on and off without a restart: the instance and device
+//   get the HDR extensions (vk_device.c), the game's tonemap is spliced as its shaders load (vk_hdr_shader_swap) and
+//   every draw's support buffer carries the settings (vk_exec_draw.c). While the swapchain is SDR the spliced tonemap
+//   returns the game's own SDR result. Always, unless NX2NAVI_HDR_LIVE = 0 with NX2NAVI_HDR = 0 (the path left out as it
+//   was before the setting followed the menu: HDR then needs a restart) or a probe turned it off (vk_hdr_off).
+// - native: NX2NAVI_HDR = native, the game's own HDR. The display is reported as HDR10 (ov_gfx.c
+//   QueryDisplayHdrStatus, with the peak and paper white of the settings), and the game then renders its HDR picture
+//   itself and presents it as PQ-encoded Rec. 2020 in A2B10G10R10 (format 64), which goes to the HDR10 swapchain as it
+//   is: no tonemap splice, no float picture, no encode (pictures still presented in 8 bits, before the switch, are
+//   encoded as for 1). The game asks once, so a change to or from native waits for a restart (vk_hdr_needs_restart).
+static int g_armed = -1, g_native = -1;
 
+static void hdr_start(void) {
+    if (g_armed >= 0) return;
+    g_native = !strcmp(cfg_value("NX2NAVI_HDR"), "native");
+    g_armed = cfg_bool("NX2NAVI_HDR") || cfg_bool("NX2NAVI_HDR_LIVE");   // last: the mark that both are read
+}
+
+int vk_hdr_armed(void) {
+    hdr_start();
+    return g_armed;
+}
+
+int vk_hdr_native(void) { return vk_hdr_armed() && g_native; }
+
+// HDR is on now: the setting as the menu has it, read again when the settings change. The swapchain follows at the
+// next present (gfx_present.c window_settings_live makes it again) and vk_hdr_active then says what it got. A run that
+// started with the game's own HDR keeps it: the game goes on presenting its PQ picture whatever the menu says.
 int vk_hdr_wanted(void) {
-    if (g_wanted < 0) g_wanted = cfg_bool("NX2NAVI_HDR");
-    return g_wanted;
+    static unsigned seen = ~0u;
+    static int on;
+    if (!vk_hdr_armed()) return 0;
+    if (g_native) return 1;
+    unsigned v = cfg_version();
+    if (__atomic_load_n(&seen, __ATOMIC_ACQUIRE) != v) {
+        __atomic_store_n(&on, cfg_bool("NX2NAVI_HDR") != 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&seen, v, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&on, __ATOMIC_ACQUIRE);
 }
 
-// NX2NAVI_HDR = native: the game's own HDR. The display is reported as HDR10 (ov_gfx.c QueryDisplayHdrStatus, with
-// the peak and paper white of the settings), and the game then renders its HDR picture itself and presents it as
-// PQ-encoded Rec. 2020 in A2B10G10R10 (format 64), which goes to the HDR10 swapchain as it is: no tonemap splice, no
-// float picture, no encode (pictures still presented in 8 bits, before the switch, are encoded as for 1).
-static int g_native = -1;
-int vk_hdr_native(void) {
-    if (g_native < 0) g_native = !strcmp(cfg_value("NX2NAVI_HDR"), "native");
-    return g_native && vk_hdr_wanted();
+// The menu's HDR row: what is set takes a restart. To or from the game's own HDR, and switching HDR on in a run that
+// started without the HDR path (NX2NAVI_HDR_LIVE = 0).
+int vk_hdr_needs_restart(void) {
+    hdr_start();
+    return (!strcmp(cfg_value("NX2NAVI_HDR"), "native")) != g_native || (!g_armed && cfg_bool("NX2NAVI_HDR"));
 }
 
-void vk_hdr_off(void) { g_wanted = 0; }
+void vk_hdr_off(void) { g_native = 0, g_armed = 0; }
 
 // The settings, read again when they change. The replay (every draw's support buffer) and the present thread read
 // them: an update fills the snapshot not in use and then publishes it.
+// The game's picture is graded for a display of gamma about 2.2, and its sRGB encode is linear near black: shown as
+// that encode decodes, its darkest tones sit up to a hundred times above where such a display puts them (a scene
+// value of 0.001, 0.08 nits at a white of 350 nits against 0.001), the floor of a dark scene lifted to grey. So the
+// present shows the picture as a 2.2 display would (hdr_encode.comp, hdr_ui.frag: the power 2.2 of the sRGB code),
+// and the tonemap aims its peak below the display's by that correction's inverse (hdr_tonemap.frag nx_tonemap).
+#define HDR_GAMMA 1.0f   // the present's correction: 0 none, 1: 2.2, 2: 2.4
+
 typedef struct {
     float peak, game, ui;   // nits
-    float gamma;            // 0 none, 1: 2.2, 2: 2.4 (the present's correction, hdr_encode.comp)
-    float tm[16];           // the support buffer's four vec4 (shaders/hdr_tonemap.frag p0..p3)
+    float gamma;            // HDR_GAMMA (hdr_encode.comp, hdr_ui.frag)
+    float tm[4];            // the support buffer's vec4 (shaders/hdr_tonemap.frag p0)
 } Nits;
 static struct { unsigned seen; int cur; Nits snap[2]; PlatMutex lock; } N = {.seen = ~0u, .lock = PLAT_MUTEX_INIT};
 
@@ -84,23 +125,8 @@ static Nits nits(void) {
             n->peak = clampf((float)cfg_double("NX2NAVI_HDR_PEAK_NITS"), 80.0f, 10000.0f);
             n->game = clampf((float)cfg_double("NX2NAVI_HDR_GAME_NITS"), 48.0f, 500.0f);
             n->ui = clampf((float)cfg_double("NX2NAVI_HDR_UI_NITS"), 48.0f, 500.0f);
-            const char *g = cfg_value("NX2NAVI_HDR_GAMMA");
-            n->gamma = !strcmp(g, "2.2") ? 1.0f : !strcmp(g, "2.4") ? 2.0f : 0.0f;
-            // the sliders' 0..100 with 50 unchanged become factors around 1; blowout and hue are fractions
-            float pct[8];
-            static const char *const keys[8] = {"NX2NAVI_HDR_HIGHLIGHTS", "NX2NAVI_HDR_SHADOWS", "NX2NAVI_HDR_CONTRAST",
-                                                "NX2NAVI_HDR_SATURATION", "NX2NAVI_HDR_HIGHLIGHT_SAT", "NX2NAVI_HDR_BLOWOUT",
-                                                "NX2NAVI_HDR_FLARE", "NX2NAVI_HDR_HUE"};
-            for (int i = 0; i < 8; i++) pct[i] = clampf((float)cfg_double(keys[i]), 0.0f, 100.0f);
-            float *t = n->tm;
-            t[0] = n->peak, t[1] = n->game, t[2] = n->ui;
-            t[3] = !strcmp(cfg_value("NX2NAVI_HDR_TONEMAP"), "vanilla") ? 0.0f : 3.0f;
-            t[4] = clampf((float)cfg_double("NX2NAVI_HDR_EXPOSURE"), 0.0f, 200.0f) / 100.0f;
-            t[5] = pct[0] * 0.02f, t[6] = pct[1] * 0.02f, t[7] = pct[2] * 0.02f;
-            t[8] = pct[3] * 0.02f, t[9] = pct[4] * 0.02f, t[10] = pct[5] * 0.01f, t[11] = pct[6] * 0.02f;
-            t[12] = pct[7] * 0.01f;
-            t[13] = clampf((float)cfg_double("NX2NAVI_HDR_GRADE"), 0.0f, 100.0f) / 100.0f;
-            t[14] = n->gamma, t[15] = 0;
+            n->gamma = HDR_GAMMA;
+            n->tm[0] = n->peak, n->tm[1] = n->game, n->tm[2] = n->ui, n->tm[3] = 1.0f;
             __atomic_store_n(&N.cur, !N.cur, __ATOMIC_RELEASE);
             __atomic_store_n(&N.seen, v, __ATOMIC_RELEASE);
         }
@@ -109,7 +135,7 @@ static Nits nits(void) {
     return N.snap[__atomic_load_n(&N.cur, __ATOMIC_ACQUIRE)];
 }
 
-void vk_hdr_support(float out[16]) {
+void vk_hdr_support(float out[4]) {
     Nits n = nits();
     memcpy(out, n.tm, sizeof n.tm);
     if (!vk_hdr_active()) out[3] = -1.0f;   // no HDR10 swapchain (yet): the game's own SDR picture
@@ -125,7 +151,7 @@ enum { SPV_OP_NAME = 5, SPV_OP_EXT_INST_IMPORT = 11, SPV_OP_EXT_INST = 12, SPV_O
        SPV_OP_FUNCTION_PARAMETER = 55, SPV_OP_FUNCTION_END = 56, SPV_OP_FUNCTION_CALL = 57, SPV_OP_VARIABLE = 59,
        SPV_OP_LOAD = 61, SPV_OP_STORE = 62, SPV_OP_ACCESS_CHAIN = 65, SPV_OP_DECORATE = 71, SPV_OP_MEMBER_DECORATE = 72,
        SPV_OP_VECTOR_SHUFFLE = 79, SPV_OP_COMPOSITE_CONSTRUCT = 80, SPV_OP_COMPOSITE_EXTRACT = 81,
-       SPV_OP_COMPOSITE_INSERT = 82, SPV_OP_FMUL = 133, SPV_OP_FDIV = 136, SPV_OP_LOOP_MERGE = 246,
+       SPV_OP_COMPOSITE_INSERT = 82, SPV_OP_FADD = 129, SPV_OP_FMUL = 133, SPV_OP_FDIV = 136, SPV_OP_LOOP_MERGE = 246,
        SPV_OP_SELECTION_MERGE = 247, SPV_OP_LABEL = 248, SPV_OP_BRANCH_CONDITIONAL = 250, SPV_OP_SWITCH = 251,
        SPV_OP_LINE = 8, SPV_OP_NO_LINE = 317, SPV_DEC_OFFSET = 35, SPV_SC_UNIFORM = 2, SPV_SC_OUTPUT = 3,
        SPV_SC_FUNCTION = 7, SPV_CAP_SHADER = 1, GLSL_FMA = 50, GLSL_FMAX = 40, GLSL_FCLAMP = 43, GLSL_NMAX = 80,
@@ -252,13 +278,149 @@ static int put_mapped(SpvOut *o, const uint32_t *ins, const uint32_t *map, uint3
 static int is_type_op(uint32_t op) { return op >= 19 && op <= 39; }
 static int is_const_op(uint32_t op) { return op >= SPV_OP_CONSTANT_TRUE && op <= SPV_OP_CONSTANT_NULL && op != 45; }
 
+// What tonemap_splice knows of the game's module while it looks for the exposure: where each result is defined
+// (def), the class of each variable (cls: 1 output, 2 uniform, 3 function), and for a function variable the value
+// its stores gave it and how many there were (sval, scnt).
+typedef struct { const uint32_t *w, *def, *sval; const uint8_t *cls, *scnt; uint32_t bound, glsl; } SpvView;
+
+// The value behind id when id loads a function variable that is stored once (the translator keeps every value in
+// one); id itself otherwise.
+static uint32_t spv_stored(const SpvView *v, uint32_t id) {
+    if (id >= v->bound || !v->def[id]) return id;
+    const uint32_t *l = v->w + v->def[id];
+    if ((l[0] & 0xffff) != SPV_OP_LOAD || l[3] >= v->bound || v->cls[l[3]] != 3 || v->scnt[l[3]] != 1) return id;
+    return v->sval[l[3]];
+}
+
+static int spv_uniform_load(const SpvView *v, uint32_t id) {   // id loads a member of a uniform block
+    if (id >= v->bound || !v->def[id]) return 0;
+    const uint32_t *l = v->w + v->def[id];
+    if ((l[0] & 0xffff) != SPV_OP_LOAD || l[3] >= v->bound || !v->def[l[3]]) return 0;
+    const uint32_t *c = v->w + v->def[l[3]];
+    return (c[0] & 0xffff) == SPV_OP_ACCESS_CHAIN && c[3] < v->bound && v->cls[c[3]] == 2;
+}
+
+// a and b are the same value read twice: one id, two loads of one variable, or two loads through access chains of
+// one base and the same indices (the translator loads a uniform anew at each use).
+static int spv_same_source(const SpvView *v, uint32_t a, uint32_t b) {
+    if (a == b) return 1;
+    if (a >= v->bound || b >= v->bound || !v->def[a] || !v->def[b]) return 0;
+    const uint32_t *la = v->w + v->def[a], *lb = v->w + v->def[b];
+    if ((la[0] & 0xffff) != SPV_OP_LOAD || (lb[0] & 0xffff) != SPV_OP_LOAD) return 0;
+    if (la[3] == lb[3]) return 1;
+    if (la[3] >= v->bound || lb[3] >= v->bound || !v->def[la[3]] || !v->def[lb[3]]) return 0;
+    const uint32_t *ca = v->w + v->def[la[3]], *cb = v->w + v->def[lb[3]];
+    return (ca[0] & 0xffff) == SPV_OP_ACCESS_CHAIN && ca[0] == cb[0] && !memcmp(ca + 3, cb + 3, ((ca[0] >> 16) - 3) * 4);
+}
+
+// The three values are products with one factor in common: 1 with the factor (the first value's operand) and what
+// each is multiplied with.
+static int spv_common_factor(const SpvView *v, const uint32_t val[3], uint32_t rest[3], uint32_t *factor) {
+    const uint32_t *m[3];
+    for (int c = 0; c < 3; c++) {
+        if (val[c] >= v->bound || !v->def[val[c]]) return 0;
+        m[c] = v->w + v->def[val[c]];
+        if ((m[c][0] & 0xffff) != SPV_OP_FMUL) return 0;
+    }
+    for (int pos = 4; pos >= 3; pos--) {
+        uint32_t f = m[0][pos];
+        int ok = 1;
+        rest[0] = m[0][7 - pos];
+        for (int c = 1; c < 3 && ok; c++) {
+            if (spv_same_source(v, f, m[c][4])) rest[c] = m[c][3];
+            else if (spv_same_source(v, f, m[c][3])) rest[c] = m[c][4];
+            else ok = 0;
+        }
+        if (ok) { *factor = f; return 1; }
+    }
+    return 0;
+}
+
+// The three values are fma(a, f, t) with one f for the three: 1 with f, and each value's a and t.
+static int spv_common_fma(const SpvView *v, const uint32_t val[3], uint32_t a[3], uint32_t t[3], uint32_t *factor) {
+    const uint32_t *m[3];
+    for (int c = 0; c < 3; c++) {
+        if (val[c] >= v->bound || !v->def[val[c]]) return 0;
+        m[c] = v->w + v->def[val[c]];
+        if ((m[c][0] & 0xffff) != SPV_OP_EXT_INST || (m[c][0] >> 16) != 8 || m[c][3] != v->glsl || m[c][4] != GLSL_FMA) return 0;
+        t[c] = m[c][7];
+    }
+    for (int pos = 6; pos >= 5; pos--) {
+        uint32_t f = m[0][pos];
+        int ok = 1;
+        a[0] = m[0][11 - pos];
+        for (int c = 1; c < 3 && ok; c++) {
+            if (spv_same_source(v, f, m[c][6])) a[c] = m[c][5];
+            else if (spv_same_source(v, f, m[c][5])) a[c] = m[c][6];
+            else ok = 0;
+        }
+        if (ok) { *factor = f; return 1; }
+    }
+    return 0;
+}
+
+// The game's exposure in the three x it feeds its curve, and those values without local exposure ("exposed"; each
+// plus add where add is set). The shapes:
+// - x = scene * gain, one gain for the three: a uniform in the scene's tonemap (its constants, element 3 .z), a value
+//   the vertex shader passes in the shaders that draw into the tonemapped picture with the curve of their own. The
+//   exposed values are x.
+// - x = (scene * gain) * local exposure, the gameplay shader: the local exposure computed from a grid, the gain a
+//   uniform under it. The exposed values are the inner products.
+// - x = fma(scene, gain, colour), a colour added per channel after the exposure, the gain a uniform: x again.
+// - x = fma(scene * gain, local exposure, colour): the inner products, plus the colours.
+// 1 when one of them is found.
+static int spv_exposure(const SpvView *v, const uint32_t x[3], uint32_t exposed[3], uint32_t add[3], uint32_t *gain) {
+    uint32_t val[3], inner[3], rest[3], a[3], t[3], f;
+    for (int c = 0; c < 3; c++) val[c] = spv_stored(v, x[c]), exposed[c] = x[c], add[c] = 0;
+    if (spv_common_factor(v, val, rest, gain)) {
+        if (spv_uniform_load(v, *gain)) return 1;
+        for (int c = 0; c < 3; c++) inner[c] = spv_stored(v, rest[c]);
+        if (spv_common_factor(v, inner, rest, &f) && spv_uniform_load(v, f)) {
+            memcpy(exposed, inner, sizeof inner);
+            *gain = f;
+        }
+        return 1;
+    }
+    if (!spv_common_fma(v, val, a, t, gain)) return 0;
+    if (spv_uniform_load(v, *gain)) return 1;
+    for (int c = 0; c < 3; c++) inner[c] = spv_stored(v, a[c]);
+    if (!spv_common_factor(v, inner, rest, &f) || !spv_uniform_load(v, f)) return 0;
+    memcpy(exposed, inner, sizeof inner);
+    memcpy(add, t, sizeof t);
+    *gain = f;
+    return 1;
+}
+
+// The instruction at pos, between the function's first label and end, is in a block outside every selection and
+// loop: such a block runs on every path and before the blocks after it. Constructs nest between the instruction that
+// names their merge block and that block's label.
+static int spv_top_level(const uint32_t *w, uint64_t first_label, uint64_t end, uint64_t pos) {
+    enum { DEPTH = 64 };
+    uint32_t merge[DEPTH];
+    int depth = 0;
+    for (uint64_t i = first_label; i < end; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff;
+        if (op == SPV_OP_LABEL)
+            while (depth && merge[depth - 1] == w[i + 1]) depth--;
+        if (i == pos) return !depth;
+        if (op == SPV_OP_SELECTION_MERGE || op == SPV_OP_LOOP_MERGE) {
+            if (depth == DEPTH) return 0;
+            merge[depth++] = w[i + 1];
+        }
+    }
+    return 0;
+}
+
 // The fitted ACES curve the game ends its tonemap with: FClamp/NClamp(FMul(FMul(x, Fma(x, 2.51, 0.03)), rcp), 0, 1)
 // per channel, each result stored to a function variable that the output store of its channel loads. tonemap_splice
-// keeps everything the game computes and only changes what the three colour channels store: nx_tonemap of the three x
-// (shaders/hdr_tonemap.frag), called just before the first of those stores, with the settings from four vec4 the
-// support buffer gains at 1440 (vk_exec_draw.c support_fill writes them; the translator's SupportBuffer ends there).
-// The library's types are matched to the game's where the same (SPIR-V allows one declaration of each), its constants
-// and functions appended with new ids. Gives up (0) on any shape it does not expect, and the shader stays as it was.
+// keeps everything the game computes and only changes what the three colour channels store: nx_tonemap
+// (shaders/hdr_tonemap.frag), called just before the first of those stores, of the three x, of those values without
+// local exposure with the exposure gain in them (spv_exposure; x and a gain of 1 when it finds none), and of the
+// settings from the HDR_SETS vec4 the support buffer gains at 1440 (vk_exec_draw.c support_fill writes them; the
+// translator's SupportBuffer ends there). The library's types are matched to the game's where the same (SPIR-V allows
+// one declaration of each), its constants and functions appended with new ids. Gives up (0) on any shape it does not
+// expect, and the shader stays as it was.
+enum { HDR_SETS = 1, HDR_PARAMS = HDR_SETS + 2 };   // nx_tonemap(vec3 x, vec4 scene, vec4 settings[HDR_SETS])
 static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
     uint32_t *w = *spirv;
     uint64_t n = *words;
@@ -273,8 +435,10 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
     int nfn = 0;
     uint32_t *def = calloc(bound, sizeof *def);   // result id -> word index of its instruction
     int32_t *cval = calloc(bound, sizeof *cval);  // integer constant id -> value + 1
-    uint8_t *outv = calloc(bound, 1);             // 1: an Output variable
-    if (!def || !cval || !outv) goto fail;
+    uint8_t *cls = calloc(bound, 1);              // a variable's class: 1 output, 2 uniform, 3 function
+    uint32_t *sval = calloc(bound, sizeof *sval); // variable -> the value last stored to it
+    uint8_t *scnt = calloc(bound, 1);             // variable -> its stores, counted to 2
+    if (!def || !cval || !cls || !sval || !scnt) goto fail;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) goto fail;
@@ -295,10 +459,17 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
         else if (op == SPV_OP_LABEL && !first_label) first_label = i;
         if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound) {
             if (a[1] == sb && sb) sb_ptr = a[0];
-            if (a[2] == SPV_SC_OUTPUT) outv[a[1]] = 1;
+            cls[a[1]] = a[2] == SPV_SC_OUTPUT ? 1 : a[2] == SPV_SC_UNIFORM ? 2 : a[2] == SPV_SC_FUNCTION ? 3 : 0;
         }
-        if (len >= 3 && a[1] < bound && (op == SPV_OP_FMUL || op == SPV_OP_FDIV || op == SPV_OP_EXT_INST ||
-                                         op == SPV_OP_LOAD || op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_VARIABLE))
+        if (op == SPV_OP_STORE && len >= 3 && a[0] < bound) sval[a[0]] = a[1], scnt[a[0]] += scnt[a[0]] < 2;
+        // where each result is defined: the globals the checks below look at, and inside the function every instruction
+        // that has a result (its second word; the first definition stands, so a word of an instruction without one,
+        // taken for a result here, cannot replace a real one)
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound) def[a[1]] = (uint32_t)i;
+        else if (first_fn && len >= 3 && a[1] < bound && !def[a[1]] && op != SPV_OP_STORE && op != SPV_OP_LABEL &&
+                 op != SPV_OP_SELECTION_MERGE && op != SPV_OP_LOOP_MERGE && op != SPV_OP_BRANCH_CONDITIONAL &&
+                 op != SPV_OP_SWITCH && op != 63 /* OpCopyMemory */ && op != 99 /* OpImageWrite */ &&
+                 op != 228 /* OpAtomicStore */ && op != 254 /* OpReturnValue */)
             def[a[1]] = (uint32_t)i;
         i += len;
     }
@@ -346,7 +517,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
         const uint32_t *a = w + i + 1;
         if ((w[i] & 0xffff) != SPV_OP_STORE || (w[i] >> 16) < 3 || a[0] >= bound || !def[a[0]]) continue;
         const uint32_t *ch = w + def[a[0]];
-        if ((ch[0] & 0xffff) != SPV_OP_ACCESS_CHAIN || (ch[0] >> 16) != 5 || ch[3] >= bound || !outv[ch[3]] ||
+        if ((ch[0] & 0xffff) != SPV_OP_ACCESS_CHAIN || (ch[0] >> 16) != 5 || ch[3] >= bound || cls[ch[3]] != 1 ||
             ch[4] >= bound || cval[ch[4]] < 1 || cval[ch[4]] > 3)
             continue;
         int c = cval[ch[4]] - 1;
@@ -372,6 +543,25 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
         if (site[chan_site[c]] >= at || def[site_x[chan_site[c]]] >= at) goto fail;
     for (uint64_t i = lo; i < hi; i += w[i] >> 16)
         if ((w[i] & 0xffff) == SPV_OP_LABEL) goto fail;
+    // the exposed values and the gain: usable at the call when defined in a block outside every selection and loop
+    // before it, or in the call's own
+    const SpvView view = {w, def, sval, cls, scnt, bound, glsl};
+    uint32_t exposed[3], add[3], gain = 0;
+    uint64_t at_block = first_label;
+    for (uint64_t i = first_label + (w[first_label] >> 16); i < at; i += w[i] >> 16)
+        if ((w[i] & 0xffff) == SPV_OP_LABEL) at_block = i;
+    const uint32_t xs[3] = {site_x[chan_site[0]], site_x[chan_site[1]], site_x[chan_site[2]]};
+    int exposure_found = spv_exposure(&view, xs, exposed, add, &gain);
+    for (int c = 0; c < 7 && exposure_found; c++) {
+        uint32_t idc = c < 3 ? exposed[c] : c < 6 ? add[c - 3] : gain;
+        if (c >= 3 && c < 6 && !idc) continue;   // nothing added
+        uint64_t d = idc < bound ? def[idc] : 0;
+        if (!d || d >= at || !(d > at_block || spv_top_level(w, first_label, at, d))) exposure_found = 0;
+    }
+    if (!exposure_found) {
+        for (int c = 0; c < 3; c++) exposed[c] = site_x[chan_site[c]], add[c] = 0;
+        gain = c1;
+    }
 
     // the library: its ids mapped into the game's id space
     const uint32_t *L = hdr_tonemap_spv;
@@ -424,13 +614,13 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
     for (uint64_t i = 5; i < ln; i += L[i] >> 16)   // nx_tonemap's function type
         if ((L[i] & 0xffff) == SPV_OP_FUNCTION && L[i + 2] == fn) fn_type = L[i + 4];
     if (!entry || !fn || !fn_type || !map[fn_type]) goto lib_fail;
-    // nx_tonemap(vec3, vec4 x 4) with its parameters by pointer, as the compiler writes them
+    // nx_tonemap(vec3, vec4 x (1 + HDR_SETS)) with its parameters by pointer, as the compiler writes them
     const uint32_t *ftype = NULL;
     for (uint64_t i = 5; i < ln && !ftype; i += L[i] >> 16)
-        if ((L[i] & 0xffff) == SPV_OP_TYPE_FUNCTION && L[i + 1] == fn_type && (L[i] >> 16) == 8) ftype = L + i;
+        if ((L[i] & 0xffff) == SPV_OP_TYPE_FUNCTION && L[i + 1] == fn_type && (L[i] >> 16) == 3 + HDR_PARAMS) ftype = L + i;
     if (!ftype) goto lib_fail;
-    uint32_t param_ptr[5], v3 = map[ftype[2]], v4 = 0, ptr_types_ok = 1;
-    for (int p = 0; p < 5; p++) {
+    uint32_t param_ptr[HDR_PARAMS], v3 = map[ftype[2]], v4 = 0, ptr_types_ok = 1;
+    for (int p = 0; p < HDR_PARAMS; p++) {
         param_ptr[p] = map[ftype[3 + p]];
         uint32_t pointee = 0;
         for (uint64_t i = 5; i < ln; i += L[i] >> 16)
@@ -469,43 +659,53 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
 
     // the result: the game's module with the support block grown, the library's globals before the first function,
     // the call in main, the three stores changed, and the library's functions at the end
-    uint32_t idx[4], ptr_v4 = ptr_v4u ? ptr_v4u : id++, var[5], pv[4], pl[4], xv = id++, res = id++, e[3];
-    for (int m = 0; m < 4; m++) idx[m] = id++, pv[m] = id++, pl[m] = id++;
-    for (int p = 0; p < 5; p++) var[p] = id++;
-    for (int c = 0; c < 3; c++) e[c] = id++;
+    uint32_t idx[HDR_SETS], ptr_v4 = ptr_v4u ? ptr_v4u : id++, var[HDR_PARAMS], pv[HDR_SETS], pl[HDR_SETS], xv = id++,
+             sv = id++, res = id++, e[3], sum[3];
+    for (int m = 0; m < HDR_SETS; m++) idx[m] = id++, pv[m] = id++, pl[m] = id++;
+    for (int p = 0; p < HDR_PARAMS; p++) var[p] = id++;
+    for (int c = 0; c < 3; c++) e[c] = id++, sum[c] = id++;
     put(&o, w, 5);
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (i == first_fn) {
             put(&o, g.w, (uint32_t)g.n);
             if (!ptr_v4u) PUT(&o, SPV_OP_TYPE_POINTER, ptr_v4, SPV_SC_UNIFORM, st_v4);
-            for (int m = 0; m < 4; m++) PUT(&o, SPV_OP_CONSTANT, it, idx[m], 11 + m);
+            for (int m = 0; m < HDR_SETS; m++) PUT(&o, SPV_OP_CONSTANT, it, idx[m], 11 + m);
         }
-        if (i == st_at) {   // the support block gains four vec4 at 1440
+        if (i == st_at) {   // the support block gains HDR_SETS vec4 at 1440
             put(&o, w + i, len);
-            o.w[o.n - len] = (len + 4) << 16 | op;
-            for (int m = 0; m < 4; m++) put(&o, &st_v4, 1);
+            o.w[o.n - len] = (len + HDR_SETS) << 16 | op;
+            for (int m = 0; m < HDR_SETS; m++) put(&o, &st_v4, 1);
         } else if (i == dec_at) {
             put(&o, w + i, len);
-            for (int m = 0; m < 4; m++) PUT(&o, SPV_OP_MEMBER_DECORATE, st, 11 + m, SPV_DEC_OFFSET, 1440 + 16 * m);
+            for (int m = 0; m < HDR_SETS; m++) PUT(&o, SPV_OP_MEMBER_DECORATE, st, 11 + m, SPV_DEC_OFFSET, 1440 + 16 * m);
         } else if (i == first_label) {
             put(&o, w + i, len);
-            for (int p = 0; p < 5; p++) PUT(&o, SPV_OP_VARIABLE, param_ptr[p], var[p], SPV_SC_FUNCTION);
+            for (int p = 0; p < HDR_PARAMS; p++) PUT(&o, SPV_OP_VARIABLE, param_ptr[p], var[p], SPV_SC_FUNCTION);
         } else if (i == store_at[0] || i == store_at[1] || i == store_at[2]) {
             int c = i == store_at[0] ? 0 : i == store_at[1] ? 1 : 2;
             put(&o, w + i, len);
             o.w[o.n - len + 2] = e[c];
         } else {
             if (i == at) {
-                for (int m = 0; m < 4; m++) {
+                for (int m = 0; m < HDR_SETS; m++) {
                     PUT(&o, SPV_OP_ACCESS_CHAIN, ptr_v4, pv[m], sb, idx[m]);
                     PUT(&o, SPV_OP_LOAD, st_v4, pl[m], pv[m]);
                 }
                 PUT(&o, SPV_OP_COMPOSITE_CONSTRUCT, v3, xv, site_x[chan_site[0]], site_x[chan_site[1]],
                     site_x[chan_site[2]]);
+                for (int c = 0; c < 3; c++)
+                    if (add[c]) {
+                        PUT(&o, SPV_OP_FADD, ft, sum[c], exposed[c], add[c]);
+                        exposed[c] = sum[c];
+                    }
+                PUT(&o, SPV_OP_COMPOSITE_CONSTRUCT, st_v4, sv, exposed[0], exposed[1], exposed[2], gain);
                 PUT(&o, SPV_OP_STORE, var[0], xv);
-                for (int m = 0; m < 4; m++) PUT(&o, SPV_OP_STORE, var[m + 1], pl[m]);
-                PUT(&o, SPV_OP_FUNCTION_CALL, v3, res, map[fn], var[0], var[1], var[2], var[3], var[4]);
+                PUT(&o, SPV_OP_STORE, var[1], sv);
+                for (int m = 0; m < HDR_SETS; m++) PUT(&o, SPV_OP_STORE, var[m + 2], pl[m]);
+                uint32_t call[4 + HDR_PARAMS] = {(4u + HDR_PARAMS) << 16 | SPV_OP_FUNCTION_CALL, v3, res, map[fn]};
+                memcpy(call + 4, var, sizeof var);
+                put(&o, call, 4 + HDR_PARAMS);
                 for (int c = 0; c < 3; c++) PUT(&o, SPV_OP_COMPOSITE_EXTRACT, ft, e[c], res, c);
             }
             put(&o, w + i, len);
@@ -515,25 +715,27 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
     put(&o, f.w, (uint32_t)f.n);
     if (o.bad) goto lib_fail;
     o.w[3] = id;
-    free(map), free(g.w), free(f.w), free(def), free(cval), free(outv);
+    free(map), free(g.w), free(f.w), free(def), free(cval), free(cls), free(sval), free(scnt);
     free(*spirv);
     *spirv = o.w;
     *words = o.n;
-    return 1;
+    return exposure_found ? 1 : 2;
 lib_fail:
     free(map), free(g.w), free(f.w), free(o.w);
 fail:
-    free(def), free(cval), free(outv);
+    free(def), free(cval), free(cls), free(sval), free(scnt);
     return 0;
 }
 #undef PUT
 
 void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
-    if (!vk_hdr_wanted() || vk_hdr_native() || !*spirv || *words < 5) return;
-    if (tonemap_splice(spirv, words)) {
-        static volatile int32_t spliced;
-        rt_log("hdr: the game's tonemap maps its picture onto the display's range (%d shaders so far)",
-               plat_inc32(&spliced));
+    // armed, not wanted: a shader loaded while HDR is off must be ready for the menu switching it on
+    if (!vk_hdr_armed() || vk_hdr_native() || !*spirv || *words < 5) return;
+    int spliced = tonemap_splice(spirv, words);
+    if (spliced) {
+        static volatile int32_t count;
+        rt_log("hdr: the game's tonemap maps its picture onto the display's range (%d shaders so far)%s",
+               plat_inc32(&count), spliced == 2 ? "; its exposure was not found, so the tone mapper takes it as 1" : "");
     }
     int unclamped = fsr_unclamp(*spirv, words);
     if (unclamped > 0) {
@@ -553,7 +755,8 @@ void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
 int vk_hdr_track;                 // vk_exec_draw.c calls vk_hdr_draw: set at the first present with NX2NAVI_HDR=1
 static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
 static PlatMutex rec_lock = PLAT_MUTEX_INIT;
-static struct { VkImage win, src; VkFormat fmt; } recs[4];   // per presented window image: what the last draw copied
+// per presented window image: what the last draw copied, and where in the stream (vk_exec_stream_pos)
+static struct { VkImage win, src; VkFormat fmt; uint64_t pos; } recs[4];
 static int nrecs;
 
 void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
@@ -571,6 +774,8 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     for (int i = 0; i < 4; i++)   // unlocked first look: most draws go elsewhere (a stale slot only costs the lock below)
         known |= __atomic_load_n(&recs[i].win, __ATOMIC_RELAXED) == t->image;
     if (!known) return;
+    // the last such draw of the stream decides, as in the replay, also when replay workers record draws at once
+    uint64_t pos = vk_exec_stream_pos();
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     int ntex = 0, slot = -1;
@@ -587,7 +792,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     }
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++)
-        if (recs[i].win == t->image) recs[i].src = src, recs[i].fmt = fmt;
+        if (recs[i].win == t->image && pos >= recs[i].pos) recs[i].src = src, recs[i].fmt = fmt, recs[i].pos = pos;
     plat_mutex_unlock(&rec_lock);
 }
 
@@ -598,7 +803,7 @@ void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *form
     int r = -1;
     for (int i = 0; i < nrecs; i++)
         if (recs[i].win == win->image) r = i;
-    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE;
+    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE, recs[r].pos = 0;
     // kept until the next draw into the window texture: a present again without a new copy shows the same picture
     if (r >= 0 && recs[r].src && vk_hdr_active()) *image = recs[r].src, *format = recs[r].fmt;
     plat_mutex_unlock(&rec_lock);
@@ -618,8 +823,8 @@ void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget i
 
 // ---- swapchain
 
-// With NX2NAVI_HDR=1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0 and the
-// reason logged once.
+// While NX2NAVI_HDR is on (vk_hdr_wanted), the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out
+// set, else 0 and the reason logged once.
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
     if (!vk_hdr_wanted()) return 0;
     static int logged;
@@ -954,14 +1159,15 @@ void vk_hdr_release(void) {
     memset(&H, 0, sizeof H);
 }
 
-// PQ code (0..1023) of a 10-bit channel to the sRGB byte of the same colour at the HUD's white (menu test shots and
-// flight thumbnails of an HDR10 swapchain).
+// Luminance of a PQ code (0..1023 over 1) in nits.
 static float pq_nits(float e) {
     const float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
     float p = powf(e, 1.0f / m2);
     return 10000.0f * powf(fmaxf(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
 }
 
+// 10-bit PQ pixels of an HDR10 swapchain to bytes that show on a display of gamma 2.2 what the HDR display shows, the
+// HUD's white at 255 (menu test shots and flight thumbnails): a dark tone the HDR display lifts looks lifted here too.
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) {
     float ui = nits().ui;
     // Rec. 2020 to Rec. 709 (the inverse of ITU-R BT.2087's matrix)
@@ -974,9 +1180,43 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) {
         for (int k = 0; k < 3; k++) c[k] = pq_nits(c[k] / 1023.0f) / ui;
         for (int k = 0; k < 3; k++) {
             float l = fminf(fmaxf(m[3 * k] * c[0] + m[3 * k + 1] * c[1] + m[3 * k + 2] * c[2], 0.0f), 1.0f);
-            float s = l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
-            out[4 * i + k] = (uint8_t)(s * 255.0f + 0.5f);
+            out[4 * i + k] = (uint8_t)(powf(l, 1.0f / 2.2f) * 255.0f + 0.5f);
         }
         out[4 * i + 3] = 255;
     }
+}
+
+// The luminance (Rec. 2020 Y, in nits) of the 10-bit PQ pixels inside the rectangle {x, y, w, h} of a stride-wide
+// image: out = the darkest pixel's, the 0.1st, 1st, 50th and 99th percentiles, the brightest's, and the share of pixels
+// under 0.01 nits. The percentiles come from a histogram of 64 bins a stop, from 2^-24 to 2^14 nits; a value is a bin's
+// upper edge.
+void vk_hdr_luminance_stats(const uint8_t *in, int stride, const int rect[4], int a2r, float out[7]) {
+    enum { LO = -24, HI = 14, PER = 64, BINS = (HI - LO) * PER };
+    static uint32_t hist[BINS + 1];
+    static float lut[1024];
+    for (int i = 0; i < 1024; i++) lut[i] = pq_nits((float)i / 1023.0f);
+    memset(hist, 0, sizeof hist);
+    float lo = 1e30f, hi = 0.0f;
+    uint64_t total = 0, dark = 0;
+    for (int y = rect[1]; y < rect[1] + rect[3]; y++)
+        for (int x = rect[0]; x < rect[0] + rect[2]; x++) {
+            uint32_t v;
+            memcpy(&v, in + 4 * ((size_t)y * (size_t)stride + (size_t)x), 4);
+            float r = lut[v & 1023], g = lut[v >> 10 & 1023], b = lut[v >> 20 & 1023];
+            if (a2r) { float t = r; r = b; b = t; }
+            float l = 0.2627002120f * r + 0.6779980715f * g + 0.0593017165f * b;
+            lo = fminf(lo, l), hi = fmaxf(hi, l);
+            dark += l < 0.01f;
+            int bin = l > 0.0f ? (int)floorf((log2f(l) - LO) * PER) + 1 : 0;   // bin 0: exactly black
+            hist[bin < 0 ? 0 : bin > BINS ? BINS : bin]++;
+            total++;
+        }
+    static const double q[4] = {0.001, 0.01, 0.5, 0.99};
+    for (int k = 0; k < 4; k++) {
+        uint64_t want = (uint64_t)(q[k] * (double)total), seen = 0;
+        int bin = 0;
+        while (bin < BINS && seen + hist[bin] <= want) seen += hist[bin++];
+        out[1 + k] = bin == 0 ? 0.0f : exp2f((float)LO + (float)bin / PER);
+    }
+    out[0] = total ? lo : 0.0f, out[5] = hi, out[6] = total ? (float)((double)dark / (double)total) : 0.0f;
 }
