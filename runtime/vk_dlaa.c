@@ -524,6 +524,9 @@ static struct {
     uint64_t cam_none_draw, cam_none_snap;   // no scene-context draw this frame / one, not in the evaluating submission's copy
     uint64_t cam_at_draw;        // camera taken from the bytes the draw read, where the evaluating submission lacks them
     uint64_t cam_kept, cam_kept_max;   // no camera, history kept with zero motion / runs cut short at KEEP_MAX
+    float cut_pos[3], cut_fwd[3];      // last frame's camera position and direction (cam_cut)
+    uint64_t cut_ns, cuts;             // when it was read; camera cuts that started a new history
+    int cut_ok, cut_logged;
     int keep_run;                // frames in a row kept without a camera
     uint64_t gap_logged, miss_logged, target_logged, second_logged;
     uint64_t seq_present;        // vk_exec_submit_seq at the last present (vk_dlaa_frame)
@@ -601,7 +604,10 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
     if (!D.fg_fresh || D.failed) return 0;
     D.fg_fresh = 0;
     if (!fg_current(D.fg_at)) return 0;
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = 0;
+    // reset: DLSS started a new history on this frame (evaluate). Handed out as 0 before, so frame generation was never
+    // told of a camera cut, another scene size or another target, and interpolated across them: an area load
+    // generated frames between two unrelated pictures.
+    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
     return 1;
 }
 
@@ -999,6 +1005,45 @@ static void cam_note(int view, int kept) {
                                                  : "new history");
 }
 
+// Camera cuts (NX2NAVI_DLAA_CUT, default 1; 0: off). Only a lost camera (mv_pass), another scene size or another
+// target started a new history, so DLSS and frame generation (vk_dlaa_fg_inputs) carried their history across a camera
+// that jumped: an area load or a spawn moves it 5 to 180 m in one frame. Such a frame now starts a new history, as
+// NVIDIA's DLSS guide asks for a camera cut: a move over 5 m, or a turn over 10 degrees together with a move over 0.5 m,
+// both per 60 Hz frame and scaled by the time since the last camera. Camera traces of play in the Fire Temple
+// (NX2NAVI_MOUSE_TRACE) had a median of 0.05 m and 0.08 degrees a frame; the second test took only the area loads and a
+// swing of the camera through a doorway at 12 to 18 degrees and 0.7 to 1.4 m a frame. A turn alone (the mouse camera,
+// which orbits about 3 m from Link) does not count. Each cut is logged, up to 24.
+// v: the Ocarina scene context's rows 0-2, the view (fg_camera).
+static void cam_cut(const float *v) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_CUT", "1");
+    float pos[3], fwd[3];
+    for (int i = 0; i < 3; i++) {
+        fwd[i] = -v[8 + i];
+        pos[i] = -(v[i] * v[3] + v[4 + i] * v[7] + v[8 + i] * v[11]);
+    }
+    uint64_t now = plat_now_ns();
+    if (on && D.cut_ok) {
+        double dot = fwd[0] * D.cut_fwd[0] + fwd[1] * D.cut_fwd[1] + fwd[2] * D.cut_fwd[2];
+        double turn = acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * (180.0 / 3.14159265358979);
+        double dx = pos[0] - D.cut_pos[0], dy = pos[1] - D.cut_pos[1], dz = pos[2] - D.cut_pos[2];
+        double move = sqrt(dx * dx + dy * dy + dz * dz);
+        double k = (now - D.cut_ns) / 1e6 / (1000.0 / 60);   // 60 Hz frames since the last camera
+        if (k < 0.25) k = 0.25;
+        if (k > 4) k = 4;
+        if (move > 5.0 * k || (turn > 10.0 * k && move > 0.5 * k)) {
+            D.reset = 1, D.cuts++;
+            if (D.cut_logged < 24)
+                D.cut_logged++, rt_log("dlaa: frame %llu: camera cut (moved %.2f m, turned %.1f degrees in %.1f ms): new "
+                                       "history (%llu so far)",
+                                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1,
+                                       move, turn, (now - D.cut_ns) / 1e6, (unsigned long long)D.cuts);
+        }
+    }
+    memcpy(D.cut_pos, pos, sizeof pos), memcpy(D.cut_fwd, fwd, sizeof fwd);
+    D.cut_ns = now, D.cut_ok = 1;
+}
+
 // The pass, recorded through the recorder like the replay's own commands. 0: no camera this frame (the vectors stay
 // zero and DLSS starts a new history); 2: no camera, but the history is kept (the vectors stay zero, dlaa_cam_keep).
 // bias > 0 with this frame's G-buffer classes (D.ids) also writes e->mask, the bias mask (dlaa_mv.comp); *masked says
@@ -1066,6 +1111,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     }
     D.fg_cam_ok = 0;
     if (cr && have_m && D.cam_size == OCAM_BLOCK) fg_camera(cr, m);
+    if (cr && D.cam_size == OCAM_BLOCK) cam_cut(cr);
     int s = D.cam_slot, had_prev = D.cam_prev_ok;
     if (D.cam_size == CAM_BLOCK) {   // the whole block, for the per-object motion pass (the deferred engine's only)
         VkBufferCopy bc = {cam.offset, (VkDeviceSize)s * CAM_SLOT, CAM_BLOCK};
@@ -1804,6 +1850,9 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    // Frame generation gets the same new start with this frame's inputs (vk_dlaa_fg_inputs): a frame DLSS starts a
+    // new history on (a camera cut, another scene size or target) has no motion from the frame before that holds.
+    D.fg_reset = D.reset;
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
     if (D.evals % 600 == 0) query_vram();
