@@ -306,7 +306,10 @@ typedef enum {
     UI_MENU_COOP_REMOVE_KEY_CONFIRM /* "%s": the player's name, "%s": the key's fingerprint */, UI_MENU_COOP_NOT_ACCEPTED,
     // a key the player accepted, now signed under another name: a new offer (CoopOfferMember.accepted_as)
     UI_MENU_COOP_ACCEPTED_AS /* "%s": the name it was accepted under */,
-    UI_MENU_LAST_ID = UI_MENU_COOP_ACCEPTED_AS,
+    // the port's own trophies (runtime/trophies.c): the menu tab, the unlock toast and the list page
+    UI_MENU_TAB_TROPHIES, UI_MENU_TROPHY_TOAST, UI_MENU_TROPHY_LOCKED, UI_MENU_TROPHY_PTS /* "%d" */,
+    UI_MENU_TROPHIES_ON_DESC, UI_MENU_TROPHY_SCORE /* "%d / %d", "%d / %d" */,
+    UI_MENU_LAST_ID = UI_MENU_TROPHY_SCORE,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total

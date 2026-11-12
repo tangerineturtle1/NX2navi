@@ -214,6 +214,8 @@ static const CfgMeta metas[] = {
     {"LANG", "", "ja|en-US|fr|de|it|es|zh-CN|ko|nl|pt|ru|zh-TW|en-GB|fr-CA|es-419|zh-Hans|zh-Hant|pt-BR|pl", RESTART},
     {"OPERATION_MODE", "docked", "docked|handheld", LIVE},
     {"ASSUME_FOCUS", "1", "0|1", LIVE},   // read on every focus change (ov_system.c)
+    // Trophies (trophies.c): the port's own achievements, watched in the game's memory once a presented frame
+    {"TROPHIES", "1", "0|1", LIVE},
     // Sound, Controls, Menu
     {"VOLUME", "100", "0..100", LIVE}, {"MENU_SOUND_VOLUME", "80", "0..100", LIVE}, {"AUDIO_CHANNELS", "stereo", "auto|stereo|5.1", LIVE},   // audio_mixer.c audio_channels_live
     {"AUDIO_DEVICE", "default", NULL, RESTART},   // default|<1-based index>|<part of a device name> (audio_mixer.c resolve_audio_device)
