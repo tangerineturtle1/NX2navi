@@ -228,8 +228,9 @@ static const CfgMeta metas[] = {
     {"VOLUME", "100", "0..100", LIVE}, {"MENU_SOUND_VOLUME", "80", "0..100", LIVE}, {"AUDIO_CHANNELS", "stereo", "auto|stereo|5.1", LIVE},   // audio_mixer.c audio_channels_live
     {"AUDIO_DEVICE", "default", NULL, RESTART},   // default|<1-based index>|<part of a device name> (audio_mixer.c resolve_audio_device)
     {"MICROPHONE", "1", "0|1", RESTART},   // ov_audio_input.c mic_on: 0 refuses the game's input streams
-    // sprint.c: the sprint button (b the bottom face button) and toggle or hold; the Controls tab's Sprint rows (1.1.1)
-    {"SPRINT_BUTTON", "off", "off|b|l|r|l3|r3", LIVE}, {"SPRINT_MODE", "toggle", "toggle|hold", LIVE},
+    // sprint.c: the sprint button (b the game's B, l3 the left stick's click) and toggle or hold; the Controls tab's
+    // Sprint rows (1.1.1)
+    {"SPRINT_BUTTON", "off", "off|b|l3", LIVE}, {"SPRINT_MODE", "toggle", "toggle|hold", LIVE},
     {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "nintendo", "auto|nintendo|xbox|playstation", LIVE},
     {"DS3", "0", "0|1", LIVE},   // input_ds3_win.c ds3_read: read a DualShock 3 directly; off: no HID scan

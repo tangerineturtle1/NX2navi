@@ -183,12 +183,16 @@ int main(int argc, char **argv) {
     frame(0, ATTACK, link);
     assert(frame(BB, ATTACK, link) == BB && !dashing());   // not moving: an attack as usual
 
-    // hold on L: sprint while held; L never reaches the game during play, R does
-    reset("l", "hold");
-    assert(frame(LL, WALK, link) == 0 && dashing());
-    assert(frame(LL, WAIT_ID, link) == 0 && dashing());
+    // hold on L3: sprint while held; L3 never reaches the game during play, other buttons do
+    reset("l3", "hold");
+    assert(frame(L3, WALK, link) == 0 && dashing());
+    assert(frame(L3, WAIT_ID, link) == 0 && dashing());
     assert(frame(0, WALK, link) == 0 && !dashing());
-    assert(frame(1u << 7, WALK, link) == (1u << 7) && !dashing());
+    assert(frame(LL, WALK, link) == LL && !dashing());
+
+    // a button the setting no longer offers is off
+    reset("r3", "toggle");
+    assert(frame(1u << 5, WALK, link) == (1u << 5) && !dashing() && !set_on);
 
     // hold on the bottom button: starts only while moving, keeps going while held
     reset("b", "hold");

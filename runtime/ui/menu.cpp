@@ -1608,10 +1608,9 @@ static void tab_controls(float scale) {
     // The sprint button (sprint.c), where the game version has the patch set sprint; both rows are live. The names
     // follow the values in their cfg.c order.
     if (sprint_available()) {
-        static const UiTextId sprint_button[] = {UI_MENU_SPRINT_OFF, UI_MENU_SPRINT_B, UI_MENU_SPRINT_L,
-                                                 UI_MENU_SPRINT_R, UI_MENU_SPRINT_L3, UI_MENU_SPRINT_R3};
+        static const UiTextId sprint_button[] = {UI_MENU_SPRINT_OFF, UI_MENU_SPRINT_B, UI_MENU_SPRINT_L3};
         static const UiTextId sprint_mode[] = {UI_MENU_SPRINT_TOGGLE, UI_MENU_SPRINT_HOLD};
-        opt_choice("NX2NAVI_SPRINT_BUTTON", UI_MENU_SPRINT_BUTTON, sprint_button, 6, UI_MENU_SPRINT_BUTTON_DESC);
+        opt_choice("NX2NAVI_SPRINT_BUTTON", UI_MENU_SPRINT_BUTTON, sprint_button, 3, UI_MENU_SPRINT_BUTTON_DESC);
         opt_choice("NX2NAVI_SPRINT_MODE", UI_MENU_SPRINT_MODE, sprint_mode, 2, UI_MENU_SPRINT_MODE_DESC);
     }
     opt_slider("NX2NAVI_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");

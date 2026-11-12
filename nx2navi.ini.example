@@ -716,11 +716,11 @@
 # Gamepad motion controls (0 = off) and vibration (0 = off).
 # motion = 1
 # rumble = 1
-# Sprint button (game 1.1.1): Link sprints without rolling first. off (the default), b (the bottom face button: it
-# sprints only while Link moves and attacks as usual otherwise), l, r, l3 or r3. During play the button only sprints:
-# L or R no longer uses its item, R3 no longer resets the camera. sprint_mode: toggle (press to sprint and again to
-# stop; the sprint also ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs) or hold. The
-# Controls tab's Sprint rows set both; changes take effect at once.
+# Sprint button (game 1.1.1): Link sprints without rolling first. off (the default), l3 (the left stick's click, which
+# has no other use) or b (the game's B button, the bottom one of the Nintendo layout: it sprints only while Link moves
+# and attacks as usual otherwise). sprint_mode: toggle (press to sprint and again to stop; the sprint also ends when
+# Link stops, attacks, rolls, targets, uses an item, swims or climbs) or hold. The Controls tab's Sprint rows set
+# both; changes take effect at once.
 # sprint_button = off
 # sprint_mode = toggle
 # Rumble strength in percent (0 to 300; 0 = off) and the exponent on the amplitude (0.2 to 1.5; lower = weak pulses

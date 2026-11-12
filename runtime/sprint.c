@@ -3,11 +3,11 @@
 // below right after the game loads those flags, and they OR the bit in while the sprint button's sprint is on, so the
 // game's own sprint runs: its speed, animation, camera and every rule that ends it.
 //
-// Settings (live): sprint_button picks the button (off, b the bottom face button, l, r, l3, r3); sprint_mode is toggle
-// (a press starts the sprint, the next press or Link's state ends it) or hold (sprint while the button is held). During
-// gameplay the button is kept from the game (sprint_pad, called by ov_input.c npad_states), so it does not also fire
-// its own action: L or R its item, R3 the camera reset. The bottom button is kept only while Link moves (Walk, Jump,
-// Land, Fall, Clamber), so it attacks as usual otherwise.
+// Settings (live): sprint_button picks the button (off, b the game's B button, the bottom face button of the Nintendo
+// layout, or l3 the left stick's click, which has no other use); sprint_mode is toggle (a press starts the sprint, the
+// next press or Link's state ends it) or hold (sprint while the button is held). During gameplay the button is kept
+// from the game (sprint_pad, called by ov_input.c npad_states), so it does not also fire its own action. B is kept only
+// while Link moves (Walk, Jump, Land, Fall, Clamber), so it attacks as usual otherwise.
 //
 // Link's state: the id at [[[[Link +0x18] +0x270] +0x188] +0x1c0] +0x28 (+0x4c when that reads 0x11a, a state that
 // wraps another), the same field main+0x4aed50 compares with 1 (Walk) before the game starts a sprint.
@@ -24,9 +24,9 @@
 #include "patches.h"
 #endif
 
-enum { BTN_OFF, BTN_B, BTN_L, BTN_R, BTN_L3, BTN_R3 };
-static const char *const button_names[] = {"off", "b", "l", "r", "l3", "r3"};
-static const uint64_t button_bits[] = {0, 1u << 1, 1u << 6, 1u << 7, 1u << 4, 1u << 5};   // HidNpadButton bits
+enum { BTN_OFF, BTN_B, BTN_L3 };
+static const char *const button_names[] = {"off", "b", "l3"};
+static const uint64_t button_bits[] = {0, 1u << 1, 1u << 4};   // HidNpadButton bits
 #define BUTTON_ZL (1u << 8)
 
 #define DASH_INPUT 0x10u
