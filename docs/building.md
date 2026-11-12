@@ -355,6 +355,12 @@ A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarin
 display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
 frame, uneven frame times one steady step, and game time follows the clock. No game files.
 
+A change to the sprint button (`runtime/sprint.c`, the set `sprint` of `recomp/patches-v111.txt`, its call in
+`runtime/ov_input.c` `npad_states`) passes `python tests\sprint_check.py`, which builds `sprint.c` with the rest of the
+runtime stubbed and plays frames against a stand-in Link: toggle and hold on each kind of button, the states that keep
+and end a sprint, ZL, the button kept from the game only during play (the bottom button only while Link moves) and a
+Link the player does not control. No game files.
+
 A change to the mouse camera (`runtime/mouse_direct.c`, the mouse path of `runtime/input.c`, the set `mouse_direct` of
 `recomp/patches-v111.txt` or `patches-v143.txt`) passes `python tests\mouse_direct_check.py --cc <clang> --deps
 <ucrt64>\include`, which builds `mouse_direct.c`, and `input.c` with `--deps`, with the rest of the runtime stubbed and

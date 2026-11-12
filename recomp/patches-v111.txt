@@ -172,3 +172,15 @@ site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
 # on the patch page (+0xf70), which puts the free camera's vectors into those registers and does the instruction's
 # own work.
 site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70
+
+# Sprint button (runtime/sprint.c). Link sprints while his input flags (the 64-bit word at *(Link +0x50)) have bit 4,
+# the dash input. Link's movement update (main+0x4aaa80) loads that word at
+# main+0x4ae798 into x10 and tests bit 4 twice from it: at main+0x4ae7a0 to start the sprint (Link +0x2c bit 20, when
+# his state is Walk) and at main+0x4afa90 to keep it. The update of the camera and stance that follows
+# (main+0xc025d0) loads the flags' low byte at main+0xc07f3c into w8 and tests the same bit at main+0xc07f40. Each site
+# keeps its load and calls the page's host function after it (+0xf40, +0xf50), which ORs bit 4 into x10 or w8 while
+# the sprint button's sprint is on for Link (sprint_link, sprint_stance); x19 is Link at both. x30 is the function's
+# own saved one at both sites: both functions call others before and after, and restore x30 from their frames.
+set sprint NX2NAVI_SPRINT_PATCH 1
+site sprint main 4ae798 f940014a f940014a 9527c9ea   # ldr x10, [x10] -> ldr x10, [x10]; bl page+0xf40
+site sprint main c07f3c 39400108 39400108 950a6405   # ldrb w8, [x8] -> ldrb w8, [x8]; bl page+0xf50
