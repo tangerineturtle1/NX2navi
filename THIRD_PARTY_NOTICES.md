@@ -139,3 +139,16 @@ https://repo.msys2.org/mingw/ucrt64/; the MSYS2 CLANG64 clang it pins beside the
 Apache-2.0 with LLVM exception; libffi MIT; zlib; zstd BSD-3-Clause; libxml2 MIT; libiconv LGPL-2.1+), from
 https://repo.msys2.org/mingw/clang64/, which only compiles the lifted code; and zbic 1.0.1.post1 (GPL-2.0), from
 PyPI. The game build links them as a source build does.
+
+## Distributed in the Linux build kit AppImage
+
+`tools/make_appimage.py` packs the build kit into `NX2navi-Linux-<version>-x86_64.AppImage`. With `--ffx` and
+`--linux-toolchain` it also carries these; their versions and sha256 are pinned in `tools/ffx_linux/build.sh` and
+`tools/make_linux_toolchain.py` (with `tools/make_release_linux.py`), and their licence texts go beside them.
+
+| Component | Source | License | Where in the AppImage |
+|---|---|---|---|
+| AMD FidelityFX SDK v1.1.4: ffx-api, the FSR 3.1 upscaler, frame interpolation, optical flow, the Vulkan backend and frame interpolation swapchain, built for Linux into `libamd_fidelityfx_vk.so` with the patches in `tools/ffx_linux/patches/` | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v1.1.4 (`FidelityFX-SDK-v1.1.4.zip`), Copyright (c) 2024 Advanced Micro Devices, Inc. | MIT | `usr/kit/ffx/libamd_fidelityfx_vk.so`, `libamd_fidelityfx_vk-LICENSE.txt` (copied next to the game by the build) |
+| xplane-fsr3's Linux port of AMD's shader compiler and SDK fixes | https://github.com/JonathanOrr/xplane-fsr3 (`fsr3-linux/`), Copyright (c) 2026 JonathanOrr | MIT (`tools/ffx_linux/LICENSE.xplane-fsr3`) | `tools/ffx_linux/ffx_sc/`, `gen_shaders.sh`, `ffx_linux_compat.h`, `patches/fidelityfx-sdk-v1.1.4-linux.patch`, `patches/fsr-3.1.5-backport.patch` (in the source only; built into `libamd_fidelityfx_vk.so`) |
+| LLVM 23.1.4, Steam Runtime 3 "sniper" SDK sysroot subset, Vulkan-Headers 1.4.363, Vulkan Memory Allocator 3.4.0 and Zstandard 1.5.7: as in the Linux release rows above | as above | as above | `usr/kit/linux-toolchain/llvm/`, `sysroot/`, `deps/`, `libSDL3.so.0` (copied next to the game by the build), `LICENSES/` |
+| dav1d 1.5.4, built from the release tarball into a static `libdav1d.a` with the folder's clang and sysroot | https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/, Copyright (c) 2018-2025 VideoLAN and dav1d authors | BSD-2-Clause | `usr/kit/linux-toolchain/deps/` (compiled into the game); `LICENSES/dav1d.txt` |

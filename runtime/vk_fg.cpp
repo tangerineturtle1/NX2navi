@@ -45,7 +45,15 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg_generating)
+    uint64_t calls = 0;      // vk_fg_frame calls, with or without a context
+    uint64_t retry_at = 0;   // a failed context creation is tried again from this call on (ctx_failed)
+    int ctx_fails = 0;       // context creations failed in a row
 } F;
+
+// A frame generation context that could not be made (VRAM full, typically: a window back to 4K late in a run, its
+// resources no longer fitting beside the game's textures) is tried again this many times before generation is off for
+// the run; idle textures are asked for the room between tries.
+constexpr int CTX_TRIES = 6;
 
 VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
     vk_queue_lock();   // the game's queue is shared with the recorder and the present path
@@ -74,6 +82,38 @@ FfxApiResource image(const VkFfxImage *i) {
 void fail(const char *what, unsigned r) {
     rt_log("fg: %s failed (%u): frame generation off for this run", what, r);
     F.failed = 1;
+}
+
+// The context goes with the swapchain's callbacks reset first: the provider's destroy leaves the swapchain configured
+// with callbacks into the freed context (ffx_provider_framegeneration.cpp DestroyContext), which a frame presented
+// before a new context is configured (a creation waiting for its retry, the menu) would call. The device is idle.
+void drop_context(VkSwapchainKHR sc, VkExtent2D ext) {
+    if (!F.fg) return;
+    ffxConfigureDescFrameGeneration cfg = {};
+    cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    cfg.swapChain = (void *)sc;
+    cfg.frameGenerationEnabled = false;
+    cfg.generationRect = FfxApiRect2D{0, 0, (int32_t)ext.width, (int32_t)ext.height};
+    cfg.frameID = ++F.frame;
+    ffxReturnCode_t r = vk_ffx_configure(&F.fg, &cfg.header);
+    if (r != FFX_API_RETURN_OK) rt_log("fg: resetting the swapchain's frame generation failed (%u)", r);
+    vk_ffx_destroy(&F.fg);
+    F.fg = nullptr;
+}
+
+// A failed context creation: generation pauses, idle textures make room for the context's resources (about 384 MiB
+// at 3840x2160, less for a smaller window), and the creation is tried again after 10 s, 20 s, 40 s... at 60 fps, or at
+// once for a new window size; past CTX_TRIES generation is off for the run as before.
+void ctx_failed(VkExtent2D ext, unsigned r) {
+    if (++F.ctx_fails >= CTX_TRIES) return fail("the frame generation context", r);
+    uint64_t room = (384ull << 20) * ((uint64_t)ext.width * ext.height) / (3840ull * 2160ull);
+    if (room < (64ull << 20)) room = 64ull << 20;
+    vk_texture_want_room(room);
+    uint64_t wait = 600ull << (F.ctx_fails - 1);
+    F.retry_at = F.calls + wait;
+    rt_log("fg: the frame generation context for %ux%u failed (%u), try %d of %d: generation paused, idle textures make "
+           "about %llu MiB of room, tried again in %llu frames", ext.width, ext.height, r, F.ctx_fails, CTX_TRIES,
+           (unsigned long long)(room >> 20), (unsigned long long)wait);
 }
 
 }  // namespace
@@ -222,10 +262,19 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     unsigned pw, ph;
     wide_picture(&pw, &ph);
     VkExtent2D max_render = {ext.width > pw ? ext.width : pw, ext.height > ph ? ext.height : ph};
+    F.calls++;
     if (F.fg && (F.fg_ext.width != ext.width || F.fg_ext.height != ext.height || F.fg_fmt != fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // a new window size: the context is made for its display size
-        vk_ffx_destroy(&F.fg);
-        F.fg = nullptr;
+        drop_context(sc, ext);
+        F.retry_at = 0;
+    }
+    if (!F.fg && F.ctx_fails && (F.fg_ext.width != ext.width || F.fg_ext.height != ext.height)) F.retry_at = 0;
+    // No context made while the menu is open (generation pauses there anyway): a window resized from it is often
+    // resized again before it closes, and each context made for a passing size costs a full set of resources. Nor
+    // before a failed creation's retry. The swapchain then presents the game's frames alone.
+    if (!F.fg && (menu_is_open() || F.calls < F.retry_at)) {
+        __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+        return;
     }
     if (!F.fg) {
         ffxCreateBackendVKDesc be = {};
@@ -247,10 +296,17 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
         d.maxRenderSize = {max_render.width, max_render.height};
         d.backBufferFormat = ffxApiGetSurfaceFormatVK(fmt);
         ffxReturnCode_t r = vk_ffx_create(&F.fg, &d.header);
-        if (r != FFX_API_RETURN_OK) return F.fg = nullptr, fail("the frame generation context", r);
-        F.fg_ext = ext, F.fg_fmt = fmt, F.fg_max = max_render;
-        rt_log("fg: frame generation context for %ux%u%s, render size up to %ux%u", ext.width, ext.height,
-               hdr_format(fmt) ? " (HDR)" : "", max_render.width, max_render.height);
+        F.fg_ext = ext;   // the size tried: a failure is tried again at once for another one
+        if (r != FFX_API_RETURN_OK) {
+            F.fg = nullptr;
+            __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+            return ctx_failed(ext, r);
+        }
+        F.fg_fmt = fmt, F.fg_max = max_render;
+        rt_log("fg: frame generation context for %ux%u%s, render size up to %ux%u%s", ext.width, ext.height,
+               hdr_format(fmt) ? " (HDR)" : "", max_render.width, max_render.height,
+               F.ctx_fails ? " (after a failed try)" : "");
+        F.ctx_fails = 0, F.retry_at = 0;
     }
     if (have && (depth.width > F.fg_max.width || depth.height > F.fg_max.height)) {
         static int told;
@@ -319,7 +375,8 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
 
 extern "C" void vk_fg_release(void) {
     vk_fg4_release();
-    if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
+    if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;   // the swapchain goes with it: no callback reset needed
+    F.ctx_fails = 0, F.retry_at = 0;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
 }

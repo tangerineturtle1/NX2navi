@@ -142,6 +142,21 @@ else:   # tools/build_game.py's Linux libraries, plus dav1d (the AV1 movies) and
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-l:libstdc++.a', '-latomic',
                  '-lm', '-lpthread', '-ldl']
 SYSTEM_DLLS_SKIP = {'vulkan-1.dll'}   # the graphics driver's loader, never a copy
+# A Linux kit can carry its own toolchain (tools/make_linux_toolchain.py): LLVM's clang and lld, a Steam Runtime
+# sysroot (glibc 2.31, SDL3, Opus, libvpx, Vulkan's loader) and deps/ (Vulkan headers, VMA, zstd and dav1d built
+# static). The game then builds with nothing from the system but the kernel, and runs on any distribution at least as
+# new as the sysroot (SteamOS included), with the toolchain's libSDL3.so.0 beside it. Without it, the system's
+# compiler and libraries (README-BuildKit.md, "Linux").
+LINUX_TOOLCHAIN = KIT / 'linux-toolchain'
+KIT_TC = LINUX_TOOLCHAIN if not WIN and (LINUX_TOOLCHAIN / 'llvm' / 'bin' / 'clang').is_file() else None
+if KIT_TC:
+    TC_FLAGS = ['--target=x86_64-linux-gnu', f'--sysroot={KIT_TC / "sysroot"}', '-isystem', str(KIT_TC / 'deps' / 'include')]
+    # Opus, libvpx, dav1d and zstd go into the executable: it needs no more than glibc, Vulkan's loader and the
+    # libSDL3.so.0 beside it
+    LINK_LIBS = ['-L', str(KIT_TC / 'deps' / 'lib'), '-lvulkan', '-lSDL3', '-l:libopus.a', '-l:libvpx.a',
+                 '-l:libdav1d.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libatomic.a', '-lm', '-lpthread', '-ldl']
+else:
+    TC_FLAGS = []
 EXE_NAME = 'ocarina.exe' if WIN else 'ocarina'
 XLATE_NAME = 'nx2navi_xlate.exe' if WIN else 'nx2navi_xlate'
 # Headers this build writes per install (gen.py, romfs_index.py): a runtime source that includes one, directly or
@@ -1122,7 +1137,9 @@ def preflight(msys, jobs, sources=None):
     with tempfile.TemporaryDirectory(prefix='nx2navi-check-') as tmp:
         probe = Path(tmp) / 'probe.c'
         probe.write_text('int main(void) { return 0; }\n', encoding='ascii')
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie']
+        # the kit's toolchain links against its sysroot, as step_compile does
+        ld = (TC_FLAGS[:2] + ['-fuse-ld=lld'] if KIT_TC else ['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + \
+             ['-no-pie']
         p = subprocess.run([str(clangxx), *ld, '-o', str(Path(tmp) / 'probe'), '-x', 'c', str(probe), '-x', 'none',
                             *LINK_LIBS], capture_output=True, text=True, env=env, errors='replace')
     if p.returncode:
@@ -1362,7 +1379,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
         # stays generic, so the prebuilt one serves every PC (its vectors are 16 bytes, passed alike at every level).
         guest = dst.name.startswith(('main_', 'sdk_', 'subsdk0_'))
         march = [f'-march=x86-64-v{level}'] if guest and level else []
-        cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
+        cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang), *TC_FLAGS]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
         return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
@@ -1396,7 +1413,8 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     lib.unlink(missing_ok=True)
     rsp = dest / 'ar.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for _, o in srcs), encoding='utf-8')
-    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else shutil.which('ar'))
+    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else
+                                          str(KIT_TC / 'llvm' / 'bin' / 'llvm-ar') if KIT_TC else shutil.which('ar'))
     if not ar:
         fail('ar is not on PATH: install binutils or set NX2NAVI_AR')
     if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
@@ -1522,6 +1540,9 @@ def toolchain(msys):
     if WIN:
         return (msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe',
                 dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', '')), msys / 'include' / 'vma')
+    if KIT_TC:   # the kit's own (LINUX_TOOLCHAIN): clang finds ld.lld beside itself
+        bin_ = KIT_TC / 'llvm' / 'bin'
+        return bin_ / 'clang', bin_ / 'clang++', dict(os.environ), KIT_TC / 'deps' / 'include' / 'vma'
     for tool in ('clang', 'clang++', 'ld.lld'):
         if not shutil.which(tool):
             fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
@@ -1702,7 +1723,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     if WIN:
         ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
+        ld = (TC_FLAGS[:2] + ['-fuse-ld=lld'] if KIT_TC else ['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + \
+             ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one.
     # -Xlinker passes the path as one argument; -Wl, would cut it at every comma of the game folder's path (issue #470)
     ld += ['-Xlinker', '--Map=' + (cache_dir / 'ocarina.map').as_posix()]
@@ -1749,6 +1771,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     if WIN and place_dlssg(out):   # DLSS Frame Generation (runtime/vk_dlssg.c): Windows DLLs too
         say('  DLSS Frame Generation: nx2navi_dlssg.dll, Streamline and nvngx_dlssg.dll beside the game')
     beside = copy_dlls(exe, msys / 'bin', out) if WIN else []
+    if KIT_TC:   # the sysroot's SDL3, which the game was linked against; rpath $ORIGIN finds it before the system's
+        copy_if_changed(KIT_TC / 'libSDL3.so.0', out / 'libSDL3.so.0')
+        beside.append('libSDL3.so.0')
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB' + (f'; beside it: {", ".join(beside)}' if beside else ''))
     (out / 'profile').mkdir(exist_ok=True)
 
@@ -2311,7 +2336,7 @@ def build_main():
         for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
             if not (msys / need).exists():
                 fail(f'{msys / need} is missing: install MSYS2 and the packages README-BuildKit.md lists')
-    else:
+    elif not KIT_TC:
         for tool in ('clang', 'clang++', 'ld.lld'):
             if not shutil.which(tool):
                 fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')

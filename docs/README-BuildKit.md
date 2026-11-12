@@ -65,6 +65,11 @@ When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C
 The same command builds a native Linux `ocarina` on an x86-64 Linux 6.7 or later (the write watch needs
 `PAGEMAP_SCAN`) with a Vulkan 1.3 driver that has `VK_EXT_external_memory_host` and `VK_EXT_mesh_shader` (NVIDIA,
 RADV). It takes clang, clang++ and lld from `PATH` and links against the system's libraries; `--msys` is not used.
+A kit with a `linux-toolchain/` folder (`tools/make_linux_toolchain.py`; the AppImage made with `--linux-toolchain`)
+builds with that instead and needs none of the packages of step 1: LLVM's clang and lld, a Steam Runtime 3 sysroot
+(glibc 2.31) with SDL3, Opus, libvpx and Vulkan's loader, current Vulkan headers, VMA, and zstd and dav1d built static.
+The game then runs on any distribution with glibc 2.31 or later, SteamOS included, and needs from the system only
+Vulkan's loader and the graphics driver; `libSDL3.so.0` is placed beside it.
 
 1. Packages, on Arch and its derivatives (other distributions: the same libraries and their `-dev` headers):
 
@@ -121,10 +126,13 @@ memory runs short, it ends the process, so while less than the larger of 4 GB an
 drops stale textures and evicts idle ones. The log names the limits at the first check (`platform: memory limits`). That
 cannot give back what the game needs after its start: about 10 GB in Kokiri Forest at a 2160p game resolution.
 
-AMD FSR 3.1 loads AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu offers neither
-FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the
-game's own scaling and swapchain as they are (the log says so). AMD FSR 4 is in the Windows build alone for the same
-reason, and `fsr4 = 1` does nothing on Linux.
+AMD FSR 3.1 on Linux loads `libamd_fidelityfx_vk.so` from beside `ocarina`. AMD ships its library for Windows only;
+`tools/ffx_linux/build.sh` builds this one from AMD's FidelityFX SDK, with FSR 3.1 upscaling, FSR 3.1 frame generation
+and its frame generation swapchain, for every Vulkan GPU (`tools/ffx_linux/README.md`). The AppImage made with `--ffx`
+carries it and the build copies it beside the game. Without it the menu offers neither FSR 3.1 upscaling nor FSR 3.1
+frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the game's own scaling and swapchain as
+they are (the log says `ffx: ... not found`). AMD FSR 4 is in the Windows build
+alone, and `fsr4 = 1` does nothing on Linux.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside
@@ -146,7 +154,7 @@ frames needed to reach the display's refresh rate (`framegen = dlss` and `fg_mul
 
 `tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python and the
 pinned Vulkan headers, for players without a source checkout: it checks for the packages above (their Vulkan headers
-are not needed), installs zbic with pip on its first run, picks
+are not needed; none of them when it carries `linux-toolchain/`), installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
 beside the game.
 

@@ -383,8 +383,11 @@ static int create_swapchain(void) {
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     // NGX frame generation's presenter holds the generated frames' images too, and the rendered frame waits for it:
-    // room for both
-    const uint32_t ngx = vk_ngxfg_wanted() ? 1 : 0, most = ngx ? 12 : 8;
+    // room for both. Not when AMD's frame generation swapchain is the one made (vk_fg_wanted; vk_ngxfg_wanted is on
+    // with any DLSS upscaling): AMD's swapchain refuses a real swapchain of more than 6 images
+    // (FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT), and frame generation stayed off for the run.
+    const int amd = vk_fg_wanted();
+    const uint32_t ngx = vk_ngxfg_wanted() && !amd ? 1 : 0, most = amd ? 6 : ngx ? 12 : 8;
     uint32_t count = caps.minImageCount + 1 + (ngx ? 2u + NG_MAX : 0u);
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > most) count = most;

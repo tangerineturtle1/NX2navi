@@ -1,4 +1,5 @@
-// AMD FidelityFX through its API library (amd_fidelityfx_vk.dll next to the executable, loaded at run time): FSR 3.1
+// AMD FidelityFX through its API library (amd_fidelityfx_vk.dll next to the executable on Windows, libamd_fidelityfx_vk.so
+// next to it on Linux, where AMD ships none and the Linux AppImage builds it from AMD's SDK; loaded at run time): FSR 3.1
 // temporal upscaling here, in the place of DLSS in vk_dlaa.c, and frame generation (vk_ffx_fg_*, below). The API's
 // headers are in third_party/ffx_api (MIT); they are C++ in places, hence this file. Nothing of it runs unless the
 // upscaler or frame generation asks for FSR 3.1.
@@ -47,11 +48,22 @@ std::atomic<int> g_loaded{-1};    // what vk_ffx_load found: 1 or 0; -1 while it
 std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
 
 #ifdef _WIN32
+#define FFX_LIBRARY "amd_fidelityfx_vk.dll"
 // amd_fidelityfx_vk.dll next to the executable
 void library_path(char *path, size_t size) {
     DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
     while (n && path[n - 1] != '\\') n--;
-    snprintf(path + n, size - n, "amd_fidelityfx_vk.dll");
+    snprintf(path + n, size - n, FFX_LIBRARY);
+}
+#else
+// libamd_fidelityfx_vk.so next to the executable: AMD ships its library for Windows only, and the Linux AppImage builds
+// this one from AMD's SDK (FSR 3.1 upscaling, frame generation and its swapchain). Empty when the executable's path is
+// unknown.
+#define FFX_LIBRARY "libamd_fidelityfx_vk.so"
+void library_path(char *path, size_t size) {
+    char *cut = plat_exe_path(path, size - 32) ? plat_last_sep(path) : NULL;
+    if (cut) snprintf(cut + 1, 32, FFX_LIBRARY);
+    else path[0] = 0;
 }
 #endif
 
@@ -233,11 +245,24 @@ extern "C" int vk_ffx_load(void) {
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
     A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
-    rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
 #else
-    // Only the Windows build loads AMD's library: there is nothing to load here
-    rt_log("ffx: this build has no FSR 3.1 (it needs amd_fidelityfx_vk.dll, which only the Windows build loads): FSR 3.1 off");
+    char path[4096];
+    library_path(path, sizeof path);
+    void *m = path[0] ? plat_lib_open(path) : NULL;
+    if (!m) {
+        rt_log("ffx: %s not found: FSR 3.1 off", path[0] ? path : FFX_LIBRARY);
+        g_loaded.store(0, std::memory_order_release);
+        return 0;
+    }
+    A.lib = m;
+    A.create = (PfnFfxCreateContext)plat_lib_sym(m, "ffxCreateContext");
+    A.destroy = (PfnFfxDestroyContext)plat_lib_sym(m, "ffxDestroyContext");
+    A.configure = (PfnFfxConfigure)plat_lib_sym(m, "ffxConfigure");
+    A.query = (PfnFfxQuery)plat_lib_sym(m, "ffxQuery");
+    A.dispatch = (PfnFfxDispatch)plat_lib_sym(m, "ffxDispatch");
+    A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
 #endif
+    rt_log("ffx: " FFX_LIBRARY " %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
     g_loaded.store(A.ok, std::memory_order_release);
     return A.ok;
 }
@@ -256,7 +281,14 @@ extern "C" int vk_ffx_available(void) {
     }
     return present;
 #else
-    return 0;
+    int present = g_present.load(std::memory_order_relaxed);
+    if (present < 0) {   // the menu asks every frame: look once, and leave the loading to the first use
+        char path[4096];
+        library_path(path, sizeof path);
+        present = path[0] && plat_file_exists(path);
+        g_present.store(present, std::memory_order_relaxed);
+    }
+    return present;
 #endif
 }
 
