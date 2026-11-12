@@ -7,5 +7,6 @@
 void sprint_pad(uint64_t *buttons);
 // One update of Link's sprint: kind is how his state treats it (sprint.c), button and hold the settings. 1 while on.
 int sprint_step(int kind, int button, int hold);
-// 1 when the game version has the patch set sprint and it is on: the Controls tab shows the sprint rows then.
+// 1 when the game version has the patch set sprint and nothing keeps it off (NX2NAVI_SPRINT_PATCH=0, a mod patching
+// its sites): the Controls tab shows the sprint rows then. The set itself runs only while a button is chosen.
 int sprint_available(void);

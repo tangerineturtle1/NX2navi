@@ -46,7 +46,8 @@ def main():
     subprocess.check_call([compiler(), '-O1', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
                            '-I', str(work), '-I', str(ROOT / 'runtime'),
                            str(ROOT / 'tests' / 'sprint_check.c'), '-o', str(exe)], env=env)
-    return subprocess.run([str(exe)], env=env).returncode
+    rc = subprocess.run([str(exe)], env=env).returncode
+    return subprocess.run([str(exe), 'kept-off'], env=env).returncode or rc
 
 
 if __name__ == '__main__':

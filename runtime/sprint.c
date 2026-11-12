@@ -98,10 +98,24 @@ static int state_kind(uint64_t link) {
     return STOP;
 }
 
-int sprint_available(void) { return rt_patch_enabled(rt_patch_set("sprint")); }
+// The set runs only while a button is chosen, so with the sprint button off its sites cost nothing. Whether it may run
+// at all is read once, after the start: NX2NAVI_SPRINT_PATCH=0 or a mod whose code patches the same sites (mods.c
+// mods_exefs_switch) leaves it off then, and switching it on later must not undo that.
+static _Atomic int allowed = -1;
+static int sprint_set(void) { return rt_patch_set("sprint"); }
+int sprint_available(void) {
+    int a = atomic_load(&allowed);
+    if (a < 0) {
+        a = rt_patch_enabled(sprint_set());
+        atomic_store(&allowed, a);
+    }
+    return a;
+}
 
 void sprint_pad(uint64_t *buttons) {
-    int b = setting_button();
+    if (!sprint_available()) return;
+    int b = setting_button(), set = sprint_set();
+    if (rt_patch_enabled(set) != (b != BTN_OFF)) rt_patch_switch(set, b != BTN_OFF);
     if (b == BTN_OFF) return;
     static uint64_t last;
     uint64_t bit = button_bits[b], now = *buttons;

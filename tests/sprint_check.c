@@ -19,8 +19,10 @@ const char *cfg_value(const char *key) {
     if (!strcmp(key, "NX2NAVI_SPRINT_MODE")) return mode;
     return "";
 }
+static int set_on = 1;   // the patch set sprint, on at the start as its default
 int rt_patch_set(const char *name) { return strcmp(name, "sprint") ? -1 : 3; }
-int rt_patch_enabled(int set) { return set == 3; }
+int rt_patch_enabled(int set) { return set == 3 && set_on; }
+void rt_patch_switch(int set, int on) { assert(set == 3); set_on = on != 0; }
 void rt_register_host(uint64_t addr, GuestFn fn) {
     if (addr == RT_PATCH_PAGE + 0xf40) link_fn = fn;
     else if (addr == RT_PATCH_PAGE + 0xf50) stance_fn = fn;
@@ -43,10 +45,10 @@ static uint64_t frame(uint64_t buttons, int32_t state, uint64_t *who) {
     memset(&c, 0, sizeof c);
     c.x[19] = (uintptr_t)who;
     c.x[10] = 0x40;   // other flag bits stay
-    link_fn(&c);
+    if (set_on) link_fn(&c);   // the sites call in only while the set is on
     flags_x10 = c.x[10];
     c.x[8] = 0x01;
-    stance_fn(&c);
+    if (set_on) stance_fn(&c);
     flags_w8 = c.x[8];
     return buttons;
 }
@@ -64,11 +66,23 @@ static void reset(const char *btn, const char *md) {
     assert(!dashing());
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     char *img = calloc(1, 0x4c80000);
     assert(img);
     test_main_base = (uintptr_t)img;
-    assert(link_fn && stance_fn && sprint_available());
+    assert(link_fn && stance_fn);
+    if (argc > 1 && !strcmp(argv[1], "kept-off")) {
+        // off at the start (NX2NAVI_SPRINT_PATCH=0, or a mod patching its sites): no rows, never switched on, and the
+        // button always reaches the game
+        set_on = 0, button = "l3";
+        assert(!sprint_available());
+        uint64_t bt = L3;
+        for (int i = 0; i < 20; i++) bt = L3, sprint_pad(&bt);
+        assert(!set_on && bt == L3);
+        puts("sprint_check kept-off: ok");
+        return 0;
+    }
+    assert(sprint_available());
     link[0] = test_main_base + 0x4b4dfc0, link[3] = (uintptr_t)owner;
     other[0] = test_main_base + 0x4b4dfc0, other[3] = (uintptr_t)a;   // Link's class, another owner
     owner[0x270 / 8] = (uintptr_t)a, a[0x188 / 8] = (uintptr_t)b, b[0x1c0 / 8] = (uintptr_t)state_obj;
@@ -79,9 +93,12 @@ int main(void) {
     manager[0] = test_main_base + 0x4bdfe68, manager[0x470 / 8] = (uintptr_t)controlled;
     controlled[0] = test_main_base + 0x4b49698, controlled[3] = (uintptr_t)owner;
 
-    // off: nothing changes, the button reaches the game
+    // off: nothing changes, the button reaches the game, and the set's sites stop calling in
     reset("off", "toggle");
-    assert(frame(L3, WALK, link) == L3 && !dashing());
+    assert(frame(L3, WALK, link) == L3 && !dashing() && !set_on);
+    button = "l3";
+    frame(0, WALK, link);
+    assert(set_on);   // a button chosen: the set runs again
 
     // toggle on L3: a press while walking starts it; the button never reaches the game during play
     reset("l3", "toggle");
