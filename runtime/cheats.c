@@ -612,6 +612,21 @@ void cheats_rebuild_allow(void) {
     plat_fs_unlink(path);
 }
 
+int cheats_rupees_supported(void) { return rt_patch_set("rupees_refill") >= 0; }
+
+int cheats_rupees_on(void) {
+    int set = rt_patch_set("rupees_refill");
+    return set >= 0 && rt_patch_enabled(set);
+}
+
+void cheats_rupees_set(int on) {
+    int set = rt_patch_set("rupees_refill");
+    if (set < 0) return;
+    on = on != 0;
+    rt_patch_switch(set, on);
+    cfg_set("NX2NAVI_CHEAT_RUPEES_REFILL", on ? "1" : "0");
+}
+
 int cheats_count(void) { return g_n; }
 
 const CheatInfo *cheats_info(int i) { return i >= 0 && i < g_n ? &g_cheats[i].info : NULL; }

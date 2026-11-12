@@ -742,6 +742,9 @@
 # shared_fonts =
 
 [cheats]
+# Refill to the wallet limit on a normal rupee gain or spend. The game's affordability checks still apply. Changes may
+# persist in saves; keep a backup. Requires a build containing the rupees refill patch.
+# cheat_rupees_refill = 0
 # One line per cheat of the mods' cheat files, mods\<mod>\cheats\<build id>.txt (docs/cheats.md); the Cheats tab of
 # the menu writes them. cheat_<hash> = 1 switches a cheat on, the hash being FNV-1a 32 of "<mod folder>/<cheat name>".
 # Default: every cheat off.

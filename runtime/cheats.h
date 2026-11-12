@@ -28,6 +28,11 @@ typedef struct {
     char key[24];         // its setting, NX2NAVI_CHEAT_<hash of "<mod>/<name>">
 } CheatInfo;
 
+// Built-in rupee refill: available only when its patch set is in this build.
+int cheats_rupees_supported(void);
+int cheats_rupees_on(void);
+void cheats_rupees_set(int on);
+
 void cheats_init(void);                    // after rt_patches_init: reads the mods' files and their build status
 int cheats_count(void);
 // 1 when a cheat of an enabled mod waits for a rebuild (CHEAT_REBUILD) and the setup left its rebuild command.

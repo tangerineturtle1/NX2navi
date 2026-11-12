@@ -470,7 +470,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OV_SCALE_BILINEAR] = "bilinear",
     [UI_MENU_OV_SCALE_DOWN] = "bilinear (FSR sharpness 0)",
     [UI_MENU_TAB_CHEATS] = "Cheats",
-    [UI_MENU_CHEATS_NONE] = "No cheats for this game version. A mod's cheats are an Atmosphere cheat file in its "
+    [UI_MENU_CHEAT_RUPEES] = "Refill rupees",
+    [UI_MENU_CHEAT_RUPEES_DESC] = "Refills to the wallet limit on a normal rupee gain or spend. Original affordability checks still apply. Changes may persist in saves; keep a backup. Do not combine with imported cheats or ExeFS mods that change the same code.",
+    [UI_MENU_CHEAT_RUPEES_UNAVAILABLE] = "Patch absent: unsupported version or rebuild required",
+    [UI_MENU_CHEATS_NONE] = "No imported cheats for this game version. A mod's cheats are an Atmosphere cheat file in its "
                             "cheats folder, named after the game's build: mods\\<mod>\\cheats\\%s. Restart the game to "
                             "read them. For cheats that change the game's code, the game rebuilds itself at start (a "
                             "few minutes).",
@@ -1147,7 +1150,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_SCALE_BILINEAR] = "билинейное",
     [UI_MENU_OV_SCALE_DOWN] = "билинейное (резкость FSR 0)",
     [UI_MENU_TAB_CHEATS] = "Читы",
-    [UI_MENU_CHEATS_NONE] = "Для этой версии игры читов нет. Читы мода — это файл читов Atmosphere в его папке cheats "
+    [UI_MENU_CHEAT_RUPEES] = "Пополнять рупии",
+    [UI_MENU_CHEAT_RUPEES_DESC] = "При обычном получении или трате рупии пополняются до предела кошелька. Проверка наличия средств остаётся. Изменения могут сохраниться; сделайте резервную копию. Не сочетайте с импортированными читами или модами ExeFS, меняющими тот же код.",
+    [UI_MENU_CHEAT_RUPEES_UNAVAILABLE] = "Патч отсутствует: версия не поддерживается или нужна пересборка",
+    [UI_MENU_CHEATS_NONE] = "Для этой версии игры нет импортированных читов. Читы мода — это файл читов Atmosphere в его папке cheats "
                             "с именем по сборке игры: mods\\<мод>\\cheats\\%s. Перезапустите игру, чтобы они "
                             "прочитались. Для читов, меняющих код игры, игра пересоберётся сама при запуске (несколько "
                             "минут).",
@@ -1812,7 +1818,10 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_FXAA_DESC] = "A suavização de bordas FXAA do próprio jogo. Borra um pouco os detalhes finos; com o DLAA "
                           "ligado não é necessária.",
     [UI_MENU_TAB_CHEATS] = "Cheats",
-    [UI_MENU_CHEATS_NONE] = "Nenhum cheat para esta versão do jogo. Os cheats de um mod são um arquivo de cheats do "
+    [UI_MENU_CHEAT_RUPEES] = "Reabastecer rupias",
+    [UI_MENU_CHEAT_RUPEES_DESC] = "Ao ganhar ou gastar rupias normalmente, repõe até o limite da carteira. A verificação de saldo continua. Alterações podem ficar no save; faça um backup. Não combine com cheats importados ou mods ExeFS que alterem o mesmo código.",
+    [UI_MENU_CHEAT_RUPEES_UNAVAILABLE] = "Patch ausente: versão não suportada ou recompilação necessária",
+    [UI_MENU_CHEATS_NONE] = "Nenhum cheat importado para esta versão do jogo. Os cheats de um mod são um arquivo de cheats do "
                             "Atmosphere na pasta cheats dele, com o nome da build do jogo: mods\\<mod>\\cheats\\%s. "
                             "Reinicie o jogo para lê-los. Para cheats que alteram o código do jogo, o jogo se recompila "
                             "sozinho ao iniciar (alguns minutos).",
@@ -2580,7 +2589,10 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_FXAA] = "游戏抗锯齿（FXAA）",
     [UI_MENU_FXAA_DESC] = "游戏自身的 FXAA 边缘平滑。会让细节略微模糊；开启 DLAA 时不需要。",
     [UI_MENU_TAB_CHEATS] = "金手指",
-    [UI_MENU_CHEATS_NONE] = "此游戏版本没有金手指。模组的金手指是它的 cheats 文件夹中以游戏构建命名的 Atmosphere "
+    [UI_MENU_CHEAT_RUPEES] = "补满卢比",
+    [UI_MENU_CHEAT_RUPEES_DESC] = "正常获得或花费卢比时补满至钱包上限。原有余额检查仍然生效。更改可能保留在存档中；请备份存档。请勿与修改相同代码的导入金手指或 ExeFS 模组一起使用。",
+    [UI_MENU_CHEAT_RUPEES_UNAVAILABLE] = "缺少补丁：版本不支持或需要重新构建",
+    [UI_MENU_CHEATS_NONE] = "此游戏版本没有导入的金手指。模组的金手指是它的 cheats 文件夹中以游戏构建命名的 Atmosphere "
                             "金手指文件：mods\\<模组>\\cheats\\%s。重启游戏后才会读取。对于修改游戏代码的金手指，"
                             "游戏会在启动时自行重新构建（几分钟）。",
     [UI_MENU_CHEATS_MOD] = "%s：%d 个金手指",

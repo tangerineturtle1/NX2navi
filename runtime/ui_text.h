@@ -235,6 +235,7 @@ typedef enum {
     UI_MENU_OV_SCALE_DOWN,    // FSR is selected but the image is larger than the window: FSR only enlarges
     // the Cheats tab (cheats.c): the file, the kinds of cheat and why one cannot be switched
     UI_MENU_TAB_CHEATS,
+    UI_MENU_CHEAT_RUPEES, UI_MENU_CHEAT_RUPEES_DESC, UI_MENU_CHEAT_RUPEES_UNAVAILABLE,
     UI_MENU_CHEATS_NONE,      // "%s": <build id>.txt
     UI_MENU_CHEATS_MOD,       // "%s": the mod, "%d": its cheats
     UI_MENU_CHEATS_REBUILD, UI_MENU_CHEATS_REBUILD_DESC,   // restart into the rebuild for unbuilt code cheats

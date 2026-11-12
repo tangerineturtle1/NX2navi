@@ -21,6 +21,12 @@ set zstd        NX2NAVI_ZSTD_NATIVE       1
 set osolver     NX2NAVI_PHYSICS_STEPS     1
 set opickup     NX2NAVI_PICKUP_COUNT      1
 set freecam     NX2NAVI_PATCH_FREECAM     0
+set rupees_refill NX2NAVI_CHEAT_RUPEES_REFILL 0
+
+# A queued rupee change has the old value in w8, its pending delta in w9, and the game's current wallet limit in w20.
+# Use that limit instead of their sum. The existing upper/lower clamps, setter, applied-delta notification and pending
+# change reset still run. This acts only on normal rupee changes and does not bypass a purchase's affordability check.
+site rupees_refill main 5efe0 0b080129 2a1403e9   # add w9, w9, w8 -> mov w9, w20
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
 # nominal frame through main+0x3b4e300 (+0x10 frames per update, +0x14 the inverse, +0x18 seconds, +0x1c the rate),

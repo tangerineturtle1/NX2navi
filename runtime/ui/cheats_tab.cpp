@@ -17,10 +17,19 @@ extern "C" {
 extern "C" bool tab_cheats(float scale) {
     opt_begin("##cheats", scale);
     static char line[512], desc[768], buttons[192];
+    bool builtin = cheats_rupees_supported() != 0;
+    if (!builtin) opt_disable_next(UI_MENU_CHEAT_RUPEES_UNAVAILABLE);
+    if (opt_toggle_text("NX2NAVI_CHEAT_RUPEES_REFILL", menu_text(UI_MENU_CHEAT_RUPEES),
+                        menu_text(UI_MENU_CHEAT_RUPEES_DESC), cheats_rupees_on() != 0)) {
+        cheats_rupees_set(!cheats_rupees_on());
+        opt_save_soon();
+    }
     int n = cheats_count();
     if (!n) {
-        snprintf(line, sizeof line, menu_text(UI_MENU_CHEATS_NONE), cheats_file()[0] ? cheats_file() : "<build id>.txt");
-        opt_text_str(line);
+        if (!builtin) {
+            snprintf(line, sizeof line, menu_text(UI_MENU_CHEATS_NONE), cheats_file()[0] ? cheats_file() : "<build id>.txt");
+            opt_text_str(line);
+        }
         opt_end();
         return false;
     }
