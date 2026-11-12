@@ -242,6 +242,21 @@ typedef struct {
 } MemoKey;
 
 // ---- the recording context
+// bind_resources: the sampled-texture descriptors this context resolved, each with the generations and slot token it
+// was resolved under: while its slot, the submission and the samplers are as they were (slot_still, as the texture
+// descriptor memo TD checks, without the lock) it holds what TD would give, and a hit takes no texture lock. The
+// replay workers' chunks waited for that lock at nearly every draw: 6.1 s of waits a minute in bind_resources alone
+// (Hyrule Field, 3 workers, NX2NAVI_LOCK_TIME, 2026-11-12).
+#define TM_N 512
+typedef struct {
+    uint64_t h, tok;
+    uint32_t gen, ep, sg;
+    uint16_t type;
+    uint8_t separate, valid;
+    VkImage image;
+    VkDescriptorImageInfo out;
+} TexMemo;
+
 // What the draws, binds and dispatches keep from one call to the next while they record a command buffer: the state
 // the command buffer holds (B), the signatures that let a draw skip its descriptor build or push (DS, RS, PB), the
 // previous draw's shaders and pipeline (SM, PM), the shader lookup's caches (AC, stagem, slotm) and the submission's
@@ -280,6 +295,7 @@ typedef struct DrawCtx {
     struct { const void *d; uint64_t ind; VkDeviceSize at; } ma[64];   // mesh_ring_entry: entries filled ahead
     int ma_n, ma_i;                      // ... how many, and the next one a draw takes
     uint32_t ma_brk;                     // ... vk_exec_brk_now when they were filled
+    TexMemo TM[TM_N];                    // bind_resources: sampled-texture descriptors (tm_take)
     VkWriteDescriptorSet bind_w[MAX_BINDINGS];   // bind_resources: write structs, packed descriptors, texel views
     VkDescSlot bind_d[MAX_DESC];
     VkBufferView bind_bv[MAX_DESC];
@@ -1057,7 +1073,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
         set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
-        int lk = vk_exec_in_chunk();   // only the chunks of a parallel group look up at once
+        int lk = vk_exec_shared();   // only while a parallel group records do several threads look up at once
         if (lk) plat_mutex_lock(&shader_lock);
         for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
             ShaderEnt *e = &set[w];
@@ -1085,7 +1101,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
     else if (set) {   // in front, the least recently used way drops out
-        int lk = vk_exec_in_chunk();
+        int lk = vk_exec_shared();
         if (lk) plat_mutex_lock(&shader_lock);
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
@@ -1351,7 +1367,8 @@ static void upd_note(const VkExec *ex, const p_update_ub *u) {
 // 1 when an update of this submission supplied [a, a+n).
 static int upd_read(const VkExec *ex, uint64_t a, void *out, size_t n) {
     if (UPD.fence != ex->fence) return 0;
-    for (uint32_t i = UPD.n, end = UPD.n > UPD_N ? UPD.n - UPD_N : 0; i-- > end;) {
+    uint32_t top = vk_exec_upd_top(UPD.n);   // a replay worker's chunk: the updates before its group
+    for (uint32_t i = top, end = top > UPD_N ? top - UPD_N : 0; i-- > end;) {
         const typeof(UPD.u[0]) *e = &UPD.u[i % UPD_N];
         if (a >= e->hi || a + n <= e->lo) continue;
         if (a < e->lo || a + n > e->hi) return 0;   // partly covered: memory
@@ -1761,10 +1778,14 @@ static struct {
 } TD[TD_N];
 
 static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                            VkDescriptorImageInfo *out) {
+                            VkDescriptorImageInfo *out, VkImage *img_out) {
     int td_on = td_mode();
-    VkImage image;
-    if (!h || storage || !td_on) return (void)tex_info_full(ex, r, h, storage, separate, out, &image);
+    VkImage image = VK_NULL_HANDLE;
+    if (!h || storage || !td_on) {
+        tex_info_full(ex, r, h, storage, separate, out, &image);
+        if (img_out) *img_out = image;
+        return;
+    }
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
     typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 51];
     if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->sgen == sg &&
@@ -1776,6 +1797,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
         *out = m->out;
         out->imageLayout = m->image && ex->nfbl && in_fbl(ex, m->image) ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
                                                                           : VK_IMAGE_LAYOUT_GENERAL;
+        if (img_out) *img_out = m->image;
         if (td_on == 2) {
             VkDescriptorImageInfo full;
             tex_info_full(ex, r, h, storage, separate, &full, &image);
@@ -1791,6 +1813,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
     // entry never matches, and the next binding fills it
     *m = (typeof(*m)){.h = h, .tok = tok, .gen = gen, .epoch = ep, .sgen = sg, .type = r->type,
                       .separate = (uint8_t)separate, .valid = 1, .reduced = (uint8_t)reduced, .image = image, .out = *out};
+    if (img_out) *img_out = image;
 }
 
 // Returns whether the image bound was made without its top mip levels (texture detail, VkTexImage.skip).
@@ -2444,9 +2467,16 @@ static void pool_sync(VkExec *ex);
 
 // A chunk of a parallel group (vk_exec.c "replay workers") binds the set as vk_exec_draw_group_begin left it, up to date
 // when the group began; the chunk that takes this submission's first set takes it in turn, under pool_mt. Elsewhere the
-// replay syncs the pools at every draw that binds them, as before.
+// replay syncs the pools at every draw that binds them, as before, under pool_mt past a group whose chunks still record
+// (NX2NAVI_REPLAY_PIPE): the set is the submission's, read by the GPU when the part runs.
 static void pool_sync_draw(VkExec *ex) {
-    if (!vk_exec_in_chunk()) return pool_sync(ex);
+    if (!vk_exec_shared()) return pool_sync(ex);
+    if (!vk_exec_in_chunk()) {
+        plat_mutex_lock(&pool_mt);
+        pool_sync(ex);
+        plat_mutex_unlock(&pool_mt);
+        return;
+    }
     if (__atomic_load_n(&PL.cur_fence, __ATOMIC_ACQUIRE) == ex->fence) return;
     vk_exec_turn();
     plat_mutex_lock(&pool_mt);
@@ -2456,11 +2486,17 @@ static void pool_sync_draw(VkExec *ex) {
 
 static int mesh_ring_make(void);
 
-void vk_exec_draw_group_begin(VkExec *ex) {
+uint32_t vk_exec_draw_group_begin(VkExec *ex) {
     dummies_init();
     if (vk_ctx()->has_mesh_shader && !vk_ctx()->mesh_fallback) mesh_ring_make();   // the chunks' indirect mesh draws
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
-    if (pool_on() && PL.cur_fence == ex->fence && !PL.sealed) pool_sync(ex);   // the set this submission took
+    if (pool_on() && PL.cur_fence == ex->fence && !PL.sealed) {   // the set this submission took
+        int lk = vk_exec_shared();   // earlier groups may still record (NX2NAVI_REPLAY_PIPE)
+        if (lk) plat_mutex_lock(&pool_mt);
+        pool_sync(ex);
+        if (lk) plat_mutex_unlock(&pool_mt);
+    }
+    return UPD.fence == ex->fence ? UPD.n : 0;
 }
 
 static void pool_sync(VkExec *ex) {
@@ -2723,7 +2759,8 @@ static void pool_sync_entries(VkExec *ex) {
 typedef struct { VkImage src, img; VmaAllocation mem; VkImageView view[2]; uint32_t w, h, layers; VkFormat fmt; } Twin;
 static Twin twins[TWINS];
 static unsigned twin_next;
-static int twin_dispatch;                // op_dispatch*: the resources being bound are a dispatch's
+// op_dispatch*: the resources being bound are a dispatch's, on this thread (the replay workers record draws meanwhile)
+static _Thread_local int twin_dispatch;
 static VkBuffer twin_buf;
 static VmaAllocation twin_buf_mem;
 static VkDeviceSize twin_buf_cap;
@@ -2873,8 +2910,9 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
 // The image descriptor of slot h; in a dispatch, a compare-sampled colour image the driver cannot compare is swapped
 // for its depth twin; in a pass larger than it, the scene's light target, once DLSS scaled it this frame, for DLSS's
 // output (vk_dlaa.c).
-static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out) {
-    tex_info_lookup(ex, r, h, storage, separate, out);
+static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out,
+                     VkImage *img_out) {
+    tex_info_lookup(ex, r, h, storage, separate, out, img_out);
     if (h && !storage && vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1 &&
         vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_dlaa_swap_img)
         out->imageView = vk_dlaa_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3081,7 +3119,7 @@ static void rs_add(RsRange *r, uint32_t *n, const VkExec *ex, const void *at, si
 static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     DrawCtx *const cx = ex->dc;
     if (info == cx->rs_last) return cx->rs_last_l;
-    int lk = vk_exec_in_chunk();
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&rs_lock);
     if (!rs_lists.klen) nvn_hm_init(&rs_lists, sizeof info);
     RsList *l = nvn_hm_get(&rs_lists, &info);
@@ -3423,15 +3461,36 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             } else {
                 kind = 1;
                 int locked = 0;   // tex_info looks up with the texture lock held; kept descriptors (pb_take) need none
+                // the context's memo (TexMemo) for sampled textures while other threads record (the lock is free
+                // otherwise), outside a dispatch's depth twins and DLSS's stand-in image, with the generations read
+                // before any lookup below
+                int tm = !img && !r->exact && td_mode() == 1 && !vk_dlaa_swap_img && !twin_dispatch && vk_exec_shared();
+                uint32_t tg = tm ? vk_texture_slots_gen() : 0, te = tm ? vk_texture_epoch() : 0;
+                uint32_t ts = tm ? vk_sampler_gen() : 0;
                 for (uint32_t k = 0; k < cnt; k++) {
                     if (pb_take(ex, b, nd + k, k, &o[k])) continue;
-                    if (!locked) vk_texture_lock(), locked = 1;
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
                     uint64_t tt = bt_now();
-                    tex_info(ex, r, h, img, r->separate, &o[k].image);
+                    TexMemo *m = tm && h ? &cx->TM[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 9 ^
+                                                    (uint64_t)r->separate) >> 55 & (TM_N - 1)] : NULL;
+                    if (m && m->valid && m->h == h && m->type == r->type && m->separate == (uint8_t)r->separate &&
+                        m->ep == te && m->sg == ts && slot_still(&m->gen, m->tok, h, tg)) {
+                        o[k].image = m->out;
+                        o[k].image.imageLayout = m->image && ex->nfbl && in_fbl(ex, m->image)
+                                                     ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                                     : VK_IMAGE_LAYOUT_GENERAL;
+                    } else {
+                        if (!locked) vk_texture_lock(), locked = 1;
+                        VkImage ti = VK_NULL_HANDLE;
+                        uint64_t tok = m ? token_of(h) : 0;   // before the lookup
+                        tex_info(ex, r, h, img, r->separate, &o[k].image, &ti);
+                        if (m) *m = (TexMemo){.h = h, .tok = tok, .gen = tg, .ep = te, .sg = ts, .type = r->type,
+                                              .separate = (uint8_t)r->separate, .valid = 1, .image = ti,
+                                              .out = o[k].image};
+                    }
                     vk_exec_frame.bind_tex_ns += (uint64_t)(bt_now() - tt);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                     pb_keep(cx, nd + k, &o[k]);
@@ -4490,7 +4549,7 @@ static int mo_desc(VkExec *ex, const VkPipeInfo *info, MoDraw *q) {
             vk_texture_lock();
             for (uint32_t k = 0; k < cnt; k++) {
                 int slot = r->slot + (int)k;
-                tex_info(ex, r, slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0, 0, r->separate, &o[k].image);
+                tex_info(ex, r, slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0, 0, r->separate, &o[k].image, NULL);
             }
             vk_texture_unlock();
         } else {
@@ -4631,7 +4690,7 @@ static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSiz
     const GfxShader *vs;
     uint32_t banks;
     int listed = mvobj_pick(ex, &vs, &banks, t0);
-    int lk = listed && vk_exec_in_chunk();
+    int lk = listed && vk_exec_shared();
     if (lk) plat_mutex_lock(&mo_lock);
     if (listed) mvobj_draw_(ex, d, ib, ib_off, t0, vs, banks);
     if (t0) __atomic_add_fetch(&MO.ns_check, kern_now_ns() - t0, __ATOMIC_RELAXED);
@@ -6056,6 +6115,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         vk_exec_frame.bind_calls++;
     }
     twin_dispatch = 0;
+    if (vk_texture_deferred()) return;   // past a parallel group: the op goes again once it is done (vk_exec.c op_again)
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vk_pass_mark_end(ex->cb, m);
@@ -6094,6 +6154,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_frame.bind_calls++;
     }
     twin_dispatch = 0;
+    if (vk_texture_deferred()) return;   // as in op_dispatch
     if (cx->B.c0_valid[2]) {   // the shader binds c0
         // NVN2 programs read the group counts from c0 byte 0 (c0_info); at 0x200 their bank holds pushed constants
         // or the driver's tables, which the copy would overwrite

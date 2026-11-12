@@ -2556,7 +2556,7 @@ void vk_mem_use(VkMemSpan *sp) {
     }
     // a refused pool not due for another try stays imported: nearly every pool in the field (two have mirrors)
     if (r->mstate == MS_REFUSED && !(r->retry_sub && (int32_t)(msub - r->retry_sub) >= 0)) return;
-    int lk = vk_exec_in_chunk();
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&use_lock);
     mem_use_locked(sp);
     if (lk) plat_mutex_unlock(&use_lock);
@@ -2581,7 +2581,7 @@ void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) {
-        int lk = vk_exec_in_chunk();
+        int lk = vk_exec_shared();
         if (lk) plat_mutex_lock(&use_lock);
         if (r->acc_sub != msub) mirror_sync(r);
         if (lk) plat_mutex_unlock(&use_lock);
@@ -3173,13 +3173,13 @@ static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader) {
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset + o, size - o);   // what found no snapshot room
 }
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
-    int lk = vk_exec_in_chunk();
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&use_lock);
     gpu_wrote(sp, size, 0);
     if (lk) plat_mutex_unlock(&use_lock);
 }
 void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size) {
-    int lk = vk_exec_in_chunk();
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&use_lock);
     gpu_wrote(sp, size, 1);
     if (lk) plat_mutex_unlock(&use_lock);

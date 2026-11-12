@@ -3535,6 +3535,10 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
 // returns nothing and sets this; the chunk replays the op again once every earlier chunk is done, so entries are made,
 // initialised and taken back in the order of the stream, as the replay would.
 static _Thread_local int tex_deferred;
+static volatile uint64_t n_deferred[3];   // by what the lookup found: no entry, a retired one, a released one
+void vk_texture_deferred_stats(uint64_t out[3]) {
+    for (int i = 0; i < 3; i++) out[i] = __atomic_exchange_n(&n_deferred[i], 0, __ATOMIC_RELAXED);
+}
 int vk_texture_deferred(void) { return tex_deferred; }
 int vk_texture_deferred_take(void) {
     int d = tex_deferred;
@@ -3542,11 +3546,26 @@ int vk_texture_deferred_take(void) {
     return d;
 }
 
+// A lookup of k that finds e (NULL: no entry) and needs no turn (vk_exec_turn_due): it returns nothing without changing
+// anything (the pool refresh asking for a held key or a retired entry, a creation that failed lately: the texture pool
+// refresh looks its unresolved slots up at every sync), or it is the submitting thread's past a group (vk_exec_behind)
+// and takes back a released entry whose image stayed its own. That keeps its content and is ordered after the
+// group's chunks anyway: one of them that looks the entry up later finds it in use, as it would have after taking it
+// back itself. A transient render target the frame releases and takes back at every pass that draws it did that after
+// nearly every group (Hyrule Field, 2026-11-12).
+static int lookup_quiet(const Tex *e, const TexKey *k) {
+    if (e && e->retiring) return pool_ctx;
+    if (e) return !e->superseded && vk_exec_behind();
+    if (holds.n && nvn_hm_get(&holds, k)) return pool_ctx;
+    return create_held(k);
+}
+
 static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
-    if ((!e || e->retiring || e->released) && vk_exec_turn_due()) {
+    if ((!e || e->retiring || e->released) && vk_exec_turn_due() && !lookup_quiet(e, &k)) {
+        __atomic_add_fetch(&n_deferred[!e ? 0 : e->retiring ? 1 : 2], 1, __ATOMIC_RELAXED);
         tex_deferred = 1;
         return NULL;
     }

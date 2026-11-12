@@ -241,36 +241,43 @@ typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t 
 // times the result calls and a reset per slot, 3.5 ms more of the wait after a frame's first submission (RX 7900 XT,
 // Hyrule Field, 3 workers). A chunk that needs more than its block takes them from the ring.
 static _Thread_local struct {
-    int on, open, counting, reported, keep, chunk;
+    int on, open, counting, reported, keep, chunk, g;
     uint32_t seg, qnext, qend;
     const uint8_t *cond;
     uint32_t ncond, i;
 } XW = {.open = -1};
-static struct { int on; OqSegment **s; uint32_t n, cap; } GS;   // the front pass's segments of the group
+// GS: per group slot (vk_exec.c LIVE_GROUPS), the front pass's segments of the group. tail: with NX2NAVI_REPLAY_PIPE
+// the submitting thread replays on past the group before its chunks are done: the first segment made after the
+// group's front pass (tail_wait), by the next group's front pass or the replay, takes the queries the chunks close
+// after the group's last report or reset, which in the stream come before that one's own.
+#define GS_GROUPS 4
+static struct { int tail_wait; OqSegment **s, *tail; uint32_t n, cap; } GS[GS_GROUPS];
+static int gs_on = -1;                   // the group slot whose front pass runs
 #define CP_CHUNKS 32
-static struct { uint32_t *seg, *q, n, cap; } CP[CP_CHUNKS];    // per chunk index: closed slots and their segment
+static struct { uint32_t *seg, *q, n, cap; } CP[GS_GROUPS][CP_CHUNKS];   // per chunk: closed slots and their segment
 
-void vk_exec_xfer_group(int on) {   // on: a new group's front pass begins; off: it ended, the list stays
-    if (on) GS.n = 0;
-    GS.on = on;
+void vk_exec_xfer_group(int group) {   // a group's front pass begins (its slot), or it ended (-1): the list stays
+    if (group >= GS_GROUPS) rt_fatal("vk: parallel group slot %d of %d", group, GS_GROUPS);
+    if (group >= 0) GS[group].n = 0, GS[group].tail_wait = 0, GS[group].tail = NULL;
+    else if (gs_on >= 0) GS[gs_on].tail_wait = 1;   // until vk_exec_xfer_group_merge
+    gs_on = group;
 }
 
 int vk_exec_xfer_counting(void) { return oq_counting; }
 
-uint32_t vk_exec_xfer_slots(uint32_t n) {
-    uint32_t first = oq_next;
-    oq_next += n;
-    return first;
+uint32_t vk_exec_xfer_slots(uint32_t n) {   // the workers of a group the submitting thread went on past take some too
+    return __atomic_fetch_add(&oq_next, n, __ATOMIC_RELAXED);
 }
 
 uint64_t vk_exec_xfer_chunk_state(void) {
-    return (uint64_t)GS.n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
+    return (uint64_t)GS[gs_on].n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
 }
 
 void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
-                         int chunk) {
+                         int chunk, int group) {
     if (chunk < 0 || chunk >= CP_CHUNKS) rt_fatal("vk: replay worker chunk %d of at most %d", chunk, CP_CHUNKS);
-    XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0, XW.chunk = chunk;
+    if (group < 0 || group >= GS_GROUPS) rt_fatal("vk: parallel group slot %d of %d", group, GS_GROUPS);
+    XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0, XW.chunk = chunk, XW.g = group;
     XW.qnext = slot0, XW.qend = slot0 + nslots;
     XW.counting = (int)(state & 1), XW.reported = (int)(state >> 1 & 1), XW.keep = (int)(state >> 2 & 1);
     XW.seg = (uint32_t)(state >> 8);
@@ -278,7 +285,7 @@ void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t s
 
 // Adds closed slot q to the segment a worker's queries belong to now, or the pending list.
 static void seg_add(uint32_t q) {
-    __typeof__(CP[0]) *l = &CP[XW.chunk];
+    __typeof__(CP[0][0]) *l = &CP[XW.g][XW.chunk];
     if (l->n == l->cap) {
         l->cap = l->cap ? l->cap * 2 : 256;
         if (!(l->seg = realloc(l->seg, sizeof *l->seg * l->cap)) || !(l->q = realloc(l->q, sizeof *l->q * l->cap)))
@@ -287,13 +294,21 @@ static void seg_add(uint32_t q) {
     l->seg[l->n] = XW.seg, l->q[l->n++] = q;
 }
 
-void vk_exec_xfer_group_merge(int nchunks) {
+void vk_exec_xfer_group_merge(int group, int nchunks) {
+    __typeof__(GS[0]) *gs = &GS[group];
     for (int c = 0; c < nchunks && c < CP_CHUNKS; c++) {
-        __typeof__(CP[0]) *l = &CP[c];
+        __typeof__(CP[0][0]) *l = &CP[group][c];
         for (uint32_t i = 0; i < l->n; i++) {
             uint32_t q = l->q[i];
-            if (l->seg[i] < GS.n) {
-                OqSegment *s = GS.s[l->seg[i]];
+            if (l->seg[i] < gs->n) {
+                OqSegment *s = gs->s[l->seg[i]];
+                if (s->n == s->cap) {
+                    s->cap = s->cap ? s->cap * 2 : 16;
+                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
+                }
+                s->q[s->n++] = q;
+            } else if (gs->tail) {
+                OqSegment *s = gs->tail;
                 if (s->n == s->cap) {
                     s->cap = s->cap ? s->cap * 2 : 16;
                     if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
@@ -309,6 +324,7 @@ void vk_exec_xfer_group_merge(int nchunks) {
         }
         l->n = 0;
     }
+    gs->tail_wait = 0, gs->tail = NULL;
 }
 
 static int oq_ready(void) {
@@ -356,17 +372,16 @@ static void oq_close(VkExec *ex) {
 void vk_exec_oq_draw(VkExec *ex) {
     int *open = XW.on ? &XW.open : &oq_open;
     if (!(XW.on ? XW.counting : oq_counting) || *open >= 0) return;
-    // a worker takes the next slot of its chunk's block, past it one from the ring at once; a busy one is lost, not
-    // tried again
-    uint32_t q = (!XW.on ? oq_next : XW.qnext != XW.qend ? XW.qnext++ : __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED)) % OQ_N;
+    // a worker takes the next slot of its chunk's block, past it one from the ring at once (as the replay does, while
+    // a group's workers may still take some); a busy one is lost, not tried again
+    uint32_t q = (XW.on && XW.qnext != XW.qend ? XW.qnext++ : __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED)) % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");
-        if (XW.on && XW.seg < GS.n) __atomic_store_n(&GS.s[XW.seg]->lost, 1, __ATOMIC_RELAXED);
+        if (XW.on && XW.seg < GS[XW.g].n) __atomic_store_n(&GS[XW.g].s[XW.seg]->lost, 1, __ATOMIC_RELAXED);
         else __atomic_store_n(&oq_lost, 1, __ATOMIC_RELAXED);
         return;
     }
     __atomic_store_n(&oq_busy[q], 1, __ATOMIC_RELAXED);
-    if (!XW.on) oq_next++;
     vkCmdBeginQuery(ex->cb, oq_pool, q, oq_flags);
     ex->recorded++;
     *open = (int)q;
@@ -500,13 +515,16 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     s->cap = oq_nseg;
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
-    if (GS.on) {   // the front pass: the workers add the queries of the group's ops before it
-        if (GS.n == GS.cap) {
-            GS.cap = GS.cap ? GS.cap * 2 : 64;
-            if (!(GS.s = realloc(GS.s, sizeof *GS.s * GS.cap))) rt_fatal("vk: out of memory");
+    if (gs_on >= 0) {   // the front pass: the workers add the queries of the group's ops before it
+        __typeof__(GS[0]) *gs = &GS[gs_on];
+        if (gs->n == gs->cap) {
+            gs->cap = gs->cap ? gs->cap * 2 : 64;
+            if (!(gs->s = realloc(gs->s, sizeof *gs->s * gs->cap))) rt_fatal("vk: out of memory");
         }
-        GS.s[GS.n++] = s;
+        gs->s[gs->n++] = s;
     }
+    for (int g = 0; g < GS_GROUPS; g++)   // the first made after a group's front pass
+        if (GS[g].tail_wait && !GS[g].tail) GS[g].tail = s;
     oq_nseg = 0, oq_lost = 0;
     vk_completion_add_result(ex->fence, oq_cb, s);
 }

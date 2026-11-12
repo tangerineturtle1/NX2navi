@@ -456,8 +456,9 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
 // NX2NAVI_GPU_TIMELINE=<frame>: from that presented frame on, TL_FRAMES frames of what the CPU and the GPU did go to the
 // log once they are complete, in milliseconds from the first of those presents: each replay's begin and end and its
 // thread, each timed part's submit, GPU start and end (calibrated timestamps, so with NX2NAVI_TRACE=perf), the waits for
-// the GPU after a frame's first submission, the replay workers' groups and the presents. It tells whether the GPU waits
-// for the replay, for a wait, or for the CPU behind one. Off (and one load per note) without the setting.
+// the GPU after a frame's first submission, the replay workers' groups, chunks and the submitting thread's waits for
+// them, and the presents. It tells whether the GPU waits for the replay, for a wait, or for the CPU behind one. Off
+// (and one load per note) without the setting.
 #define TL_CAP 16384
 #define TL_FRAMES 4
 typedef struct { uint64_t t, a, b; uint32_t tid; int kind; } TlEv;
@@ -502,7 +503,12 @@ static void tl_dump(void) {
         case 'w': rt_log("vk: tl %8.3f t%-5u wait ends", at, e->tid); break;
         case 'g': rt_log("vk: tl %8.3f t%-5u group of %llu draws in %llu chunks", at, e->tid, (unsigned long long)e->a,
                          (unsigned long long)e->b); break;
-        case 'h': rt_log("vk: tl %8.3f t%-5u group recorded", at, e->tid); break;
+        case 'h': rt_log("vk: tl %8.3f t%-5u group recorded and in the part", at, e->tid); break;
+        case 'q': rt_log("vk: tl %8.3f t%-5u waits for its group: %s", at, e->tid, (const char *)(uintptr_t)e->a); break;
+        case 'u': rt_log("vk: tl %8.3f t%-5u group done, goes on", at, e->tid); break;
+        case 'c': rt_log("vk: tl %8.3f t%-5u records chunk %llu (%llu ops)", at, e->tid, (unsigned long long)e->a,
+                         (unsigned long long)e->b); break;
+        case 'd': rt_log("vk: tl %8.3f t%-5u chunk %llu done", at, e->tid, (unsigned long long)e->a); break;
         case 'S': rt_log("vk: tl %8.3f t%-5u part submitted, value %llu", at, e->tid, (unsigned long long)e->a); break;
         case 'G': rt_log("vk: tl %8.3f gpu    part runs %.3f ms (submitted %.3f ms before)", at,
                          (double)(e->a - e->t) / 1e6, (double)(int64_t)(e->t - e->b) / 1e6); break;
@@ -783,25 +789,30 @@ static uint32_t part_list(VkCommandBufferSubmitInfo *cbi, VkCommandBuffer pro, V
     uint32_t n = 0;
     VkCommandBufferSubmitInfo one = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     if (pro) one.commandBuffer = pro, cbi[n++] = one;
-    for (int i = 0; i < npart_cbs; i++) one.commandBuffer = part_cbs[i], cbi[n++] = one;
+    for (int i = 0; i < npart_cbs; i++) {
+        if (!part_cbs[i]) rt_fatal("vk: a replay worker's command buffer is missing from a part");
+        one.commandBuffer = part_cbs[i], cbi[n++] = one;
+    }
     if (with_last) one.commandBuffer = last, cbi[n++] = one;
     npart_cbs = 0;
     return n;
 }
 
 // The replay workers (vk_exec.c "replay workers"): the replay's command buffer being recorded ends and joins the
-// part's list, then the n command buffers the workers recorded, in that order, and a new command buffer of the same
-// part is begun and returned: the same timeline value, timed and submitted with the rest, so the workers' commands run
-// between the replay's commands before and after. vk_sync_append_room: whether the list has room for n more.
+// part's list, then n places for the command buffers the workers record, in that order, and a new command buffer of
+// the same part is begun and returned: the same timeline value, timed and submitted with the rest, so the workers'
+// commands run between the replay's commands before and after. The places are filled (vk_sync_append_fill) before the
+// part is submitted, which part_list checks. vk_sync_append_room: whether the list has room for n more.
 int vk_sync_append_room(int n) { return npart_cbs + n + 1 <= PART_CBS; }
 
-VkCommandBuffer vk_sync_append(const VkCommandBuffer *cbs, int n) {
+VkCommandBuffer vk_sync_append_later(int n, int *at) {
     if (!vk_sync_append_room(n)) rt_fatal("vk: a submission part of more than %d command buffers", PART_CBS);
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of it is in cb, ended by its recorder
     part_cbs[npart_cbs++] = cb;
-    for (int i = 0; i < n; i++) part_cbs[npart_cbs++] = cbs[i];
+    *at = npart_cbs;
+    for (int i = 0; i < n; i++) part_cbs[npart_cbs++] = VK_NULL_HANDLE;
     CmdSlot *s = take_slot(c, cur_fence);   // the ended one keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -810,10 +821,16 @@ VkCommandBuffer vk_sync_append(const VkCommandBuffer *cbs, int n) {
     return s->cb;
 }
 
+void vk_sync_append_fill(int at, const VkCommandBuffer *cbs, int n) {
+    if (at < 0 || at + n > npart_cbs) rt_fatal("vk: replay worker command buffers past the part's list");
+    for (int i = 0; i < n; i++) part_cbs[at + i] = cbs[i];
+}
+
 // The replay workers' command buffers: each worker has a command pool of its own (a pool belongs to one thread at a
 // time) and claims command buffers from it for the submission being recorded, as the replay claims its slots. Called
-// on the worker while the submitting thread holds sub_lock and waits for it, so cur_fence stays put.
-#define SYNC_WORKERS 16
+// on the worker while the submitting thread holds sub_lock and records on (NX2NAVI_REPLAY_PIPE) or waits for it: the
+// part with the worker's command buffer is not submitted before it is done, so cur_fence stays put.
+#define SYNC_WORKERS 17                // the replay workers (at most 16) and the submitting thread
 static struct { VkCommandPool pool; CmdSlot *slots; int n; } WP[SYNC_WORKERS];
 
 VkCommandBuffer vk_sync_worker_begin(int w) {

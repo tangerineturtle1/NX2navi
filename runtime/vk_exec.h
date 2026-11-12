@@ -154,20 +154,24 @@ void vk_exec_probe_inline(VkCommandBuffer cb, uint64_t fence);
 void *vk_exec_draw_ctx_new(void);
 void vk_exec_draw_ctx_use(void *ctx);
 // vk_exec_draw.c, before the chunks of a parallel group are recorded (submitting thread): the stand-ins are made and the
-// texture pool set this submission took is brought up to date, which the chunks then only bind.
-void vk_exec_draw_group_begin(VkExec *ex);
-// vk_exec_xfer.c, parallel groups: vk_exec_xfer_group turns the front pass on (it lists the group's occlusion segments)
-// or off; vk_exec_xfer_front replays a counter report or reset, render enable or render condition in the front pass
-// (returns the condition's decision, 1 renders); vk_exec_xfer_chunk_state is the occlusion counting at a chunk's first
-// op, which vk_exec_xfer_worker hands to the worker side with the chunk's decisions (on), or turns it off.
-void vk_exec_xfer_group(int on);
+// texture pool set this submission took is brought up to date, which the chunks then only bind. Returns the inline
+// uniform updates of the submission so far (vk_exec_upd_top).
+uint32_t vk_exec_draw_group_begin(VkExec *ex);
+// vk_exec.c: of the submission's inline uniform updates (all), those a draw on the calling thread may read.
+uint32_t vk_exec_upd_top(uint32_t all);
+// vk_exec_xfer.c, parallel groups: vk_exec_xfer_group turns the front pass of the group in slot `group` on (it lists
+// the group's occlusion segments) or off (-1); vk_exec_xfer_front replays a counter report or reset, render enable or
+// render condition in the front pass (returns the condition's decision, 1 renders); vk_exec_xfer_chunk_state is the
+// occlusion counting at a chunk's first op, which vk_exec_xfer_worker hands to the worker side with the chunk's
+// decisions and its group's slot (on), or turns it off.
+void vk_exec_xfer_group(int group);
 int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload);
 uint64_t vk_exec_xfer_chunk_state(void);
 void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
-                         int chunk);
-// After every chunk of the group is done (submitting thread): the slots the chunks closed go into their segments, in
-// the order of the chunks.
-void vk_exec_xfer_group_merge(int nchunks);
+                         int chunk, int group);
+// After every chunk of the group in slot `group` is done (submitting thread, groups oldest first): the slots the
+// chunks closed go into their segments, in the order of the chunks.
+void vk_exec_xfer_group_merge(int group, int nchunks);
 // The front pass: whether a draw here counts samples (a query slot), and n slots of the ring in the order of the stream
 // for one chunk (the first is returned; vk_exec_xfer_worker hands them to the chunk's worker).
 int vk_exec_xfer_counting(void);

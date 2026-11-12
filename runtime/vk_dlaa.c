@@ -1457,7 +1457,7 @@ static void dlaa_draw_locked(VkExec *ex);
 void vk_dlaa_draw(VkExec *ex) {
     if (!dl_active() || D.ended) return;
     static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once (vk_exec.c chunks)
-    int lk = vk_exec_in_chunk();
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&lock);
     dlaa_draw_locked(ex);
     if (lk) plat_mutex_unlock(&lock);
@@ -2013,6 +2013,9 @@ void vk_dlaa_pass(VkExec *ex) {
         int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
         int same = c->width == D.color.width && c->height == D.color.height;
         if (one && big && c->width > D.color.width && c->height > D.color.height) {
+            // DLSS runs: the replay workers' draws read the jitter and its end, and list the per-object motion it
+            // takes (vk_exec.c "replay workers"); the G-buffer and the arming above change nothing they read
+            vk_exec_hook_turn();
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
         } else if (one && same && native && scene_color(c->format)) {
@@ -2026,9 +2029,11 @@ void vk_dlaa_pass(VkExec *ex) {
             if (!told++)
                 rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
                        c->width, c->height, (int)c->format);
+            vk_exec_hook_turn();
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
         } else if (one && same && output_target(c->format)) {
+            vk_exec_hook_turn();
             D.ended = D.done = 1;
             evaluate(ex, NULL);
         }
@@ -2036,6 +2041,7 @@ void vk_dlaa_pass(VkExec *ex) {
     }
     if (!D.ended) {
         if (!ex->pass_w || ex->pass_w * 4 > D.color.width) return;
+        vk_exec_hook_turn();
         D.ended = 1;
         if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL);   // DLAA in place; else wait for the scaling pass
         return;
@@ -2043,6 +2049,7 @@ void vk_dlaa_pass(VkExec *ex) {
     // the game's scaling pass: one colour target of the output size, no depth
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
+        vk_exec_hook_turn();
         D.done = D.up = 1;
         evaluate(ex, c);
     }

@@ -50,29 +50,54 @@ static _Thread_local VkExec *x_cur;
 // ---- parallel groups (NX2NAVI_REPLAY_WORKERS; "replay workers" below). A chunk: a part of a group's ops that one
 // thread records into a command buffer of its own, from the replay state the front pass left at its first op.
 #define GROUP_CHUNKS 17                 // chunks a group is cut into at most: RW_MAX workers and the submitting thread
+#define LIVE_GROUPS 4                   // groups handed out whose command buffers are not in their part yet, at most
+typedef struct Group Group;
 typedef struct {
     VkExec ex;                          // the state at its first op, then the state it records with
     const op_hdr *h;                    // its first op
     uint32_t nops;                      // the ops it records (JUMPs not counted)
-    uint32_t cond0, ncond;              // its render conditions' decisions in G.cond
+    uint32_t cond0, ncond;              // its render conditions' decisions in its group's cond
     uint64_t oq;                        // the occlusion counting at its first op (vk_exec_xfer_chunk_state)
     uint32_t slot0, nslots;             // its block of occlusion query slots (vk_exec_xfer_slots)
     uint32_t brk;                       // its ops that are not state or a draw (vk_exec_brk_now)
     int idx;                            // in its group: 0 runs the group's pass hooks
+    Group *g;                           // its group
     VkCommandBuffer cb;
     int recorded;
     volatile int32_t done;
 } Chunk;
-static struct {
+struct Group {
     Chunk c[GROUP_CHUNKS];
     int n;
     uint8_t *cond;                      // the decisions of the group's render conditions, in stream order
     uint32_t ncond, ccond;
-    volatile int32_t next;              // the next chunk to take (huge between groups)
     volatile int32_t hooks;             // chunk 0 began its first pass (or ended): the others may start
-    volatile uint32_t gen;              // bumped when a group is handed out
-} G = {.next = 1 << 30};
+    volatile int32_t ndone;             // its chunks done
+    volatile uint64_t seq;              // its number: Q.out when it was handed out (vk_exec_stream_pos)
+    uint32_t upd;                       // the submission's inline uniform updates before it (vk_exec_upd_top)
+    int at;                             // its chunks' places in the part's list (vk_sync_append_later)
+    uint64_t out_ns;                    // when it was handed out
+};
+// Group number s is GQ[s % LIVE_GROUPS]. Its chunks wait in Q in the order of the stream once it is handed out; the
+// workers (and the submitting thread, while it waits) take them in that order.
+static Group GQ[LIVE_GROUPS];
+#define QN (LIVE_GROUPS * GROUP_CHUNKS)
+static struct {
+    Chunk *q[QN];                       // chunk number i of those handed out is q[i % QN]
+    volatile uint64_t put, take;        // chunks handed out, taken
+    volatile uint64_t done;             // every group up to this number has all its chunks done
+    uint64_t out, drained;              // the submitting thread: groups handed out, and put into their parts
+} Q;
+static PlatMutex done_lock = PLAT_MUTEX_INIT;   // Q.done moves on (groups_done_advance)
 static _Thread_local Chunk *rw_chunk;   // the chunk the calling thread records, NULL outside one
+// The submitting thread records on past groups whose chunks may not all be done yet (NX2NAVI_REPLAY_PIPE).
+static _Thread_local int rw_behind;
+// Why it waited for them (RW.pw_*): room for the next group, an op chunks never record, a pass's hooks, an effect that
+// waits for its turn (vk_exec_turn), a texture entry, a part split, the submission's end; and the waits that found
+// every group done already.
+enum { PW_NEXT, PW_OP, PW_HOOKS, PW_TURN, PW_TEX, PW_SPLIT, PW_END, PW_DONE, PW_N };
+static void group_wait(int why, int help);
+static void group_drain(VkExec *ex, int why);
 static _Thread_local const op_hdr *rw_op;   // in a chunk: the op it records (vk_exec_mesh_run reads on from it)
 static _Thread_local int rw_ordered;    // every earlier chunk of its group is done
 static PlatMutex tfr_lock = PLAT_MUTEX_INIT;   // target frames (vk_target_frames.h) noted by several chunks at once
@@ -786,6 +811,9 @@ void vk_exec_pass_begin(VkExec *ex) {
     // A parallel group's targets do not change: its pass hooks, which follow the frame pass by pass, run in its first
     // chunk, which the others start after (chunk_record).
     if (!rw_chunk || !rw_chunk->idx) {
+        // the submitting thread past a group: the hooks read what its first chunk's left, and wait for the whole
+        // group where they change what its draws read (vk_exec_hook_turn)
+        if (!rw_chunk) vk_exec_hooks_wait();
         vk_contact_pass_begin(ex);
         vk_dlaa_pass(ex);   // DLAA runs before the bloom chain's first pass (vk_dlaa.c)
     }
@@ -849,7 +877,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     vk_exec_frame.passes++;
     ex->recorded++;
     ex->in_pass = 1;
-    if (rw_chunk && !rw_chunk->idx) __atomic_store_n(&G.hooks, 1, __ATOMIC_RELEASE);
+    if (rw_chunk && !rw_chunk->idx) __atomic_store_n(&rw_chunk->g->hooks, 1, __ATOMIC_RELEASE);
 }
 
 void vk_exec_pass_end(VkExec *ex) {
@@ -871,7 +899,8 @@ void vk_exec_pass_end(VkExec *ex) {
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed) vk_dump_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    if (rw_chunk) plat_mutex_lock(&tfr_lock);
+    int lk = vk_exec_shared();
+    if (lk) plat_mutex_lock(&tfr_lock);
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) {
             TfrTarget ft = tfr_of(&ex->color[i]);
@@ -881,7 +910,7 @@ void vk_exec_pass_end(VkExec *ex) {
         TfrTarget ft = tfr_of(&ex->depth);
         vk_texture_gpu_written(ex->depth.tex), tfr_note(&ft, stamp);
     }
-    if (rw_chunk) plat_mutex_unlock(&tfr_lock);
+    if (lk) plat_mutex_unlock(&tfr_lock);
 }
 
 VkCommandBuffer vk_exec_inline_begin(int *reopen) {
@@ -1103,6 +1132,10 @@ static void maybe_split(VkExec *ex) {
         split_at = split_n ? split_n : INT_MAX;
     }
     if (!split_n) return;
+    if (Q.drained < Q.out) {   // groups the submitting thread went on past go into the part first, once done
+        if (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < Q.out) return;   // split_draws stays: a later op asks again
+        group_drain(ex, PW_SPLIT);
+    }
     // the first part while the GPU is idle: at a pass boundary only, where a split costs no pass restart
     int idle = !ex->in_pass && split_idle && split_draws && !part_start && vk_sync_fence_done() >= vk_sync_issued();
     if (!idle) {
@@ -1750,6 +1783,34 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // replays the op again once in turn, and so do the contact shadows' pass and the HDR pass's source. Per-object motion
 // lists its draws under a lock (vk_exec_draw.c mvobj_draw), and the occlusion queries' slots and segments follow the
 // stream (vk_exec_xfer.c vk_exec_xfer_slots, vk_exec_xfer_group_merge).
+// NX2NAVI_REPLAY_PIPE=1 (default 0): the submitting thread hands the group to the workers, takes chunks of it as they do
+// until none is left to take, and goes on with the ops after it, in a new command buffer after the chunks' places in
+// the part (vk_sync_append_later), while the last chunks are recorded; also into the front pass of the next group: up
+// to LIVE_GROUPS groups are handed out and not in their part yet, their chunks taken from one queue in the order of
+// the stream (Q). Hyrule Field, 3 workers (2026-11-12): the frame's groups took 6.8 ms of the submitting thread and the
+// ops between them 4.6. A group's chunk 0 runs its pass hooks after the group before began its pass, and waits for
+// every earlier group where a hook acts; a turn (vk_exec_turn) waits for every earlier chunk, of earlier groups too.
+// The submitting thread waits for the groups (group_wait), and puts their command buffers and query slots in place
+// (group_drain, oldest first: groups_put_done), only where the order needs it:
+// - for room when LIVE_GROUPS are out, before a part is split off or submitted (a part due before a group goes to the
+//   GPU first: its work would otherwise wait for the group's last chunk too), and before an op that chunks never
+//   record (pipe_op: copies, clears of textures and buffers);
+// - where a pass's hook acts: DLAA's run (vk_dlaa.c: the jitter and its end, and the per-object motion lists it takes)
+//   and the contact shadows' targets (vk_contact.c) change what earlier draws read (vk_exec_hook_turn);
+// - when a lookup would make a texture entry or take back a retired one: the op returns early and goes again once the
+//   groups are done (op_again), as a chunk's does in turn (vk_texture.c lookup_quiet: what changes nothing, or takes
+//   back a released render target that kept its image, needs no turn);
+// - uniform snapshot drops count from where they are in the stream (vk_exec_epoch: a group's chunks do not see the
+//   drops of ops after the group), the texture pool set syncs under the lock the chunks take, a chunk reads only the
+//   inline uniform updates before its group (vk_exec_upd_top), the HDR present's source goes by stream position
+//   (vk_exec_stream_pos), and the queries after a group's last report go into the next segment made after its front
+//   pass (vk_exec_xfer.c GS).
+// Locks a chunk takes, the submitting thread takes too while it is behind (vk_exec_shared). The chunks it records,
+// at the hand-out or while it waits between two ops, use a draw context of its own (RW.help_dc).
+// Off by default: Hyrule Field, 3 workers, standing (2026-11-12), it shortened the replay (11.5 against 12.1 ms a
+// frame) but not the frame (49.2 against 49.6 fps in the same batch). The main thread's wait for the GPU after the
+// frame's first submission grew by 0.8 ms: the GPU gets a group's commands only once its last chunk is recorded, and
+// a part goes only when every group in it is done, so fewer parts reach it, later.
 #define RW_MAX 16
 #define CHUNK_DRAWS 32                  // draws a chunk takes at least
 #define GROUP_PEEK 65536u               // ops read ahead for a group, at most
@@ -1777,8 +1838,13 @@ typedef struct {
     PlatEvent wake;
 } RwWorker;
 
+static const char *const pw_name[PW_N] = {"next group", "op", "pass hooks", "turn", "texture entry", "split",
+                                          "submission end", "done before"};
+
 static struct {
     int n;                              // workers; 0 off, -1 not read yet
+    int pipe;                           // NX2NAVI_REPLAY_PIPE
+    void *help_dc;                      // the submitting thread's draw context for chunks it takes while it waits
     RwWorker *w[RW_MAX];
     const op_hdr *skip_to[CALL_DEPTH + 1];   // per call depth: the walk read ahead to this op, a group too small
     uint64_t groups, group_draws, chunks, serial_draws, wait_ns;   // since the last perf line
@@ -1788,7 +1854,10 @@ static struct {
     // the submitting thread, since the last perf line: ops outside groups by kind (SER_*), and in groups the front
     // pass, its own chunks and the wait for the others'
     uint64_t ser_n[4], ser_ns[4], front_ns, own_ns, spin_ns;
-    volatile uint64_t turns, turn_ns, redos;
+    // NX2NAVI_REPLAY_PIPE, since the last perf line: waits by why (PW_*), the time from a group's hand-out to the end
+    // of the wait for it, and the ops that waited (PW_OP)
+    uint64_t pw_n[PW_N], pw_ns[PW_N], behind_ns, pd_op[OP_COUNT_];
+    volatile uint64_t turns, turn_ns, redos, chunk_ns;   // chunk_ns: the chunks' recording, every thread's
 } RW = {.n = -1};
 
 static void group_take(int pool);
@@ -1803,26 +1872,33 @@ static int ser_kind(uint32_t op) {
     }
 }
 
+static Chunk *chunk_take(void);
+static void chunk_record(Chunk *c, int pool);
+
 static void rw_main(void *arg) {
     RwWorker *w = arg;
     plat_thread_priority(PLAT_PRIO_HIGHEST);   // as the recording thread (rec_claim)
+    perf_lock_timing_here();   // NX2NAVI_LOCK_TIME, as on the recording thread
     vk_exec_draw_ctx_use(w->dc);
-    uint32_t seen = 0;
     for (;;) {
-        // spins about 100 us after a group (the next one of the frame is usually closer), then sleeps
+        Chunk *c = chunk_take();
+        if (c) {
+            chunk_record(c, w->idx);
+            continue;
+        }
+        // spins about 100 us after a chunk (the next group of the frame is usually closer), then sleeps
         uint64_t t0 = kern_now_ns();
-        for (unsigned i = 0; __atomic_load_n(&G.gen, __ATOMIC_ACQUIRE) == seen; i++) {
+        for (unsigned i = 0; __atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST); i++) {
             if ((i & 63) || kern_now_ns() - t0 < 100000) {
                 plat_pause();
                 continue;
             }
             __atomic_store_n(&w->sleeping, 1, __ATOMIC_SEQ_CST);
-            if (__atomic_load_n(&G.gen, __ATOMIC_SEQ_CST) == seen) plat_event_wait_ns(&w->wake, 2000000);
+            if (__atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST))
+                plat_event_wait_ns(&w->wake, 2000000);
             __atomic_store_n(&w->sleeping, 0, __ATOMIC_RELAXED);
             t0 = kern_now_ns();
         }
-        seen = __atomic_load_n(&G.gen, __ATOMIC_ACQUIRE);
-        group_take(w->idx);
     }
 }
 
@@ -1839,19 +1915,76 @@ static void rw_init(void) {
         if (!(w->t = plat_thread_new(rw_main, w, name))) rt_fatal("vk: cannot start a replay worker");
         RW.w[k] = w;
     }
-    if (RW.n) rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s and the submitting thread "
-                     "(NX2NAVI_REPLAY_WORKERS)", 2 * CHUNK_DRAWS, RW.n, RW.n > 1 ? "s" : "");
+    RW.pipe = RW.n > 0 && cfg_bool("NX2NAVI_REPLAY_PIPE");
+    if (RW.pipe) RW.help_dc = vk_exec_draw_ctx_new();
+    if (RW.pipe)
+        rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s while the submitting thread goes on "
+               "past them (NX2NAVI_REPLAY_WORKERS, NX2NAVI_REPLAY_PIPE)", 2 * CHUNK_DRAWS, RW.n, RW.n > 1 ? "s" : "");
+    else if (RW.n)
+        rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s and the submitting thread "
+               "(NX2NAVI_REPLAY_WORKERS)", 2 * CHUNK_DRAWS, RW.n, RW.n > 1 ? "s" : "");
 }
 
-int vk_exec_turn_due(void) { return rw_chunk && !rw_ordered; }
+// Every group before g has all its chunks done.
+static int groups_before_done(const Group *g) { return __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) + 1 >= g->seq; }
+
+// Every chunk before c in the stream is done: those of earlier groups, and its group's earlier ones.
+static int chunk_in_turn(const Chunk *c) {
+    if (!groups_before_done(c->g)) return 0;
+    for (int i = 0; i < c->idx; i++)
+        if (!__atomic_load_n(&c->g->c[i].done, __ATOMIC_ACQUIRE)) return 0;
+    return 1;
+}
+
+int vk_exec_turn_due(void) {
+    if (!rw_chunk) {
+        if (rw_behind && __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) >= Q.out) rw_behind = 0;
+        return rw_behind;
+    }
+    if (!rw_ordered && chunk_in_turn(rw_chunk)) rw_ordered = 1;
+    return !rw_ordered;
+}
 int vk_exec_in_chunk(void) { return rw_chunk != NULL; }
+int vk_exec_shared(void) { return rw_chunk || rw_behind; }
+int vk_exec_behind(void) { return !rw_chunk && rw_behind; }
+
+// A chunk of a group comes after the ops before the group and after its group's earlier chunks; the submitting
+// thread after every chunk of the groups it handed out.
+uint64_t vk_exec_stream_pos(void) { return rw_chunk ? rw_chunk->g->seq << 5 | (uint64_t)rw_chunk->idx : Q.out << 5 | 31; }
+
+// Uniform snapshot drops (vk_usnap.c): a chunk's are its group's; the submitting thread's come after every group it
+// handed out. A chunk sees the drops of epochs up to its group's, the submitting thread every one.
+uint64_t vk_exec_epoch(int write) { return rw_chunk ? rw_chunk->g->seq : write ? Q.out + 1 : UINT64_MAX; }
+
+// The inline uniform updates of the submission a draw may read (vk_exec_draw.c upd_read): a chunk only those before
+// its group.
+uint32_t vk_exec_upd_top(uint32_t all) { return rw_chunk ? rw_chunk->g->upd : all; }
+
+void vk_exec_hooks_wait(void) {
+    if (!vk_exec_behind()) return;
+    const Group *g = &GQ[Q.out % LIVE_GROUPS];   // the last handed out, whose first chunk ran after the others'
+    while (!__atomic_load_n(&g->hooks, __ATOMIC_ACQUIRE)) plat_pause();
+}
+
+void vk_exec_hook_turn(void) {
+    if (!rw_chunk) {
+        group_wait(PW_HOOKS, 0);
+        return;
+    }
+    // a group's hooks run in its first chunk, after its group's earlier chunks; the earlier groups' draws read what
+    // the hook changes
+    while (!groups_before_done(rw_chunk->g)) plat_pause();
+}
 
 void vk_exec_turn(void) {
     Chunk *c = rw_chunk;
-    if (!c || rw_ordered) return;
+    if (!c) {   // the submitting thread: after every chunk of the groups it went on past
+        group_wait(PW_TURN, 0);
+        return;
+    }
+    if (rw_ordered) return;
     uint64_t t0 = kern_now_ns();
-    for (int i = 0; i < c->idx; i++)
-        while (!__atomic_load_n(&G.c[i].done, __ATOMIC_ACQUIRE)) plat_pause();
+    while (!chunk_in_turn(c)) plat_pause();
     rw_ordered = 1;
     __atomic_add_fetch(&RW.turns, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&RW.turn_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
@@ -1908,22 +2041,52 @@ static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end
     return draws;
 }
 
-static Chunk *chunk_open(const VkExec *ex, const op_hdr *h, int idx) {
-    Chunk *c = &G.c[idx];
+static Chunk *chunk_open(Group *g, const VkExec *ex, const op_hdr *h, int idx) {
+    Chunk *c = &g->c[idx];
     memcpy(&c->ex, ex, sizeof *ex);
-    c->h = h, c->nops = 0, c->cond0 = G.ncond, c->ncond = 0, c->idx = idx, c->oq = vk_exec_xfer_chunk_state();
+    c->h = h, c->nops = 0, c->cond0 = g->ncond, c->ncond = 0, c->idx = idx, c->g = g, c->oq = vk_exec_xfer_chunk_state();
     c->nslots = 0, c->brk = 0;
     return c;
 }
 
+// The groups whose every chunk is done, in order (Q.done), once a group's last chunk is.
+static void groups_done_advance(void) {
+    plat_mutex_lock(&done_lock);
+    for (;;) {
+        uint64_t d = Q.done;
+        const Group *g = &GQ[(d + 1) % LIVE_GROUPS];
+        if (__atomic_load_n(&g->seq, __ATOMIC_ACQUIRE) != d + 1 || __atomic_load_n(&g->ndone, __ATOMIC_ACQUIRE) != g->n)
+            break;
+        __atomic_store_n(&Q.done, d + 1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&done_lock);
+}
+
+static Chunk *chunk_take(void) {
+    uint64_t t = __atomic_load_n(&Q.take, __ATOMIC_ACQUIRE);
+    while (t < __atomic_load_n(&Q.put, __ATOMIC_ACQUIRE))
+        if (__atomic_compare_exchange_n(&Q.take, &t, t + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return Q.q[t % QN];
+    return NULL;
+}
+
 // Records chunk c with the command pool `pool` (a worker's index; the submitting thread's is RW.n).
 static void chunk_record(Chunk *c, int pool) {
+    Group *g = c->g;
     if (c->idx)
-        while (!__atomic_load_n(&G.hooks, __ATOMIC_ACQUIRE)) plat_pause();
+        while (!__atomic_load_n(&g->hooks, __ATOMIC_ACQUIRE)) plat_pause();
+    else if (!groups_before_done(g)) {   // the pass hooks follow the frame pass by pass: after the group before's
+        const Group *p = &GQ[(g->seq - 1) % LIVE_GROUPS];   // not done, so not put in its part yet: still its slot
+        while (!__atomic_load_n(&p->hooks, __ATOMIC_ACQUIRE)) plat_pause();
+    }
+    uint64_t t0 = kern_now_ns();
+    gfx_tl_note('c', t0, (uint64_t)c->idx, (uint64_t)c->nops);
     VkExec *ex = &c->ex, *was = x_cur;
-    if (pool < RW.n) ex->dc = RW.w[pool]->dc;   // the submitting thread records with its own (the state's)
-    x_cur = ex, rw_chunk = c, rw_ordered = !c->idx;
-    vk_exec_xfer_worker(1, G.cond + c->cond0, c->ncond, c->oq, c->slot0, c->nslots, c->idx);
+    // the submitting thread records with its own (the state's), or one of its own past the group (RW.pipe)
+    int help = pool == RW.n && RW.pipe;
+    if (pool < RW.n) ex->dc = RW.w[pool]->dc;
+    else if (help) ex->dc = RW.help_dc, vk_exec_draw_ctx_use(RW.help_dc);
+    x_cur = ex, rw_chunk = c, rw_ordered = !c->idx && groups_before_done(g);
+    vk_exec_xfer_worker(1, g->cond + c->cond0, c->ncond, c->oq, c->slot0, c->nslots, c->idx, (int)(g - GQ));
     ex->cb = vk_sync_worker_begin(pool);
     // the replay's command buffer before the group ended behind a full barrier, with every image in GENERAL
     ex->recorded = 0, ex->barrier_at = 0, ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL;
@@ -1949,24 +2112,104 @@ static void chunk_record(Chunk *c, int pool) {
         }
         k++, o = nvn_op_next(o);
     }
-    if (!c->idx) __atomic_store_n(&G.hooks, 1, __ATOMIC_RELEASE);   // a chunk 0 that began no pass
+    if (!c->idx) __atomic_store_n(&g->hooks, 1, __ATOMIC_RELEASE);   // a chunk 0 that began no pass
     vk_exec_barrier(ex);   // the next command buffer starts after it, every image back in GENERAL
     vk_sync_worker_end(ex->cb);
     views_release(ex, ex->fence);
     free(ex->views);
     ex->views = NULL;
     c->cb = ex->cb, c->recorded = ex->recorded;
-    vk_exec_xfer_worker(0, NULL, 0, 0, 0, 0, 0);
+    vk_exec_xfer_worker(0, NULL, 0, 0, 0, 0, 0, 0);
     x_cur = was, rw_chunk = NULL;
+    if (help) vk_exec_draw_ctx_use(NULL);
+    __atomic_add_fetch(&RW.chunk_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
+    gfx_tl_note('d', 0, (uint64_t)c->idx, 0);
     __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+    if (__atomic_add_fetch(&g->ndone, 1, __ATOMIC_ACQ_REL) == g->n) groups_done_advance();
 }
 
 static void group_take(int pool) {
-    for (;;) {
-        int i = __atomic_fetch_add(&G.next, 1, __ATOMIC_ACQ_REL);
-        if (i >= __atomic_load_n(&G.n, __ATOMIC_ACQUIRE)) return;
-        chunk_record(&G.c[i], pool);
+    for (Chunk *c; (c = chunk_take());) chunk_record(c, pool);
+}
+
+// The submitting thread past groups it handed out (RW.pipe): until every chunk of them is done. With `help` (only
+// between two ops) it records the chunks no worker took yet itself. Then nothing of them runs beside it any more.
+static void group_wait(int why, int help) {
+    if (!rw_behind) return;
+    uint64_t t0 = kern_now_ns();
+    int done = __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) >= Q.out;
+    if (!done) {
+        gfx_tl_note('q', t0, (uint64_t)(uintptr_t)pw_name[why], 0);
+        if (help) group_take(RW.n);
+        while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < Q.out) plat_pause();
+        gfx_tl_note('u', 0, 0, 0);
     }
+    rw_behind = 0;
+    uint64_t t1 = kern_now_ns();
+    if (done) RW.pw_n[PW_DONE]++;
+    else RW.pw_n[why]++, RW.pw_ns[why] += t1 - t0;
+}
+
+// A done group's command buffers into their places in the part, its closed query slots into their segments.
+static void group_put(VkExec *ex, Group *g) {
+    vk_exec_xfer_group_merge((int)(g - GQ), g->n);
+    VkCommandBuffer cbs[GROUP_CHUNKS];
+    int rec = 0;
+    for (int i = 0; i < g->n; i++) cbs[i] = g->c[i].cb, rec += g->c[i].recorded;
+    vk_sync_append_fill(g->at, cbs, g->n);
+    if (ex->barrier_at == ex->recorded) ex->barrier_at += rec;   // nothing since the chunks' closing barrier
+    ex->recorded += rec;
+    RW.behind_ns += kern_now_ns() - g->out_ns;
+    gfx_tl_note('h', 0, 0, 0);
+}
+
+// The done groups not in their parts yet, oldest first; when every one handed out is, the submitting thread is no
+// longer behind.
+static void groups_put_done(VkExec *ex) {
+    uint64_t d = __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE);
+    while (Q.drained < d) Q.drained++, group_put(ex, &GQ[Q.drained % LIVE_GROUPS]);
+    if (Q.drained == Q.out) rw_behind = 0;
+}
+
+static void group_drain(VkExec *ex, int why) {
+    if (Q.drained == Q.out) return;
+    group_wait(why, 1);
+    groups_put_done(ex);
+}
+
+// Before the front pass of a new group: its slot holds a group put in its part (the oldest goes in first).
+static void group_room(VkExec *ex) {
+    if (Q.out - Q.drained < LIVE_GROUPS) return;
+    uint64_t want = Q.drained + 1;
+    if (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < want) {
+        uint64_t t0 = kern_now_ns();
+        gfx_tl_note('q', t0, (uint64_t)(uintptr_t)pw_name[PW_NEXT], 0);
+        group_take(RW.n);
+        while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < want) plat_pause();
+        gfx_tl_note('u', 0, 0, 0);
+        RW.pw_n[PW_NEXT]++, RW.pw_ns[PW_NEXT] += kern_now_ns() - t0;
+    }
+    groups_put_done(ex);
+}
+
+// The ops the submitting thread replays past a group it handed out; before any other it waits for the group. The
+// ops a chunk records, the game's barriers, dispatches, and events (a wait reads memory, a signal's value goes there
+// from the completion thread): their lookups go again once the group is done (op_again), and they leave what the
+// chunks read as it was (vk_exec_shared, vk_exec_epoch, vk_exec_upd_top).
+static int pipe_op(uint32_t op) {
+    return run_op(op) || op == OP_BARRIER || op == OP_DISPATCH || op == OP_DISPATCH_IND || op == OP_WAIT_EVENT ||
+           op == OP_SIGNAL_EVENT;
+}
+
+// A lookup of op h would have made or taken back a texture entry before the group it went on past was done (the
+// submitting thread's vk_texture_deferred): once it is, h goes again, as a chunk's op does in turn.
+static void op_again(VkExec *ex, const op_hdr *h) {
+    vk_exec_pass_end(ex);
+    ex->rt_resolved = 0, ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    group_wait(PW_TEX, 1);
+    __atomic_add_fetch(&RW.redos, 1, __ATOMIC_RELAXED);
+    op_one(ex, h);
 }
 
 // The submitting thread, at op h of the walk: when a group large enough to split starts here, it is recorded by the
@@ -1987,23 +2230,30 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         RW.skip_to[depth] = end, RW.serial_draws += draws, RW.small_end[why] += draws;
         return h;
     }
+    if (RW.pipe) {
+        // a part due goes to the GPU before the group, with the groups still recording in it: its GPU work would
+        // otherwise wait for this group's chunks too
+        if (split_draws && split_wanted()) group_drain(ex, PW_SPLIT), maybe_split(ex);
+        group_room(ex);
+    }
+    Group *g = &GQ[(Q.out + 1) % LIVE_GROUPS];
     uint64_t t0 = kern_now_ns();
     gfx_tl_note('g', 0, draws, (uint64_t)n);
     vk_exec_barrier(ex);         // the command buffer so far ends behind a full barrier, every image back in GENERAL
-    vk_exec_draw_group_begin(ex);
+    g->upd = vk_exec_draw_group_begin(ex);
     // the front pass
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;
     int nc = 1, cut = 0;
-    G.ncond = 0;
-    vk_exec_xfer_group(1);
-    Chunk *c = chunk_open(ex, h, 0);
+    g->ncond = 0;
+    vk_exec_xfer_group((int)(g - GQ));
+    Chunk *c = chunk_open(g, ex, h, 0);
     for (const op_hdr *o = h; o != end;) {
         const void *a = nvn_op_payload(o);
         if (o->op == OP_JUMP) {
             o = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target;
             continue;
         }
-        if (cut) c = chunk_open(ex, o, nc++), cd = 0, cut = 0;
+        if (cut) c = chunk_open(g, ex, o, nc++), cd = 0, cut = 0;
         switch (o->op) {
         case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
             if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots++;   // at most one query each
@@ -2013,11 +2263,11 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND: {
             int on = vk_exec_xfer_front(ex, o->op, a);
             if (o->op == OP_RENDER_COND) {
-                if (G.ncond == G.ccond) {
-                    G.ccond = G.ccond ? G.ccond * 2 : 1024;
-                    if (!(G.cond = realloc(G.cond, G.ccond))) rt_fatal("vk: out of memory (render conditions)");
+                if (g->ncond == g->ccond) {
+                    g->ccond = g->ccond ? g->ccond * 2 : 1024;
+                    if (!(g->cond = realloc(g->cond, g->ccond))) rt_fatal("vk: out of memory (render conditions)");
                 }
-                G.cond[G.ncond++] = (uint8_t)on;
+                g->cond[g->ncond++] = (uint8_t)on;
                 c->ncond++;
             }
             break;
@@ -2027,35 +2277,42 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         c->nops++;
         o = nvn_op_next(o);
     }
-    vk_exec_xfer_group(0);   // the segments stay listed for the workers until the next group
-    for (int i = 0; i < nc; i++) G.c[i].slot0 = vk_exec_xfer_slots(G.c[i].nslots);   // in the order of the stream
-    // handed out: the workers and this thread take the chunks in order
-    for (int i = 0; i < nc; i++) G.c[i].done = 0;
-    G.hooks = 0;
-    __atomic_store_n(&G.n, nc, __ATOMIC_RELEASE);
-    __atomic_store_n(&G.next, 0, __ATOMIC_RELEASE);
+    vk_exec_xfer_group(-1);   // the segments stay listed for the workers until the group is put in its part
+    for (int i = 0; i < nc; i++) g->c[i].slot0 = vk_exec_xfer_slots(g->c[i].nslots);   // in the order of the stream
+    // handed out: the workers (and without RW.pipe this thread) take the chunks in order
+    for (int i = 0; i < nc; i++) g->c[i].done = 0;
+    g->hooks = 0, g->ndone = 0, g->n = nc;
+    __atomic_store_n(&g->seq, ++Q.out, __ATOMIC_RELEASE);
+    // the replay's command buffer so far goes into the part, then the chunks' places, and the replay goes on in a new
+    // one at once
+    ex->cb = vk_sync_append_later(nc, &g->at);
+    for (int i = 0; i < nc; i++) Q.q[(Q.put + (uint64_t)i) % QN] = &g->c[i];
     uint64_t tf = kern_now_ns();
-    __atomic_add_fetch(&G.gen, 1, __ATOMIC_SEQ_CST);
+    g->out_ns = tf;
+    __atomic_store_n(&Q.put, Q.put + (uint64_t)nc, __ATOMIC_SEQ_CST);
     for (int k = 0; k < RW.n; k++)
         if (__atomic_load_n(&RW.w[k]->sleeping, __ATOMIC_SEQ_CST)) plat_event_set(&RW.w[k]->wake);
-    group_take(RW.n);
-    uint64_t to = kern_now_ns();
-    for (int i = 0; i < nc; i++)
-        while (!__atomic_load_n(&G.c[i].done, __ATOMIC_ACQUIRE)) plat_pause();
-    uint64_t tw = kern_now_ns();
-    RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.spin_ns += tw - to;
-    vk_exec_xfer_group_merge(nc);   // the chunks' closed query slots into their segments
-    __atomic_store_n(&G.next, 1 << 30, __ATOMIC_RELEASE);
-    // the state the front pass left goes on in a new command buffer of the replay's, after the chunks' in the part
-    VkCommandBuffer cbs[GROUP_CHUNKS];
-    int rec = 0;
-    for (int i = 0; i < nc; i++) cbs[i] = G.c[i].cb, rec += G.c[i].recorded;
-    ex->cb = vk_sync_append(cbs, nc);
-    gfx_tl_note('h', 0, 0, 0);
-    ex->recorded += rec, ex->barrier_at = ex->recorded;   // the last chunk ended with a full barrier
+    ex->barrier_at = ex->recorded;   // the chunks end with a full barrier
     ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->fb_fs = NULL;
     vk_exec_draw_new_cb();
-    RW.groups++, RW.group_draws += draws, RW.chunks += (uint64_t)nc, RW.wait_ns += kern_now_ns() - t0;
+    RW.groups++, RW.group_draws += draws, RW.chunks += (uint64_t)nc;
+    if (RW.pipe) {
+        // the submitting thread takes chunks too, as the workers wake up, and goes on once none is left to take: the
+        // GPU waits for the group's part until its last chunk is done
+        rw_behind = 1;
+        group_take(RW.n);
+        uint64_t to = kern_now_ns();
+        RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.wait_ns += to - t0;
+        return end;
+    }
+    group_take(RW.n);
+    uint64_t to = kern_now_ns();
+    while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < g->seq) plat_pause();
+    uint64_t tw = kern_now_ns();
+    RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.spin_ns += tw - to;
+    groups_put_done(ex);
+    vk_exec_draw_new_cb();   // the submitting thread's own chunks used its draw context
+    RW.wait_ns += kern_now_ns() - t0;
     return end;
 }
 
@@ -2065,6 +2322,7 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         if (RW.skip_to[depth] == h) RW.skip_to[depth] = NULL;   // the small group read ahead is behind
+        if (Q.drained < Q.out && Q.drained < __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE)) groups_put_done(ex);
         if (RW.n > 0 && !RW.skip_to[depth] && !evo_in && h->op != OP_JUMP && run_op(h->op)) {
             const op_hdr *stop = group_start(ex, h, depth);
             if (stop != h) {
@@ -2095,14 +2353,16 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         }
         default:
             if (RW.n > 0) {   // the perf line's split of the replay outside groups
+                if (Q.drained < Q.out && !pipe_op(h->op)) RW.pd_op[h->op]++, group_drain(ex, PW_OP);
                 int k = ser_kind(h->op);
                 uint64_t t = kern_now_ns();
                 op_one(ex, h);
+                if (vk_texture_deferred_take()) op_again(ex, h);
                 RW.ser_n[k]++, RW.ser_ns[k] += kern_now_ns() - t;
             } else op_one(ex, h);
             break;
         }
-        if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);
+        if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);   // their ops go through this walk's checks
         if (split_draws && split_wanted()) maybe_split(ex);
         h = nvn_op_next(h);
     }
@@ -2156,6 +2416,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
     if (RW.n < 0) rw_init();
+    if (Q.drained != Q.out) rt_fatal("vk: a parallel group outlived its submission");
     const tex_t *keep[9];   // the render targets carry over to this submission (set_rt compares them by pointer)
     memcpy(keep, ex->rt.color, sizeof ex->rt.color);
     keep[8] = ex->rt.depth;
@@ -2219,6 +2480,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         AH.live = 0;
         evo_queue = 0;
     }
+    group_drain(ex, PW_END);
     vk_exec_pass_end(ex);
     if (RR.on > 0) runs_break(RB_SUBMIT);
     x_cur = NULL;
@@ -2301,6 +2563,35 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
                    (double)RW.front_ns / ns, (double)RW.own_ns / ns, (double)RW.spin_ns / ns);
             memset(RW.ser_n, 0, sizeof RW.ser_n), memset(RW.ser_ns, 0, sizeof RW.ser_ns);
             RW.front_ns = RW.own_ns = RW.spin_ns = 0;
+            rt_log("perf: replay workers: the chunks took %.3f ms per submission, every thread's",
+                   (double)__atomic_exchange_n(&RW.chunk_ns, 0, __ATOMIC_RELAXED) / ns);
+            if (RW.pipe) {
+                o = 0;
+                for (int k = 0; k < PW_N; k++)
+                    o += snprintf(e + o, sizeof e - (size_t)o, "%s %s %.2f (%.3f ms)", k ? "," : "", pw_name[k],
+                                  (double)RW.pw_n[k] / (double)n_subs, (double)RW.pw_ns[k] / ns);
+                rt_log("perf: replay workers: past a group the submitting thread went on %.3f ms per submission until "
+                       "it was done; waits for it per submission:%s", (double)RW.behind_ns / ns, e);
+                o = 0;
+                for (int k = 0; k < 5; k++) {   // the ops that waited the most often
+                    int best = 0;
+                    for (int op = 1; op < OP_COUNT_; op++)
+                        if (RW.pd_op[op] > RW.pd_op[best]) best = op;
+                    if (!RW.pd_op[best]) break;
+                    o += snprintf(e + o, sizeof e - (size_t)o, "%s %s %.2f", k ? "," : "", nvn_op_name((uint32_t)best),
+                                  (double)RW.pd_op[best] / (double)n_subs);
+                    RW.pd_op[best] = 0;
+                }
+                if (o) rt_log("perf: replay workers: ops that waited for a group, per submission:%s", e);
+                uint64_t td[3];
+                vk_texture_deferred_stats(td);
+                rt_log("perf: replay workers: texture lookups put off until their turn, per submission: no entry "
+                       "%.2f, a retired one %.2f, a released one %.2f", (double)td[0] / (double)n_subs,
+                       (double)td[1] / (double)n_subs, (double)td[2] / (double)n_subs);
+                memset(RW.pw_n, 0, sizeof RW.pw_n), memset(RW.pw_ns, 0, sizeof RW.pw_ns);
+                memset(RW.pd_op, 0, sizeof RW.pd_op);
+                RW.behind_ns = 0;
+            }
         }
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;

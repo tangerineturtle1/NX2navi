@@ -44,8 +44,9 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-typedef struct { uint64_t lo, hi, off; int dropped; } Reg;
-typedef struct { uint64_t lo, hi, fence; } Wrote;
+// dropped: 0, or the epoch of its first drop in the stream (vk_exec_epoch); epoch: of the write
+typedef struct { uint64_t lo, hi, off, dropped; } Reg;
+typedef struct { uint64_t lo, hi, fence, epoch; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
@@ -422,7 +423,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    if ((r->dropped && r->dropped <= vk_exec_epoch(0)) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
@@ -433,15 +434,22 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 
 static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders write storage at once
 
+// The replay workers (vk_exec.c NX2NAVI_REPLAY_PIPE) record a group's draws while the submitting thread goes on past
+// it: a drop holds from its place in the stream on (vk_exec_epoch), so a chunk does not see the drops of ops after its
+// group, and the submitting thread sees every one.
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
-    int lk = vk_exec_in_chunk();
+    uint64_t ep = vk_exec_epoch(1);
+    int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
-    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
+    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ep};
     if (U.on)
         for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-            if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+            if (!U.reg[i].dropped || ep < U.reg[i].dropped) {
+                if (!U.reg[i].dropped) U.drops++;
+                U.reg[i].dropped = ep, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+            }
     if (lk) plat_mutex_unlock(&drop_lock);
 }
 
@@ -450,8 +458,9 @@ uint64_t vk_usnap_gen(void) { return U.gen; }
 // A GPU write of a submission not known to be complete touches [lo, hi). A linear scan: vk_usnap_drop appends after
 // wr_prune sorted the list, so wr_hits's binary search does not hold here; only called on rare paths.
 static int wr_overlaps(uint64_t lo, uint64_t hi) {
+    uint64_t ep = vk_exec_epoch(0);
     for (int i = 0; i < U.nwr; i++)
-        if (U.wr[i].lo < hi && lo < U.wr[i].hi) return 1;
+        if (U.wr[i].lo < hi && lo < U.wr[i].hi && U.wr[i].epoch <= ep) return 1;
     return 0;
 }
 
@@ -464,7 +473,12 @@ static int cpu_written(uint64_t addr, uint64_t n) {   // the same test vk_usnap_
 int vk_usnap_read(uint64_t addr, uint64_t n, void *dst) {
     const uint8_t *s = vk_usnap_bytes(addr, n);
     if (s) return memcpy(dst, s, n), 1;
-    if (!n || !cpu_written(addr, n) || wr_overlaps(addr, addr + n)) return 0;
+    if (!n || !cpu_written(addr, n)) return 0;
+    int lk = vk_exec_shared();   // a chunk's drop may grow the list
+    if (lk) plat_mutex_lock(&drop_lock);
+    int w = wr_overlaps(addr, addr + n);
+    if (lk) plat_mutex_unlock(&drop_lock);
+    if (w) return 0;
     memcpy(dst, (const void *)(uintptr_t)addr, n);
     return 2;
 }

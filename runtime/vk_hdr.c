@@ -755,7 +755,8 @@ void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
 int vk_hdr_track;                 // vk_exec_draw.c calls vk_hdr_draw: set at the first present with NX2NAVI_HDR=1
 static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
 static PlatMutex rec_lock = PLAT_MUTEX_INIT;
-static struct { VkImage win, src; VkFormat fmt; } recs[4];   // per presented window image: what the last draw copied
+// per presented window image: what the last draw copied, and where in the stream (vk_exec_stream_pos)
+static struct { VkImage win, src; VkFormat fmt; uint64_t pos; } recs[4];
 static int nrecs;
 
 void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
@@ -773,7 +774,8 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     for (int i = 0; i < 4; i++)   // unlocked first look: most draws go elsewhere (a stale slot only costs the lock below)
         known |= __atomic_load_n(&recs[i].win, __ATOMIC_RELAXED) == t->image;
     if (!known) return;
-    vk_exec_turn();   // a replay worker's chunk: the last such draw of the stream decides, as in the replay
+    // the last such draw of the stream decides, as in the replay, also when replay workers record draws at once
+    uint64_t pos = vk_exec_stream_pos();
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     int ntex = 0, slot = -1;
@@ -790,7 +792,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     }
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++)
-        if (recs[i].win == t->image) recs[i].src = src, recs[i].fmt = fmt;
+        if (recs[i].win == t->image && pos >= recs[i].pos) recs[i].src = src, recs[i].fmt = fmt, recs[i].pos = pos;
     plat_mutex_unlock(&rec_lock);
 }
 
@@ -801,7 +803,7 @@ void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *form
     int r = -1;
     for (int i = 0; i < nrecs; i++)
         if (recs[i].win == win->image) r = i;
-    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE;
+    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE, recs[r].pos = 0;
     // kept until the next draw into the window texture: a present again without a new copy shows the same picture
     if (r >= 0 && recs[r].src && vk_hdr_active()) *image = recs[r].src, *format = recs[r].fmt;
     plat_mutex_unlock(&rec_lock);

@@ -533,8 +533,22 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 // be done yet; vk_exec_turn waits until they are (no-op elsewhere).
 int vk_texture_deferred(void);
 int vk_texture_deferred_take(void);
+void vk_texture_deferred_stats(uint64_t out[3]);   // since the last call, by what the lookup found: none, retired, released
 int vk_exec_turn_due(void);
 int vk_exec_in_chunk(void);   // the calling thread records a chunk of a parallel group
+// vk_exec_shared: other threads may record now (a chunk, or the submitting thread past a group, NX2NAVI_REPLAY_PIPE),
+// so the shared tables lock; vk_exec_behind: the calling thread is that submitting thread; vk_exec_hooks_wait: then
+// waits until the group's first chunk ran the pass hooks.
+int vk_exec_shared(void);
+int vk_exec_behind(void);
+void vk_exec_hooks_wait(void);
+// A pass hook (vk_contact_pass_begin, vk_dlaa_pass) about to change what draws read or to record: the submitting
+// thread past a group waits for the group first; a group's hooks run in its first chunk, in turn already.
+void vk_exec_hook_turn(void);
+// Where the calling thread records in the order of the stream as the replay workers cut it (later records larger).
+uint64_t vk_exec_stream_pos(void);
+// The epoch of a uniform snapshot drop the calling thread makes (write) or of the drops it sees (vk_usnap.c).
+uint64_t vk_exec_epoch(int write);
 void vk_exec_turn(void);
 VkSampler vk_sampler_by_id_locked(int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
@@ -710,13 +724,15 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
 // batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
 // is signalled by its last part, whose signal covers every earlier part in submission order.
 VkCommandBuffer vk_sync_split(void);
-// Inside vk_exec_record, for the replay workers (vk_exec.c): vk_sync_append ends the command buffer recorded so far,
-// puts it and then cbs (recorded by the workers) into the part, in that order, and returns a new begun one for the rest
-// of the part; vk_sync_append_room says whether the part has room for n more. A worker claims and begins a command
-// buffer of its own pool for the submission being recorded with vk_sync_worker_begin(w) and ends it with
-// vk_sync_worker_end, on its own thread, while the submitting thread waits for it.
+// Inside vk_exec_record, for the replay workers (vk_exec.c): vk_sync_append_later ends the command buffer recorded so
+// far, puts it into the part followed by n places for command buffers the workers record (*at the first), and returns
+// a new begun one for the rest of the part; vk_sync_append_fill puts the workers' command buffers into their places,
+// before the part ends; vk_sync_append_room says whether the part has room for n more. A worker claims and begins a
+// command buffer of its own pool for the submission being recorded with vk_sync_worker_begin(w) and ends it with
+// vk_sync_worker_end, on its own thread.
 int vk_sync_append_room(int n);
-VkCommandBuffer vk_sync_append(const VkCommandBuffer *cbs, int n);
+VkCommandBuffer vk_sync_append_later(int n, int *at);
+void vk_sync_append_fill(int at, const VkCommandBuffer *cbs, int n);
 VkCommandBuffer vk_sync_worker_begin(int w);
 void vk_sync_worker_end(VkCommandBuffer cb);
 extern int vk_sub_in_frame;   // replay: the submission being recorded is the frame's n-th (0 the first; vk_backend.c)
