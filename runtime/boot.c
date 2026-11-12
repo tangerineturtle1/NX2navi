@@ -23,6 +23,7 @@
 #include "gfx.h"
 #include "mods.h"
 #include "nvn_api.h"
+#include "trophies.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
 #include "vk.h"
@@ -415,6 +416,7 @@ void rt_boot(void) {
     res_init();
     wide_init();   // Ocarina's widescreen sets (recomp/patches-v111.txt)
     cheats_init();   // after the patch sets: a cheat's set follows its setting
+    trophies_init();   // after the loader: the triggers' addresses resolve against main's base
     cb_addr[0] = hostfn_register("<rtld loader_ready>", cb_loader_ready);
     cb_addr[1] = hostfn_register("<rtld module_inits>", cb_module_inits);
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);

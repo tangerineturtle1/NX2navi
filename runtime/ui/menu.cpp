@@ -40,6 +40,8 @@ static int g_font_bad;
 #include "ui/debug_menu.h"
 #include "ui/option_rows.h"
 #include "ui/perf_panel.h"
+#include "ui/trophy_page.h"
+#include "ui/trophy_toast.h"
 
 extern "C" {
 #include "amiibo.h"
@@ -90,6 +92,7 @@ int frame_free_running(void);
 extern const int rt_game_version;
 extern const char rt_port_version[];
 void cheats_frame(uint64_t frame);   // cheats.c
+void trophies_frame(uint64_t frame);   // trophies.c
 bool tab_cheats(float scale);        // ui/cheats_tab.cpp; true: restart into the rebuild
 }
 
@@ -504,7 +507,7 @@ static int fonts_up(float scale) {
         // what the title face shows in the CJK languages: the menu's title and tabs (Simplified Chinese menu text) and
         // the boot screen's title (the game's language)
         static const UiTextId titles[] = {UI_MENU_TITLE, UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                          UI_MENU_TAB_CONTROLS, UI_MENU_TAB_COOP, UI_BOOT_TITLE};
+                                          UI_MENU_TAB_CONTROLS, UI_MENU_TAB_TROPHIES, UI_MENU_TAB_COOP, UI_BOOT_TITLE};
         for (int i = 0; i < N; i++) {
             if (!data[i]) continue;
             ImFontGlyphRangesBuilder b;
@@ -573,7 +576,7 @@ extern "C" void menu_vk_release(void) {
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs. COOP_PAGE, COOP_JOIN
 // and COOP_ACCEPT_OFFER drive the Co-op tab (ui/coop_page.h coop_test_set).
 // Ocarina of Time: the options this port has and co-op (ui/coop_page.cpp)
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COOP, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_TROPHIES, TAB_COOP, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1615,6 +1618,13 @@ static void tab_controls(float scale) {
     binds_after_page();
 }
 
+// The Trophies tab (ui/trophy_page.cpp): the port's own achievements.
+static void tab_trophies(float scale) {
+    opt_begin("##trophies", scale);
+    trophy_rows(scale);
+    opt_end();
+}
+
 // The Co-op tab (ui/coop_page.cpp): the rows, then the window a row opens.
 static void tab_coop(float scale) {
     opt_begin("##coop", scale);
@@ -1624,7 +1634,7 @@ static void tab_coop(float scale) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_COOP};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_TROPHIES, UI_MENU_TAB_COOP};
 static int g_tab;               // the tab shown
 
 // The tabs the menu shows: the Co-op tab is a beta, shown only with coop_beta = 1 in nx2navi.ini (NX2NAVI_COOP_BETA),
@@ -1750,6 +1760,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_TROPHIES: tab_trophies(scale); break;
             case TAB_COOP: tab_coop(scale); break;
             }
             ImGui::EndTabItem();
@@ -1978,12 +1989,14 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     }
     menu_art_start();      // the game's interface textures decode on a worker from the first present on
     cheats_frame(frame);   // the data cheats and the buttons of the cheats that need them held
+    trophies_frame(frame);   // the trophies' memory conditions
     if (!g_test.parsed) test_parse();
     if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
     if (g_perf_save.exchange(0)) cfg_save();
     perf_tick(plat_now_ns(), t);
     amiibo_tick();
     const bool toast = coop_toast_tick();   // a co-op player came or went: a toast over the game, the menu closed
+    const bool ttoast = trophy_toast_tick();   // a trophy unlocked: its toast slides in at the top right
     if (g_booting.load(std::memory_order_relaxed)) g_booting.store(0, std::memory_order_release);   // the game runs
     bool open = g_open.load(std::memory_order_relaxed);
     // the frame the menu is first laid out after opening: also when its g_reset went to an earlier frame of the overlay
@@ -2001,7 +2014,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !toast) {
+        } else if (!g_perf_mode && !toast && !ttoast) {
             return 0;
         }
     }
@@ -2067,7 +2080,17 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
         layout_menu(t->width, t->height, scale);
     }
     perf_draw(t, scale);
-    if (!open && toast) coop_toast_draw((float)t->width, (float)t->height, scale);
+    if (!open && (toast || ttoast)) {
+        if (toast) coop_toast_draw((float)t->width, (float)t->height, scale);
+        // the trophy toast sits at the top right corner, under the performance overlay's panel
+        float top = 12 * scale;
+        if (g_perf_mode == 1 && g_perf_text[0])
+            top += ImGui::CalcTextSize(g_perf_text).y + 9 * scale * 2 + 6 * scale;
+        else if (g_perf_mode == 2) {
+            if (ImGuiWindow *pw = ImGui::FindWindowByName("##perf")) top = pw->Pos.y + pw->Size.y + 6 * scale;
+        }
+        if (ttoast) trophy_toast_draw((float)t->width, (float)t->height, top, scale);
+    }
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;
