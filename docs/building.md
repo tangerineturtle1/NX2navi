@@ -295,6 +295,21 @@ copies are only the slower path. In Kokiri Forest on 0.7.1 (RTX 4090, driver 615
 51.9 frames a second and the copies at 27.4; on that version the copies also flickered between two looks almost every
 frame, which the wait for the write-backs under shadow storage (`vk_sync_exec_wait`) has since addressed.
 
+`NX2NAVI_SHARED_MEMORY=1` (Linux, environment only: it is read before `nx2navi.ini`) shares guest memory with the GPU
+instead. The game's watched reservations become mappings of a memfd, which the userfaultfd write watch covers as it
+covers private memory (`runtime/platform/linux.c`), and each CPU-visible pool is a buffer placed in a dma-buf of those
+pages, made through `/dev/udmabuf` and imported with `VK_EXT_external_memory_dma_buf` (`runtime/vk_memory.c`
+`shared_pool`). The GPU reads and writes the guest pages in place, with no copy either way, and the dma-buf holds the
+pages themselves rather than the CPU's mapping of them, so the write watch protecting them again does not invalidate
+it. Memory defaults to `import` and shadow storage to off. The kernel checks every imported memory object at every
+submission, so pools share imports of 64 MiB chunks (`NX2NAVI_SHARED_CHUNK_MB`) that never overlap, kept within the
+driver's budget for its system-memory heap (`NX2NAVI_SHARED_MAX_MB`, `NX2NAVI_SHARED_RESERVE_MB`) and freed once no
+pool has used them for `NX2NAVI_SHARED_IDLE_S` seconds. It needs `/dev/udmabuf` open to the user (a udev ACL or the
+`kvm` group) and a kernel whose write watch covers shared memory (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`); without either
+the memory stays private, as without the setting. Measured on 0.9.2 (RX 6800 XT, RADV 26.2.5, Hyrule Field, 75 s
+scripted walk, FSR 1): 55.4 frames a second with a 1% low of 40.8, against 35.5 and 23.5 with shadow storage and VRAM
+mirrors.
+
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
 the copy-in: a guest submission whose record binds the table (`vk_exec_draw.c` `ssbo_info`) brings the shadow of

@@ -24,6 +24,9 @@
 #include "wb_lazy_choice.h"
 #include "wb_merge_spv.h"
 #include "platform/platform.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 // Timestamps for the tracking cost, in ns; qpc_ms converts.
 static uint64_t qpc(void) { return plat_now_ns(); }
@@ -47,6 +50,7 @@ typedef struct PoolRec {
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
+    struct ShChunk *sh;                // POOL_IMPORT: the shared guest memory import mem belongs to (shared_pool), NULL none
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
@@ -158,9 +162,259 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     return -1;
 }
 
+// CPU-visible storage of shared guest memory (NX2NAVI_SHARED_MEMORY): the pool's buffer is placed in a dma-buf of the
+// guest pages around it (platform.h plat_mem_dmabuf) imported as device memory. The GPU reads and writes the guest pages
+// in place, as with a host pointer import, but the dma-buf holds the pages themselves: the write watch protecting them
+// again leaves it valid, where amdgpu invalidates a host pointer import (a userptr) at every such change and validates
+// it again at the next submission, the cost shadow storage was made to avoid.
+// The kernel checks every imported memory object at every submission (4,000 imports made each vkQueueSubmit about 5 ms
+// on an RX 6800 XT with RADV, against 0.016 ms with none), so pools share imports ("extents"): a pool inside one gets
+// its buffer bound into it at its offset; any other gets a new extent around it, widened to the
+// NX2NAVI_SHARED_CHUNK_MB (64) MiB grid but never into another extent. Extents overlap only where a pool itself
+// crosses into one: each import counts its whole size against the GPU's system memory, and the game's pools live long,
+// so overlapping imports would count the same pages twice for good. An extent its last pool left stays for the next
+// pools there for NX2NAVI_SHARED_IDLE_S, sooner when the room runs out (sh_room). A pool that cannot have one (no
+// room with every extent in use, no udmabuf, no memory type) gets no GPU buffer: RADV imports only anonymous memory
+// as a host pointer, so shared guest memory has no fallback import.
+typedef struct ShChunk {
+    uint64_t lo, n;
+    VkDeviceMemory mem;
+    uint32_t type_bits;
+    int32_t refs;        // pools bound into it, sh_lock
+    uint64_t dup;        // its bytes inside other extents when it was made, sh_lock
+    uint64_t empty_ns;   // when its last pool left (plat_now_ns), sh_lock; 0 while it has pools
+} ShChunk;
+static ShChunk **sh_ext;               // sh_lock, by start address
+static int n_sh_ext, cap_sh_ext;
+static PlatMutex sh_lock = PLAT_MUTEX_INIT;
+static uint64_t sh_bytes, sh_dup, sh_cap;   // sh_lock: the extents' bytes, those also in another extent; the cap
+static uint64_t sh_made, sh_freed;          // sh_lock: statistics
+static PFN_vkGetMemoryFdPropertiesKHR p_fd_props;
+static int32_t n_shared, n_shared_failures;
+
+// An import of the shared pages [lo, lo + n), or NULL. sh_lock held.
+static ShChunk *sh_import(VkCtx *c, uint64_t lo, uint64_t n) {
+#ifdef _WIN32
+    (void)c, (void)lo, (void)n;
+    return NULL;
+#else
+    int fd = plat_mem_dmabuf(lo, n);
+    if (fd < 0) return NULL;
+    if (!p_fd_props) p_fd_props = (PFN_vkGetMemoryFdPropertiesKHR)vk_dpa(c->device, "vkGetMemoryFdPropertiesKHR");
+    VkMemoryFdPropertiesKHR fp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    VkResult res = p_fd_props ? p_fd_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp)
+                              : VK_ERROR_EXTENSION_NOT_PRESENT;
+    int type = res == VK_SUCCESS ? memory_type(c, fp.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                                 : -1;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (type >= 0) {
+        VkImportMemoryFdInfoKHR im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+        // Buffers with device address usage need memory allocated for device addresses (vk_gpa.c).
+        VkMemoryAllocateFlagsInfo fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   .pNext = vk_gpa_wanted() ? (void *)&fi : (void *)&im, .allocationSize = n,
+                                   .memoryTypeIndex = (uint32_t)type};
+        res = vkAllocateMemory(c->device, &ai, NULL, &mem);
+        if (res == VK_SUCCESS) fd = -1;   // the driver owns it now
+    }
+    if (fd >= 0) close(fd);
+    ShChunk *ch = mem ? calloc(1, sizeof *ch) : NULL;
+    if (!ch) {
+        if (mem) vkFreeMemory(c->device, mem, NULL);
+        plat_mem_dmabuf_done(lo, n);
+        rt_log("vk: no import of the shared guest pages %#llx+%#llx (memory type %d, result %d)", (unsigned long long)lo,
+               (unsigned long long)n, type, (int)res);
+        return NULL;
+    }
+    ch->lo = lo, ch->n = n, ch->mem = mem, ch->type_bits = 1u << type;
+    return ch;
+#endif
+}
+
+// Frees extent i (no pool in it), sh_lock held.
+static void sh_free_at(VkCtx *c, int i) {
+    ShChunk *ch = sh_ext[i];
+    vkFreeMemory(c->device, ch->mem, NULL);
+    plat_mem_dmabuf_done(ch->lo, ch->n);
+    sh_bytes -= ch->n, sh_dup -= ch->dup, sh_freed++;
+    free(ch);
+    memmove(&sh_ext[i], &sh_ext[i + 1], (size_t)(n_sh_ext - i - 1) * sizeof *sh_ext);
+    n_sh_ext--;
+}
+
+// destroy_rec: the pool is retired (the GPU is done with it). Its extent stays for the next pools there.
+static void sh_release(VkCtx *c, ShChunk *ch) {
+    (void)c;
+    if (!ch) return;
+    plat_mutex_lock(&sh_lock);
+    if (--ch->refs == 0) ch->empty_ns = plat_now_ns() | 1;
+    plat_mutex_unlock(&sh_lock);
+}
+
+// Whether n more bytes of imports fit: under the cap (NX2NAVI_SHARED_MAX_MB, by default 90% of the GPU's system memory
+// heap) and, where the driver reports a budget, with NX2NAVI_SHARED_RESERVE_MB (512) MiB of that heap left over. The
+// game's own memory is about 9 GiB, so its pools and the memory around them can need about that much (a fixed 70% of
+// a 13 GiB heap ran out in a long session). sh_lock held; *used and *budget get the heap's figures (0 without a budget).
+static int sh_room(VkCtx *c, uint64_t n, uint64_t *used, uint64_t *budget) {
+    static uint64_t reserve;
+    static int heap = -2;
+    if (heap == -2) {
+        const char *e = cfg_get("NX2NAVI_SHARED_RESERVE_MB");
+        reserve = (uint64_t)(e && *e ? atoll(e) : 512) << 20;
+        heap = -1;
+        for (uint32_t i = 0; i < c->mem_props.memoryHeapCount; i++)
+            if (!(c->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                (heap < 0 || c->mem_props.memoryHeaps[i].size > c->mem_props.memoryHeaps[heap].size))
+                heap = (int)i;
+    }
+    *used = *budget = 0;
+    if (sh_bytes + n > sh_cap) return 0;
+    if (!c->has_memory_budget || heap < 0) return 1;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    *used = b.heapUsage[heap], *budget = b.heapBudget[heap];
+    return !*budget || *used + n + reserve <= *budget;
+}
+
+// The extent for the pages [lo, hi) with a reference taken, or NULL. sh_lock held.
+static ShChunk *sh_extent(VkCtx *c, uint64_t lo, uint64_t hi, uint64_t base, uint64_t span, uint64_t chunk) {
+    // Extents without a pool for NX2NAVI_SHARED_IDLE_S (10) seconds go: their pages stay pinned while they live, and
+    // pinned pages cannot be swapped out, so the rest of the system's memory is.
+    static uint64_t idle_ns;
+    if (!idle_ns) {
+        const char *e = cfg_get("NX2NAVI_SHARED_IDLE_S");
+        idle_ns = (uint64_t)(e && *e ? atoll(e) : 10) * 1000000000ull + 1;
+    }
+    uint64_t now = plat_now_ns();
+    for (int i = 0; i < n_sh_ext;) {
+        ShChunk *e = sh_ext[i];
+        if (!e->refs && e->empty_ns && now - e->empty_ns > idle_ns) sh_free_at(c, i);
+        else i++;
+    }
+    for (int i = 0; i < n_sh_ext && sh_ext[i]->lo < hi; i++) {
+        ShChunk *e = sh_ext[i];
+        if (lo >= e->lo && hi <= e->lo + e->n) return e->refs++, e->empty_ns = 0, e;
+    }
+    // The grid chunks around it, cut short by the nearest extents below and above it that it does not overlap.
+    uint64_t ulo = base + ((lo - base) & ~(chunk - 1)), uhi = base + ((hi - base + chunk - 1) & ~(chunk - 1));
+    if (uhi > base + span) uhi = base + span;
+    uint64_t dup = 0;
+    for (int i = 0; i < n_sh_ext; i++) {
+        uint64_t elo = sh_ext[i]->lo, ehi = elo + sh_ext[i]->n;
+        if (ehi <= lo) { if (ehi > ulo) ulo = ehi; }        // below the pool
+        else if (elo >= hi) { if (elo < uhi) uhi = elo; }   // above it
+        else dup += (ehi < hi ? ehi : hi) - (elo > lo ? elo : lo);   // the pool crosses into it
+    }
+
+    // Room: the extents no pool uses go first, the farthest from the new one first.
+    uint64_t used, budget;
+    while (!sh_room(c, uhi - ulo, &used, &budget)) {
+        int best = -1;
+        uint64_t far = 0;
+        for (int i = 0; i < n_sh_ext; i++) {
+            ShChunk *e = sh_ext[i];
+            if (e->refs) continue;
+            uint64_t d = e->lo > ulo ? e->lo - ulo : ulo - e->lo;
+            if (best < 0 || d > far) best = i, far = d;
+        }
+        if (best < 0) {
+            static int told;
+            if (!told++)
+                rt_log("mem: shared guest memory: no room for %.0f MiB more with its imports at %.0f MiB (%.0f MiB of it in "
+                       "two imports), every one in use; the GPU's system memory %.0f of %.0f MiB used (NX2NAVI_SHARED_MAX_MB "
+                       "%llu, NX2NAVI_SHARED_RESERVE_MB): pools past it get no GPU buffer", (uhi - ulo) / 1048576.0,
+                       sh_bytes / 1048576.0, sh_dup / 1048576.0, used / 1048576.0, budget / 1048576.0,
+                       (unsigned long long)(sh_cap >> 20));
+            return NULL;
+        }
+        sh_free_at(c, best);
+    }
+    ShChunk *ne = sh_import(c, ulo, uhi - ulo);
+    if (!ne) return NULL;
+    int at = 0;
+    while (at < n_sh_ext && sh_ext[at]->lo < ne->lo) at++;
+    if (n_sh_ext == cap_sh_ext) grow((void **)&sh_ext, &cap_sh_ext, sizeof *sh_ext);
+    memmove(&sh_ext[at + 1], &sh_ext[at], (size_t)(n_sh_ext - at) * sizeof *sh_ext);
+    sh_ext[at] = ne, n_sh_ext++;
+    ne->refs = 1, ne->dup = dup;
+    sh_bytes += ne->n, sh_dup += dup, sh_made++;
+    if (!(sh_made & (sh_made - 1)) || !(sh_made % 256))   // at 1, 2, 4 ... imports, then every 256
+        rt_log("mem: shared guest memory: %llu imports made, %llu freed; %d alive, %.0f MiB (%.0f MiB of it in two); the "
+               "GPU's system memory %.0f of %.0f MiB used", (unsigned long long)sh_made, (unsigned long long)sh_freed,
+               n_sh_ext, sh_bytes / 1048576.0, sh_dup / 1048576.0, used / 1048576.0, budget / 1048576.0);
+    return ne;
+}
+
+static int shared_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    static uint64_t chunk;
+    uint64_t base, span;
+    if (!c->has_dmabuf || !plat_mem_shared_range(addr, &base, &span) || addr + size > base + span) return 0;
+    plat_mutex_lock(&sh_lock);
+    if (!chunk) {
+        const char *e = cfg_get("NX2NAVI_SHARED_CHUNK_MB");
+        long mb = e && *e ? atol(e) : 64;
+        if (mb < 2) mb = 2;
+        uint64_t b = 2ull << 20;
+        while (b < (uint64_t)mb << 20) b <<= 1;   // a power of two
+        chunk = b;
+        // The cap: NX2NAVI_SHARED_MAX_MB, by default 90% of the largest heap that is not device-local (the GPU's system
+        // memory): imports past it the kernel would refuse at the submission, with the device lost. sh_room also keeps
+        // the driver's budget for that heap.
+        e = cfg_get("NX2NAVI_SHARED_MAX_MB");
+        uint64_t heap = 0;
+        for (uint32_t i = 0; i < c->mem_props.memoryHeapCount; i++)
+            if (!(c->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && c->mem_props.memoryHeaps[i].size > heap)
+                heap = c->mem_props.memoryHeaps[i].size;
+        sh_cap = e && *e ? (uint64_t)atoll(e) << 20 : heap / 10 * 9;
+        if (!sh_cap) sh_cap = 4ull << 30;
+        rt_log("mem: shared guest memory: CPU-visible pools are placed in imports of %llu MiB chunks of it, up to %llu MiB "
+               "(NX2NAVI_SHARED_CHUNK_MB, NX2NAVI_SHARED_MAX_MB)", (unsigned long long)(chunk >> 20),
+               (unsigned long long)(sh_cap >> 20));
+    }
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    ShChunk *ch = sh_extent(c, lo, hi, base, span, chunk);
+    uint32_t bits = ch ? ch->type_bits : 0;
+    uint64_t off = ch ? lo - ch->lo : 0, cn = ch ? ch->n : 0;
+    VkDeviceMemory mem = ch ? ch->mem : VK_NULL_HANDLE;
+    plat_mutex_unlock(&sh_lock);
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = hi - lo,
+                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult res = VK_ERROR_UNKNOWN;
+    if (ch && (res = vkCreateBuffer(c->device, &bi, NULL, &buf)) == VK_SUCCESS) {
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(c->device, buf, &req);
+        res = !(req.memoryTypeBits & bits) || (off & (req.alignment - 1)) || off + req.size > cn
+                  ? VK_ERROR_FORMAT_NOT_SUPPORTED
+                  : vkBindBufferMemory(c->device, buf, mem, off);
+    }
+    if (res != VK_SUCCESS) {
+        if (buf) vkDestroyBuffer(c->device, buf, NULL);
+        sh_release(c, ch);
+        long k = plat_inc32(&n_shared_failures);
+        if (k <= 8) rt_log("vk: pool %#llx+%#llx: not placed in shared guest memory (result %d; %ld so far)",
+                           (unsigned long long)addr, (unsigned long long)size, (int)res, k);
+        return 0;
+    }
+    r->import_lo = lo, r->import_hi = hi;
+    r->buf = buf, r->mem = mem, r->sh = ch;
+    plat_inc32(&n_imports);
+    plat_inc32(&n_shared);
+    return 1;
+}
+
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
+    if (shared_pool(c, r, addr, size)) return 1;
+    uint64_t sb, ss;   // RADV imports only anonymous memory as a host pointer: shared guest memory would be refused
+    if (c->has_dmabuf && plat_mem_shared_range(addr, &sb, &ss)) return 0;
     if (!p_host_props)
         p_host_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vk_dpa(c->device, "vkGetMemoryHostPointerPropertiesEXT");
     uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
@@ -294,7 +548,8 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
-    if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->sh) sh_release(c, r->sh);
+    else if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
@@ -700,10 +955,10 @@ void vk_mem_census(uint64_t frame) {
         total[r->kind] += r->size, count[r->kind]++;
     }
     plat_mutex_unlock_shared(&pool_lock);
-    rt_log("mem: census at frame %llu: import %llu pools %.1f MiB (%d without a GPU buffer), physical %llu pools %.1f MiB, "
-           "virtual %llu pools %.1f MiB of address space",
+    rt_log("mem: census at frame %llu: import %llu pools %.1f MiB (%d without a GPU buffer; %d imported as shared guest "
+           "memory so far, %d refused), physical %llu pools %.1f MiB, virtual %llu pools %.1f MiB of address space",
            (unsigned long long)frame, (unsigned long long)count[POOL_IMPORT], total[POOL_IMPORT] / 1048576.0,
-           n_import_failures, (unsigned long long)count[POOL_PHYS], total[POOL_PHYS] / 1048576.0,
+           n_import_failures, n_shared, n_shared_failures, (unsigned long long)count[POOL_PHYS], total[POOL_PHYS] / 1048576.0,
            (unsigned long long)count[POOL_VIRT], total[POOL_VIRT] / 1048576.0);
     static const char *const kinds[] = {"", "import", "physical", "virtual"};
     for (int j = 0; j < ng; j++) {
@@ -2159,6 +2414,8 @@ static void mirror_mode(int discrete, int nvidia_own) {
     const char *e = cfg_value("NX2NAVI_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
     const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
+    // Guest memory the GPU shares in place (NX2NAVI_SHARED_MEMORY, import_pool): auto means import, as on a UMA device.
+    if (plat_mem_shared()) mode = 0, why = "auto, shared guest memory";
     if (strcmp(e, "auto")) {
         if (!strcmp(e, "import")) mode = 0, why = "NX2NAVI_MEMORY=import";
         else if (!strcmp(e, "mirror")) mode = 1, why = "NX2NAVI_MEMORY=mirror";
@@ -2199,7 +2456,9 @@ static void mirror_mode(int discrete, int nvidia_own) {
     // shader stores through the device address table into a pool with a shadow copy also does not come back to guest
     // memory (vk_gpa.c). The pools stay imports unless NX2NAVI_SHADOW asks for the copies. The open driver for the same
     // cards keeps the copies: it is not measured. The AppImage's play.sh has set the same for this driver since 0.6.0.
-    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !nvidia_own;
+    // Shared guest memory (NX2NAVI_SHARED_MEMORY) has none of the costs shadow storage avoids: its pools are dma-bufs
+    // of the guest pages, which protection changes leave valid (shared_pool).
+    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !nvidia_own && !plat_mem_shared();
 #endif
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
                           sh && *sh ? " (NX2NAVI_SHADOW)" : "");
@@ -5066,6 +5325,11 @@ void vk_mem_shutdown(void) {
     plat_mutex_unlock(&shadow_lock);
     for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i]);   // finalized ones whose callback never ran
     nretiring = 0;
+    plat_mutex_lock(&sh_lock);   // the shared guest memory extents, after every buffer bound into them
+    for (int i = 0; i < n_sh_ext; i++)
+        vkFreeMemory(c->device, sh_ext[i]->mem, NULL), plat_mem_dmabuf_done(sh_ext[i]->lo, sh_ext[i]->n), free(sh_ext[i]);
+    n_sh_ext = 0, sh_bytes = 0;
+    plat_mutex_unlock(&sh_lock);
     npwait = 0;   // those waiting for pool_wait_collect were on the retiring list too
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;

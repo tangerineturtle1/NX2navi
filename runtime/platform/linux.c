@@ -75,6 +75,9 @@ struct pm_scan_arg {
 #define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
 #define UFFD_FEATURE_WP_ASYNC (1 << 15)
 #endif
+#ifndef UFFD_FEATURE_WP_HUGETLBFS_SHMEM
+#define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1 << 12)
+#endif
 #ifndef UFFD_USER_MODE_ONLY
 #define UFFD_USER_MODE_ONLY 1
 #endif
@@ -1101,9 +1104,29 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 // clears a page's protection on the first write without a round trip to us, and PAGEMAP_SCAN lists the pages whose
 // protection was cleared and protects them again. Without it (an older kernel), plat_mem_written reports the ranges as
 // untracked and the back end uploads them in full.
+//
+// Shared backing (plat_mem_share_init, NX2NAVI_SHARED_MEMORY): each watched reservation is a mapping of a memfd of its
+// size instead of private anonymous memory. The pages behave the same for the guest and for the write watch (an
+// asynchronous userfaultfd covers shared memory too), and any page-aligned range of them can be handed to the GPU as a
+// dma-buf (plat_mem_dmabuf, through /dev/udmabuf) that the GPU reads and writes in place. The dma-buf holds the pages
+// themselves, not the CPU's mapping of them, so protecting pages again for the write watch leaves it valid: a buffer
+// imported from the guest's pointer (VK_EXT_external_memory_host) is a userptr that amdgpu invalidates and validates
+// again at the next submission after every such change. Decommit frees the pages through the memfd (a hole punched
+// reads zero again), as MADV_DONTNEED does for private pages, except where a dma-buf holds the pages: a hole punched
+// there gives the CPU new pages while the GPU keeps the old ones, so those pages are zeroed in place instead, through
+// a second mapping of the memfd that the write watch does not cover (pinned, by 2 MiB granule). When the last dma-buf
+// over a granule goes (plat_mem_dmabuf_done), its pages that are decommitted by then are freed: zeroed in place they
+// still held memory, which the system could not swap out either while they were pinned.
 
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
+static int sh_want;                           // plat_mem_share_init: back the watched reservations with memfds
+#define SH_GRAN_SHIFT 21
+// view: the host's mapping of the memfd; pinned: the dma-bufs holding each 2 MiB granule (plat_mem_dmabuf, _done)
+typedef struct { uint64_t addr, n; int fd; uint8_t *view; uint16_t *pinned; } ShReg;
+static ShReg sh_reg[8];                       // vm_lock for writes; read-only once the reservations are made
+static int nsh;
+static int udmabuf_dev = -1;                  // /dev/udmabuf, opened by plat_mem_share_init
 enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
 static uint8_t *pstate;
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
@@ -1116,13 +1139,27 @@ static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
 static void ww_open(void) {
     int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
     struct uffdio_api api = {.api = UFFD_API,
-                             .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+                             .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED |
+                                         (sh_want ? UFFD_FEATURE_WP_HUGETLBFS_SHMEM : 0)};
+    if (fd >= 0 && sh_want && ioctl(fd, UFFDIO_API, &api)) {
+        // A kernel whose write watch does not cover shared memory: private memory, as without the setting. The API
+        // handshake happens once per userfaultfd, so the retry needs a new one.
+        fprintf(stderr, "platform: the write watch cannot cover shared memory (%s): guest memory stays private\n",
+                strerror(errno));
+        sh_want = 0;
+        close(fd);
+        fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        api = (struct uffdio_api){.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+    } else if (fd >= 0 && sh_want) {
+        goto handshaken;
+    }
     if (fd < 0 || ioctl(fd, UFFDIO_API, &api)) {
         fprintf(stderr, "platform: no asynchronous userfaultfd write protection (%s): written memory is not tracked\n",
                 strerror(errno));
         if (fd >= 0) close(fd);
         return;
     }
+handshaken:
     pm_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
     if (pm_fd < 0) {
         close(fd);
@@ -1138,12 +1175,47 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
         pstate = p == MAP_FAILED ? NULL : p;
     }
     if (watch && ww_fd < 0 && pm_fd < 0) ww_open();
+    int mfd = -1;
+    if (watch && sh_want && ww_fd >= 0 && nsh < (int)(sizeof sh_reg / sizeof *sh_reg)) {
+        // memfd files are sparse and charge no commit until a page is written. udmabuf needs the size sealed.
+        mfd = memfd_create("nx2navi guest memory", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (mfd >= 0 && (ftruncate(mfd, (off_t)n) || fcntl(mfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW))) {
+            fprintf(stderr, "platform: no memfd of %#llx bytes for shared guest memory (%s)\n", (unsigned long long)n,
+                    strerror(errno));
+            close(mfd);
+            mfd = -1;
+        }
+    }
+    // The host's view (to zero pinned pages in place) and the pin counts, before the reservation is mapped: without
+    // them the reservation stays private.
+    void *view = NULL;
+    uint16_t *pin = NULL;
+    if (mfd >= 0) {
+        view = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, mfd, 0);
+        pin = calloc((size_t)((n >> SH_GRAN_SHIFT) + 1), sizeof *pin);
+        if (view == MAP_FAILED || !pin) {
+            fprintf(stderr, "platform: no host view of shared guest memory: the reservation stays private\n");
+            if (view != MAP_FAILED) munmap(view, n);
+            free(pin);
+            close(mfd);
+            mfd = -1, view = NULL, pin = NULL;
+        }
+    }
     void *p = pstate && addr + n <= PS_LIMIT
                   ? mmap((void *)(uintptr_t)addr, n, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0)
+                         mfd >= 0 ? MAP_SHARED | MAP_NORESERVE | MAP_FIXED_NOREPLACE
+                                  : MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+                         mfd, 0)
                   : MAP_FAILED;
     int ok = p == (void *)(uintptr_t)addr;
     if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
+    if (ok && mfd >= 0) {
+        sh_reg[nsh++] = (ShReg){addr, n, mfd, view, pin};
+    } else if (mfd >= 0) {
+        munmap(view, n);
+        free(pin);
+        close(mfd);
+    }
     if (ok) {
         ps_set(addr, n, PS_RESERVED);
         // Transparent huge pages would populate (and count as written) 2 MiB at the first write of one page; writes are
@@ -1169,7 +1241,29 @@ int plat_mem_commit(uint64_t addr, size_t n) {
     return 1;
 }
 
+static const ShReg *sh_find(uint64_t addr, uint64_t n) {
+    for (int i = 0; i < nsh; i++)
+        if (addr >= sh_reg[i].addr && n <= sh_reg[i].n && addr - sh_reg[i].addr <= sh_reg[i].n - n) return &sh_reg[i];
+    return NULL;
+}
+
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    const ShReg *r = sh_find(addr, n);
+    // Shared pages outlive MADV_DONTNEED (it drops only the mapping's references): the hole punched in the memfd frees
+    // them, and the range reads zero after its next commit. A dma-buf still holding them keeps its own references.
+    if (r) {
+        for (uint64_t at = addr, end = addr + n; at < end;) {
+            uint64_t off = at - r->addr, g = off >> SH_GRAN_SHIFT;
+            uint64_t next = r->addr + ((g + 1) << SH_GRAN_SHIFT);
+            uint64_t len = (next < end ? next : end) - at;
+            if (r->pinned && __atomic_load_n(&r->pinned[g], __ATOMIC_ACQUIRE)) memset(r->view + off, 0, (size_t)len);
+            else if (fallocate(r->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)len)) return 0;
+            at += len;
+        }
+        if (mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
+        ps_set(addr, n, PS_RESERVED);
+        return 1;
+    }
     if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
     ps_set(addr, n, PS_RESERVED);
     return 1;
@@ -1205,6 +1299,70 @@ int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
     struct uffdio_writeprotect wp = {.range = {lo, hi - lo}, .mode = 0};
     // PAGEMAP_SCAN observes cleared protection as written, just as after an asynchronous write fault.
     return ioctl(ww_fd, UFFDIO_WRITEPROTECT, &wp) == 0;
+}
+
+// udmabuf's UAPI (linux/udmabuf.h), declared here so that a build does not need the header.
+struct plat_udmabuf_create { uint32_t memfd, flags; uint64_t offset, size; };
+#define PLAT_UDMABUF_CREATE _IOW('u', 0x42, struct plat_udmabuf_create)
+#define PLAT_UDMABUF_FLAGS_CLOEXEC 0x01
+
+void plat_mem_share_init(int on) {
+    // Without /dev/udmabuf no pool could be shared, and shared memory has no other import: private memory then.
+    if (on) {
+        int fd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "platform: /dev/udmabuf cannot be opened (%s): guest memory stays private\n", strerror(errno));
+            on = 0;
+        } else {
+            udmabuf_dev = fd;
+        }
+    }
+    sh_want = on;
+}
+
+int plat_mem_shared(void) { return nsh > 0; }
+
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n) {
+    const ShReg *r = n ? sh_find(addr, n) : NULL;
+    if (!r || !r->pinned) return;
+    for (uint64_t g = (addr - r->addr) >> SH_GRAN_SHIFT, e = (addr - r->addr + n - 1) >> SH_GRAN_SHIFT; g <= e; g++) {
+        if (__atomic_sub_fetch(&r->pinned[g], 1, __ATOMIC_ACQ_REL)) continue;
+        // The granule's decommitted pages: freed now. A commit racing this reads the page as zero either way.
+        uint64_t glo = r->addr + (g << SH_GRAN_SHIFT), ghi = glo + (1ull << SH_GRAN_SHIFT);
+        if (ghi > r->addr + r->n) ghi = r->addr + r->n;
+        for (uint64_t p = glo; p < ghi;) {
+            if (pstate[p / PG] >= PS_NONE) { p += PG; continue; }
+            uint64_t q = p;
+            while (q < ghi && pstate[q / PG] < PS_NONE) q += PG;
+            fallocate(r->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(p - r->addr), (off_t)(q - p));
+            p = q;
+        }
+    }
+}
+
+int plat_mem_shared_range(uint64_t addr, uint64_t *base, uint64_t *size) {
+    const ShReg *r = sh_find(addr, 1);
+    if (!r || !r->pinned) return 0;
+    *base = r->addr, *size = r->n;
+    return 1;
+}
+
+int plat_mem_dmabuf(uint64_t addr, uint64_t n) {
+    const ShReg *r = (addr | n) & (PG - 1) ? NULL : sh_find(addr, n);
+    if (!r || !n || !r->pinned) return -1;
+    // Counted before the dma-buf pins the pages, so a decommit from here on zeroes them in place (plat_mem_decommit).
+    for (uint64_t g = (addr - r->addr) >> SH_GRAN_SHIFT, e = (addr - r->addr + n - 1) >> SH_GRAN_SHIFT; g <= e; g++)
+        __atomic_add_fetch(&r->pinned[g], 1, __ATOMIC_ACQ_REL);
+    int dev = udmabuf_dev;
+    if (dev < 0) {
+        plat_mem_dmabuf_done(addr, n);
+        return -1;
+    }
+    struct plat_udmabuf_create c = {.memfd = (uint32_t)r->fd, .flags = PLAT_UDMABUF_FLAGS_CLOEXEC,
+                                     .offset = addr - r->addr, .size = n};
+    int fd = ioctl(dev, PLAT_UDMABUF_CREATE, &c);
+    if (fd < 0) plat_mem_dmabuf_done(addr, n);
+    return fd;
 }
 
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {

@@ -239,6 +239,19 @@ enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1 };   // plat_mem_state besides
 // Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. watch: writes to its pages are
 // tracked for plat_mem_written.
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch);
+// Before the first plat_mem_reserve: on, the watched reservations are backed by memory the GPU can share (Linux: a
+// memfd each; nothing elsewhere). plat_mem_shared: 1 when at least one reservation got it.
+void plat_mem_share_init(int on);
+int plat_mem_shared(void);
+// A dma-buf file descriptor over the pages [addr, addr + n) of a shared reservation (page-aligned), which the GPU
+// reads and writes in place; -1 when the range is not shared or the system cannot make one. The caller owns it.
+int plat_mem_dmabuf(uint64_t addr, uint64_t n);
+// The shared reservation holding addr: 1 with its start and size, 0 when addr is not in one. Pages a dma-buf holds
+// keep holding their bytes through a decommit, zeroed in place, so a later dma-buf over them sees what the CPU sees.
+int plat_mem_shared_range(uint64_t addr, uint64_t *base, uint64_t *size);
+// The dma-buf of plat_mem_dmabuf(addr, n) is gone (its import freed): granules no other dma-buf holds give back their
+// decommitted pages.
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n);
 // n bytes of read-write memory anywhere, zero, backed only as pages are first written (plat_mem_protect may seal them);
 // NULL on failure. Kept until exit.
 void *plat_mem_alloc(size_t n);

@@ -1202,6 +1202,12 @@ void mem_init(void) {
     if (!reserve_at(RT_KERNEL_BASE, RT_KERNEL_SIZE, 0)) reexec_or_fail("the kernel region");
     if (!reserve_at(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
 
+    // NX2NAVI_SHARED_MEMORY=1 (Linux): the stack and heap block and the alias region below are shared memory that the
+    // GPU can use in place (platform.h plat_mem_dmabuf; vk_memory.c import_pool). Read from the environment only: the
+    // reservations come before nx2navi.ini is read.
+    const char *sh = getenv("NX2NAVI_SHARED_MEMORY");
+    plat_mem_share_init(sh && sh[0] == '1');
+
     // Stack and heap block, then the alias region above it, both searched below the module window.
     uint64_t low = 0, alias = 0;
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)

@@ -803,6 +803,12 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 
 // ---- virtual memory: VirtualAlloc reservations, MEM_WRITE_WATCH for the watched ones.
 
+void plat_mem_share_init(int on) { (void)on; }
+int plat_mem_shared(void) { return 0; }
+int plat_mem_dmabuf(uint64_t addr, uint64_t n) { (void)addr; (void)n; return -1; }
+int plat_mem_shared_range(uint64_t addr, uint64_t *base, uint64_t *size) { (void)addr, (void)base, (void)size; return 0; }
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
     if (p && p != (void *)(uintptr_t)addr) {
