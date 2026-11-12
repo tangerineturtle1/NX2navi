@@ -1783,16 +1783,17 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // replays the op again once in turn, and so do the contact shadows' pass and the HDR pass's source. Per-object motion
 // lists its draws under a lock (vk_exec_draw.c mvobj_draw), and the occlusion queries' slots and segments follow the
 // stream (vk_exec_xfer.c vk_exec_xfer_slots, vk_exec_xfer_group_merge).
-// NX2NAVI_REPLAY_PIPE=1 (default 0): the submitting thread hands the group to the workers, takes chunks of it as they do
-// until none is left to take, and goes on with the ops after it, in a new command buffer after the chunks' places in
-// the part (vk_sync_append_later), while the last chunks are recorded; also into the front pass of the next group: up
-// to LIVE_GROUPS groups are handed out and not in their part yet, their chunks taken from one queue in the order of
-// the stream (Q). Hyrule Field, 3 workers (2026-11-12): the frame's groups took 6.8 ms of the submitting thread and the
-// ops between them 4.6. A group's chunk 0 runs its pass hooks after the group before began its pass, and waits for
-// every earlier group where a hook acts; a turn (vk_exec_turn) waits for every earlier chunk, of earlier groups too.
+// NX2NAVI_REPLAY_PIPE=N (1-4, default 0): the submitting thread hands the group to the workers, takes chunks of it as
+// they do until none is left to take, and goes on with the ops after it, in a new command buffer after the chunks'
+// places in the part (vk_sync_append_later), while the last chunks are recorded; also into the front pass of the next
+// group: up to N (at most LIVE_GROUPS) groups are handed out and not in their part yet, their chunks taken from one
+// queue in the order of the stream (Q). Hyrule Field, 3 workers (2026-11-12): the frame's groups took 6.8 ms of the
+// submitting thread and the ops between them 4.6. A group's chunk 0 runs its pass hooks after the group before began
+// its pass, and waits for every earlier group where a hook acts; a turn (vk_exec_turn) waits for every earlier chunk,
+// of earlier groups too.
 // The submitting thread waits for the groups (group_wait), and puts their command buffers and query slots in place
 // (group_drain, oldest first: groups_put_done), only where the order needs it:
-// - for room when LIVE_GROUPS are out, before a part is split off or submitted (a part due before a group goes to the
+// - for room when N groups are out, before a part is split off or submitted (a part due before a group goes to the
 //   GPU first: its work would otherwise wait for the group's last chunk too), and before an op that chunks never
 //   record (pipe_op: copies, clears of textures and buffers);
 // - where a pass's hook acts: DLAA's run (vk_dlaa.c: the jitter and its end, and the per-object motion lists it takes)
@@ -1807,10 +1808,13 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 //   pass (vk_exec_xfer.c GS).
 // Locks a chunk takes, the submitting thread takes too while it is behind (vk_exec_shared). The chunks it records,
 // at the hand-out or while it waits between two ops, use a draw context of its own (RW.help_dc).
-// Off by default: Hyrule Field, 3 workers, standing (2026-11-12), it shortened the replay (11.5 against 12.1 ms a
-// frame) but not the frame (49.2 against 49.6 fps in the same batch). The main thread's wait for the GPU after the
-// frame's first submission grew by 0.8 ms: the GPU gets a group's commands only once its last chunk is recorded, and
-// a part goes only when every group in it is done, so fewer parts reach it, later.
+// Off by default: Hyrule Field, 3 workers, standing (2026-11-12), it shortens the replay (10.9-11.5 against 11.7-12.1
+// ms a frame) but not the frame: with 1, 2 or 4 groups out the fps stayed within one of the 50 the stage 2 mode makes,
+// over three batches. A frame there is the replay (about 11.5 ms) and then the GPU's work after it (about 6.6 ms: the
+// temporal upscaler about 4, the write-back copies 1.5), which the next frame waits for (nvn_api_core.c
+// nvnQueueSubmitCommands, NX2NAVI_SUBMIT_FINISH; without that wait the game waits as long itself, 52.4 fps); during the
+// replay the GPU keeps up with what is submitted. Sending the part's command buffers up to the first chunk place still
+// being recorded while later groups record (tried) did so for at most 0.2 parts per submission and gained nothing.
 #define RW_MAX 16
 #define CHUNK_DRAWS 32                  // draws a chunk takes at least
 #define GROUP_PEEK 65536u               // ops read ahead for a group, at most
@@ -1843,7 +1847,7 @@ static const char *const pw_name[PW_N] = {"next group", "op", "pass hooks", "tur
 
 static struct {
     int n;                              // workers; 0 off, -1 not read yet
-    int pipe;                           // NX2NAVI_REPLAY_PIPE
+    int pipe;                           // NX2NAVI_REPLAY_PIPE: the groups out at once at most, 0 none
     void *help_dc;                      // the submitting thread's draw context for chunks it takes while it waits
     RwWorker *w[RW_MAX];
     const op_hdr *skip_to[CALL_DEPTH + 1];   // per call depth: the walk read ahead to this op, a group too small
@@ -1915,11 +1919,13 @@ static void rw_init(void) {
         if (!(w->t = plat_thread_new(rw_main, w, name))) rt_fatal("vk: cannot start a replay worker");
         RW.w[k] = w;
     }
-    RW.pipe = RW.n > 0 && cfg_bool("NX2NAVI_REPLAY_PIPE");
+    int pipe = cfg_int("NX2NAVI_REPLAY_PIPE");   // the groups out at once
+    RW.pipe = RW.n <= 0 || pipe <= 0 ? 0 : pipe > LIVE_GROUPS ? LIVE_GROUPS : pipe;
     if (RW.pipe) RW.help_dc = vk_exec_draw_ctx_new();
     if (RW.pipe)
         rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s while the submitting thread goes on "
-               "past them (NX2NAVI_REPLAY_WORKERS, NX2NAVI_REPLAY_PIPE)", 2 * CHUNK_DRAWS, RW.n, RW.n > 1 ? "s" : "");
+               "past them, %d at once at most (NX2NAVI_REPLAY_WORKERS, NX2NAVI_REPLAY_PIPE)", 2 * CHUNK_DRAWS, RW.n,
+               RW.n > 1 ? "s" : "", RW.pipe);
     else if (RW.n)
         rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s and the submitting thread "
                "(NX2NAVI_REPLAY_WORKERS)", 2 * CHUNK_DRAWS, RW.n, RW.n > 1 ? "s" : "");
@@ -2179,7 +2185,7 @@ static void group_drain(VkExec *ex, int why) {
 
 // Before the front pass of a new group: its slot holds a group put in its part (the oldest goes in first).
 static void group_room(VkExec *ex) {
-    if (Q.out - Q.drained < LIVE_GROUPS) return;
+    if (Q.out - Q.drained < (uint64_t)RW.pipe) return;
     uint64_t want = Q.drained + 1;
     if (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < want) {
         uint64_t t0 = kern_now_ns();

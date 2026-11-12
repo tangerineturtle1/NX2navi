@@ -247,7 +247,7 @@ static const CfgMeta metas[] = {
     {"COOP_ACCEPT", "ask", NULL, LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
-    {"REPLAY_WORKERS", "0", "0..16", RESTART}, {"REPLAY_PIPE", "0", "0|1", RESTART},
+    {"REPLAY_WORKERS", "0", "0..16", RESTART}, {"REPLAY_PIPE", "0", "0..4", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
     // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds
     {"DYN_RES", "0", "0|1", LIVE}, {"DYN_RES_TARGET", "16.7", "1..100", LIVE}, {"DYN_RES_STEP", "45", "8..600", LIVE},
