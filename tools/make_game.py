@@ -1870,6 +1870,13 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
             copy_if_changed(KIT / 'bin' / name, out / name)
         if (KIT / 'bin' / FFX4_FG_DLL).is_file():   # its frame generation (runtime/vk_fg4.cpp)
             copy_if_changed(KIT / 'bin' / FFX4_FG_DLL, out / FFX4_FG_DLL)
+    if not WIN:   # FSR 4 on Linux: the kit's bin/, else tools/ffx4_linux/fetch.sh's own output folder
+        for d in (KIT / 'bin', KIT / 'build' / 'ffx4_linux'):
+            if (d / 'amd_fidelityfx_upscaler_vk.so').is_file():
+                copy_if_changed(d / 'amd_fidelityfx_upscaler_vk.so', out / 'amd_fidelityfx_upscaler_vk.so')
+                if (d / 'amd_fidelityfx_upscaler_vk-LICENSE.txt').is_file():
+                    copy_if_changed(d / 'amd_fidelityfx_upscaler_vk-LICENSE.txt', out / 'amd_fidelityfx_upscaler_vk-LICENSE.txt')
+                break
     kept = place_dlss(out, linux=not WIN)   # NVIDIA DLSS (runtime/vk_dlaa.c): this platform's library from the kit
     if kept:
         say(f'  {kept}')

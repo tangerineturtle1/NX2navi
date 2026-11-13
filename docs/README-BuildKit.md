@@ -121,10 +121,21 @@ memory runs short, it ends the process, so while less than the larger of 4 GB an
 drops stale textures and evicts idle ones. The log names the limits at the first check (`platform: memory limits`). That
 cannot give back what the game needs after its start: about 10 GB in Kokiri Forest at a 2160p game resolution.
 
-AMD FSR 3.1 loads AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu offers neither
-FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the
-game's own scaling and swapchain as they are (the log says so). AMD FSR 4 is in the Windows build alone for the same
-reason, and `fsr4 = 1` does nothing on Linux.
+AMD FSR 3.1 on Linux loads `libamd_fidelityfx_vk.so` from beside `ocarina`. AMD ships that library for Windows only;
+`tools/ffx_linux/build.sh` builds this one from AMD's FidelityFX SDK, with FSR 3.1 upscaling, FSR 3.1 frame generation
+and its frame generation swapchain, for every Vulkan GPU (`tools/ffx_linux/README.md`). Without it the menu offers
+neither FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave
+the game's own scaling and swapchain as they are (the log says `ffx: ... not found`).
+
+AMD's own FSR 4 upscaler (`amd_fidelityfx_loader_vk.dll`/`amd_fidelityfx_upscaler_vk.dll`) is likewise Windows-only,
+but `runtime/vk_ffx4.cpp` also loads `amd_fidelityfx_upscaler_vk.so` on Linux: an independent FSR 4.1.1 implementation,
+[fsr4-vk](https://github.com/Astyyyyy/fsr4-vk) (GPL-3.0; not affiliated with or endorsed by AMD), built from AMD's own
+extracted model weights and not shipped in this repository. `tools/ffx4_linux/fetch.sh build/ffx4_linux` downloads and
+builds it (`tools/ffx4_linux/README.md`, `THIRD_PARTY_NOTICES.md`); the next `make_game.py` run finds
+`build/ffx4_linux/amd_fidelityfx_upscaler_vk.so` and copies it beside the game, with its licence text. It is built
+once; rerun `fetch.sh` only to pick up a newer upstream commit. `vk_ffx_upscale` (`runtime/vk_ffx.cpp`) only tries
+FSR 4 after FSR 3.1's own library above loads, so FSR 4 needs it too; with both in place `fsr4 = 1` works the same as
+on Windows.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside

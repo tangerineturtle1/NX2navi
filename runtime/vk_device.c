@@ -387,6 +387,7 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT dbuf;
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
@@ -438,6 +439,10 @@ static int create_device(void) {
     // (vk_pipeline.c spirv_reconverge)
     OPTIONAL_EXT(has_maximal_reconvergence, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME, mrc,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR);
+    // Nothing of ours calls it: FSR 4's Linux library (vk_ffx4.cpp) needs it enabled on the device it is given, to
+    // bind its own model weights
+    OPTIONAL_EXT(has_descriptor_buffer, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, dbuf,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
     // Compiled pipelines kept under the runtime's own keys (vk_pipeline.c pipe_create): VK_KHR_pipeline_binary, which
     // needs VK_KHR_maintenance5 (core only from Vulkan 1.4; the instance asks for 1.3). NX2NAVI_PIPE_BINARIES=0 leaves
     // both off.
@@ -527,6 +532,7 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;
+    if (g_vk.has_descriptor_buffer && !c->dbuf.descriptorBuffer) g_vk.has_descriptor_buffer = 0;
     if (g_vk.has_vrs) {   // the rate is set per draw; no rate attachment and no per-primitive rates
         c->vrs.attachmentFragmentShadingRate = c->vrs.primitiveFragmentShadingRate = VK_FALSE;
         if (!c->vrs.pipelineFragmentShadingRate) g_vk.has_vrs = 0;
