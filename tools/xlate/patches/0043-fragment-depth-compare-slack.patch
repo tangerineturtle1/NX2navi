@@ -1,0 +1,89 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+@@ -40,6 +40,7 @@
+                 if (context.Stage == ShaderStage.Fragment)
+                 {
+                     EliminateMultiplyByFragmentCoordW(context.Blocks[blkIndex]);
++                    FragmentDepthCompareSlack(context.Blocks[blkIndex]);
+                 }
+ 
+                 // If the host does not support double operations, we need to turn them into float operations.
+@@ -291,6 +292,78 @@
+             return modified;
+         }
+ 
++        // NX2NAVI: on Maxwell, gl_FragCoord.z equals bit for bit the depth the same surface stored in an earlier pass, and
++        // shaders rely on it: a fog sheet compares its depth with a depth pre-pass of the same sheet and discards when
++        // it is behind (z > pre-pass depth). Other GPUs make the shader's z and the stored depth apart and they differ
++        // by one unit in the last place at scattered pixels, which shows as flickering holes. Float comparisons with
++        // gl_FragCoord.z therefore treat values one unit apart as equal. Depths are not negative, so their float order
++        // is the order of their bits: the comparison becomes an unsigned one on the bits with one unit of slack, the
++        // other side clamped to 0 first (max, then the sign bit cleared for -0).
++        private static void FragmentDepthCompareSlack(BasicBlock block)
++        {
++            for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
++            {
++                if (node.Value is not Operation operation || operation.SourcesCount != 2 || operation.Dest == null)
++                {
++                    continue;
++                }
++
++                bool zLeft = Utils.IsInputLoad(operation.GetSource(0).AsgOp, IoVariable.FragmentCoord, 2);
++                bool zRight = Utils.IsInputLoad(operation.GetSource(1).AsgOp, IoVariable.FragmentCoord, 2);
++
++                if (zLeft == zRight)
++                {
++                    continue;
++                }
++
++                // As z OP t.
++                Instruction? asZt = operation.Inst switch
++                {
++                    Instruction.FP32 | Instruction.CompareGreater => zLeft ? Instruction.CompareGreater : Instruction.CompareLess,
++                    Instruction.FP32 | Instruction.CompareGreaterOrEqual => zLeft ? Instruction.CompareGreaterOrEqual : Instruction.CompareLessOrEqual,
++                    Instruction.FP32 | Instruction.CompareLess => zLeft ? Instruction.CompareLess : Instruction.CompareGreater,
++                    Instruction.FP32 | Instruction.CompareLessOrEqual => zLeft ? Instruction.CompareLessOrEqual : Instruction.CompareGreaterOrEqual,
++                    _ => null,
++                };
++
++                if (asZt is not Instruction inst)
++                {
++                    continue;
++                }
++
++                Operand z = operation.GetSource(zLeft ? 0 : 1);
++                Operand t = operation.GetSource(zLeft ? 1 : 0);
++                Operand tMax = OperandHelper.Local();
++                Operand tBits = OperandHelper.Local();
++                Operand slack = OperandHelper.Local();
++                Operand result = OperandHelper.Local();
++
++                block.Operations.AddBefore(node, new Operation(Instruction.FP32 | Instruction.Maximum, tMax, t, OperandHelper.ConstF(0f)));
++                block.Operations.AddBefore(node, new Operation(Instruction.BitwiseAnd, tBits, tMax, OperandHelper.Const(0x7fffffff)));
++
++                Operation compare = inst switch
++                {
++                    // z > t + 1 unit, z <= t + 1 unit
++                    Instruction.CompareGreater or Instruction.CompareLessOrEqual =>
++                        new Operation(Instruction.Add, slack, tBits, OperandHelper.Const(1)),
++                    // z + 1 unit >= t, z + 1 unit < t
++                    _ => new Operation(Instruction.Add, slack, z, OperandHelper.Const(1)),
++                };
++
++                block.Operations.AddBefore(node, compare);
++
++                block.Operations.AddBefore(node, inst switch
++                {
++                    Instruction.CompareGreater => new Operation(Instruction.CompareGreaterU32, result, z, slack),
++                    Instruction.CompareLessOrEqual => new Operation(Instruction.CompareLessOrEqualU32, result, z, slack),
++                    Instruction.CompareGreaterOrEqual => new Operation(Instruction.CompareGreaterOrEqualU32, result, slack, tBits),
++                    _ => new Operation(Instruction.CompareLessU32, result, slack, tBits),
++                });
++
++                operation.TurnIntoCopy(result);
++            }
++        }
++
+         private static void EliminateMultiplyByFragmentCoordW(BasicBlock block)
+         {
+             foreach (INode node in block.Operations)
