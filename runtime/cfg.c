@@ -61,6 +61,9 @@ static const char *const known[] = {
     "SKIN_MOTION",   // vk_skin_motion.inc
     "MVOBJ_ALL", "MVOBJ_BANKS", "MVOBJ_EQUAL", "MVOBJ_EXACT", "MVOBJ_EXEC", "MVOBJ_NOC4", "MVOBJ_ONLY", "MVOBJ_TIMES", "MVPREV_CHECK", "MVPREV_GROW", "MVPREV_SKIP", "MVPREV_TRUST", "MV_CHECK",
     "MV_SURVEY",
+    "LOD_MAX_DIST", "LOD_START_DIST", "LOD_START_DIST_HANDHELD", "LOD_STATIC_OFFSET", "LOD_DYNAMIC_OFFSET", "MODEL_LOD_MAX_DIST",
+    "MODEL_LOD_START_DIST", "PLANT_DRAW_DIST", "FOLIAGE_UNDERGROWTH_DIST", "FOLIAGE_ORNAMENT_DIST", "FOLIAGE_TREE_DIST", "FOLIAGE_TREE_SHADOW_DIST",
+    "FOLIAGE_TURF_POLY_LEN", "FOLIAGE_CAPACITY", "PATCH_LOD",
     "PIPE_SEED_BOOT", "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_LAYOUT", "PACE_HZ", "PASS_CRUMBS", "PATCH_OUTPUT", "PATCH_RES_FIXED", "PATCH_SCENE", "PATCH_WIDE_ASPECT", "PATCH_WIDE_HUD", "PATCH_WIDE_MOVIE", "PATCH_WIDE_OUT", "PATCH_FREECAM", "PATCH_OCCLUSION_OFF", "PATCH_WIDE_SAVE", "PATCH_WIDE_SCENE", "PCSS", "PCSS_K", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPELINE_CACHE_MAX_MB", "PIPELINE_CACHE_PLAY", "PIPELINE_CACHE_PLAY_MB", "PIPE_BINARIES", "PIPE_BINARIES_MAX_MB", "PIPE_FEEDBACK", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SEED", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POWER_FULL", "TEX_SAME", "TEX_SAME_BIG", "TEX_FLAT3D", "TEX_KEEP_TAKEN", "TEX_STALE_KEPT", "PRESENT_HELD", "HELD_SYNC",
     "PREPARE_PIPELINES", "PREWARM_FULL", "PREWARM_FULL_S", "PREWARM_WAIT_MS", "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES", "PROFILE_REPLAY", "PROFILE_SLOW",
     "POOL_FAST", "POOL_GROUP", "POOL_GROUP_CHECK", "POOL_PRESNAP", "POOL_PRESNAP_RUNS",
@@ -118,6 +121,11 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_LIVE", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
     {"HDR_UI_NITS", "display"}, {"SHADOW_RES", "display"},
+    {"LOD_MAX_DIST", "display"}, {"LOD_START_DIST", "display"}, {"LOD_START_DIST_HANDHELD", "display"},
+    {"LOD_STATIC_OFFSET", "display"}, {"LOD_DYNAMIC_OFFSET", "display"}, {"MODEL_LOD_MAX_DIST", "display"},
+    {"MODEL_LOD_START_DIST", "display"}, {"PLANT_DRAW_DIST", "display"},
+    {"FOLIAGE_UNDERGROWTH_DIST", "display"}, {"FOLIAGE_ORNAMENT_DIST", "display"}, {"FOLIAGE_TREE_DIST", "display"},
+    {"FOLIAGE_TREE_SHADOW_DIST", "display"}, {"FOLIAGE_TURF_POLY_LEN", "display"}, {"FOLIAGE_CAPACITY", "display"},
     {"DLAA", "display"}, {"FSR4", "display"}, {"FSR4_FG", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_IDLE_FREE", "display"}, {"DLSS_RANGE", "display"}, {"DLSS_PREBLOOM", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"}, {"AA", "display"},
     {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"}, {"FG_MULT", "display"}, {"SKIN_MOTION", "display"},
     {"LOW_LATENCY", "display"},
@@ -232,6 +240,14 @@ static const CfgMeta metas[] = {
     {"HDR_PEAK_NITS", "1000", "400..10000", LIVE}, {"HDR_GAME_NITS", "203", "48..500", LIVE},
     {"HDR_UI_NITS", "203", "48..500", LIVE},
     {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
+    // lod.c: Ocarina's level-of-detail distances
+    {"LOD_MAX_DIST", "100", "10..1000", LIVE}, {"LOD_START_DIST", "100", "10..1000", LIVE},
+    {"LOD_START_DIST_HANDHELD", "100", "10..1000", LIVE}, {"LOD_STATIC_OFFSET", "0", "-100000..100000", LIVE},
+    {"LOD_DYNAMIC_OFFSET", "0", "-100000..100000", LIVE}, {"MODEL_LOD_MAX_DIST", "100", "10..1000", RESTART},
+    {"MODEL_LOD_START_DIST", "100", "10..1000", RESTART}, {"PLANT_DRAW_DIST", "game", "game|extended", RESTART},
+    {"FOLIAGE_UNDERGROWTH_DIST", "100", "10..1000", LIVE}, {"FOLIAGE_ORNAMENT_DIST", "100", "10..1000", LIVE},
+    {"FOLIAGE_TREE_DIST", "100", "10..1000", LIVE}, {"FOLIAGE_TREE_SHADOW_DIST", "100", "10..1000", RESTART},
+    {"FOLIAGE_TURF_POLY_LEN", "100", "10..1000", LIVE}, {"FOLIAGE_CAPACITY", "100", "100..400", RESTART},
     {"SHADOW_RES", "game", "game|256|512|768|1024|1536|2048", RESTART},
     {"SHADOW_SCALE", "1", "1..4", RESTART}, {"SHADOW_COMPARE", "1", "0|1", RESTART},   // vk_texture.c
     {"SHADOW_BULK_WRITE", "0", "0|1", RESTART},   // vk_memory.c shadow_write_back

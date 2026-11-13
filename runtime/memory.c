@@ -1307,9 +1307,13 @@ static uint32_t map_gen;
 uint32_t mem_map_gen(void) { return __atomic_load_n(&map_gen, __ATOMIC_ACQUIRE); }
 
 // The application pool is the title's own plus res_heap_extra_bytes (mem_init), and the game asks for a heap of
-// nearly all of it: past HEAP_CAP the request below is refused, so this is the most that may be added.
+// nearly all of it: past HEAP_CAP the request below is refused, so this is the most that may be added. The foliage's
+// heap (res_heap_grow_kib, lod.c) is part of that growth and comes first: what is left is the most res_heap_extra_kib
+// may be.
 uint64_t mem_heap_extra_max_kib(void) {
-    return HEAP_CAP > DEFAULT_POOL ? ((HEAP_CAP - DEFAULT_POOL) & ~0x1fffffull) >> 10 : 0;
+    uint64_t room = HEAP_CAP > DEFAULT_POOL ? ((HEAP_CAP - DEFAULT_POOL) & ~0x1fffffull) >> 10 : 0;
+    uint64_t grow = (res_heap_grow_kib() + 2047) & ~2047ull;
+    return room > grow ? room - grow : 0;
 }
 
 // ---- 0x01 SetHeapSize

@@ -73,6 +73,7 @@ void wide_picture(unsigned *w, unsigned *h);
 double wide_scene_share(void);
 double wide_scene_wanted(void);
 int wide_scene_restart(void);
+int lod_available(void);                // lod.c: the build has Ocarina's level-of-detail patch set
 const char *const *vk_color_preset(const char *name);
 int vk_hdr_wanted(void);
 int vk_hdr_active(void);
@@ -1351,6 +1352,22 @@ static void tab_screen(float scale) {
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
     row_texture_detail();
+    // Ocarina's level-of-detail distances (lod.c): the game's own values times these, at once (lod_frame); the low trees'
+    // shadow distance and the list capacity at the next start. They need the set lod of
+    // recomp/patches-v111.txt (lod_available)
+    if (lod_available()) {
+        opt_slider("NX2NAVI_FOLIAGE_UNDERGROWTH_DIST", UI_MENU_FOLIAGE_UNDERGROWTH, 10, 1000, UI_MENU_FOLIAGE_UNDERGROWTH_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_FOLIAGE_ORNAMENT_DIST", UI_MENU_FOLIAGE_ORNAMENT, 10, 1000, UI_MENU_FOLIAGE_ORNAMENT_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_FOLIAGE_TREE_DIST", UI_MENU_FOLIAGE_TREE, 10, 1000, UI_MENU_FOLIAGE_TREE_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_FOLIAGE_TREE_SHADOW_DIST", UI_MENU_FOLIAGE_TREE_SHADOW, 10, 1000, UI_MENU_FOLIAGE_TREE_SHADOW_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_FOLIAGE_TURF_POLY_LEN", UI_MENU_FOLIAGE_TURF, 10, 1000, UI_MENU_FOLIAGE_TURF_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_FOLIAGE_CAPACITY", UI_MENU_FOLIAGE_CAP, 100, 400, UI_MENU_FOLIAGE_CAP_DESC, 100, "%.0f %%");
+        opt_slider("NX2NAVI_LOD_MAX_DIST", UI_MENU_LOD_MAX, 10, 1000, UI_MENU_LOD_MAX_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_LOD_START_DIST", UI_MENU_LOD_START, 10, 1000, UI_MENU_LOD_START_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_LOD_START_DIST_HANDHELD", UI_MENU_LOD_START_HH, 10, 1000, UI_MENU_LOD_START_HH_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_LOD_STATIC_OFFSET", UI_MENU_LOD_STATIC, -10000, 10000, UI_MENU_LOD_STATIC_DESC, 100, "%.0f");
+        opt_slider("NX2NAVI_LOD_DYNAMIC_OFFSET", UI_MENU_LOD_DYNAMIC, -10000, 10000, UI_MENU_LOD_DYNAMIC_DESC, 100, "%.0f");
+    }
     opt_end();
 }
 

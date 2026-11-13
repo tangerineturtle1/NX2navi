@@ -38,6 +38,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "lod.h"
 #include "platform/platform.h"
 
 #define BASE_W 1920
@@ -193,11 +194,16 @@ uint64_t res_heap_extra_kib(void) {
     return kib + ((shadow_kib() + 1023) & ~1023ull);   // whole MiB
 }
 
-uint64_t res_heap_extra_bytes(void) { return ((res_heap_extra_kib() << 10) + 0x1fffff) & ~0x1fffffull; }
+// The Foliage heap of the HeapDef table grows for larger foliage list capacities (lod.c lod_foliage_heap_kib).
+uint64_t res_heap_grow_kib(void) { return lod_foliage_heap_kib(); }
+
+uint64_t res_heap_extra_bytes(void) {
+    return (((res_heap_extra_kib() + res_heap_grow_kib()) << 10) + 0x1fffff) & ~0x1fffffull;
+}
 
 // ---- the HeapDef table. BYML version 2..7, little endian ("YB"): a hash node is {u8 0xC1, u24 count} and count
 // entries {u24 key index, u8 type, u32 value}; an int (type 0xD1) is stored in the entry, so a size changes in place.
-typedef struct { uint8_t *p; size_t n; uint32_t keys; } Byml;
+typedef struct { uint8_t *p; size_t n; uint32_t keys, strs; } Byml;
 
 static int u32_at(const Byml *b, size_t off, uint32_t *v) {
     if (off + 4 > b->n) return 0;
@@ -205,13 +211,16 @@ static int u32_at(const Byml *b, size_t off, uint32_t *v) {
     return 1;
 }
 
-static const char *key_name(const Byml *b, uint32_t k) {
+// The k-th string of the string table at `table` (the key names, or the string values)
+static const char *table_name(const Byml *b, uint32_t table, uint32_t k) {
     uint32_t head, at;
-    if (!u32_at(b, b->keys, &head) || (head & 0xff) != 0xc2 || k >= head >> 8 || !u32_at(b, b->keys + 4 + 4 * k, &at) ||
-        (size_t)b->keys + at >= b->n || !memchr(b->p + (size_t)b->keys + at, 0, b->n - ((size_t)b->keys + at)))
+    if (!table || !u32_at(b, table, &head) || (head & 0xff) != 0xc2 || k >= head >> 8 || !u32_at(b, table + 4 + 4 * k, &at) ||
+        (size_t)table + at >= b->n || !memchr(b->p + (size_t)table + at, 0, b->n - ((size_t)table + at)))
         return NULL;   // in size_t: a mod's table offset near 2^32 would wrap the 32-bit sum below n
-    return (const char *)b->p + (size_t)b->keys + at;
+    return (const char *)b->p + (size_t)table + at;
 }
+
+static const char *key_name(const Byml *b, uint32_t k) { return table_name(b, b->keys, k); }
 
 // The offset of the value of hash node `node`'s entry `name`, which must have type `type`; 0 when there is none.
 static size_t field(const Byml *b, uint32_t node, const char *name, uint8_t type) {
@@ -226,6 +235,31 @@ static size_t field(const Byml *b, uint32_t node, const char *name, uint8_t type
     return 0;
 }
 
+// The heap `heap` and its parents grow by kib. 0 when the table has no such heap.
+static int heap_grow(Byml *b, uint32_t heaps, const char *heap, uint32_t kib) {
+    char line[256];
+    size_t len = 0;
+    for (int depth = 0; heap && depth < 8; depth++) {
+        size_t at = field(b, heaps, heap, 0xc1), size_at, parent_at;
+        uint32_t node, parent;
+        if (!at || !u32_at(b, at, &node) || !(size_at = field(b, node, "Size", 0xd1))) {
+            if (!depth) return 0;
+            break;
+        }
+        int32_t size;
+        memcpy(&size, b->p + size_at, 4);
+        int32_t grown = size + (int32_t)kib;
+        memcpy(b->p + size_at, &grown, 4);
+        if (len < sizeof line)
+            len += (size_t)snprintf(line + len, sizeof line - len, "%s%s %d -> %d KiB", depth ? ", its parent " : "", heap, size,
+                                    grown);
+        parent_at = field(b, node, "Parent", 0xa0);
+        heap = parent_at && u32_at(b, parent_at, &parent) ? table_name(b, b->strs, parent) : NULL;
+    }
+    rt_log("resolution: HeapDef %s", line);
+    return 1;
+}
+
 static size_t heap_size_field(const Byml *b, uint32_t heaps, const char *heap) {
     size_t at = field(b, heaps, heap, 0xc1);
     uint32_t node;
@@ -234,8 +268,9 @@ static size_t heap_size_field(const Byml *b, uint32_t heaps, const char *heap) {
 
 int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
     uint64_t extra = res_heap_extra_kib();
+    uint32_t foliage = (uint32_t)res_heap_grow_kib();
     *out = NULL;
-    if (!extra) return 0;
+    if (!extra && !foliage) return 0;
     if (ZSTD_getDictID_fromFrame(in, n)) {
         rt_log("resolution: the HeapDef table needs a zstd dictionary; the game keeps its own resolution");
         return 0;
@@ -245,7 +280,7 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
         rt_log("resolution: the HeapDef table is not a zstd frame with a size; the game keeps its own resolution");
         return 0;
     }
-    Byml b = {malloc((size_t)raw), (size_t)raw, 0};
+    Byml b = {malloc((size_t)raw), (size_t)raw, 0, 0};
     if (!b.p) return 0;
     size_t got = ZSTD_decompress(b.p, b.n, in, n);
     uint32_t root, heaps = 0;
@@ -256,19 +291,29 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
         (heaps_at = field(&b, root, "Heaps", 0xc1)) && u32_at(&b, heaps_at, &heaps)) {
         dta_at = heap_size_field(&b, heaps, "DynamicTextureAllocatorMem");
         gfx_at = heap_size_field(&b, heaps, "Graphics");
+        u32_at(&b, 8, &b.strs);
     }
-    if (!dta_at || !gfx_at) {
+    if (!heaps) {
+        rt_log("resolution: the HeapDef table has no Heaps; the game keeps its own heap sizes");
+        free(b.p);
+        return 0;
+    }
+    if (extra && (!dta_at || !gfx_at)) {
         rt_log("resolution: the HeapDef table has no DynamicTextureAllocatorMem / Graphics sizes; the game keeps its own "
                "resolution");
         free(b.p);
         return 0;
     }
-    int32_t dta, gfx;
-    memcpy(&dta, b.p + dta_at, 4);
-    memcpy(&gfx, b.p + gfx_at, 4);
-    int32_t dta2 = dta + (int32_t)extra, gfx2 = gfx + (int32_t)extra;
-    memcpy(b.p + dta_at, &dta2, 4);
-    memcpy(b.p + gfx_at, &gfx2, 4);
+    int32_t dta = 0, gfx = 0, dta2 = 0, gfx2 = 0;
+    if (extra) {
+        memcpy(&dta, b.p + dta_at, 4);
+        memcpy(&gfx, b.p + gfx_at, 4);
+        dta2 = dta + (int32_t)extra, gfx2 = gfx + (int32_t)extra;
+        memcpy(b.p + dta_at, &dta2, 4);
+        memcpy(b.p + gfx_at, &gfx2, 4);
+    }
+    if (foliage && !heap_grow(&b, heaps, "Foliage", foliage))
+        rt_log("resolution: the HeapDef table has no heap Foliage with a size; it does not grow");
     size_t cap = ZSTD_compressBound(b.n);
     void *z = malloc(cap);
     size_t zn = z ? ZSTD_compress(z, cap, b.p, b.n, 9) : 0;
@@ -279,7 +324,7 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
     }
     *out = z;
     *out_n = zn;
-    rt_log("resolution: HeapDef DynamicTextureAllocatorMem %d -> %d KiB, Graphics %d -> %d KiB", dta, dta2, gfx, gfx2);
+    if (extra) rt_log("resolution: HeapDef DynamicTextureAllocatorMem %d -> %d KiB, Graphics %d -> %d KiB", dta, dta2, gfx, gfx2);
     return 1;
 }
 

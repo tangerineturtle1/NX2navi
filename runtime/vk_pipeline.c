@@ -48,6 +48,7 @@
 #include "host.h"
 #include "boot_warm.h"
 #include "mem_need.h"
+#include "lod.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "prp_file.h"
@@ -2702,8 +2703,100 @@ static int spirv_mark_list_test(const char *list) {
     return bad;
 }
 
+static VkShaderModule make_module_in(const uint32_t *w, uint64_t words, int early_ok);
+
+// The tree gather shader with its test of the foliage block's flag 2 gone, in a run that starts with the low trees'
+// shadow distance changed (lod.c lod_tree_shadow_split). The shader is the compute shader that reads the block's
+// row 32 .w (the low trees' shadow distance); the test is the flag word (row 6 .x, as an integer) and 2, which
+// becomes the word and 0. A malloc'd copy, or NULL when w is not that shader.
+static uint32_t *spirv_tree_shadow(const uint32_t *w, uint64_t n) {
+    if (!lod_tree_shadow_split() || n < 5) return NULL;
+    uint32_t bound = w[3], zero = 0, *o = NULL;
+    enum { C0 = 1, C2, C3, C6, C32, CHAIN, LOADED, CAST };
+    uint8_t *tag = calloc(bound ? bound : 1, 1), *is_int = calloc(bound ? bound : 1, 1);
+    uint64_t at[8];
+    int n_at = 0, reads_dist = 0;
+    for (uint64_t i = 5; tag && is_int && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 21 && len == 4 && w[i + 1] < bound) is_int[w[i + 1]] = w[i + 2] == 32 && w[i + 3];       // OpTypeInt, signed
+        else if (op == 43 && len == 4 && w[i + 1] < bound && w[i + 2] < bound && is_int[w[i + 1]]) {     // OpConstant
+            uint32_t v = w[i + 3];
+            tag[w[i + 2]] = v == 0 ? C0 : v == 2 ? C2 : v == 3 ? C3 : v == 6 ? C6 : v == 32 ? C32 : 0;
+            if (!v) zero = w[i + 2];
+        } else if (op == 65 && len == 7 && w[i + 2] < bound && w[i + 4] < bound && w[i + 5] < bound && w[i + 6] < bound &&
+                   tag[w[i + 4]] == C0) {                                                                // OpAccessChain
+            if (tag[w[i + 5]] == C6 && tag[w[i + 6]] == C0) tag[w[i + 2]] = CHAIN;
+            reads_dist |= tag[w[i + 5]] == C32 && tag[w[i + 6]] == C3;
+        } else if (op == 61 && len >= 4 && w[i + 2] < bound && w[i + 3] < bound && tag[w[i + 3]] == CHAIN) tag[w[i + 2]] = LOADED;
+        else if (op == 124 && len == 4 && w[i + 2] < bound && w[i + 3] < bound && tag[w[i + 3]] == LOADED) tag[w[i + 2]] = CAST;
+        else if (op == 199 && len == 5 && w[i + 3] < bound && w[i + 4] < bound && tag[w[i + 3]] == CAST && tag[w[i + 4]] == C2 &&
+                 n_at < 8)
+            at[n_at++] = i + 4;
+        i += len;
+    }
+    if (tag && is_int && reads_dist && n_at && zero && (o = malloc(n * 4))) {
+        memcpy(o, w, n * 4);
+        for (int k = 0; k < n_at; k++) o[at[k]] = zero;
+    }
+    free(tag), free(is_int);
+    return o;
+}
+
+// A foliage shader with its list capacities scaled by lod_foliage_capacity (lod.c): the capacities, and the offsets
+// of the arrays that follow an array of that many entries in the lists' buffers. The capacities that are common
+// numbers are taken only in the shader that owns the list, told by its other constants. A malloc'd copy, or NULL when
+// nothing is scaled or the shader holds none of them.
+static uint32_t *spirv_foliage_lists(const uint32_t *w, uint64_t n) {
+    uint32_t k = lod_foliage_capacity();
+    if (k <= 1 || n < 5) return NULL;
+    uint32_t bound = w[3], *o = NULL;
+    uint8_t *ty = calloc(bound ? bound : 1, 1);   // 1 unsigned, 2 signed 32-bit integer type
+    if (!ty) return NULL;
+    int u288 = 0, u25600 = 0, u40960 = 0, i24640 = 0, i16448 = 0, offs = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint64_t i = 5; i < n;) {
+            uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+            if (!len || i + len > n || op == 54) break;   // OpFunction: the constants are all before it
+            if (!pass && op == 21 && len == 4 && w[i + 1] < bound && w[i + 2] == 32) ty[w[i + 1]] = w[i + 3] ? 2 : 1;
+            if (op == 43 && len == 4 && w[i + 1] < bound && ty[w[i + 1]]) {   // OpConstant
+                uint32_t v = w[i + 3], nv = 0;
+                int u = ty[w[i + 1]] == 1;
+                if (!pass) {
+                    u288 |= u && v == 288, u25600 |= u && v == 25600, u40960 |= u && v == 40960;
+                    i24640 |= !u && v == 24640, i16448 |= !u && v == 16448;
+                    offs |= v == 81984 || v == 163904 || v == 327744;
+                } else if ((v == 20480 || v == 40960) && (u || offs)) nv = v * k;
+                else if (v == 81984 || v == 163904 || v == 327744) nv = 64 + (v - 64) * k;
+                else if (v == 225280 && u) nv = v * k;
+                else if (v == 16384 && u && u40960) nv = v * k;
+                else if (v == 2048 && u && u288 && i24640 && i16448) nv = v * k;
+                else if (v == 24640 && !u && (u288 || u25600)) nv = 16448 + 8192 * k;
+                if (nv) {
+                    if (!o && (o = malloc(n * 4))) memcpy(o, w, n * 4);
+                    if (o) o[i + 3] = nv;
+                }
+            }
+            i += len;
+        }
+    free(ty);
+    return o;
+}
+
 // early_ok: a fragment shader whose pipeline has no alpha to coverage (spirv_pool_mark)
 static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_ok) {
+    uint32_t *lists = spirv_foliage_lists(w, words);
+    uint32_t *tree = spirv_tree_shadow(lists ? lists : w, words);
+    if (tree) free(lists), lists = tree;
+    if (lists) {   // the rest works on the changed copy
+        VkShaderModule lm = make_module_in(lists, words, early_ok);
+        free(lists);
+        return lm;
+    }
+    return make_module_in(w, words, early_ok);
+}
+
+static VkShaderModule make_module_in(const uint32_t *w, uint64_t words, int early_ok) {
     const uint32_t *orig_w = w;   // for the log of a module the marks cannot take
     uint64_t orig_words = words, fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);

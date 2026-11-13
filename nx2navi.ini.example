@@ -624,6 +624,34 @@
 # cpu or astc_bc = 0) and the budget is under 20480 MiB, auto goes one step lower, as they take four times the memory.
 # The log says what was picked ("texture detail:"). Read at start.
 # texture_detail = auto
+# Ocarina of Time: how far away the game keeps detail, in percent of its own distances (10 to 1000; 100 = the game's).
+# Higher draws more and costs GPU power. foliage_undergrowth_dist and foliage_ornament_dist: how far undergrowth and
+# ornament plants are drawn. foliage_tree_dist: how far the low trees keep their full shape and leaves.
+# foliage_turf_poly_len: the length at which a blade of grass is drawn as one flat piece. lod_max_dist: where models
+# reach their simplest shape; lod_start_dist and lod_start_dist_handheld: where they begin to lose detail (the second
+# in handheld mode). lod_static_offset and lod_dynamic_offset are added to the game's two offsets on that distance (0 =
+# the game's). Changes while the game runs take effect at once.
+# foliage_undergrowth_dist = 100
+# foliage_ornament_dist = 100
+# foliage_tree_dist = 100
+# foliage_turf_poly_len = 100
+# lod_max_dist = 100
+# lod_start_dist = 100
+# lod_start_dist_handheld = 100
+# lod_static_offset = 0
+# lod_dynamic_offset = 0
+# The low trees' shadow distance, in percent of the distance foliage_tree_dist gives (10 to 1000): how far a tree
+# outside the view keeps its full shape for the shadow it casts into the view. Read at start.
+# foliage_tree_shadow_dist = 100
+# The two scales each model carries on its own level-of-detail distances, in percent (10 to 1000), and the plants' draw
+# distance: game, or extended (every plant type is drawn to the game's extended distance). Read at start.
+# model_lod_max_dist = 100
+# model_lod_start_dist = 100
+# plant_draw_dist = game
+# Room for the foliage the distances above add: foliage_capacity (100, 200, 300 or 400 percent) is the capacity of the
+# foliage's GPU lists; trees and leaves past it are dropped, other ones every frame, which shows as flicker. Read at
+# start.
+# foliage_capacity = 100
 # Sun shadow map size: game (the game's own, which changes with the view and drops to about 400 near the ground, so
 # leaf shadows look blocky and jump) or a fixed 256, 512, 768, 1024, 1536 or 2048. Above 960 the texture heap grows with
 # it. 256 is coarser than the game's own and is for integrated GPUs short of memory bandwidth. Read at start.

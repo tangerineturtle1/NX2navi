@@ -28,6 +28,7 @@
 #include "gfx.h"
 #include "motion_owner.h"
 #include "host.h"
+#include "lod.h"
 #include "nvn_api.h"
 #include "perfmon.h"
 #include "vk.h"
@@ -227,6 +228,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     vk_exec_barrier_log(frame);
     vk_dlaa_frame();
     vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
+    lod_frame();               // the LoD distances changed in the menu: the game's parameters take them
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);

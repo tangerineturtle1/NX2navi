@@ -43,6 +43,16 @@ __attribute__((constructor)) static void day_register(void) {
     rt_register_host(RT_PATCH_PAGE + 0xf10, frame_rate_sound_gate_host);
     rt_register_host(RT_PATCH_PAGE + 0xf00, frame_rate_sound_step_host);
 }
+// The level-of-detail settings' host functions (lod.c): the sites of the set lod call the page's +0xee0 to +0xea0.
+#include "lod.h"
+__attribute__((constructor)) static void lod_register(void) {
+    if (!RT_V111) return;
+    rt_register_host(RT_PATCH_PAGE + 0xee0, lod_plant_host);
+    rt_register_host(RT_PATCH_PAGE + 0xed0, lod_model_max_host);
+    rt_register_host(RT_PATCH_PAGE + 0xec0, lod_model_start_host);
+    rt_register_host(RT_PATCH_PAGE + 0xeb0, lod_param_host);
+    rt_register_host(RT_PATCH_PAGE + 0xea0, lod_foliage_host);
+}
 #endif
 
 #if RT_PATCH_COUNT

@@ -749,7 +749,7 @@ static void restbl_overlay(void) {
 static const char *const heapdef_names[] = {"System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs",
                                             "System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs"};
 static void heapdef_overlay(void) {
-    if (!res_heap_extra_kib()) return;
+    if (!res_heap_extra_kib() && !res_heap_grow_kib()) return;
     static const char keeps[] = "the game keeps its own resolution";
     const char *rel = heapdef_names[0];
     for (size_t k = 0; k < sizeof heapdef_names / sizeof *heapdef_names; k++) {
