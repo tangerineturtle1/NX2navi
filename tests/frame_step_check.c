@@ -20,6 +20,9 @@ const char *cfg_get(const char *key) {
     if (!strcmp(key, "NX2NAVI_RTSS")) return "0";
     return NULL;
 }
+static const char *fg_setting = "2";
+const char *cfg_value(const char *key) { return !strcmp(key, "NX2NAVI_FRAMEGEN_MULTIPLIER") ? fg_setting : ""; }
+void vk_dlssg_adaptive_sample(double work_s, double goal_hz) { (void)work_s; (void)goal_hz; }
 unsigned cfg_version(void) { return version; }
 int rt_patch_set(const char *name) { return !strcmp(name, "ostep") ? 0 : !strcmp(name, "ofollow") ? 1 : -1; }
 int rt_patch_enabled(int set) { return set == 0 || set == 1; }
@@ -278,7 +281,15 @@ int main(int argc, char **argv) {
         CHECK(fabs(game - caps[i].game_hz) < 0.01, "limit %s at %dx reports %.3f game fps, not %.0f", caps[i].l,
               caps[i].gen, game, caps[i].game_hz);
     }
+    // Adaptive treats a numeric cap as the displayed target, while fixed multipliers keep upstream semantics.
+    fg_setting = "adaptive";
+    set_limit("60");
+    fg_mult = 2;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 30) < 0.01, "adaptive 60 at 2x must render at 30");
+    CHECK(fabs(frame_step_game_hz() - 30) < 0.01, "adaptive game rate must match the pacer");
     fg_mult = 1;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 60) < 0.01, "adaptive 60 without generation must render at 60");
+    fg_setting = "2";
 
     // The water's ripples at 144 fps, a step of 60/144 frame: 64 water objects asked once a frame each run 600 steps
     // in 1440 frames (the cut gave none), and the day's seconds asked between them keep their own fraction.

@@ -720,7 +720,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
                                    "the frames the game draws, so the screen shows the limit times this. 2x needs a "
-                                   "GeForce RTX 40 GPU or newer, 3x and 4x an RTX 50.",
+                                   "GeForce RTX 40 GPU or newer, 3x and 4x an RTX 50. Adaptive uses the selected limit "
+                                   "as the displayed rate and adds generated frames only when needed.",
+    [UI_MENU_FRAMEGEN_MULT_ADAPTIVE] = "Adaptive",
     [UI_MENU_FRAMEGEN_MULT_RTX50] = "3x and 4x need an RTX 50 GPU",
     [UI_MENU_FRAMEGEN_MULT_UPTO] = "up to %dx on this GPU and driver",
     [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
