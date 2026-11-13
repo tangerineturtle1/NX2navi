@@ -16,7 +16,7 @@ first (rpath $ORIGIN). docs/building.md lists the packages.
         --out build/v121-llvmmingw                                    # llvm-mingw instead of MSYS2 UCRT64
 
 Every runtime/*.c is compiled. build/<version>/modules.c carries the layout, the linked function tables, the
-expected SHA-256 of each ExeFS file (tools/data/expected-<display version>.json) and the default game paths
+expected SHA-256 of each ExeFS file (the version's table in tools/data/) and the default game paths
 (--exefs, --romfs, --profile), which nx2navi.exe uses unless its own command line names others. --exefs and --romfs
 default to extracted/<version> in the work folder: the [work] dir of config.local.toml, where tools/extract.py writes
 them, else build/. tools/romfs_index.py writes build/<version>/romfs-index.bin and romfs_config.h from the RomFS
@@ -235,8 +235,10 @@ WINDRES = UCRT / 'windres.exe'   # runtime/nx2navi.rc: the manifest of nx2navi.e
 WINDRES_PP = '--preprocessor=gcc --preprocessor-arg=-E --preprocessor-arg=-xc --preprocessor-arg=-DRC_INVOKED'
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
-# tools/data/expected-<display version>.json for each build version name.
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v110': '1.1.0', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
+# Hash tables in tools/data/. Ocarina's is named by title id, as tools/extract.py reads every expected-v*.json.
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v110': '1.1.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
+TITLE_ID = '0400486024DEC000'   # Ocarina of Time's title id (tools/make_game.py TITLE_ID)
+EXPECTED_FILES = {'v111': f'{TITLE_ID}-v1.1.1.json'}
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -853,7 +855,7 @@ def main():
                          '(needs --toolchain on Windows: MSYS2 clang ships no profile runtime); FILE builds with that '
                          '.profdata (tools/pgo.py merge)')
     ap.add_argument('--expected', type=Path,
-                    help='expected hashes (default tools/data/expected-<display version>.json)')
+                    help="expected hashes (default: the version's table in tools/data/)")
     args = ap.parse_args()
     set_cpu(args.cpu)
 
@@ -878,7 +880,8 @@ def main():
     if not expected:
         if args.version not in DISPLAY_VERSIONS:
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
-        expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
+        name = EXPECTED_FILES.get(args.version) or f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
+        expected = ROOT / 'tools' / 'data' / name
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
     global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
