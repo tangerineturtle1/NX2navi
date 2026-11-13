@@ -1267,14 +1267,15 @@ static void row_framegen(void) {
 
 // One Resolution row for the picture's height (NX2NAVI_GAME_RES, widescreen.c picture_height: 1080, the game's 1440 or
 // more) and the window outside fullscreen (NX2NAVI_WINDOW_SIZE): each height is shown as the size of the game's shape at
-// it (16:9 2560 x 1440, 21:9 3440 x 1440, 32:9 5120 x 1440, the window's own shape where the picture follows the window),
+// it (16:9 2560 x 1440, 16:10 2304 x 1440, 21:9 3440 x 1440, 32:9 5120 x 1440, the window's own shape where the picture
+// follows the window),
 // and choosing one sets both. The window takes it at once (gfx_present.c applies a changed size at the next present),
 // within the monitor, and the picture after a restart. Native draws at the window's size and leaves the window as it is.
 // As two rows of their own, a window of one size took a picture of another and scaled it for nothing.
 static void row_resolution(void) {
     static const int heights[] = {1080, 1440, 1800, 2160, 2880};
     static const int wide169[] = {1920, 2560, 3200, 3840, 5120}, wide219[] = {2560, 3440, 4300, 5120, 6880},
-                     wide329[] = {3840, 5120, 6400, 7680, 10240};
+                     wide329[] = {3840, 5120, 6400, 7680, 10240}, tall1610[] = {1728, 2304, 2880, 3456, 4608};
     enum { N = sizeof heights / sizeof *heights };
     const char *aspect = cfg_value("NX2NAVI_GAME_ASPECT");
     int mw = 0, mh = 0, ww = 0, wh = 0;
@@ -1286,6 +1287,7 @@ static void row_resolution(void) {
     const char *pn[N + 1];
     for (int i = 0; i < N; i++) {
         int w = !strcmp(aspect, "21:9") ? wide219[i] : !strcmp(aspect, "32:9") ? wide329[i] :
+                !strcmp(aspect, "16:10") ? tall1610[i] :
                 !strcmp(aspect, "window") ? ((int)(heights[i] * shape + 0.5) & ~1) : wide169[i];
         int h = heights[i], fw = w, fh = h;
         // the window within the monitor, in the same shape (the picture keeps its height and is scaled into it)
@@ -1333,9 +1335,10 @@ static void tab_screen(float scale) {
     // none and always draws its own size, so the row would change nothing
     if (res_adjustable()) row_output_res();
     // Widescreen needs the patch sets of recomp/patches-v111.txt (widescreen.c wide_available)
-    static const UiTextId wide[] = {UI_MENU_GAME_ASPECT_16_9, UI_MENU_GAME_ASPECT_WINDOW, UI_MENU_GAME_ASPECT_21_9,
-                                    UI_MENU_GAME_ASPECT_32_9};
-    if (wide_available()) opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 4, UI_MENU_GAME_ASPECT_DESC);
+    // (the order of cfg.c's values for NX2NAVI_GAME_ASPECT)
+    static const UiTextId wide[] = {UI_MENU_GAME_ASPECT_16_9, UI_MENU_GAME_ASPECT_WINDOW, UI_MENU_GAME_ASPECT_16_10,
+                                    UI_MENU_GAME_ASPECT_21_9, UI_MENU_GAME_ASPECT_32_9};
+    if (wide_available()) opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 5, UI_MENU_GAME_ASPECT_DESC);
     if (wide_available()) row_resolution();
     row_upscaling();
     row_aa();
@@ -2087,7 +2090,8 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
     if (wide_available()) {
         const char *a = cfg_value("NX2NAVI_GAME_ASPECT");
         snprintf(v[7], sizeof v[7], "%s", menu_text(!strcmp(a, "window") ? UI_MENU_GAME_ASPECT_WINDOW : !strcmp(a, "21:9") ? UI_MENU_GAME_ASPECT_21_9
-                                                    : !strcmp(a, "32:9") ? UI_MENU_GAME_ASPECT_32_9 : UI_MENU_GAME_ASPECT_16_9));
+                                                    : !strcmp(a, "32:9") ? UI_MENU_GAME_ASPECT_32_9
+                                                    : !strcmp(a, "16:10") ? UI_MENU_GAME_ASPECT_16_10 : UI_MENU_GAME_ASPECT_16_9));
         const char *r = cfg_value("NX2NAVI_GAME_RES");
         if (!strcmp(r, "window")) snprintf(v[8], sizeof v[8], "%s", menu_text(UI_MENU_GAME_RES_NATIVE));
         else snprintf(v[8], sizeof v[8], "%sp", r);

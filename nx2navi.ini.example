@@ -565,7 +565,9 @@
 # tools/make_romfs_patches.py --aspect WxH. Read at start.
 # output_res = 1920x1080
 # Ocarina of Time sizes its picture with these two instead (output_res and render_scale do nothing there). The shape:
-# 16:9, window (the window's shape, or the monitor's in fullscreen), 21:9 or 32:9. The height: 1080 (lighter than the
+# 16:9, window (the window's shape, or the monitor's in fullscreen), 16:10, 21:9 or 32:9. Wider shapes show more at the
+# sides; 16:10 (1920x1200, 2560x1600 and other 16:10 screens) shows more above and below with the same view across.
+# The HUD, menus and movies keep their 16:9 shape in the middle. The height: 1080 (lighter than the
 # game's own), 1440 (the game's own), 1800, 2160, 2880 or window (the window's height, at least 1440). The DLSS and
 # FSR 3.1 modes render their share of this picture. Read at start.
 # game_aspect = 16:9

@@ -37,7 +37,7 @@ extern "C" {
 static const CfgMeta kMeta[] = {
     {"FULLSCREEN", "1", "0|1", 1},       {"WINDOW_SIZE", "", NULL, 1},  {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", 1},
     {"GPU_INDEX", "", NULL, 0},          {"PERF_OVERLAY", "off", "off|fps|full", 1},
-    {"GAME_ASPECT", "16:9", "16:9|window|21:9|32:9", 0}, {"RENDER_SCALE", "", NULL, 0},
+    {"GAME_ASPECT", "16:9", "16:9|window|16:10|21:9|32:9", 0}, {"RENDER_SCALE", "", NULL, 0},
     {"UPSCALER", "bilinear", "bilinear|fsr", 0},         {"SHARPNESS", "50", "0..100", 1},
     {"ASPECT", "fit", "fit|stretch", 1}, {"MENU_LANG", "", NULL, 1},
 };
@@ -214,9 +214,9 @@ static void scene_menu(float w, float h, float scale, ImFont *title, bool first)
             static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
             opt_choice("NX2NAVI_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
             opt_group(UI_MENU_GRAPHICS);
-            static const UiTextId wide[] = {UI_MENU_GAME_ASPECT_16_9, UI_MENU_GAME_ASPECT_WINDOW, UI_MENU_GAME_ASPECT_21_9,
-                                            UI_MENU_GAME_ASPECT_32_9};
-            opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 4, UI_MENU_GAME_ASPECT_DESC);
+            static const UiTextId wide[] = {UI_MENU_GAME_ASPECT_16_9, UI_MENU_GAME_ASPECT_WINDOW, UI_MENU_GAME_ASPECT_16_10,
+                                            UI_MENU_GAME_ASPECT_21_9, UI_MENU_GAME_ASPECT_32_9};
+            opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 5, UI_MENU_GAME_ASPECT_DESC);
             opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
             opt_end();
             ImGui::EndTabItem();

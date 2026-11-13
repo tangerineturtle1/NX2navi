@@ -26,7 +26,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - Native code, not emulation
 - 60 fps by default, or a limit of 30 to 240 fps, the display's refresh rate or unlimited
-- Native widescreen and ultrawide (the window's shape, 21:9 or 32:9) with the HUD, menus and movies kept 16:9
+- Native widescreen, ultrawide and 16:10 (the window's shape, 16:10, 21:9 or 32:9) with the HUD, menus and movies kept 16:9
 - Game resolutions from 1080p to above the game's 1440p: 1800p, 4K, 5K or the window's own size, sharp on high-DPI
   displays
 - Upscaling and anti-aliasing: NVIDIA DLSS (DLAA, Quality, Balanced, Performance, Ultra Performance; RTX GPUs) or

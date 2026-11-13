@@ -12,8 +12,8 @@
 // a load (no update of Link within GAMEPLAY_POLLS polls) start nothing: B closes the pause menu, and that press is the
 // menu's. Under the game's Swap Jump Controls B is the jump, which a B sprint button keeps from the game while Link
 // moves: L3 is the one to use then.
-// Patch page slots: the set's sites call +0xf40 and +0xf30; +0xf20 and +0xf50 to +0xff0 belong to other sets
-// (runtime/patches.c, mouse_direct.c, ov_zstd.c). A slot registered twice ends the start (dispatch.c rt_register_host).
+// Patch page slots: the set's sites call +0xf40 and +0xf30; +0xef0, +0xf20 and +0xf50 to +0xff0 belong to other sets
+// (runtime/patches.c, mouse_direct.c, ov_zstd.c, widescreen.c). A slot registered twice ends the start (dispatch.c rt_register_host).
 //
 // Link's state: the id at [[[[Link +0x18] +0x270] +0x188] +0x1c0] +0x28 (+0x4c when that reads 0x11a, a state that
 // wraps another), the same field main+0x4aed50 compares with 1 (Walk) before the game starts a sprint.

@@ -367,6 +367,7 @@ int res_heapdef_ok(void);                                  // 1 once it does; 0 
 void wide_init(void);
 void wide_present(void);                                    // each present: DLSS's render scale (res_fixed)                                      // after rt_patches_init: widescreen.c, NX2NAVI_GAME_ASPECT
 int wide_available(void);                                  // the generated C has the widescreen sets
+void wide_tall_camera_host(Cpu *c);                        // the camera site of the set wide_tall (page +0xef0)
 void wide_picture(unsigned *w, unsigned *h);               // the picture the game draws (its scene is never larger)
 int wide_scene_settable(void);                             // the generated C has res_fixed: the scene's share can be set
 double wide_scene_share(void);                             // the scene's share of the picture now (0: the game's own)

@@ -5,7 +5,8 @@
 # patterns of the UI's full-screen orthographic projection (m00 = 2 / 3840, m11 = 2 / 2160), +160..+175 and +208..+223
 # the four screen vtables that keep it, +176 the UI's horizontal squeeze (16:9 over the picture's ratio) in four lanes, +192 the
 # movie's margin on each side as a share of the width, +224 what the viewport of the save's picture gets added to its x
-# and +228 to its width, as 32-bit integers.
+# and +228 to its width, as 32-bit integers. The set wide_tall (a picture taller than 16:9) reads the same words with
+# the other axis' meaning and +124, the factor on the vertical view's half-angle tangent.
 #
 # The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF (MIT; see THIRD_PARTY_NOTICES.md). Each is
 # written without branches or flags, as the generator's patch sites need. The set names differ from the other patch
@@ -286,6 +287,47 @@ site wide_movie main 3b5c758 a941a269 d100a3b0 bd400a10 bd401211 1e303a32 @page:
 # wider than 16:9.
 set wide_save NX2NAVI_PATCH_WIDE_SAVE 0
 site wide_save main 284824 f9400108 f9400108 @page:x16 295c2e0a 51087c69 5104c88c 2a0c0129 2a010129 2a020129 5ac01129 53057d29 1b0a0521 1b0b0d23   # ldr x8, [x8]; ldp w10, w11, [x16, #224]; sub w9, w3, #543; sub w12, w4, #306; orr w9, w9, w12; orr w9, w9, w1; orr w9, w9, w2; clz w9, w9; lsr w9, w9, #5; madd w1, w9, w10, w1; madd w3, w9, w11, w3
+
+# A picture taller than 16:9 (16:10, runtime/widescreen.c "taller pictures"): the view grows at the top and bottom
+# instead (Vert+: the horizontal view stays the game's), the HUD and menus keep their 16:9 shape in the middle band of
+# the picture, and so do movies and a save's picture. The set takes the place of wide_aspect, wide_hud, wide_movie and
+# wide_save, which stay off while it is on (widescreen.c wide_init switches one group or the other): its sites are
+# theirs, with the vertical counterpart of each replacement, and the page's words keep their places with the other
+# axis' meaning (+116 the picture's ratio, +176 the UI's vertical squeeze, the picture's ratio over 16:9, +192 the
+# movie's margin at the top and bottom as a share of the height, +224 what the save's viewport gets added to its y and
+# +228 to its height), plus +124, the factor on the tangent of the half vertical angle, 16:9 over the picture's ratio.
+#
+# The camera update (main+0x4c52fc, the instruction that halves the camera's vertical angle before the sine, cosine and
+# tangent of the half are computed and stored at +0xa4..+0xac) calls the page's +0xef0 after it
+# (widescreen.c wide_tall_camera_host): for a camera whose ratio (+0x140) is 16:9 within the page's tolerance, the
+# host widens the angle in s0 and its half in s8 so the tangent of the half grows by +124, and the projection the
+# game fills from them (angle, sine, cosine and tangent) is the taller view's throughout. s0 is the angle the next
+# instruction stores, s8 the half the next three calls take; x30 is written by the call at main+0x4c5308 before any
+# read. The ratio the game stores after them takes the page's at main+0x4c5334, as wide_aspect's does.
+set wide_tall NX2NAVI_PATCH_WIDE_TALL 0
+site wide_tall main 4c52fc 1e210808 1e210808 95276efd   # fmul s8, s0, s1 -> fmul s8, s0, s1; bl page+0xef0
+site wide_tall main 4c5334 bd414260 bd414260 @page:x9 2d4e0921 bd407923 7ea1d404 7e24e464 2ea41c40   # as wide_aspect's
+
+# The projections that do not come from that camera (the matrix update and its inlined copies, as for wide_aspect):
+# a 16:9 one is built with the picture's ratio and the tangent times +124, in the registers only. Nothing is written
+# back, as a ratio written back without its tangent would be read back as another shape at the next update and a
+# tangent written back without its ratio would grow at each one; the camera above fills its own projection whole.
+# The registers are wide_aspect's at each site.
+site wide_tall main 3485cc0 2d558400 2d558400 @page:x9 2d4e0d22 bd407924 7ea2d422 7e22e482 2ea21c61 bd407d24 1e240804 2ea21c80   # ...; bit v1, v3, v2 (ratio); ldr s4, [x9, #124]; fmul s4, s0, s4; bit v0, v4, v2 (tangent)
+site wide_tall main 4f1e8 2d558ea0 2d558ea0 @page:x9 2d4e1524 bd407922 7ea4d464 7e24e444 2ea41ca3 bd407d22 1e220802 2ea41c40   # ...; bit v3, v5, v4; ldr s2, [x9, #124]; fmul s2, s0, s2; bit v0, v2, v4
+site wide_tall main 23b9a8 2d558c00 2d558c00 @page:x9 2d4e1524 bd407922 7ea4d464 7e24e444 2ea41ca3 bd407d22 1e220802 2ea41c40   # the same on x0
+site wide_tall main 33b82c 2d558440 2d558440 @page:x9 2d4e1123 bd407922 7ea3d423 7e23e443 2ea31c81 bd407d22 1e220802 2ea31c40   # ...; bit v1, v4, v3; ldr s2, [x9, #124]; fmul s2, s0, s2; bit v0, v2, v3
+
+# HUD and menus: wide_hud's words with the second row of the projection (v4, which makes y) scaled instead of the
+# first, so the UI keeps its shape in the middle 16:9 band. The same screens keep the whole picture.
+site wide_tall main 774368 ad401041 ad401041 @page:x16 fd404a10 6e040431 6e0c2491 0ea0fa31 2eb08e31 2eb1ae31 0e040631 9e660231 d106e010 8a110210 8a310011 aa110210 fd400210 @page:x17 3dc02a32 3dc03633 4e080610 6ef28e12 6ef38e13 4eb31e52 6e124253 0eb31e52 0e721e31 4e040631 3dc02e33 6e33dc93 6eb11e64   # ...; fmul v19.4s, v4.4s, v19.4s; bit v4.16b, v19.16b, v17.16b
+
+# Movies: the viewport's min y (+12) and max y (+20) move in by the page's margin, the middle 16:9 band.
+site wide_tall main 3b5c758 a941a269 d100a3b0 bd400e10 bd401611 1e303a32 @page:x17 bd40c233 1e330a52 1e322a10 1e323a31 bd000e10 bd001611 a941a269   # wide_movie's words on +12 and +20
+
+# The save's picture: wide_save's words with the page's two numbers added to y (w2) and the height (w4), so the 543x306
+# target holds the middle 16:9 band of a taller picture.
+site wide_tall main 284824 f9400108 f9400108 @page:x16 295c2e0a 51087c69 5104c88c 2a0c0129 2a010129 2a020129 5ac01129 53057d29 1b0a0922 1b0b1124   # ...; madd w2, w9, w10, w2; madd w4, w9, w11, w4
 
 # The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c): the
 # three calls of ZSTD_decompressMultiFrame (main+0xeb380: dctx, dst, capacity, src, size, dict, dict size, ddict) go to
