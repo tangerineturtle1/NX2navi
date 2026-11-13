@@ -6746,13 +6746,25 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 // through a village not seen before skipped 11,180 draws while their pipelines built and 94 draws waited 5.5 s in
 // all, one of them 1.9 s.
 //
-// So every start checks: a sample of the prepared fragment libraries is built (lw_probe), and when their median time
-// says the cache is cold, the whole prepared list is built again into the driver's cache on a few idle-priority
+// So every start checks: a sample of the prepared fragment libraries is built (lw_probe), and when their times say
+// the cache is cold, the whole prepared list is built again into the driver's cache on a few idle-priority
 // threads while the game runs (lw_worker), as the preparation does but without stopping play. shader-warm.txt beside
 // the caches says where that stands: "warming" while it runs, so a start after a run that ended meanwhile goes on,
 // and "done" with the driver and a count of the times the cache was cold again right after a finished warm. At two in
 // a row the driver does not keep stage libraries at all and warming stops being tried (NX2NAVI_LIB_WARM=0 turns it off;
 // =force warms at every start).
+// The check times what a busy CPU only makes longer, so it takes the third fastest of the sample, built at normal
+// priority, and a sample over LW_COLD_MS is built again 10 s later before the cache counts as cold. Before, the median
+// of a sample built at below-normal priority, as the guest starts beside the boot's background builds, read a warm
+// cache as cold: on an RTX 5080 (0.9.2, 2026-11-12, the process on 16 logical processors) it came to 136 ms, and the
+// whole list of 42,231 libraries was built again in 873 s on 4 idle threads, although ocarina.exe --warm-shaders gave
+// all of them back in 10.6 s (6-9 ms each) and the driver's cache file did not change in that session nor in the two
+// before it. Checked the new way on that PC: 0.3 and 1.1 ms. A start after a run that ended during a warm is checked
+// too: it skipped the check and built the list again from its first entry, and as sessions there were shorter than a
+// warm under play (15 minutes), every start from 0.8.0 on warmed again although the driver had the libraries.
+// (Asking the driver with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT instead of timing does not work
+// for stage libraries on NVIDIA's driver, with or without a pipeline cache: it answers VK_PIPELINE_COMPILE_REQUIRED for
+// a library it was just given, 2026-11-13.)
 #define LW_SAMPLE 12
 #define LW_COLD_MS 15.0
 #define LW_MAX_THREADS 6
@@ -6824,8 +6836,9 @@ static void lw_worker(void *arg) {
     }
 }
 
-// The median time of LW_SAMPLE prepared fragment libraries spread over the list; negative without that many.
-static double lw_probe(void) {
+// The third fastest build time of LW_SAMPLE prepared fragment libraries spread over the list, in ms; negative
+// without enough of them.
+static double lw_time_sample(void) {
     double ms[LW_SAMPLE];
     int got = 0;
     size_t step = LW.n / LW_SAMPLE ? LW.n / LW_SAMPLE : 1, at = (size_t)(plat_now_ns() / 1000) % step;
@@ -6842,12 +6855,26 @@ static double lw_probe(void) {
             double t = ms[j];
             ms[j] = ms[j - 1], ms[j - 1] = t;
         }
-    return ms[got / 2];
+    return ms[2];
+}
+
+// lw_time_sample at normal priority, once more 10 s later when it says cold: a busy moment passes, a cold cache stays.
+static double lw_probe(void) {
+    plat_thread_priority(PLAT_PRIO_NORMAL);
+    double t = lw_time_sample();
+    if (t > LW_COLD_MS && !LW.stop) {
+        for (int i = 0; i < 100 && !LW.stop; i++) plat_sleep_ms(100);
+        double again = lw_time_sample();
+        if (again >= 0 && again < t) t = again;
+    }
+    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    return t;
 }
 
 static void lw_main(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    no_cache = 1;   // the check's libraries go into the driver's cache only, as the workers' do (see no_cache)
     char was[16] = "", id[64] = "";
     int strikes = 0;
     uint64_t size = 0;
@@ -6860,19 +6887,19 @@ static void lw_main(void *arg) {
     free(f);
     int same = !strcmp(id, LW.id), resume = same && !strcmp(was, "warming");
     const char *mode = cfg_value("NX2NAVI_LIB_WARM");
-    double median = resume ? 0 : lw_probe();
+    double fast = lw_probe();
     if (LW.stop) return;
-    int cold = median > LW_COLD_MS || !strcmp(mode, "force");
-    if (!resume && !cold) {
-        if (same && strikes) lw_stamp("done", 0);   // the driver kept them this time
-        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (a sample's median %.1f ms)",
-               median);
+    int cold = fast > LW_COLD_MS || !strcmp(mode, "force");
+    if (!cold) {
+        if (resume || (same && strikes)) lw_stamp("done", 0);   // the driver kept them this time
+        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (the third fastest of a "
+               "sample built in %.1f ms)%s", fast, resume ? "; the warm an earlier run began is not needed" : "");
         return;
     }
     if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
-        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
-               "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
+        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (the third fastest of a sample built "
+               "in %.0f ms) after two finished warms on this driver: it does not keep them, so pipelines compile when a "
+               "draw first needs them (NX2NAVI_LIB_WARM=force warms anyway).%s", fast,
                lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
         return;
     }
@@ -6881,15 +6908,15 @@ static void lw_main(void *arg) {
     int cpus = (int)plat_cpu_usable(), t = cpus / 4;
     t = t < 2 ? 2 : t > LW_MAX_THREADS ? LW_MAX_THREADS : t;
     if (resume)
-        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
-               "idle threads", LW.n, t);
+        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began (the third fastest of a "
+               "sample built in %.0f ms): %zu prepared variants on %d idle threads", fast, LW.n, t);
     else   // cold right after a finished warm on this driver says more than a first cold (vk_warm_hint.h)
-        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
-               "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
-               "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
-               "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
+        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (the third fastest "
+               "of a sample built in %.0f ms; a driver update or a change of what they are built with): building %zu "
+               "prepared variants into it on %d idle threads while the game runs. Until it is done, a pipeline a draw "
+               "first needs may compile, which skips that draw for some frames or makes it wait.%s", fast, LW.n, t,
                lw_cold_hint(LW.vendor,
-                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                            fast <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
                             : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
                             LW_ON_WINDOWS));
     LW.t0 = now_ms();
