@@ -8192,8 +8192,33 @@ static void lb_warm_prepared(const char *dir, int sample) {
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
+    // shader-warm.txt (lw_check) says "warming" with this driver while a warm the game began in play has not come to
+    // the end of the list. The variants before the point it reached are in the driver's cache and the rest are not, and
+    // the sample, spread over the list, finds about that share fast: at 31,996 of 42,239 it found 9 of 12, which is
+    // LW_WARM_SHARE, and read the cache as warm. --warm-shaders built nothing, and the next start went on warming the
+    // rest on idle threads during play (10,243 of 42,239 variants left on an RTX 5080, with the replay at 20-39 ms a
+    // frame in Castle Town meanwhile). An unfinished warm is built here whatever the sample says, and a preparation
+    // that builds the whole list marks the warm done, so the game does not start it again.
+    snprintf(LW.stamp, sizeof LW.stamp, "%s/shader-warm.txt", dir);
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
+    snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
+    char was[16] = "", sid[64] = "";
+    uint64_t ssize = 0;
+    char *sf = (char *)plat_file_read(LW.stamp, &ssize);
+    if (sf && ssize < 200) {
+        char line[200];
+        memcpy(line, sf, ssize), line[ssize] = 0;
+        if (sscanf(line, "%15s %63s", was, sid) < 2) was[0] = 0;
+    }
+    free(sf);
+    int unfinished = P.gpl && !strcmp(was, "warming") && !strcmp(sid, LW.id);
+    if (sample && unfinished)
+        printf("prepare-shaders: a warm of the graphics driver's cache that the game began did not finish "
+               "(shader-warm.txt): all %zu variants are built into it\n", n);
     int fast = 0, got = 0;
-    if (sample && P.gpl && strcmp(cfg_value("NX2NAVI_LIB_WARM"), "force") && prep_sample_warm(&fast, &got)) {
+    if (sample && !unfinished && P.gpl && strcmp(cfg_value("NX2NAVI_LIB_WARM"), "force") &&
+        prep_sample_warm(&fast, &got)) {
         if (SK.journal) plat_file_close(SK.journal), SK.journal = NULL, plat_file_delete(jp);
         printf("prepare-shaders: progress build %zu %zu\n", n, n);
         printf("prepare-shaders: the graphics driver's cache still has the prepared shaders (%d of %d sampled came from "
@@ -8225,6 +8250,7 @@ static void lb_warm_prepared(const char *dir, int sample) {
     fflush(stdout);
     if (SK.journal) plat_file_close(SK.journal), SK.journal = NULL, plat_file_delete(jp);   // every build returned
     lb_report("preparation done");
+    if (P.gpl && !LB.nolib) lw_stamp("done", 0);   // the whole list is in the driver's cache (see shader-warm.txt above)
     // with gpl off only compute variants are built: say so, rather than count the skipped ones as built
     unsigned long long skipped = LB.skipped;
     size_t tried = n - (size_t)skipped;
