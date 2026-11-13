@@ -203,15 +203,202 @@ def known_folder(name):
         return None
 
 
-def start_game(exe):
-    """Start the game from its own folder; returns the process to watch. ocarina.exe is a console program and the
-    launcher has no console, so without CREATE_NO_WINDOW Windows opened an empty console window beside the game,
-    titled with the exe's path. With it the game still has a console (hidden), which its restarts inherit."""
+CREATE_SUSPENDED = 0x00000004
+
+
+def merged_env(extra):
+    """os.environ with extra's variables put over it. Windows matches variable names without regard to case, so a
+    name extra sets replaces the one os.environ has in another case."""
+    env = dict(os.environ)
+    for k, v in (extra or {}).items():
+        if os.name == 'nt':
+            for old in [o for o in env if o.upper() == k.upper()]:
+                del env[old]
+        env[k] = v
+    return env
+
+
+def start_game(exe, env_extra=None, dlls=None, log=print):
+    """Start the game from its own folder; returns the process to watch (a subprocess.Popen, with dll_errors: the
+    libraries of dlls that did not load). ocarina.exe is a console program and the launcher has no console, so
+    without CREATE_NO_WINDOW Windows opened an empty console window beside the game, titled with the exe's path.
+    With it the game still has a console (hidden), which its restarts inherit.
+
+    env_extra: variables put over the launcher's own environment. dlls (Windows only): libraries loaded into the
+    game before its main thread runs: the process starts suspended, each library is loaded by a thread of its own in
+    the game's process (inject_dlls), then the main thread goes on. A library that does not load is logged and left
+    out; the game starts anyway."""
     exe = Path(exe)
-    flags = {'creationflags': CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' \
-        else {'start_new_session': True}
-    return subprocess.Popen([str(exe)], cwd=str(exe.parent), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, close_fds=True, **flags)
+    libs = [str(d) for d in (dlls or [])] if os.name == 'nt' else []
+    if dlls and not libs:
+        log('mods: game code (DLLs) is loaded on Windows only; the game starts without it')
+    flags = {'creationflags': CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | (CREATE_SUSPENDED if libs else 0)} \
+        if os.name == 'nt' else {'start_new_session': True}
+    proc = subprocess.Popen([str(exe)], cwd=str(exe.parent), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, close_fds=True,
+                            env=merged_env(env_extra) if env_extra else None, **flags)
+    proc.dll_errors = inject_dlls(proc.pid, libs, log) if libs else []
+    return proc
+
+
+class _ThreadEntry(ctypes.Structure):
+    _fields_ = [('dwSize', ctypes.c_uint32), ('cntUsage', ctypes.c_uint32), ('th32ThreadID', ctypes.c_uint32),
+                ('th32OwnerProcessID', ctypes.c_uint32), ('tpBasePri', ctypes.c_long),
+                ('tpDeltaPri', ctypes.c_long), ('dwFlags', ctypes.c_uint32)]
+
+
+class _ModuleEntry(ctypes.Structure):
+    _fields_ = [('dwSize', ctypes.c_uint32), ('th32ModuleID', ctypes.c_uint32), ('th32ProcessID', ctypes.c_uint32),
+                ('GlblcntUsage', ctypes.c_uint32), ('ProccntUsage', ctypes.c_uint32),
+                ('modBaseAddr', ctypes.c_void_p), ('modBaseSize', ctypes.c_uint32), ('hModule', ctypes.c_void_p),
+                ('szModule', ctypes.c_wchar * 256), ('szExePath', ctypes.c_wchar * 260)]
+
+
+def _kernel32():
+    """A private kernel32 handle with every function the DLL loading uses typed for 64 bits (handles and addresses
+    as pointers, sizes as size_t)."""
+    from ctypes import wintypes as w
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    H, P, S, D, B = w.HANDLE, ctypes.c_void_p, ctypes.c_size_t, w.DWORD, w.BOOL
+    for name, res, args in (
+            ('OpenProcess', H, (D, B, D)),
+            ('OpenThread', H, (D, B, D)),
+            ('ResumeThread', D, (H,)),
+            ('CloseHandle', B, (H,)),
+            ('VirtualAllocEx', P, (H, P, S, D, D)),
+            ('VirtualFreeEx', B, (H, P, S, D)),
+            ('WriteProcessMemory', B, (H, P, P, S, ctypes.POINTER(S))),
+            ('CreateRemoteThread', H, (H, P, S, P, P, D, ctypes.POINTER(D))),
+            ('WaitForSingleObject', D, (H, D)),
+            ('GetExitCodeThread', B, (H, ctypes.POINTER(D))),
+            ('GetModuleHandleW', H, (w.LPCWSTR,)),
+            ('GetProcAddress', P, (H, ctypes.c_char_p)),
+            ('CreateToolhelp32Snapshot', H, (D, D)),
+            ('Thread32First', B, (H, ctypes.POINTER(_ThreadEntry))),
+            ('Thread32Next', B, (H, ctypes.POINTER(_ThreadEntry))),
+            ('Module32FirstW', B, (H, ctypes.POINTER(_ModuleEntry))),
+            ('Module32NextW', B, (H, ctypes.POINTER(_ModuleEntry)))):
+        f = getattr(k, name)
+        f.restype, f.argtypes = res, args
+    return k
+
+
+def _snapshot(k, flags, pid):
+    h = k.CreateToolhelp32Snapshot(flags, pid)
+    return None if h in (None, 0, ctypes.c_void_p(-1).value) else h
+
+
+def _threads(k, pid):
+    """The ids of the process's threads (of a process just started suspended: its main thread)."""
+    h = _snapshot(k, 0x4, 0)   # TH32CS_SNAPTHREAD lists every process's threads
+    if not h:
+        return []
+    out, e = [], _ThreadEntry()
+    e.dwSize = ctypes.sizeof(e)
+    try:
+        ok = k.Thread32First(h, ctypes.byref(e))
+        while ok:
+            if e.th32OwnerProcessID == pid:
+                out.append(e.th32ThreadID)
+            ok = k.Thread32Next(h, ctypes.byref(e))
+    finally:
+        k.CloseHandle(h)
+    return out
+
+
+def _has_module(k, pid, path):
+    """Whether the process has loaded the library at path (compared by full path, else by file name)."""
+    h = _snapshot(k, 0x8 | 0x10, pid)   # TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32
+    if not h:
+        return False
+    want, name = os.path.normcase(os.path.abspath(path)), os.path.basename(path).lower()
+    e = _ModuleEntry()
+    e.dwSize = ctypes.sizeof(e)
+    try:
+        ok = k.Module32FirstW(h, ctypes.byref(e))
+        while ok:
+            if os.path.normcase(e.szExePath) == want or e.szModule.lower() == name:
+                return True
+            ok = k.Module32NextW(h, ctypes.byref(e))
+    finally:
+        k.CloseHandle(h)
+    return False
+
+
+DLL_WAIT_MS = 30000   # how long one library's loading (its DllMain included) may take
+
+
+def inject_dlls(pid, dlls, log=print, resume=True):
+    """Load each library into the suspended process pid, in order, then resume its main thread (resume=False leaves
+    it suspended, for tests). Each library is loaded by a thread of the launcher's making in that process, which
+    calls LoadLibraryW with the library's path written into the process's memory. kernel32.dll lies at the same
+    address in every process of a session, so LoadLibraryW's address here is its address there; in a process that
+    has not run yet, that first thread also does the process's start-up (loading the exe's own imports) before it
+    calls LoadLibraryW. The thread's exit code is the low 32 bits of the module handle: zero means the library did
+    not load (not found, the wrong architecture, its DllMain returned FALSE), unless the module list has it (a handle
+    whose low 32 bits are zero). Returns the problems as text, one per library that did not load."""
+    errors = []
+    if os.name != 'nt':
+        return [f'{d}: game code is loaded on Windows only' for d in dlls]
+    k = _kernel32()
+    main = _threads(k, pid)
+    access = 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0400   # CREATE_THREAD, VM_OPERATION, VM_READ, VM_WRITE, QUERY
+    hp = k.OpenProcess(access, False, pid)
+    try:
+        if not hp:
+            errors = [f'{d}: the game\'s process could not be opened (error {ctypes.get_last_error()})' for d in dlls]
+            return errors
+        load = k.GetProcAddress(k.GetModuleHandleW('kernel32.dll'), b'LoadLibraryW')
+        for d in dlls:
+            path = os.path.abspath(d)
+            if not os.path.isfile(path):
+                errors.append(f'{path}: the file is missing')
+                continue
+            data = ctypes.create_unicode_buffer(path)
+            size = ctypes.sizeof(data)
+            mem = k.VirtualAllocEx(hp, None, size, 0x3000, 0x04)   # MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+            if not mem:
+                errors.append(f'{path}: no memory in the game\'s process (error {ctypes.get_last_error()})')
+                continue
+            try:
+                done = ctypes.c_size_t(0)
+                if not k.WriteProcessMemory(hp, mem, ctypes.cast(data, ctypes.c_void_p), size, ctypes.byref(done)):
+                    errors.append(f'{path}: could not be written to the game\'s process '
+                                  f'(error {ctypes.get_last_error()})')
+                    continue
+                ht = k.CreateRemoteThread(hp, None, 0, load, mem, 0, None)
+                if not ht:
+                    errors.append(f'{path}: no thread in the game\'s process (error {ctypes.get_last_error()})')
+                    continue
+                try:
+                    if k.WaitForSingleObject(ht, DLL_WAIT_MS) != 0:
+                        errors.append(f'{path}: loading took longer than {DLL_WAIT_MS // 1000} s')
+                        mem = None   # the thread may still read the path: the memory stays
+                        continue
+                    code = ctypes.c_uint32(0)
+                    k.GetExitCodeThread(ht, ctypes.byref(code))
+                    if code.value == 0 and not _has_module(k, pid, path):
+                        errors.append(f'{path}: did not load (missing dependency, not 64-bit, or it refused to '
+                                      'start)')
+                    else:
+                        log(f'mods: loaded {path} into the game')
+                finally:
+                    k.CloseHandle(ht)
+            finally:
+                if mem:
+                    k.VirtualFreeEx(hp, mem, 0, 0x8000)   # MEM_RELEASE
+    finally:
+        if hp:
+            k.CloseHandle(hp)
+        if resume:
+            for tid in main:
+                th = k.OpenThread(0x0002, False, tid)   # THREAD_SUSPEND_RESUME
+                if th:
+                    k.ResumeThread(th)
+                    k.CloseHandle(th)
+        for e in errors:
+            log(f'mods: {e}')
+    return errors
 
 
 def start_detached(cmd, cwd=None):

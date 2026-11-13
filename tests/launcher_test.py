@@ -22,6 +22,10 @@ Run: python tests/launcher_test.py   (Python 3.14 for the zstd tests; the window
 - the look: the colour schemes with the Custom one, its colour square and a typed hex code, the background picture's
   fitting below the title band and kept copy, the sound effects (low by default,
   only the game's own select and back sounds, decoded from a made-up .bwav)
+- mods: the mods folder and mod.json (bad ones, paths that leave the folder), the switch the game reads too, launcher
+  add-ons registering rows and menus and failing without harm, their settings file, the variables and DLLs a game
+  start gets, a DLL loaded into a suspended system program (Windows, with a C compiler), single-file mods packed,
+  installed and refused when unsafe
 - the window: --selftest draws every screen (skipped without a display)
 """
 import contextlib
@@ -4850,12 +4854,550 @@ class UnfinishedUpdateTest(Tmp):
         self.assertEqual(rows['Rebuild the Game'].value, 'Built with 0.6.1')
 
 
+# ---------------------------------------------------------------- mods
+
+def write_mod(root, name, manifest=None, files=()):
+    """A mod folder: mod.json (a dict, or text for a broken one) and files as (relative path, text)."""
+    d = Path(root) / name
+    d.mkdir(parents=True, exist_ok=True)
+    if manifest is not None:
+        (d / 'mod.json').write_text(manifest if isinstance(manifest, str) else json.dumps(manifest), encoding='utf-8')
+    for rel, text in files:
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(text, encoding='utf-8')
+    return d
+
+
+class ModScanTest(Tmp):
+    """launcher/modext.py over launcher/mods.py: the mods folder, mod.json, the switches the game reads too. The
+    names are taken from launcher.mods, where code written before modext.py finds them."""
+
+    def setUp(self):
+        super().setUp()
+        self.game = self.tmp / 'game'
+        self.mods = self.game / 'mods'
+        self.mods.mkdir(parents=True)
+
+    def test_scan_manifest_kinds_and_order(self):
+        from launcher import mods
+        write_mod(self.mods, 'Zelda HD', {'name': 'Zelda HD Pack', 'version': '2', 'author': 'Saria',
+                                          'description': 'Sharper.'}, [('romfs/a.txt', ''), ('cheats/x.txt', '')])
+        write_mod(self.mods, 'Timer', {'launcher': 'plug.py', 'dlls': ['bin/t.dll'], 'env': {'TIMER': '1'}},
+                  [('plug.py', 'def register(api): pass\n'), ('bin/t.dll', '')])
+        write_mod(self.mods, 'Bare', None, [('exefs/p.ips', '')])
+        (self.mods / '.installed').mkdir()            # the launcher's own folder is no mod
+        (self.mods / 'loose.txt').write_text('')
+        (self.game / 'nx2navi.ini').write_text('[mods]\nmods_order = Timer\nmods_disabled = Bare\n')
+        ms = mods.scan(self.game)
+        self.assertEqual([m.name for m in ms], ['Timer', 'Bare', 'Zelda HD'])   # mods_order first, then by name
+        timer, bare, hd = ms
+        self.assertEqual(hd.title, 'Zelda HD Pack')
+        self.assertEqual(hd.kinds, ['romfs', 'cheats'])
+        self.assertEqual(timer.kinds, ['launcher', 'dlls'])
+        self.assertEqual(timer.plugin, (self.mods / 'Timer' / 'plug.py').resolve())
+        self.assertEqual(timer.env, {'TIMER': '1'})
+        self.assertEqual(bare.kinds, ['exefs'])
+        self.assertEqual(bare.title, 'Bare')
+        self.assertFalse(bare.enabled)
+        self.assertTrue(all(not m.problems for m in ms))
+        self.assertEqual(mods.scan(''), [])
+        # one kind of mod whoever scans: the game's side of it (launcher/mods.py Mod) and the mod.json's
+        from launcher import modext
+        self.assertIsInstance(timer, modext.Mod)
+        self.assertEqual([m.name for m in modext.scan(self.game, None)], ['Timer', 'Bare', 'Zelda HD'])
+        self.assertEqual([m.name for m in mods.scan(self.game, print)], ['Timer', 'Bare', 'Zelda HD'])   # the old call
+        self.assertEqual(len(mods.scan(self.game)[2].files), 1)           # Zelda HD's romfs file, with details
+        self.assertEqual(mods.scan(self.game, details=False)[2].files, [])
+        self.assertTrue(timer.usable)        # nothing the game reads, but an add-on and game code: no fault
+        self.assertEqual(timer.problem, '')
+        write_mod(self.mods, 'Empty', {'name': 'Nothing in it'})
+        self.assertIn('holds nothing the game reads',
+                      next(m for m in mods.scan(self.game) if m.name == 'Empty').problem)
+
+    def test_mods_dir_from_the_games_settings(self):
+        from launcher import mods
+        self.assertEqual(mods.mods_dir(self.game), self.game / 'mods')
+        (self.game / 'nx2navi.ini').write_text('[mods]\nmods_dir = other/place\n')
+        self.assertEqual(mods.mods_dir(self.game), self.game / 'other' / 'place')
+        (self.game / 'nx2navi.ini').write_text(f'[mods]\nmods_dir = "{self.tmp / "elsewhere"}"\n')
+        self.assertEqual(mods.mods_dir(self.game), self.tmp / 'elsewhere')
+
+    def test_bad_manifest_and_paths_that_leave_the_folder(self):
+        from launcher import mods
+        (self.tmp / 'evil.py').write_text('raise SystemExit\n')
+        write_mod(self.mods, 'Broken', '{"name": "x",', [('romfs/a', '')])
+        write_mod(self.mods, 'List', '[1, 2]')
+        write_mod(self.mods, 'Escape', {'launcher': '../../evil.py',
+                                        'dlls': ['C:\\Windows\\x.dll', '/etc/x.dll', 'bin/../../../x.dll', 'gone.dll'],
+                                        'env': {'A': 1}})
+        if os.name != 'nt':   # a Windows file name cannot hold '|'
+            write_mod(self.mods, 'Bad|Name', {})
+        by = {m.name: m for m in mods.scan(self.game)}
+        self.assertIn('mod.json is not valid', by['Broken'].problems[0])
+        self.assertEqual(by['Broken'].kinds, ['romfs'])   # the game still takes its files
+        self.assertIn('not valid', by['List'].problems[0])
+        esc = by['Escape']
+        self.assertIsNone(esc.plugin)
+        self.assertEqual(esc.dlls, [])
+        text = ' '.join(esc.problems)
+        self.assertEqual(text.count('lies outside the mod folder'), 4)
+        self.assertIn('gone.dll is missing', text)
+        self.assertIn('env: not an object of text values', text)
+        if os.name != 'nt':
+            self.assertIn('"|"', by['Bad|Name'].problem)
+        self.assertIsNone(mods.inside(self.mods, ''))
+        self.assertEqual(mods.inside(self.mods, 'Broken/romfs/a'), (self.mods / 'Broken' / 'romfs' / 'a').resolve())
+
+    def test_the_disabled_key_round_trip_keeps_the_games_format(self):
+        from launcher import mods
+        ini = self.game / 'nx2navi.ini'
+        ini.write_bytes(b'\xef\xbb\xbf[video]\r\nwidth = 1920\r\n[mods]\r\nmods_order = B|A\r\n'
+                        b'mods_disabled = Other|A\r\n')
+        write_mod(self.mods, 'A', {})
+        write_mod(self.mods, 'B', {})
+        mods.set_enabled(self.game, 'B', False)
+        self.assertEqual(gameini.get(self.game, 'mods_disabled'), 'Other|A|B')
+        mods.set_enabled(self.game, 'A', True)
+        mods.set_enabled(self.game, 'A', True)            # already on: nothing changes
+        self.assertEqual(ini.read_bytes(), b'\xef\xbb\xbf[video]\r\nwidth = 1920\r\n[mods]\r\nmods_order = B|A\r\n'
+                                           b'mods_disabled = Other|B\r\n')
+        self.assertEqual([(m.name, m.enabled) for m in mods.scan(self.game)], [('B', False), ('A', True)])
+        fresh = self.tmp / 'fresh'
+        fresh.mkdir()
+        mods.set_enabled(fresh, 'X', False)               # no nx2navi.ini yet: made with the game's section
+        self.assertEqual((fresh / 'nx2navi.ini').read_text(), '[mods]\nmods_disabled = X\n')
+
+    def test_env_merge_and_dlls_in_order(self):
+        from launcher import mods
+        write_mod(self.mods, 'Top', {'env': {'K': 'top', 'T': '1'}, 'dlls': ['a.dll']}, [('a.dll', '')])
+        write_mod(self.mods, 'Low', {'env': {'K': 'low', 'L': '1'}, 'dlls': ['b.dll']}, [('b.dll', '')])
+        write_mod(self.mods, 'Off', {'env': {'OFF': '1'}, 'dlls': ['c.dll']}, [('c.dll', '')])
+        (self.game / 'nx2navi.ini').write_text('[mods]\nmods_order = Top|Low\nmods_disabled = Off\n')
+        ms = mods.scan(self.game)
+        env = mods.game_env(ms, {'T': 'extra'})
+        self.assertEqual(env, {'K': 'top', 'L': '1', 'T': 'extra', 'NX2NAVI_MODS_LOADED': 'Top|Low'})
+        self.assertEqual(mods.game_dlls(ms, ['x.dll']), [str((self.mods / 'Top' / 'a.dll').resolve()),
+                                                        str((self.mods / 'Low' / 'b.dll').resolve()), 'x.dll'])
+        with mock.patch.dict(os.environ, {'PATH_LIKE': 'old'}):
+            merged = winsys.merged_env({'path_like' if os.name == 'nt' else 'PATH_LIKE': 'new'})
+            self.assertEqual([v for k, v in merged.items() if k.upper() == 'PATH_LIKE'], ['new'])
+        with mock.patch('launcher.modext.winsys.start_game') as start:
+            mods.start_game(self.game, self.game / 'ocarina.exe', {'E': '1'}, ['y.dll'], log=lambda t: None)
+        exe, env, dlls, _ = start.call_args[0]
+        self.assertEqual(exe, self.game / 'ocarina.exe')
+        self.assertEqual(env['E'], '1')
+        self.assertEqual(env['NX2NAVI_MODS_LOADED'], 'Top|Low')
+        self.assertEqual(len(dlls), 3)
+        self.assertEqual(dlls[-1], 'y.dll')
+        # the game loads the same libraries itself from this variable, so its own Restart keeps them
+        self.assertEqual(mods.dlls_env(['y.dll', os.path.abspath('z.dll')]),
+                         os.path.abspath('y.dll') + '|' + os.path.abspath('z.dll'))
+        if os.name == 'nt':
+            self.assertEqual(env['NX2NAVI_MOD_DLLS'].split('|'), [os.path.abspath(d) for d in dlls])
+            write_mod(self.mods, 'Top', {}, [])               # no library left: the variable is set, and empty
+            write_mod(self.mods, 'Low', {}, [])
+            with mock.patch('launcher.modext.winsys.start_game') as start:
+                mods.start_game(self.game, self.game / 'ocarina.exe', log=lambda t: None)
+            self.assertEqual(start.call_args[0][1]['NX2NAVI_MOD_DLLS'], '')
+        else:
+            self.assertNotIn('NX2NAVI_MOD_DLLS', env)
+
+
+class ModPluginTest(Tmp):
+    """Launcher add-ons: register(api), rows and menus, a failing add-on, the settings file, api.play."""
+
+    def setUp(self):
+        super().setUp()
+        self.game = self.tmp / 'game'
+        self.mods = self.game / 'mods'
+
+    def test_register_rows_menu_and_settings(self):
+        from launcher import mods
+        write_mod(self.mods, 'Timer', {'launcher': 'p.py'}, [('p.py', '''
+import dataclasses
+
+@dataclasses.dataclass
+class State:
+    on: bool = True
+
+def register(api):
+    st = State()
+    api.state = st
+    def menu():
+        return [api.toggle('Splits', lambda: st.on, lambda v: setattr(st, 'on', v)),
+                api.text('Key', lambda: 'k', lambda v: None, secret=True), api.divider(),
+                api.value('Best', lambda: '1:00'), api.action('Go', lambda: api.play({'X': '1'}, ['bin/a.dll']))]
+    api.add_home_row('Timer', value=lambda: 'Best 1:00', desc='d', on=lambda: api.show_menu('Timer', menu))
+''')])
+        write_mod(self.mods, 'Off', {'launcher': 'p.py'}, [('p.py', 'raise RuntimeError("must not load")\n')])
+        (self.game / 'nx2navi.ini').write_text('[mods]\nmods_disabled = Off\n')
+        played = []
+
+        class H(mods.Host):
+            def mod_play(self, env, dlls):
+                played.append((env, dlls))
+                return True
+        host = H(self.game, log=lambda t: None)
+        ms = mods.scan(self.game)
+        apis = mods.load_plugins(ms, host)
+        self.assertEqual([a.name for a in apis], ['Timer'])
+        api = apis[0]
+        self.assertEqual((api.mod_dir, api.game_dir), (self.mods / 'Timer', self.game))
+        self.assertEqual([(r.kind, r.label) for r in api.home_rows], [('value', 'Timer')])
+        api.home_rows[0].on()
+        (_, title, rows), = host.menus
+        self.assertEqual(title, 'Timer')
+        specs = rows()
+        self.assertEqual([s.kind for s in specs], ['toggle', 'text', 'divider', 'value', 'action'])
+        self.assertTrue(specs[1].secret)
+        specs[0].set(False)
+        self.assertFalse(api.state.on)
+        specs[4].on()
+        self.assertEqual(played, [({'X': '1'}, [str(self.mods / 'Timer' / 'bin' / 'a.dll')])])
+        self.assertTrue(any(k.startswith('nx2navi_mod_Timer_') for k in sys.modules))
+        mods.unload_plugins(apis, host)
+        self.assertFalse(any(k.startswith('nx2navi_mod_Timer_') for k in sys.modules))
+        # the settings file
+        self.assertEqual(api.load_settings(), {})
+        api.save_settings({'name': 'Link', 'n': 3})
+        self.assertEqual(api.load_settings(), {'name': 'Link', 'n': 3})
+        (api.mod_dir / 'settings.json').write_text('{broken')
+        self.assertEqual(api.load_settings(), {})
+        self.assertFalse((self.mods / 'Timer' / '__pycache__').exists())   # no bytecode written into the mod
+
+    def test_a_failing_add_on_is_a_problem_not_a_crash(self):
+        from launcher import mods
+        write_mod(self.mods, 'Raises', {'launcher': 'p.py'}, [('p.py', 'def register(api):\n    raise KeyError("x")\n')])
+        write_mod(self.mods, 'Syntax', {'launcher': 'p.py'}, [('p.py', 'def register(api)\n')])
+        write_mod(self.mods, 'Exits', {'launcher': 'p.py'}, [('p.py', 'import sys\nsys.exit(3)\n')])
+        write_mod(self.mods, 'NoRegister', {'launcher': 'p.py'}, [('p.py', 'x = 1\n')])
+        write_mod(self.mods, 'Fine', {'launcher': 'p.py'}, [('p.py', 'def register(api):\n    api.log("hi")\n')])
+        lines = []
+        host = mods.Host(self.game, log=lines.append)
+        ms = mods.scan(self.game)
+        apis = mods.load_plugins(ms, host)
+        self.assertEqual([a.name for a in apis], ['Fine'])
+        by = {m.name: m for m in ms}
+        self.assertIn("KeyError: 'x'", by['Raises'].problems[0])
+        self.assertIn('SyntaxError', by['Syntax'].problems[0])
+        self.assertIn('SystemExit', by['Exits'].problems[0])
+        self.assertIn('has no register(api)', by['NoRegister'].problems[0])
+        self.assertIn('mod Fine: hi', lines)
+        self.assertTrue(any('Traceback' in t and 'KeyError' in t for t in lines))
+
+    def test_the_window_shows_the_rows_and_survives_a_raising_callback(self):
+        from launcher import mods
+        write_mod(self.mods, 'Timer', {'launcher': 'p.py'}, [('p.py', '''
+def register(api):
+    api.add_home_row('Timer', value=lambda: 1 / 0, desc=lambda: 'about', on=lambda: [][1])
+    api.on_game_exit(lambda code: api.message(f'ended {code}'))
+''')])
+        App, a = mock_app(self, self.game)
+        for name in ('mod_game_dir', 'mod_log', 'mod_value', 'mod_call', 'mod_row', 'mod_home_rows', 'mods_row',
+                     'mod_list', 'mod_game_ended', 'mod_message'):
+            setattr(a, name, getattr(App, name).__get__(a))
+        a.plugin_problems = {}
+        a.mod_apis = mods.load_plugins(mods.scan(self.game), a)
+        a.screen = 'home'
+        labels = [r.label for r in App.rows_home(a)]
+        self.assertEqual(labels[:5], ['Play', 'Updates', '', 'Timer', ''])   # their own group under Updates
+        rows = {r.label: r for r in App.rows_home(a) if isinstance(r.label, str) and r.label}
+        self.assertEqual(rows['Timer'].value, '?')            # a value that raises shows '?'
+        self.assertEqual(rows['Mods'].value, '1 On')
+        a.message = ''
+        self.assertEqual(rows['Timer'].desc(), ('about',))
+        rows['Timer'].on()                                    # raises IndexError: shown, not passed on
+        self.assertIn('Timer: IndexError', a.message)
+        App.mod_game_ended(a, 3)
+        self.assertEqual(a.message, 'ended 3')
+
+    def window(self):
+        """mock_app with the Mods screen's own methods and state."""
+        App, a = mock_app(self, self.game)
+        for name in ('mod_list', 'mods_row', 'mods_page_count', 'mod_desc', 'game_busy', 'load_mods', 'addon_of',
+                     'mod_game_dir', 'mod_log', 'play_gave_up'):
+            setattr(a, name, getattr(App, name).__get__(a))
+        a.mods_page, a.mods_message, a.plugin_problems, a.mod_apis, a.mod_stack = 0, '', {}, [], []
+        a.game_proc = a.play_extra = None
+        a.mods_failed = []
+        a.screen = 'mods'
+        return App, a
+
+    def test_the_mods_screen_shows_what_a_mod_json_brings(self):
+        from launcher import mods
+        from launcher.ui import app as appmod
+        write_mod(self.mods, 'Pack', {'name': 'HD Pack', 'version': '2', 'author': 'Saria', 'description': 'Sharper.'},
+                  [('romfs/a.txt', '')])
+        write_mod(self.mods, 'Code', {'launcher': 'p.py', 'dlls': ['x.dll']},
+                  [('p.py', 'def register(api):\n    api.add_home_row("Code")\n'), ('x.dll', '')])
+        write_mod(self.mods, 'Fails', {'launcher': 'p.py'}, [('p.py', 'def register(api):\n    raise KeyError("x")\n'),
+                                                              ('romfs/b.txt', '')])
+        write_mod(self.mods, 'Broken', '{"name": ', [('romfs/c.txt', '')])
+        App, a = self.window()
+        with mock.patch.object(appmod, 'fit', lambda font, text, width: text), \
+                mock.patch.object(appmod.saves, 'game_running', return_value=False):
+            App.load_mods(a)
+            self.assertEqual([api.name for api in a.mod_apis], ['Code'])
+            rows = {r.label: r for r in App.rows_mods(a) if r.label}
+            self.assertEqual(list(rows), ['Open Mods Folder', 'Add a Mod', 'Add a Mod Folder', 'Reload Mods', 'Broken',
+                                          'Code', 'Fails', 'Pack', 'Load Order', 'Back'])
+            self.assertEqual(rows['Code'].kind, 'toggle')        # no game files, and yet a switch
+            code = rows['Code'].desc()
+            self.assertIn('adds to this launcher (a launcher add-on) and loads code of its own into the game (DLL)',
+                          ' '.join(code['text']))
+            self.assertEqual(code['note'], appmod.MOD_TRUST)
+            pack = rows['Pack'].desc()
+            self.assertEqual(pack['title'], 'HD Pack')
+            self.assertEqual(pack['text'][:3], ['Sharper.', 'Version 2 · by Saria', 'Folder: Pack'])
+            self.assertNotIn('note', pack)
+            self.assertTrue(any(t.startswith("Problem: Its launcher add-on failed: KeyError: 'x'")
+                                for t in rows['Fails'].desc()['text']))
+            self.assertTrue(any(t.startswith('Problem: mod.json is not valid') for t in rows['Broken'].desc()['text']))
+            self.assertIn('2 of them have a problem', ' '.join(App.mods_row(a, str(self.game)).desc))
+            # the switch is the game's, and the add-on goes at once
+            code_mod = next(m for m in mods.scan(self.game) if m.name == 'Code')
+            App.switch_mod(a, code_mod, False)
+            self.assertEqual(gameini.get(self.game, 'mods_disabled'), 'Code')
+            self.assertEqual(a.mod_apis, [])
+            App.switch_mod(a, code_mod, True)
+            self.assertEqual([api.name for api in a.mod_apis], ['Code'])
+
+    def test_play_from_an_add_on_goes_through_the_build_of_a_mods_code(self):
+        from launcher.ui import app as appmod
+        self.game.mkdir(parents=True)
+        (self.game / 'ocarina.exe').write_bytes(b'')
+        App, a = self.window()
+        a.mods_before_play.return_value = ['Patch']
+        with mock.patch.object(appmod.saves, 'game_running', return_value=False), \
+                mock.patch.object(appmod.jobs, 'ModsRebuildJob') as job, \
+                mock.patch.object(appmod.modext, 'start_game') as start:
+            start.return_value.dll_errors = []
+            self.assertTrue(App.play(a, env={'X': '1'}, dlls=['a.dll']))   # true: the game starts after the build
+            start.assert_not_called()
+            a.run_job.assert_called_once_with(job.return_value, 'home')
+            self.assertTrue(App.play(a, built=True))                       # as job_finished calls it
+            self.assertEqual(start.call_args[0][2:4], ({'X': '1'}, ['a.dll']))
+            self.assertIsNone(a.play_extra)
+            # a build that fails or is cancelled: the add-on that asked hears that no game runs
+            App.play(a, env={'X': '1'})
+            App.play_gave_up(a, mock.Mock(after='play'))
+            a.mod_game_ended.assert_called_once_with(None)
+            # the Play row's own start tells no add-on
+            a.mod_game_ended.reset_mock()
+            App.play(a)
+            App.play_gave_up(a, mock.Mock(after='play'))
+            a.mod_game_ended.assert_not_called()
+            # no code waiting: prepare ran (mods_before_play) and the game starts with the mods' parts
+            a.mods_before_play.return_value = []
+            start.reset_mock()
+            self.assertTrue(App.play(a))
+            self.assertEqual(start.call_args[0][:4], (str(self.game), self.game / 'ocarina.exe', None, None))
+
+
+def compiler():
+    for c in (shutil.which('gcc'), r'C:\ProgramData\mingw64\mingw64\bin\gcc.exe', r'C:\msys64\ucrt64\bin\clang.exe',
+              r'C:\msys64\ucrt64\bin\gcc.exe'):
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+TEST_DLL = r'''
+#include <windows.h>
+BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r) {
+    if (why == DLL_PROCESS_ATTACH) {
+        wchar_t path[1024];
+        DWORD n = GetEnvironmentVariableW(L"NX2NAVI_TEST_DLL_OUT", path, 1024);
+        if (n && n < 1024) {
+            HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD w;
+                WriteFile(f, "loaded", 6, &w, NULL);
+                CloseHandle(f);
+            }
+        }
+    }
+    return TRUE;
+}
+'''
+
+
+@unittest.skipUnless(os.name == 'nt', 'game code is loaded on Windows only')
+class DllLoadTest(Tmp):
+    """winsys.start_game with DLLs, against a system program (never the game): the child starts suspended, the
+    library is loaded before its main thread runs and reads the variables start_game set; libraries that do not
+    load are reported and the child runs anyway."""
+
+    def test_a_dll_is_loaded_before_the_main_thread(self):
+        cc = compiler()
+        if not cc:
+            self.skipTest('no C compiler')
+        src, dll = self.tmp / 't.c', self.tmp / 'with space' / 'mark.dll'
+        dll.parent.mkdir()
+        src.write_text(TEST_DLL)
+        r = subprocess.run([cc, '-shared', '-O2', '-static-libgcc', '-o', str(dll), str(src)], capture_output=True,
+                           text=True)
+        if r.returncode:
+            self.skipTest(f'the test DLL did not compile: {r.stderr[-300:]}')
+        out = self.tmp / 'out.txt'
+        bad = self.tmp / 'bad.dll'
+        bad.write_text('not a library')
+        lines = []
+        # a harmless system program that prints a line and ends (python itself would wait: it takes the NUL device
+        # given as its input for a console); the mark is written by DllMain alone
+        child = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'hostname.exe'
+        if not child.is_file():
+            self.skipTest('no hostname.exe')
+        proc = winsys.start_game(child, {'NX2NAVI_TEST_DLL_OUT': str(out)},
+                                 [str(dll), str(bad), str(self.tmp / 'missing.dll')], lines.append)
+        self.assertEqual(proc.wait(timeout=60), 0)            # its main thread was resumed
+        self.assertEqual(out.read_text(), 'loaded')
+        self.assertEqual(len(proc.dll_errors), 2, proc.dll_errors)
+        self.assertIn('bad.dll: did not load', proc.dll_errors[0])
+        self.assertIn('missing.dll: the file is missing', proc.dll_errors[1])
+        self.assertTrue(any('loaded' in t and 'mark.dll' in t for t in lines))
+        out.unlink()
+        plain = winsys.start_game(child, {'NX2NAVI_TEST_DLL_OUT': str(out)})   # no DLLs: the plain start
+        self.assertEqual(plain.wait(timeout=60), 0)
+        self.assertEqual(plain.dll_errors, [])
+        self.assertFalse(out.exists())
+
+
+class ModArchiveTest(Tmp):
+    """Single-file mods: pack and install, an existing mod's settings kept, unsafe archives refused, .nx2mod files
+    in the mods folder unpacked where the other archives are (modext.prepare), Add a Mod (modext.add)."""
+
+    def zip(self, name, entries):
+        p = self.tmp / name
+        with zipfile.ZipFile(p, 'w') as z:
+            for arc, data in entries:
+                z.writestr(arc, data)
+        return p
+
+    def test_pack_and_install_round_trip(self):
+        from launcher import mods
+        src = write_mod(self.tmp / 'src', 'Timer', {'name': 'Timer', 'launcher': 'p.py'},
+                        [('p.py', 'def register(api): pass\n'), ('romfs/a/b.txt', 'b'), ('settings.json', '{"me": 1}'),
+                         ('__pycache__/p.pyc', 'x'), ('.git/config', 'x')])
+        packed = mods.pack(src, self.tmp / 'out' / 'Timer.nx2mod')
+        with zipfile.ZipFile(packed) as z:
+            self.assertEqual(sorted(z.namelist()), ['mod.json', 'p.py', 'romfs/a/b.txt'])
+        root = self.tmp / 'game' / 'mods'
+        old = write_mod(root, 'Timer', {}, [('settings.json', '{"kept": true}'), ('stale.txt', '')])
+        dest = mods.install_archive(packed, root)
+        self.assertEqual(dest, old)
+        self.assertEqual((dest / 'settings.json').read_text(), '{"kept": true}')
+        self.assertFalse((dest / 'stale.txt').exists())
+        self.assertEqual((dest / 'romfs' / 'a' / 'b.txt').read_text(), 'b')
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ['Timer'])   # no temporary folders left
+        # one top folder holding the files is stripped; a .zip works too
+        z = self.zip('Other Mod.zip', [('Other Mod/mod.json', '{}'), ('Other Mod/romfs/x', 'x')])
+        self.assertEqual(sorted(p.relative_to(root / 'Other Mod').as_posix()
+                                for p in mods.install_archive(z, root).rglob('*')), ['mod.json', 'romfs', 'romfs/x'])
+
+    def test_unsafe_archives_are_refused(self):
+        from launcher import modext, mods
+        self.assertTrue(issubclass(mods.ArchiveError, mods.ModError))   # what the Mods screen catches
+        root = self.tmp / 'mods'
+        link = zipfile.ZipInfo('evil')
+        link.external_attr = (0o120777 << 16)
+        cases = {'up.nx2mod': [('../outside.txt', 'x')], 'abs.nx2mod': [('/abs.txt', 'x')],
+                 'drive.nx2mod': [('C:/x.txt', 'x')], 'link.nx2mod': [(link, '../../etc')],
+                 'deep.nx2mod': [('a/../../x', 'x')], 'empty.nx2mod': []}
+        for name, entries in cases.items():
+            with self.subTest(name=name), self.assertRaises(mods.ArchiveError):
+                mods.install_archive(self.zip(name, entries), root)
+        big = self.zip('big.nx2mod', [('a.bin', b'\0' * 5000)])
+        with mock.patch.object(modext, 'MAX_BYTES', 4096), self.assertRaises(mods.ArchiveError):
+            mods.install_archive(big, root)
+        (self.tmp / 'junk.nx2mod').write_bytes(b'not a zip')
+        with self.assertRaises(mods.ArchiveError):
+            mods.install_archive(self.tmp / 'junk.nx2mod', root)
+        with self.assertRaises(mods.ArchiveError):
+            mods.install_archive(self.zip('ok.nx2mod', [('a', 'x')]), root, name='..')
+        self.assertFalse((self.tmp / 'outside.txt').exists())
+        self.assertEqual([p.name for p in root.iterdir()] if root.exists() else [], [])
+        # a refused archive leaves an installed mod of that name as it was
+        write_mod(root, 'up', {}, [('keep.txt', 'k')])
+        with self.assertRaises(mods.ArchiveError):
+            mods.install_archive(self.tmp / 'up.nx2mod', root)
+        self.assertEqual((root / 'up' / 'keep.txt').read_text(), 'k')
+
+    def test_nx2mod_files_in_the_mods_folder_are_unpacked_and_stay(self):
+        from launcher import modext, mods
+        game = self.tmp / 'game'
+        root = game / 'mods'
+        root.mkdir(parents=True)
+        shutil.copy(self.zip('Fresh.nx2mod', [('Fresh/mod.json', '{"name": "Fresh"}'), ('Fresh/p.py', 'x = 1')]), root)
+        shutil.copy(self.zip('Bad.nx2mod', [('../x', 'x')]), root)
+        shutil.copy(self.zip('Zipped Addon.zip', [('inner/mod.json', '{}'), ('inner/bin/a.dll', '')]), root)
+        shutil.copy(self.zip('Plain.zip', [('Plain/romfs/a', 'a')]), root)
+        (root / '.installed').mkdir()                     # an earlier launcher's: its files come back, it goes
+        shutil.copy(self.zip('Earlier.nx2mod', [('mod.json', '{"name": "from the file"}')]), root / '.installed')
+        write_mod(root, 'Earlier', {'name': 'as installed'}, [('own.txt', 'mine')])
+        self.assertEqual([m.name for m in mods.scan(game)], ['Earlier'])   # scan unpacks nothing, and hides .installed
+        lines = []
+        done = modext.prepare(game, lines.append)
+        self.assertEqual([m.name for m in mods.scan(game)], ['Earlier', 'Fresh', 'Plain', 'Zipped Addon'])
+        self.assertEqual(sorted(p.name for p in root.iterdir() if p.is_file()),
+                         ['Bad.nx2mod', 'Earlier.nx2mod', 'Fresh.nx2mod', 'Plain.zip', 'Zipped Addon.zip'])
+        self.assertFalse((root / '.installed').exists())
+        self.assertTrue((root / 'Fresh' / 'mod.json').is_file())           # the one top folder is gone
+        self.assertTrue((root / 'Zipped Addon' / 'mod.json').is_file())    # a zip with a mod.json likewise
+        self.assertTrue((root / 'Plain' / 'romfs' / 'a').is_file())        # mods.prepare's
+        self.assertEqual((root / 'Earlier' / 'own.txt').read_text(), 'mine')   # a folder that came another way stays
+        self.assertTrue(any('Bad.nx2mod was not unpacked' in t for t in done))
+        self.assertTrue(any('mods: Fresh.nx2mod unpacked into Fresh.' == t for t in lines))
+        # nothing new: nothing done but the bad file's note
+        (root / 'Fresh' / 'settings.json').write_text('{"mine": 1}')
+        (root / 'Fresh' / 'edited.txt').write_text('e')
+        self.assertEqual([t for t in modext.prepare(game) if 'Bad' not in t], [])
+        self.assertTrue((root / 'Fresh' / 'edited.txt').is_file())
+        # a newer file in the old one's place: unpacked over the mod, its settings kept
+        time.sleep(0.05)
+        (self.tmp / 'new').mkdir()
+        shutil.copy(self.zip('new/Fresh.nx2mod', [('mod.json', '{"name": "Fresh 2"}'), ('more.txt', 'm')]), root)
+        done = modext.prepare(game)
+        self.assertTrue(any('Fresh.nx2mod unpacked into Fresh, over the mod that was there' in t for t in done))
+        self.assertEqual(mods.scan(game)[1].title, 'Fresh 2')
+        self.assertEqual((root / 'Fresh' / 'settings.json').read_text(), '{"mine": 1}')
+        self.assertFalse((root / 'Fresh' / 'edited.txt').exists())
+        self.assertEqual([t for t in modext.prepare(game) if 'Bad' not in t], [])
+        packed = modext.pack(root / 'Fresh', self.tmp / 'packed.nx2mod')   # the note of its source stays out
+        with zipfile.ZipFile(packed) as z:
+            self.assertEqual(sorted(z.namelist()), ['mod.json', 'more.txt'])
+
+    def test_add_a_mod_takes_single_file_mods_and_the_rest(self):
+        from launcher import modext, mods
+        game = self.tmp / 'game'
+        root = game / 'mods'
+        write_mod(root, 'Timer', {'name': 'old'}, [('settings.json', '{"kept": true}'), ('stale.txt', '')])
+        single = self.zip('Timer.nx2mod', [('mod.json', '{"name": "new"}')])
+        self.assertTrue(modext.replaces(game, single))
+        self.assertEqual(modext.add(game, single), root / 'Timer')          # over the mod of its name
+        self.assertEqual((root / 'Timer' / 'settings.json').read_text(), '{"kept": true}')
+        self.assertFalse((root / 'Timer' / 'stale.txt').exists())
+        zipped = self.zip('Timer.zip', [('Timer/mod.json', '{"name": "newer"}')])   # a zip with a mod.json: the same
+        self.assertEqual(modext.add(game, zipped), root / 'Timer')
+        self.assertEqual(mods.scan(game)[0].title, 'newer')
+        plain = self.zip('Pack.zip', [('Pack/romfs/a', 'a')])                # any other archive: mods.add
+        self.assertFalse(modext.replaces(game, plain))
+        self.assertEqual(modext.add(game, plain), root / 'Pack')
+        self.assertEqual(modext.add(game, plain), root / 'Pack 2')           # under a free name, nothing replaced
+        self.assertTrue((root / 'Pack 2' / 'romfs' / 'a').is_file())
+        with self.assertRaises(mods.ModError):
+            modext.add(game, self.zip('Evil.nx2mod', [('../x', 'x')]))
+        (self.tmp / 'notes.txt').write_text('')
+        with self.assertRaises(mods.ModError):
+            modext.add(game, self.tmp / 'notes.txt')
+
+
 class WindowTest(Tmp):
     def test_selftest(self):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('19 screens drawn', r.stdout)
+        self.assertIn('21 screens drawn', r.stdout)
 
 
 # ---------------------------------------------------------------- mods

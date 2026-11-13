@@ -87,10 +87,11 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
-Mods, Rebuild the Game, Customize Launcher, Settings); mods (Open Mods Folder, Add a Mod, Add a Mod Folder, one On/Off
-row for each mod, More Mods when they fill more than a page, Load Order, Back); load order (each mod with its place,
-left and right to move it); customize (Color Scheme, with Custom Background Color, Panel Color and
+last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, the rows the mods' launcher
+add-ons put there, Game Folder, Saves, Mods, Rebuild the Game, Customize Launcher, Settings); mods (Open Mods Folder,
+Add a Mod, Add a Mod Folder, Reload Mods, one On/Off row for each mod, More Mods when they fill more than a page, Load
+Order, Back); load order (each mod with its place, left and right to move it); the menus a mod's launcher add-on
+opens; customize (Color Scheme, with Custom Background Color, Panel Color and
 Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
 Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
@@ -352,7 +353,8 @@ Mods (home, under Saves; `launcher/mods.py`) is where the player puts the mods t
 folder's `mods` folder (`runtime/mods.c`; `mods_dir` in nx2navi.ini names another): one folder per mod, holding a
 `romfs` folder with the game files it replaces, an `exefs` folder with code patches (`.ips`, `.pchtxt`) or a `cheats`
 folder, either at its top or in the Atmosphere layout (`atmosphere/contents/0400486024DEC000/romfs` and the others
-`tools/mod_files.py` lists).
+`tools/mod_files.py` lists). A mod made for NX2navi can bring more than the game reads, named in its `mod.json`
+(`launcher/modext.py`, "What a mod brings for the launcher" below).
 
 A mod goes in as it came. Play first puts the folder in order (`mods.prepare`): an archive (`.zip`, and `.7z` or
 `.rar` through Windows' own `tar`, which reads them on Windows 10 and 11) is unpacked into a folder of its name unless
@@ -360,14 +362,32 @@ that folder is there already, and the archive stays; a mod folder whose files si
 that held the mod's own folder) gets them moved up; a `romfs`, `romfslite`, `exefs` or `cheats` folder put straight into
 the mods folder becomes a mod of its own, *Unnamed mod*. An archive that would write outside its folder is refused.
 Nothing is deleted. Add a Mod and Add a Mod Folder do the same for an archive or folder the player picks, which is
-unpacked or copied into the mods folder under a free name; Open Mods Folder opens it.
+unpacked or copied into the mods folder under a free name; Open Mods Folder opens it (the Settings screen's Mods
+Folder row too). Reload Mods reads the folder again after the player changed it by hand and loads the launcher add-ons
+anew.
 
-Each mod has an On/Off row; its description says what it changes (how many game files, code patches, cheats), which
-other mod changes the same files and which of the two wins, and why the game leaves it off when it does: a code module
-(`subsdk*`), a download with options to pick from (several folders that each hold a mod), a mod for another game or
-another version, or nothing the game reads. Load Order sets which mod wins a file two of them change: the higher one.
+A mod made for NX2navi can come as one file, `<Mod Name>.nx2mod` (a zip; a `.zip` that holds a `mod.json` counts as
+one). It is an archive like the others, with three differences (`modext.prepare`, `modext.add`). It is unpacked into
+`mods\<Mod Name>` with the one folder it may hold at its top taken off, whatever that folder holds. Add a Mod unpacks
+it over the mod of that name instead of beside it, and that mod's settings (`settings.json`) stay: this is how such a
+mod is updated; it waits while the game runs. And a `.nx2mod` in the mods folder is unpacked again when the player
+puts a newer file in its place (the folder notes which file it came from, in `.nx2mod-source`; a folder that came
+another way is never replaced). It is refused when it holds names that leave the folder, links, more than 20,000
+files or more than 8 GB. The launcher unpacks these files before Play as the other archives, and also when it starts
+and at Reload Mods, so that a mod's launcher add-on is there before the first Play. Like every archive the file stays
+in the mods folder: removing the folder and the file removes the mod. (Launchers before this one moved the file to
+`mods\.installed`; those files come back beside their folders, which stay as they are.)
+
+Each mod has an On/Off row; its description says what the mod is when its `mod.json` tells (name, version, author,
+its own text), what it changes (how many game files, code patches, cheats, a launcher add-on, code of its own for
+the game, variables), which other mod changes the same files and which of the two wins, what is wrong with its
+`mod.json` or its add-on, and why the game leaves it off when it does: a code module (`subsdk*`), a download with
+options to pick from (several folders that each hold a mod), a mod for another game or another version, or nothing
+the game reads (which is no fault in a mod that brings a launcher add-on, code or variables: it has its switch). Load
+Order sets which mod wins a file two of them change: the higher one.
 The switches and the order are the game's own settings, `mods_disabled` and `mods_order` in nx2navi.ini, written as the
-game writes them; they apply at the game's next start, so they wait while it runs.
+game writes them; they apply at the game's next start, so they wait while it runs. One switch turns a mod off in the
+game and in the launcher: its launcher add-on comes and goes at once.
 
 **Mods that change the game's code.** The game is lifted from the console's code ahead of time, so code cheats and
 ExeFS patches cannot be applied while it runs: the build turns them into patch sets of the lifted code
@@ -377,6 +397,17 @@ change (only the changed parts compile, and the shaders stay prepared), and `bui
 files it took up. When an enabled mod brings code no build has seen, Play builds the game again first (a few minutes;
 the home's Mods row says "Build Waiting") and starts it after. A Play from Steam then opens the window for that build.
 Code mods are built from the game folder's own `mods` folder only.
+
+**What a mod brings for the launcher.** A mod's `mod.json` ([mods-launcher.md](mods-launcher.md)) can name a launcher
+add-on, which may put rows of its own on home (in a group under Updates) and open menus of its own; environment
+variables for the game; and game code, DLLs the launcher loads into the game before it starts running and the game
+then gives its plugin interface ([plugins.md](plugins.md)). Play and the Steam shortcut both start the game with the
+variables and DLLs of the enabled mods (`modext.start_game`), after the mods folder is put in order and, when a mod's
+code waits, after that build; an add-on that starts the game itself goes the same way. A DLL that does not load is
+named on home when the launcher comes back; the game runs without it.
+
+Mods with a launcher add-on or game code run with the player's rights on the PC, as any program does: install only
+mods you trust. The Mods screen says so beside each such mod and at Add a Mod.
 
 ## Importing a save folder
 
@@ -474,6 +505,36 @@ game folder is the default `<launcher>\game`. The dump is never touched.
 The release resolves the MSYS2 packages of the day into `toolchain.lock.json` (`--lock` reuses an older lock). The
 repository keeps old package files, so a release keeps building with the compiler it was tested with.
 
+## Custom build
+
+`.github/workflows/custom-build.yml` makes the release above on a Windows runner of this fork, with `--feed` naming the
+repository it runs in, so a launcher installed from it updates from the fork. It runs only when asked, never on a
+schedule or a branch push:
+
+- Actions > Custom build > Run workflow: an optional version suffix (`custom.1` gives `<VERSION>-custom.1`; empty keeps
+  `VERSION`), whether to create a release, and whether to put NVIDIA DLSS in (off by default).
+- A pushed tag `custom-v<version>` (`git tag custom-v0.9.0-custom.1`, then `git push origin custom-v0.9.0-custom.1`):
+  the version is the tag's, and a release is always created.
+
+It runs `tools/check_content.py`, `tests/launcher_test.py` and `tests/plugins_check.py` without a game, builds the
+runtime's shaders and the shader translator, then `make_launcher.py --no-dlss` (FSR, DLSS Frame Generation and the
+button art are never in it). Every run uploads `build/launcher-release` as the artifact
+`nx2navi-launcher-<version>` (the four release files, `SHA256SUMS.txt` and the launcher folder). With a release, those
+four files and the checksums go to a draft pre-release `custom-v<version>`. No game file is involved: players build the
+game from their own dump, as with every release.
+
+A draft is seen by nobody: publish it by hand. A published pre-release reaches only launchers on the Preview channel;
+untick "pre-release" for the Stable channel. A suffix makes the version a pre-release one (`launcher/versions.py`): it
+sorts before the plain `VERSION`, and two suffixes compare as text, so `custom.10` sorts before `custom.9` (use
+`custom.09` or bump `VERSION`).
+
+A player downloads `NX2navi-Setup-<version>.exe` from the fork's release and runs it; the launcher then installs the
+build tools and builds the game from the player's dump as described under "Installing", and its updates come from the
+fork. A launcher installed from upstream keeps upstream's feed: the custom setup replaces it only when the installed
+version is not newer than the setup's (`launcher/native/setup.c` `work`), and `0.9.0-custom.1` is older than an
+installed `0.9.0`, so uninstall it first, install into another folder (`--dest`), or set `feed_repo` in
+`data/launcher.json` to the fork.
+
 ## Tests
 
 `python tests/launcher_test.py` (Python 3.14): versions, settings, the toolchain resolver and installer against a
@@ -495,8 +556,12 @@ largest-first order, its windres call under folders with spaces in their names, 
 install, the save import (the account folder, the save folders it recognises, backup, the commit journal, the saves
 folder, refusals), the shared save's zip (export of the save the game would load, the bug report files, no key
 files, the import of a zip with its backup, a zip in the saves folder, the menu's waiting import dropped, the zips it
-refuses: no manifest, another format or game, a newer format, paths outside the save, links, damage), the install
-job with a fake
+refuses: no manifest, another format or game, a newer format, paths outside the save, links, damage), what the mods
+bring for the launcher (`mod.json`, bad manifests and paths that leave the mod, the `mods_disabled` switch written as
+the game reads it, launcher add-ons registering rows and menus, add-ons that raise or exit, their settings file, the
+Mods screen's rows for them, a Play from an add-on that waits for the build of a mod's code, the variables and DLLs a
+start gets, a DLL built with the C compiler loaded into a suspended system program, `.nx2mod` files packed, unpacked
+from the mods folder and by Add a Mod, and refused when unsafe), the install job with a fake
 `make_game.py` (with and without the prompts row), and the window's selftest when a display is there.
 
 What goes wrong around a build is tested the same way, on made-up folders and stand-in processes: an update that
