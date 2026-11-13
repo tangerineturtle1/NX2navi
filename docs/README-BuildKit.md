@@ -130,9 +130,12 @@ the game's own scaling and swapchain as they are (the log says `ffx: ... not fou
 AMD's own FSR 4 upscaler (`amd_fidelityfx_loader_vk.dll`/`amd_fidelityfx_upscaler_vk.dll`) is likewise Windows-only,
 but `runtime/vk_ffx4.cpp` also loads `amd_fidelityfx_upscaler_vk.so` on Linux: an independent FSR 4.1.1 implementation,
 [fsr4-vk](https://github.com/Astyyyyy/fsr4-vk) (GPL-3.0; not affiliated with or endorsed by AMD), built from AMD's own
-extracted model weights and not shipped in this repository. Its `tools/build/linux.sh` builds the library; drop the
-result beside `ocarina`. `vk_ffx_upscale` (`runtime/vk_ffx.cpp`) only tries FSR 4 after FSR 3.1's own library above
-loads, so FSR 4 needs it too; with both in place `fsr4 = 1` works the same as on Windows.
+extracted model weights and not shipped in this repository. `tools/ffx4_linux/fetch.sh build/ffx4_linux` downloads and
+builds it (`tools/ffx4_linux/README.md`, `THIRD_PARTY_NOTICES.md`); the next `make_game.py` run finds
+`build/ffx4_linux/amd_fidelityfx_upscaler_vk.so` and copies it beside the game, with its licence text. It is built
+once; rerun `fetch.sh` only to pick up a newer upstream commit. `vk_ffx_upscale` (`runtime/vk_ffx.cpp`) only tries
+FSR 4 after FSR 3.1's own library above loads, so FSR 4 needs it too; with both in place `fsr4 = 1` works the same as
+on Windows.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside
