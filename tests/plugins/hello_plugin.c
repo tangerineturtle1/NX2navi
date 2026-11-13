@@ -4,7 +4,8 @@
 // count its calls, adds a button to the game's title menu, logs the first presses of the game's buttons, and says
 // goodbye when the game closes. In a game with version 3 the title menu button opens a page of two rows in the game's
 // own settings screen (a switch for the text, and a button that closes the page); in an older one it shows and hides
-// the text itself. In a game with version 4 it marks the point the game's camera looks at, with its distance.
+// the text itself. In a game with version 4 it marks the point the game's camera looks at, with its distance. In a
+// game with version 6 it draws a small picture made from four pixels beside its text.
 // Build (the toolchain's clang; runtime/ holds plugin_api.h):
 //   clang -O2 -shared -I runtime -o hello_plugin.dll tests/plugins/hello_plugin.c
 // Run: set NX2NAVI_MOD_DLLS to the DLL's full path and start the game, or name the DLL in a mod's mod.json.
@@ -23,6 +24,7 @@ static atomic_ullong frames;   // written by the frame callback (the game's thre
 static atomic_ullong steps;    // written by the hook (the thread that runs the game's frame step)
 static atomic_int shown = 1;   // the overlay text shows; the title menu button "Hello Plugin" toggles it
 static atomic_int pads;        // pad events logged so far
+static int picture;            // version 6: a picture of 2x2 pixels (texture_create), 0 in an older game
 static _Thread_local char here;   // its address tells one thread from another in the log
 
 static void on_frame(const Nx2Frame *frame, void *user) {
@@ -119,6 +121,12 @@ static void on_overlay(const Nx2Draw *d, void *user) {
     d->rect(x, y, x + wh[0] + 2 * pad, y + wh[1] + 2 * pad, NX2_RGBA(236, 196, 104, 255), 2 * d->scale);
     d->text(x + pad, y + pad, size, NX2_RGBA(255, 255, 255, 255), text);
     d->line(x, y - 4 * d->scale, x + wh[0] + 2 * pad, y - 4 * d->scale, NX2_RGBA(236, 196, 104, 255), 2 * d->scale);
+    // Version 6: a picture, here the whole of it (0, 0 to 1, 1) as a square the height of the box, untinted. The
+    // overlay's structure of an older game ends before `image`.
+    if (picture && NX2_HAS(d, Nx2Draw, text_font_size)) {
+        float side = wh[1] + 2 * pad, px = x + wh[0] + 3 * pad;
+        d->image(picture, px, y, px + side, y + side, 0, 0, 1, 1, NX2_RGBA(255, 255, 255, 255));
+    }
     // Version 4: the scene's camera. world_to_screen places a point of the game's world in the overlay (inside the
     // game picture's rectangle); here the point is the one the camera looks at, which is near Link in play. Nothing
     // is drawn while there is no camera (the title screen, a loading screen).
@@ -159,5 +167,12 @@ void nx2navi_plugin_init(const Nx2PluginApi *a) {
                                  .on_select = on_title_button};
         if (!api->add_title_button(&button)) api->log("hello: no title menu button in this game");
         api->on_pad(on_pad, NULL);
+    }
+    if (NX2_HAS(api, Nx2PluginApi, font_free)) {
+        // four pixels, red, green, blue, alpha each: red and green above, blue and half clear white below. With
+        // NX2_TEXTURE_PIXELS they stay four squares when drawn larger. texture_load would read a PNG file instead.
+        static const uint8_t four[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128};
+        picture = api->texture_create(2, 2, four, NX2_TEXTURE_PIXELS);
+        api->log("hello: a picture of 2x2 pixels, handle %d", picture);
     }
 }

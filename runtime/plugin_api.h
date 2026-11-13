@@ -1,4 +1,4 @@
-// NX2navi plugin interface, version 5: what a mod's native library (a DLL loaded into the game's process) can ask of the
+// NX2navi plugin interface, version 7: what a mod's native library (a DLL loaded into the game's process) can ask of the
 // game. docs/plugins.md is the guide; runtime/plugins.c is the implementation.
 //
 // Copyright (c) 2026 chrg6.
@@ -33,12 +33,16 @@
 // the keyboard mark of pad events and restart. Version 5 added the follow camera's reset (camera_reset), the save
 // folder changed on the title screen (set_save_dir), the caller's frame pointer in a hook (Nx2HookCall.fp), the game's
 // language and the account's name (Nx2GameInfo), a text row typed into with a gamepad, and a menu page whose cursor
-// goes where focus_row says. A plugin built against an earlier version runs unchanged.
+// goes where focus_row says. Version 6 added pictures and fonts from files for the overlay (texture_create,
+// texture_load, texture_free, font_load, font_free, and Nx2Draw's image, text_font and text_font_size). Version 7 added
+// Steam for a mod's own multiplayer (steam: rooms, invites and datagrams between the games of a room). A plugin built
+// against an earlier version runs unchanged.
 //
 // Threads, in short (docs/plugins.md has the rules): frame callbacks run on the game's thread between two frames; hook
 // callbacks run on whichever thread of the game calls the hooked function; guest_call works in those two and nowhere
-// else; overlay callbacks run on the thread that presents; key and text callbacks run on the window's thread. A
-// library that registered a callback must stay loaded (the game pins it).
+// else; overlay callbacks run on the thread that presents; key and text callbacks run on the window's thread; Steam events
+// (version 7) run on the runtime's Steam thread. A library that registered a callback must stay loaded (the game pins
+// it).
 #ifndef NX2NAVI_PLUGIN_API_H
 #define NX2NAVI_PLUGIN_API_H
 
@@ -49,7 +53,7 @@
 extern "C" {
 #endif
 
-#define NX2_PLUGIN_API_VERSION 5u
+#define NX2_PLUGIN_API_VERSION 7u
 #define NX2_PLUGIN_API_EXPORT "nx2navi_plugin_api"     // exported by the game's executable
 #define NX2_PLUGIN_INIT_EXPORT "nx2navi_plugin_init"   // optionally exported by a plugin
 
@@ -153,7 +157,34 @@ typedef struct Nx2Draw {
     // A point of the game's picture at the fractions (u, v) is at (picture_x + u * picture_width, picture_y + v *
     // picture_height): what a marker on the game's map or over a character is placed with.
     float picture_x, picture_y, picture_width, picture_height;
+    // ---- version 6: check with NX2_HAS(draw, Nx2Draw, text_font_size)
+    // A picture (texture_create, texture_load) over the rectangle (x0, y0)-(x1, y1), in the same pixels as rect_filled.
+    // (u0, v0) and (u1, v1) are the corners of the part of the picture to show, as fractions of it: 0, 0 is its top
+    // left corner and 1, 1 its bottom right one, so 0, 0, 1, 1 shows all of it and a part given in the picture's own
+    // pixels is px / width, py / height. Swapped corners mirror it. Every pixel is multiplied by rgba: NX2_RGBA(255,
+    // 255, 255, 255) leaves the picture as it is, a lower alpha lets the game show through, a colour tints it.
+    // Nothing is drawn for a handle that is not a picture's.
+    void (*image)(int texture, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1,
+                  uint32_t rgba);
+    // text and text_size with a font of the plugin's own (font_load). size is the height in pixels; 0 is the size
+    // the font's letters were made at (its pixel_size * scale, or its pixel_size alone with NX2_FONT_EXACT), the one
+    // size at which they are drawn as they were made and not stretched. shadow_rgba other than 0 draws the text once more under it in that
+    // colour, a little down and to the right (NX2_RGBA(0, 0, 0, 160) is a soft dark one). A handle that is not a
+    // font's, or a font loaded since the last picture, draws and measures with the overlay's own font.
+    void (*text_font)(int font, float x, float y, float size, uint32_t rgba, uint32_t shadow_rgba, const char *utf8);
+    void (*text_font_size)(int font, float size, const char *utf8, float out_wh[2]);
 } Nx2Draw;
+
+// ---- version 6: flags of texture_create and texture_load, and of font_load
+enum {
+    NX2_TEXTURE_PIXELS = 1,       // pixel art: shown larger, the picture's pixels stay squares with hard edges, and no
+                                  // smaller copies are made of it. Without it a picture is smoothed when stretched and
+                                  // keeps smaller copies of itself, so that it stays clean when drawn much smaller.
+};
+enum {
+    NX2_FONT_EXACT = 1,           // pixel_size is in the window's own pixels: the letters are made at that size whatever
+                                  // the window's size (see font_load)
+};
 
 // A key going down or up. key is an NX2_KEY_* value.
 typedef struct Nx2KeyEvent {
@@ -294,6 +325,136 @@ typedef struct Nx2Camera {
     float view[16];
     float projection[16];
 } Nx2Camera;
+
+// ---- version 7: Steam for a mod's own multiplayer (Nx2PluginApi.steam; docs/plugins.md "Steam"). The game signs in to
+// Steam as Steam's public test app (480), as the game's own co-op does, with the Steam library the launcher puts
+// beside the game; rooms are friends-only Steam lobbies, and the games of a room send each other datagrams through
+// Steam's network: no port to forward, no address to type. Every text is UTF-8.
+enum {                            // Nx2SteamStatus.state
+    NX2_STEAM_OFF,                // start was not called, or stop was
+    NX2_STEAM_STARTING,           // start was called; Steam has not answered yet
+    NX2_STEAM_READY,              // signed in: rooms can be made and joined
+    NX2_STEAM_UNAVAILABLE,        // Steam cannot be used now: `why` and `says` tell; tried again every few seconds
+};
+enum {                            // Nx2SteamStatus.why
+    NX2_STEAM_WHY_NONE,
+    NX2_STEAM_WHY_NO_LIBRARY,     // steam_api64.dll is not beside the game (the launcher copies it there from a Steam
+                                  // game the player has installed), or does not load
+    NX2_STEAM_WHY_OLD_LIBRARY,    // the library beside the game lacks a call this needs (it is from before 2021)
+    NX2_STEAM_WHY_NO_CLIENT,      // Steam is not running, or not signed in
+    NX2_STEAM_WHY_GAME_COOP,      // the game's own co-op is on (coop_steam = 1) and has Steam: one of the two at a time
+    NX2_STEAM_WHY_IN_USE,         // another plugin has it
+    NX2_STEAM_WHY_OTHER,
+};
+enum {                            // Nx2SteamEvent.kind
+    NX2_STEAM_EV_STATE = 1,       // Nx2SteamStatus.state changed (ready, unavailable): ask status
+    NX2_STEAM_EV_ROOM_ENTERED,    // a: the room. This game made it or came into it; members and status know it
+    NX2_STEAM_EV_ROOM_FAILED,     // code: NX2_STEAM_FAIL_*. The room was not made or not entered; this game is in none
+    NX2_STEAM_EV_MEMBER_JOINED,   // a: the player's id
+    NX2_STEAM_EV_MEMBER_LEFT,     // a: the player's id
+    NX2_STEAM_EV_OWNER_CHANGED,   // a: the new owner's id (the owner left and Steam handed the room to a member)
+    NX2_STEAM_EV_INVITED,         // a: the room, b: the friend who invites this player (room_code gives its text)
+    NX2_STEAM_EV_JOIN_ASKED,      // a: the room. The player accepted an invite, or chose "Join game", in Steam itself
+    NX2_STEAM_EV_MESSAGE,         // a: the sender (a member of the room), data and n: the datagram, valid in the callback
+    NX2_STEAM_EV_LOST,            // Steam closed or lost its connection: the room is gone, this game is in none
+};
+enum {                            // Nx2SteamEvent.code of NX2_STEAM_EV_ROOM_FAILED
+    NX2_STEAM_FAIL_CREATE = 1,    // Steam did not make the room
+    NX2_STEAM_FAIL_NO_ROOM,       // no room has that id (any more)
+    NX2_STEAM_FAIL_FULL,
+    NX2_STEAM_FAIL_REFUSED,       // Steam does not let this player in
+    NX2_STEAM_FAIL_OTHER,
+    NX2_STEAM_FAIL_NOT_OURS,      // the lobby is not one of this plugin's (another tag, or another program's): left at once
+};
+#define NX2_STEAM_NAME_CAP 64     // a player's name with its terminator
+#define NX2_STEAM_CODE_CAP 16     // a room id's text with its terminator
+#define NX2_STEAM_MESSAGE_MAX 1200   // the most bytes of one datagram (send)
+#define NX2_STEAM_ROOM_MAX 8      // the most players of a room
+typedef struct Nx2SteamEvent {
+    uint32_t size;
+    uint32_t kind;                // NX2_STEAM_EV_*
+    uint64_t a, b;
+    int32_t code;
+    uint32_t n;                   // NX2_STEAM_EV_MESSAGE: the datagram's bytes
+    const void *data;
+} Nx2SteamEvent;
+// Called on the runtime's Steam thread (never the game's: guest_call does not work in it), one event at a time. It may
+// call every function of Nx2Steam; it should return soon, since no other event and no datagram is handed out
+// meanwhile.
+typedef void (*Nx2SteamFn)(const Nx2SteamEvent *event, void *user);
+typedef struct Nx2SteamStatus {
+    uint32_t size;                // set it before the call; only that many bytes are written
+    uint32_t state;               // NX2_STEAM_*
+    uint32_t why;                 // NX2_STEAM_WHY_*, while state is NX2_STEAM_UNAVAILABLE (and after a refused start)
+    uint32_t local;               // 1: the stand-in for tests is in use, not Steam (docs/plugins.md)
+    char says[200];               // the reason as an English sentence, for a log; "" when there is none
+    uint64_t self;                // this player's Steam id; 0 until ready
+    char name[NX2_STEAM_NAME_CAP];   // this player's Steam name
+    uint64_t room;                // the room this game is in, 0 none
+    uint64_t owner;               // its owner's id: the player whose game made it, or the one Steam handed it to
+    char room_code[NX2_STEAM_CODE_CAP];   // the room's id as players pass it on, "XXXX-XXXX"; "" in no room
+    uint32_t entering;            // 1 from room_create or room_join until its ENTERED or FAILED event
+    uint32_t members;             // players in the room, this one included
+} Nx2SteamStatus;
+typedef struct Nx2SteamMember {   // fixed: 80 bytes
+    uint64_t id;
+    char name[NX2_STEAM_NAME_CAP];   // "" while Steam has not got the name yet
+    uint8_t self, owner;
+    uint8_t reserved[6];
+} Nx2SteamMember;
+typedef struct Nx2SteamFriend {   // fixed: 80 bytes
+    uint64_t id;
+    char name[NX2_STEAM_NAME_CAP];
+    uint8_t online;               // signed in to Steam now
+    uint8_t in_app;               // shown as playing app 480: probably in this game with Steam on, so that an invite
+                                  // reaches the game itself and not only Steam's own window
+    uint8_t reserved[6];
+} Nx2SteamFriend;
+// The functions may be called from any thread. Those that ask something of Steam (start, room_create, room_join,
+// room_leave, invite, send) only queue it for the runtime's Steam thread and return at once; what came of it arrives
+// as an event.
+typedef struct Nx2Steam {
+    uint32_t size;
+    uint32_t reserved;
+    // Signs in to Steam for this plugin and starts the events. tag names the plugin's rooms, 1 to 31 characters of
+    // a-z, 0-9, '-', '_' and '.': a room made carries it, and a lobby entered that carries another tag, or none (the
+    // game's own co-op's, another program's), is left at once (NX2_STEAM_FAIL_NOT_OURS). fn(event, user) gets what
+    // happens. Returns 1 when the sign-in is on its way: NX2_STEAM_EV_STATE follows, with state READY, or UNAVAILABLE
+    // and the reason; an unavailable Steam is tried again every few seconds until stop. Returns 0, with status().why
+    // saying why, when it cannot start at all: the game's own co-op is on, another plugin has Steam, a tag out of
+    // the rule, fn NULL. Steam shows the player as playing "Spacewar" from the sign-in until stop.
+    int (*start)(const char *tag, Nx2SteamFn fn, void *user);
+    // Leaves the room and signs out; no event comes after it returned, unless it was called inside the callback
+    // (the one being handled is then the last). Also done by the runtime when the game ends.
+    void (*stop)(void);
+    // Where Steam stands, a copy made under a lock. 1 when *out was filled.
+    int (*status)(Nx2SteamStatus *out);
+    // Makes a room for up to max_players (2 to NX2_STEAM_ROOM_MAX): a friends-only lobby, which the player's friends
+    // may see and join from Steam and anyone else joins by its id or an invite. 1 when asked: ROOM_ENTERED or
+    // ROOM_FAILED follows. 0: not ready, or already in a room or on the way into one.
+    int (*room_create)(int max_players);
+    // Joins the room a room id names (any case, with or without the dash and spaces). 1 when asked, as room_create; 0
+    // also when the text is no room id (nothing is asked of Steam).
+    int (*room_join)(const char *code);
+    void (*room_leave)(void);     // leaves the room, or gives up entering one; no event follows
+    // A room's number as the text players pass on ("XXXX-XXXX", the game's own co-op's format), for the room of an
+    // invite. 1 when out was written; 0 for a number that is no room's.
+    int (*room_code)(uint64_t room, char out[NX2_STEAM_CODE_CAP]);
+    // The players in the room, the owner first, then in Steam's order; at most max are written. Returns how many.
+    int (*members)(Nx2SteamMember *out, int max);
+    // The player's friends as of a moment ago (looked up every few seconds while ready): those in the app first, then
+    // those online, then the rest, each group by name. Returns how many were written.
+    int (*friends)(Nx2SteamFriend *out, int max);
+    // Steam shows that friend an invite to the room this game is in. In a game with Steam started through this
+    // interface it also arrives as NX2_STEAM_EV_INVITED. 1 when asked.
+    int (*invite)(uint64_t friend_id);
+    // A datagram of n bytes (1 to NX2_STEAM_MESSAGE_MAX) to a member of the room; to 0: to every other member.
+    // reliable 1: it arrives, in order with the other reliable ones; 0: it may be lost and is never late. Steam
+    // encrypts it and vouches for the sender's id; only a member's datagrams are handed out (NX2_STEAM_EV_MESSAGE).
+    // They travel on a channel of the plugin interface's own, apart from the game's own co-op's. 1 when queued; 0: in
+    // no room, n out of range, or 512 datagrams are waiting.
+    int (*send)(uint64_t to, const void *data, size_t n, int reliable);
+} Nx2Steam;
 
 typedef struct Nx2PluginApi {
     uint32_t size;
@@ -439,10 +600,67 @@ typedef struct Nx2PluginApi {
     // callback, a hook, a menu page's on_event). Returns 1 when the folder is in use; game_info()->save_dir then names
     // it (a new pointer).
     int (*set_save_dir)(const char *folder);
+
+    // ---- version 6: in a game that may be older, check with NX2_HAS(api, Nx2PluginApi, font_free)
+    // Pictures and fonts for the overlay's image and text_font. All five may be called from any thread and at any
+    // time, before the window exists too (nx2navi_plugin_init): the work on the graphics card is done by the
+    // presenting thread when the picture or font is first needed.
+    // A picture from width x height pixels in memory, 4 bytes a pixel in the order red, green, blue, alpha (alpha 255
+    // opaque; colours not multiplied by alpha), the top row first, rows without padding. The pixels are copied. flags:
+    // NX2_TEXTURE_* or 0. Returns a handle above 0, or 0 (the log says why): a side of 0 or above NX2_TEXTURE_SIDE_MAX,
+    // rgba NULL, no memory, or NX2_TEXTURES_MAX pictures in use over all plugins.
+    int (*texture_create)(uint32_t width, uint32_t height, const void *rgba, uint32_t flags);
+    // A picture from a file. path is UTF-8, absolute (build it from game_info()->mods_dir or the plugin's own folder):
+    //   - a PNG file: 8 or 16 bits a channel, grey, grey with alpha, colour, colour with alpha or a palette, with or
+    //     without a transparent colour; not interlaced (Adam7), which is refused;
+    //   - "romfs:<file>#<name>": the texture <name> of a texture archive (.bntx, or .bntx.zs) of the game's own files,
+    //     named as in its RomFS, such as "romfs:UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs#<name>".
+    //     Unpacking an archive takes from a moment to a few seconds each call: call it from a thread of the plugin's
+    //     own, or once at the start. A mask of the game's (one channel) comes out white with the mask as alpha.
+    // out_wh, when not NULL, gets the picture's width and height in pixels. Returns a handle or 0 as texture_create.
+    int (*texture_load)(const char *path, uint32_t flags, uint32_t out_wh[2]);
+    // Gives a picture up. It may be called while an overlay callback draws with it on another thread: the picture
+    // drawn this frame still shows, and the handle draws nothing afterwards. Freeing a picture that was drawn makes
+    // the presenting thread wait once for the graphics card (a few milliseconds): free rarely, not every frame.
+    void (*texture_free)(int texture);
+    // A font from a file for text_font: a TrueType or OpenType file (.ttf, .otf; of a collection .ttc the first
+    // face), path as for texture_load, or "romfs:<file>" for a font of the game's own (.bfotf, .bfttf, with or
+    // without .zs), such as "romfs:Font2/Scalable/ClarimoUDPE-Regular.Nin_Ounce_NVN2.bfotf.zs". pixel_size is the
+    // height the letters are made for (4 to 400), flags NX2_FONT_* or 0:
+    //   - flags 0: the height in a picture 1080 pixels high. The runtime makes the letters at pixel_size *
+    //     Nx2Draw.scale and again when the window's size changes, so text drawn with size 0, or with pixel_size *
+    //     scale, is sharp in every window. Nx2Draw.scale does not go under 2 / 3 (more on a display scaled above
+    //     100 %), so that text stays readable in a small window: there such text takes a larger share of the picture;
+    //   - NX2_FONT_EXACT: the height in the window's pixels as they are. For text that must keep its share of the
+    //     game's picture in every window, as the game's own does: load the font at share * Nx2Draw.picture_height,
+    //     and when that height has changed (and held for a moment: a window being dragged changes it every frame),
+    //     free the font and load it at the new size.
+    // Load a font once for each size the plugin draws at; a size other than the one the letters were made at
+    // stretches them, which blurs. The letters made are Latin with its accented letters (U+0020 to U+00FF), Cyrillic
+    // (U+0400 to U+052F) and the dashes, quotes and dots U+2010 to U+2027; any other character shows as the font's
+    // mark for a missing one.
+    // Returns a handle above 0, or 0 (the log says why): the file is missing or is not a font the runtime can read,
+    // the size is out of range, or NX2_FONTS_MAX fonts are loaded over all plugins. The font can be drawn with from the
+    // next picture on (until then text_font uses the overlay's own font at the size asked for); making the letters
+    // takes the presenting thread some tens of milliseconds each time a font was loaded, so load fonts at the start
+    // or on a change of the window, not while playing. Fonts whose letters would take more than about 24 million
+    // pixels together (a font takes about 250 * its size squared) are left out, with a line in the log, and draw
+    // with the overlay's own font.
+    int (*font_load)(const char *path, float pixel_size, uint32_t flags);
+    void (*font_free)(int font);   // gives a font up; the handle then draws with the overlay's own font
+
+    // ---- version 7: in a game that may be older, check with NX2_HAS(api, Nx2PluginApi, steam)
+    // Steam for a mod's own multiplayer: rooms (friends-only Steam lobbies with a room id), invites, and datagrams
+    // between the games of a room (Nx2Steam above; docs/plugins.md "Steam"). The table is always returned; whether
+    // Steam can be used is what its start and status say. Any thread.
+    const Nx2Steam *(*steam)(void);
 } Nx2PluginApi;
 
 #define NX2_HOOKS_MAX 64          // function hooks registered at a time, over all plugins
 #define NX2_TITLE_BUTTONS_MAX 4   // title menu buttons at a time, over all plugins
+#define NX2_TEXTURES_MAX 256      // version 6: pictures at a time, over all plugins
+#define NX2_TEXTURE_SIDE_MAX 4096 // version 6: the most pixels along a picture's side
+#define NX2_FONTS_MAX 16          // version 6: fonts at a time, over all plugins (one per file and size)
 
 // The executable's export NX2_PLUGIN_API_EXPORT.
 typedef const Nx2PluginApi *(*Nx2PluginApiFn)(uint32_t version);

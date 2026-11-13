@@ -25,6 +25,18 @@ int plugins_overlay_wanted(void);
 // runs the overlay callbacks through plugins_overlay.
 void plugins_overlay_imgui(float w, float h, float scale, int menu_open);
 void plugins_overlay(Nx2Draw *draw);   // fills draw->frame and calls every overlay callback with it
+// ui/plugin_draw.cpp: pictures and fonts for the overlay (plugin_api.h texture_create ... font_free), from any thread.
+int plugin_texture_create(uint32_t width, uint32_t height, const void *rgba, uint32_t flags);
+int plugin_texture_load(const char *path, uint32_t flags, uint32_t out_wh[2]);
+void plugin_texture_free(int texture);
+int plugin_font_load(const char *path, float pixel_size, uint32_t flags);
+void plugin_font_free(int font);
+// plugin_steam.c: Steam for a mod's own multiplayer (plugin_api.h Nx2Steam). plugin_steam_shutdown: from plugins_exit.
+const Nx2Steam *plugin_steam(void);
+void plugin_steam_shutdown(void);
+// The PNG reader behind texture_load: the file's bytes as RGBA8 (malloc'd, *w x *h), or NULL with *why saying what
+// was wrong. plugins_probe.c checks it.
+uint8_t *plugin_png_decode(const uint8_t *data, size_t n, uint32_t *w, uint32_t *h, const char **why);
 // The window's thread (ui/menu_win.cpp, ui/menu_sdl.cpp). plugins_key: 1 when a callback asked to keep the key from the
 // menu's own keys. plugins_text: a typed character, delivered while a plugin has the input.
 int plugins_key(unsigned key, int down, int repeat);

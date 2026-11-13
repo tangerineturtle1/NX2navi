@@ -6,7 +6,11 @@
     read): a change here breaks plugins built before it, and belongs at the end of a structure with this record
     extended. What each version recorded is kept as it was, apart from the sizes of the structures a later one added to;
   - a plugin built against the version 1 header (kept below, cut to what it needs) still gets the table from a
-    later game and passes it a register block of the old size;
+    later game and passes it a register block of the old size, and one with the version 5 table finds its 26
+    functions in a version 6 game;
+  - version 6 (pictures and fonts for the overlay) is wired: the table's functions, the overlay's drawing calls,
+    the freeing of pictures before the callbacks, the atlas made again for a font loaded later (the PNG reader, the
+    handles and the limits are checked by the game's own `--probe-plugins`);
   - tests/plugins/hello_plugin.c builds into a library that exports nx2navi_plugin_init;
   - with a game executable given: it exports nx2navi_plugin_api (Windows), `--probe-plugins` passes, and the same
     probe started with NX2NAVI_MOD_DLLS naming that library and a missing one loads the first, calls its
@@ -25,8 +29,9 @@ MSYS_BIN = Path(r'C:\msys64\ucrt64\bin')
 
 # sizeof and offsetof on x86-64, as each version fixed them (docs/plugins.md, "Versions": members are only added at the
 # end). The first block is version 1's record, unchanged but for the three sizes that grew; the second is version 2's, and after
-# it what versions 3 (the menu page, the picture's rectangle), 4 (the camera, the menu page's additions) and 5 (the hook's
-# frame pointer, the game's language and account, camera_reset, set_save_dir) added.
+# it what versions 3 (the menu page, the picture's rectangle), 4 (the camera, the menu page's additions), 5 (the hook's
+# frame pointer, the game's language and account, camera_reset, set_save_dir), 6 (pictures and fonts for the
+# overlay) and 7 (Steam for a mod's own multiplayer) added.
 LAYOUT = '''
 #include <stdio.h>
 #include "plugin_api.h"
@@ -66,6 +71,18 @@ int main(void) {
     O(Nx2PluginApi, camera); O(Nx2PluginApi, world_to_screen); O(Nx2PluginApi, restart);
     O(Nx2HookCall, fp); O(Nx2GameInfo, language); O(Nx2GameInfo, account);
     O(Nx2PluginApi, camera_reset); O(Nx2PluginApi, set_save_dir);
+    O(Nx2Draw, image); O(Nx2Draw, text_font); O(Nx2Draw, text_font_size);
+    O(Nx2PluginApi, texture_create); O(Nx2PluginApi, texture_load); O(Nx2PluginApi, texture_free);
+    O(Nx2PluginApi, font_load); O(Nx2PluginApi, font_free);
+    O(Nx2PluginApi, steam); S(Nx2Steam); O(Nx2Steam, start); O(Nx2Steam, send);
+    S(Nx2SteamEvent); O(Nx2SteamEvent, data); S(Nx2SteamStatus); O(Nx2SteamStatus, says); O(Nx2SteamStatus, self);
+    O(Nx2SteamStatus, room_code); O(Nx2SteamStatus, members); S(Nx2SteamMember); O(Nx2SteamMember, self);
+    S(Nx2SteamFriend); O(Nx2SteamFriend, online);
+    printf("steam %d %d %d %d, events %d %d, fails %d %d, caps %d %d %d %d\\n", NX2_STEAM_OFF, NX2_STEAM_STARTING, NX2_STEAM_READY,
+           NX2_STEAM_UNAVAILABLE, NX2_STEAM_EV_STATE, NX2_STEAM_EV_LOST, NX2_STEAM_FAIL_CREATE, NX2_STEAM_FAIL_NOT_OURS,
+           NX2_STEAM_NAME_CAP, NX2_STEAM_CODE_CAP, NX2_STEAM_MESSAGE_MAX, NX2_STEAM_ROOM_MAX);
+    printf("flags %d %d, pictures %d of %d pixels a side, fonts %d\\n", NX2_TEXTURE_PIXELS, NX2_FONT_EXACT, NX2_TEXTURES_MAX,
+           NX2_TEXTURE_SIDE_MAX, NX2_FONTS_MAX);
     printf("version %u, hooks %d, stack arguments %d\\n", NX2_PLUGIN_API_VERSION, NX2_HOOKS_MAX, NX2_STACK_ARGS_MAX);
     return 0;
 }
@@ -79,7 +96,7 @@ Nx2Frame.index 8
 Nx2GuestRegs 224
 Nx2GuestRegs.x 8
 Nx2GuestRegs.v 80
-Nx2Draw 88
+Nx2Draw 112
 Nx2Draw.width 8
 Nx2Draw.frame 24
 Nx2Draw.text 32
@@ -88,7 +105,7 @@ Nx2KeyEvent 16
 Nx2KeyEvent.key 4
 Nx2KeyEvent.down 8
 Nx2KeyEvent.repeat 9
-Nx2PluginApi 216
+Nx2PluginApi 264
 Nx2PluginApi.game_info 8
 Nx2PluginApi.read 24
 Nx2PluginApi.on_frame 40
@@ -170,7 +187,32 @@ Nx2GameInfo.language 72
 Nx2GameInfo.account 80
 Nx2PluginApi.camera_reset 200
 Nx2PluginApi.set_save_dir 208
-version 5, hooks 64, stack arguments 64
+Nx2Draw.image 88
+Nx2Draw.text_font 96
+Nx2Draw.text_font_size 104
+Nx2PluginApi.texture_create 216
+Nx2PluginApi.texture_load 224
+Nx2PluginApi.texture_free 232
+Nx2PluginApi.font_load 240
+Nx2PluginApi.font_free 248
+Nx2PluginApi.steam 256
+Nx2Steam 96
+Nx2Steam.start 8
+Nx2Steam.send 88
+Nx2SteamEvent 40
+Nx2SteamEvent.data 32
+Nx2SteamStatus 328
+Nx2SteamStatus.says 16
+Nx2SteamStatus.self 216
+Nx2SteamStatus.room_code 304
+Nx2SteamStatus.members 324
+Nx2SteamMember 80
+Nx2SteamMember.self 72
+Nx2SteamFriend 80
+Nx2SteamFriend.online 72
+steam 0 1 2 3, events 1 10, fails 1 6, caps 64 16 1200 8
+flags 1 1, pictures 256 of 4096 pixels a side, fonts 16
+version 7, hooks 64, stack arguments 64
 '''
 
 # A plugin as one built against the version 1 header: the structures as that header had them (56, 208 and 104 bytes),
@@ -213,6 +255,22 @@ __declspec(dllexport) void nx2navi_plugin_init(const void *a) {
     if (api->version < 1 || api->size < sizeof *api) return;
     api->log("old: a version 1 plugin got a table of version %u, %u bytes", api->version, api->size);
     api->on_frame(frame, 0);
+}
+'''
+
+# A plugin as one built against the version 5 header: a table of 216 bytes (26 functions). It must get the same table
+# from a version 6 game, with everything version 5 had still in its place.
+V5_PLUGIN = '''
+#include <stddef.h>
+#include <stdint.h>
+typedef struct { uint32_t size, version; void *fn[26]; } Api5;
+_Static_assert(sizeof(Api5) == 216, "the version 5 layout");
+__declspec(dllexport) void nx2navi_plugin_init(const Api5 *a) {
+    void (*log)(const char *, ...) = (void (*)(const char *, ...))a->fn[1];
+    int all = 1;
+    for (int i = 0; i < 26; i++) all &= a->fn[i] != 0;
+    if (a->version < 5 || a->size < sizeof *a || !all) return;
+    log("five: a version 5 plugin got a table of version %u, %u bytes, its 26 functions there", a->version, a->size);
 }
 '''
 
@@ -289,6 +347,30 @@ def main():
     subprocess.check_call([tool('clang'), '-O2', '-Wall', '-Werror', '-shared', *([] if win else ['-fPIC']),
                            '-o', str(old), str(old_src)], env=env)
 
+    five_src, five = work / 'five_plugin.c', work / ('five_plugin.dll' if win else 'five_plugin.so')
+    five_src.write_text(V5_PLUGIN if win else V5_PLUGIN.replace('__declspec(dllexport)', '__attribute__((visibility("default")))'))
+    subprocess.check_call([tool('clang'), '-O2', '-Wall', '-Werror', '-shared', *([] if win else ['-fPIC']),
+                           '-o', str(five), str(five_src)], env=env)
+
+    # Version 6 by the source: the table holds its five functions, every overlay gets the three drawing calls, the
+    # pictures given up are freed before the callbacks, and a font loaded later makes the atlas again before a frame.
+    plugins_c = (rt / 'plugins.c').read_text(encoding='utf-8')
+    draw_cpp = (rt / 'ui' / 'plugin_draw.cpp').read_text(encoding='utf-8')
+    menu_cpp = (rt / 'ui' / 'menu.cpp').read_text(encoding='utf-8')
+    # Version 7 by the source: the table has steam, and the game's end leaves a plugin's room.
+    if '.steam = plugin_steam,' not in plugins_c or 'plugin_steam_shutdown();' not in plugins_c:
+        fails.append('plugins.c: the table has no steam, or the exit does not shut it down')
+    for name in ('texture_create', 'texture_load', 'texture_free', 'font_load', 'font_free'):
+        if f'.{name} = plugin_{name},' not in plugins_c:
+            fails.append(f'plugins.c: the table has no {name}')
+    if 'd.image = draw_image, d.text_font = draw_text_font, d.text_font_size = draw_text_font_size;' not in draw_cpp:
+        fails.append("ui/plugin_draw.cpp: the overlay's structure lacks the version 6 drawing calls")
+    overlay = draw_cpp.split('extern "C" void plugins_overlay_imgui(', 1)[-1]
+    if not 0 < overlay.find('plugin_tex_sweep();') < overlay.find('plugins_overlay(&d);'):
+        fails.append('ui/plugin_draw.cpp: pictures given up are not freed before the overlay callbacks')
+    if 'g_pfont_dirty.load(std::memory_order_acquire) ? fonts_up(scale) : 1' not in menu_cpp:
+        fails.append('ui/menu.cpp: a font a plugin loaded does not make the atlas again')
+
     # A menu page's game calls are made at the frame step, never where a plugin calls update_menu (a frame callback
     # runs while the game's layout animator may: docs/plugins.md "Threads"). Held here by the source: update_menu's
     # body calls no game function, and the frame step's hook does the work.
@@ -310,12 +392,14 @@ def main():
             fails.append("--probe-plugins: the plugin's log line is missing")
         missing = work / 'not_there.dll'
         p = subprocess.run([game, '--probe-plugins'], capture_output=True, text=True, errors='replace',
-                           env=dict(os.environ, NX2NAVI_MOD_DLLS=f'{lib}|{missing}|{old}'))
-        for want in ('probe-plugins: ok', 'plugins: loaded ', '[plugin hello_plugin] hello: interface version 5',
+                           env=dict(os.environ, NX2NAVI_MOD_DLLS=f'{lib}|{missing}|{old}|{five}'))
+        for want in ('probe-plugins: ok', 'plugins: loaded ', '[plugin hello_plugin] hello: interface version 7',
+                     '[plugin hello_plugin] hello: a picture of 2x2 pixels, handle ',
                      '[plugin hello_plugin] hello: first frame callback', 'not_there.dll did not load',
                      '[plugin hello_plugin] hello: the game ends after 1 frames',
                      'hello_plugin added the title menu button "Hello Plugin"',
-                     '[plugin old_plugin] old: a version 1 plugin got a table of version 5',
+                     '[plugin old_plugin] old: a version 1 plugin got a table of version 7',
+                     '[plugin five_plugin] five: a version 5 plugin got a table of version 7, 264 bytes, its 26 functions there',
                      '[plugin old_plugin] old: frame ', 'regs call 0'):
             if want not in p.stdout + p.stderr:
                 fails.append(f'--probe-plugins with NX2NAVI_MOD_DLLS: no line "{want}"\n{p.stderr[-2000:]}')

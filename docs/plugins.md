@@ -64,7 +64,7 @@ objects opens them and calls `nx2navi_plugin_init`; that path is compiled but ha
 
 ## Versions
 
-`NX2_PLUGIN_API_VERSION` is 5. Every structure starts with `size`, its size in bytes in the game that filled it. A
+`NX2_PLUGIN_API_VERSION` is 7. Every structure starts with `size`, its size in bytes in the game that filled it. A
 later game adds members only at the end of a structure and functions only at the end of the table, and keeps the
 meaning of what is there. So:
 
@@ -84,6 +84,8 @@ The interface is the same for every game version, but the game's addresses are n
 | 3 | `open_menu`, `update_menu`, `close_menu` (a page in the game's settings screen); the title menu button is the game's own entry and its `on_select` runs inside the game's handling of the choice; `Nx2Draw.picture_x`, `picture_y`, `picture_width`, `picture_height`. |
 | 4 | `camera`, `world_to_screen`; for the menu page: `open_menu` from a page (it replaces the page), `Nx2Menu.focus_row`, `update_menu` enables a row again, `Nx2MenuRow.text_max` with `NX2_MENU_TEXT` and `Nx2MenuEvent.text` (a text row the player types into); `Nx2PadEvent.keyboard`; `restart`; the environment variable `NX2NAVI_SAVE_DIR`. |
 | 5 | `camera_reset`, `set_save_dir`; `Nx2HookCall.fp` (a backtrace from a hook); `Nx2GameInfo.language` and `account`; for the menu page: the cursor goes where `focus_row` says and passes over every disabled row, `update_menu` sets the caption of the row under the cursor again, and a text row is typed into with a gamepad too. |
+| 6 | Pictures and fonts for the overlay: `texture_create`, `texture_load`, `texture_free`, `font_load`, `font_free`; `Nx2Draw.image`, `text_font`, `text_font_size`. |
+| 7 | Steam for a mod's own multiplayer: `steam`, which returns the table `Nx2Steam` (`start`, `stop`, `status`, `room_create`, `room_join`, `room_leave`, `room_code`, `members`, `friends`, `invite`, `send`) with `Nx2SteamEvent`, `Nx2SteamStatus`, `Nx2SteamMember`, `Nx2SteamFriend`. |
 
 A plugin built against an older header runs unchanged in a later game: it asks for its version and gets the same
 table, of which it reads the part it knows. A plugin built against a newer header asks for the newest version first
@@ -421,8 +423,12 @@ the safest to the fastest:
   where it took 240 before.
 - `map_range(addr, n, writable)` makes that check once and hands back `addr` as a pointer. Use it for a structure
   you read or write field by field. The pointer is good for as long as the game does not unmap the memory: inside a
-  frame or hook callback, until the callback returns; ask again in the next callback (the answer is remembered, so
-  asking is cheap). It is NULL for memory that is not plainly the game's (unmapped addresses, the game's code when
+  hook callback on the game's own thread, until the callback returns; ask again in the next callback (the answer is
+  remembered, so asking is cheap). **Not across a frame callback (`on_frame`, `on_overlay`):** those run while the
+  picture is presented, the game's other threads free and map memory meanwhile, and a pointer kept from earlier in
+  the same callback can be gone: a mod that kept a page's pointer for a whole frame callback ended the game with an
+  access violation during a scene load (2026-11-13, the co-op mod's page cache). There, use `read` (it checks the
+  mapping's generation at every call, which costs one load), or ask `map_range` again right before each use. It is NULL for memory that is not plainly the game's (unmapped addresses, the game's code when
   asked for writing, thread blocks of the kernel region, your own process's memory): fall back to `read` and `write`.
   Use the pointer in your own code only; do not hand it to a system call (`ReadFile`, `recv`) as its buffer, which
   can fail on pages the game's memory manager has set aside. Copy through a buffer of your own instead.
@@ -534,13 +540,196 @@ game's settings menu is open; your drawing shows under it) and `frame` (the inde
 | `rect(x0, y0, x1, y1, rgba, thickness)` | An outline. |
 | `rect_filled(x0, y0, x1, y1, rgba, rounding)` | A filled rectangle, its corners rounded by `rounding` pixels. |
 | `line(x0, y0, x1, y1, rgba, thickness)` | A line. |
+| `image(texture, x0, y0, x1, y1, u0, v0, u1, v1, rgba)` | Version 6: a picture, or a part of it, over a rectangle (below). |
+| `text_font(font, x, y, size, rgba, shadow_rgba, utf8)` | Version 6: text in a font of the plugin's own (below). |
+| `text_font_size(font, size, utf8, out_wh)` | Version 6: nothing: the width and height that text would take. |
 
 Colours are `NX2_RGBA(r, g, b, a)`. Coordinates are pixels of the window's picture, the origin at its top left; the
 game's own image may be letterboxed inside it: since version 3 `picture_x`, `picture_y`, `picture_width` and
 `picture_height` give its rectangle (check `NX2_HAS(draw, Nx2Draw, picture_height)`), and a point of the game's
 picture at the fractions (u, v) is at `(picture_x + u * picture_width, picture_y + v * picture_height)`. The calls and the `draw` pointer are valid only inside the callback
 that got them. The font holds the characters the menu's languages need; a character it lacks shows as its
-replacement glyph.
+replacement glyph. When the game's own files are there, that font is the game's text font (ClarimoUDPE), made at
+`text_height`: `text` at another size stretches its letters.
+
+`scale` is 1 in a window 1080 pixels high and follows the window's height, but it does not go under 2 / 3 (720
+lines; more on a display scaled above 100 %), so that the runtime's own text stays readable in a small window: there,
+things sized with `scale` take a larger share of the picture. What must keep its share of the game's picture in every
+window, as the game's own HUD does, is sized with `picture_height / 1080` instead and placed from `picture_x` and
+`picture_y`.
+
+The runtime does not know whether the game shows its own HUD (a cutscene, a menu of the game's, a dialogue): a plugin
+that must hide its drawing with the game's reads that from the game's memory itself.
+
+### Pictures and fonts
+
+Version 6 (check `NX2_HAS(api, Nx2PluginApi, font_free)` for the functions and `NX2_HAS(draw, Nx2Draw,
+text_font_size)` for the drawing calls). With no picture and no font loaded none of this costs anything.
+
+| Call | Does |
+| --- | --- |
+| `texture_create(width, height, rgba, flags)` | A picture from pixels in memory: 4 bytes a pixel, red, green, blue, alpha (255 opaque, colours not multiplied by alpha), the top row first. The pixels are copied. Returns a handle above 0, or 0. |
+| `texture_load(path, flags, out_wh)` | A picture from a PNG file (`path` UTF-8 and absolute), or one of the game's own textures as `romfs:<archive>#<texture>`. `out_wh` (may be NULL) gets its width and height. |
+| `texture_free(texture)` | Gives the picture up. |
+| `font_load(path, pixel_size, flags)` | A font from a TrueType or OpenType file, or one of the game's own as `romfs:<file>`. Returns a handle above 0, or 0. |
+| `font_free(font)` | Gives the font up. |
+
+All five may be called from any thread and at any time, `nx2navi_plugin_init` included: the pixels and the font
+file are kept, and the presenting thread puts them on the graphics card when they are first needed. A handle is only
+ever drawn with inside an overlay callback. When a call returns 0 the log says why.
+
+**Pictures.** At most `NX2_TEXTURES_MAX` (256) at a time over all plugins, each side 1 to `NX2_TEXTURE_SIDE_MAX`
+(4096) pixels. The runtime keeps a copy of the pixels for as long as the picture lives (4 bytes a pixel), so put
+small pictures that are drawn together into one picture and draw its parts. The PNG reader takes every colour type at
+1 to 16 bits a channel, with a palette's or a colour key's transparency; an interlaced file is refused. Without flags
+a picture is smoothed when stretched and keeps smaller copies of itself, so that it stays clean when drawn much
+smaller than it is (leave a clear pixel or two between the parts of a sheet, or neighbours bleed into each other
+when it is drawn small); `NX2_TEXTURE_PIXELS` keeps hard pixel edges for pixel art. Freeing a picture that was drawn
+makes the presenting thread wait once for the graphics card, a few milliseconds: free rarely, never per frame.
+
+`image` draws the part of the picture between the corners (`u0`, `v0`) and (`u1`, `v1`), **fractions of the picture
+from 0 to 1** with 0, 0 at its top left corner, over the rectangle (`x0`, `y0`)-(`x1`, `y1`) in the overlay's pixels:
+`0, 0, 1, 1` is the whole picture, a part given in pixels is `px / width`, `py / height`, and swapped corners mirror
+it. Every pixel is multiplied by `rgba`: `NX2_RGBA(255, 255, 255, 255)` leaves the picture as it is, an alpha under
+255 lets the game show through, a colour tints it.
+
+```c
+static int hearts;             // one row of three 32x32 hearts: full, half, empty
+static uint32_t hearts_wh[2];
+...
+hearts = api->texture_load(path_of("hearts.png"), 0, hearts_wh);          // once, at the start
+...
+static void on_overlay(const Nx2Draw *d, void *user) {
+    if (!NX2_HAS(d, Nx2Draw, text_font_size)) return;                      // a game before version 6
+    float s = d->picture_height / 1080, x = d->picture_x + 40 * s, y = d->picture_y + 120 * s, side = 36 * s;
+    for (int i = 0; i < 3; i++) {
+        int kind = i < full ? 0 : 2;
+        d->image(hearts, x + i * side, y, x + (i + 1) * side, y + side, kind / 3.0f, 0, (kind + 1) / 3.0f, 1,
+                 NX2_RGBA(255, 255, 255, 255));
+    }
+}
+```
+
+**The game's own textures.** `texture_load("romfs:UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs#BtnThinBase_01", 0, wh)`
+reads the texture `BtnThinBase_01` out of that archive of the player's own game files (a `.bntx` file, or one packed
+as `.zs`). Nothing of the game is copied into the mod: the picture exists only in the running game. The call unpacks
+the whole archive each time (about 0.4 s for that one on a fast PC, seen at 0.35 to 0.5 s), so make such calls at the
+start or on a thread of your own, not in a callback. A texture's name is the one the archive lists. Three formats are read: RGBA8, ASTC
+4x4 and the one-channel BC4 masks (which come out white with the mask as alpha: give them their colour with `rgba`);
+any other gives 0 with a line in the log.
+
+**Fonts.** At most `NX2_FONTS_MAX` (16) at a time over all plugins; a font is one file at one size. The letters are
+made once for a size and drawn sharp at that size only:
+
+- `font_load(path, 30, 0)`: 30 pixels in a window 1080 high. The runtime makes the letters at `30 * scale` and again
+  when the window's size changes; draw with `size` 0. Right for text that should behave like the runtime's own.
+- `font_load(path, px, NX2_FONT_EXACT)`: `px` pixels as they are. For text that keeps its share of the game's
+  picture, load at `share * picture_height` and, when `picture_height` has changed and held for a few frames (a window
+  being dragged changes it every frame), `font_free` and load again at the new size.
+
+`text_font(font, x, y, size, rgba, shadow_rgba, utf8)` draws like `text`; `size` 0 is the size the letters were made
+at, any other size stretches them (blurred when much larger). A `shadow_rgba` other than 0 draws the text once more
+under it in that colour, 7 % of the size down and to the right: `NX2_RGBA(0, 0, 0, 160)` is a soft dark one. `text_font_size` measures the same text. A font loaded since the last picture is not in the
+letter sheet yet: for that one picture, and for a handle that is no font's, both calls use the overlay's own font at
+the size asked for. Each load makes the presenting thread build the letter sheet again (some tens of milliseconds):
+load at the start and on a window change, not while the player plays.
+
+The letters made are Latin with its accented letters (U+0020 to U+00FF), Cyrillic (U+0400 to U+052F) and the dashes,
+quotes and dots U+2010 to U+2027. Another character (Japanese, Korean, Chinese, emoji) shows as the font's mark for a
+missing one: for a name that may hold such characters, measure nothing by hand and fall back to `text`, whose font
+has what the menu's languages need.
+
+**The game's own fonts** need no extraction: `font_load("romfs:Font2/Scalable/ClarimoUDPE-Regular.Nin_Ounce_NVN2.bfotf.zs", 30, 0)`
+is the game's text font and `romfs:Font2/Scalable/CetraDisplayPro-Medium.Nin_Ounce_NVN2.bfotf.zs` the one of its
+titles (game 1.1.1; the runtime's own menu uses the same two). They are read from the player's game files when the
+call is made.
+
+## Steam
+
+Version 7. For a mod that has a multiplayer of its own and wants its players to meet without a port forwarded and
+without an address typed: rooms the players' friends can see, a room id to pass on, invites, and datagrams between
+the games of a room. It is the game's own co-op's Steam code (`runtime/steam.c`) behind an interface: the game signs
+in to Steam as *Spacewar* (app 480, the test app every account may use), a room is a friends-only Steam lobby, and
+datagrams go through Steam's networking messages, which find a direct path or relay, encrypt, and vouch for the
+sender's Steam id. The mod brings its own protocol; the runtime carries its bytes. `runtime/plugin_steam.c` is the
+implementation.
+
+```c
+static void on_steam(const Nx2SteamEvent *e, void *user) {
+    switch (e->kind) {
+    case NX2_STEAM_EV_STATE: /* status(): ready, or unavailable and why */ break;
+    case NX2_STEAM_EV_ROOM_ENTERED: /* status().room_code is the id to show; members() */ break;
+    case NX2_STEAM_EV_MESSAGE: /* e->a sent the e->n bytes at e->data */ break;
+    }
+}
+
+const Nx2Steam *steam = NX2_HAS(api, Nx2PluginApi, steam) ? api->steam() : NULL;
+if (steam && steam->start("my-mod", on_steam, NULL)) { /* NX2_STEAM_EV_STATE follows */ }
+steam->room_create(4);                 /* or steam->room_join("ABCD-2345"); then ROOM_ENTERED or ROOM_FAILED */
+steam->send(0, bytes, n, 1);           /* to every other member, reliable */
+steam->stop();                         /* leaves the room, signs out */
+```
+
+- **What the player needs** is what the game's co-op needs ([coop.md](coop.md)): Steam running and signed in, and
+  `steam_api64.dll` beside `ocarina.exe`, which the launcher copies there from a Steam game the player has (at every
+  start of the game, a mod's `api.play` included). `status()` says which of the two is missing
+  (`NX2_STEAM_WHY_NO_LIBRARY`, `NX2_STEAM_WHY_OLD_LIBRARY`, `NX2_STEAM_WHY_NO_CLIENT`) with a sentence for the log in
+  `says`; an unavailable Steam is tried again every five seconds, and `NX2_STEAM_EV_STATE` comes when that changes.
+  Steam shows the player as playing Spacewar from `start` to `stop`: start when the player opens your multiplayer
+  page, not when the game starts.
+- **One user of Steam at a time.** While the game's own co-op is on (`coop_steam = 1`), `start` returns 0 and
+  `status().why` is `NX2_STEAM_WHY_GAME_COOP`: tell the player to turn it off in the menu's Co-op tab. Co-op turned
+  on while a plugin has Steam finds Steam in use until the plugin stops. A second plugin's `start` returns 0 while
+  the first has it. With no plugin using Steam the game's co-op runs exactly as without this interface.
+- **Whose rooms.** `start` takes a tag (`a-z`, `0-9`, `-`, `_`, `.`; up to 31 characters): the room your plugin makes
+  carries it as lobby data (`nx2navi_plugin = <tag>`), and a lobby entered that does not is left at once
+  (`NX2_STEAM_EV_ROOM_FAILED` with `NX2_STEAM_FAIL_NOT_OURS`). The app id is shared with every program that uses
+  the test app and with the game's own co-op, whose rooms carry another note and never this one: neither side
+  enters the other's rooms, and the two use different channels of Steam's networking, so no datagram of one is read
+  as the other's.
+- **A room** is friends-only: the player's Steam friends see it and may join it from Steam; anyone else needs the room
+  id (`status().room_code`, eight letters and digits as `XXXX-XXXX`, the co-op's format) or an invite. Anyone who has
+  the id can join while the room is open: your protocol decides what a member may do, and lobby data is readable by
+  anyone who knows the room, so a secret goes to a member in a reliable datagram, never into lobby data (the
+  interface has no call for lobby data for that reason). The owner is the player whose game made the room; when that
+  game leaves, Steam hands the room to another member (`NX2_STEAM_EV_OWNER_CHANGED`).
+- **Members** have a Steam id (a 64-bit number, what `send` takes and events carry) and a name. Names come from
+  Steam and from other people: they are cleaned of control characters, but treat them as text from outside.
+- **Invites.** `friends()` lists the player's friends, those shown as playing app 480 first (`in_app`: probably this
+  game with Steam on); `invite(id)` makes Steam show that friend an invite. In a game that has Steam started through
+  this interface the invite arrives as `NX2_STEAM_EV_INVITED` (the room in `a`, the friend in `b`; `room_code(a, out)`
+  gives the text for `room_join`). A friend whose game is not running gets Steam's own invite, which would start
+  Spacewar and not this game: tell them the room id. `NX2_STEAM_EV_JOIN_ASKED` comes when the player accepted an
+  invite in Steam's own window while the game runs.
+- **Datagrams.** `send(to, data, n, reliable)`: up to `NX2_STEAM_MESSAGE_MAX` (1200) bytes to one member, or to every
+  other member with `to` 0. Reliable ones arrive, in order; the others may be lost and are never late. Only a
+  member's datagrams are handed out, and only members are sent to. A protocol that needs larger packets splits them
+  itself.
+- **Threads.** Every function of `Nx2Steam` may be called from any thread; those that ask something of Steam queue it
+  and return at once. Events come on **the runtime's Steam thread**, one at a time, never on the game's thread
+  (`guest_call` does not work there): queue what the game's thread needs. `stop` waits for the event being handled,
+  so do not call it while holding a lock your event callback takes; called inside the callback it returns at once.
+- **The log** (`logs/nx2navi.log`) gets `plugins: Steam for the plugin with the tag "<tag>": on, signed in to Steam as
+  app 480`, `... is not available: <why>`, `plugins: Steam: room made`, `in the room`, `a player came into the room
+  (N in it)`, `N friends listed`, `left the room`: never a Steam id, a friend's name or a room id. Keep yours as clean.
+- **When the game ends** in an orderly way the runtime leaves the room and signs out, after the exit callbacks.
+
+### Two games on one PC
+
+One Steam account cannot be in two games at once, so the interface has a stand-in for tests, as the game's co-op
+has. Only the environment turns it on: `NX2NAVI_PLUGIN_STEAM_LOCAL=<port>` makes the game the player whose id is that
+UDP port on 127.0.0.1, named `NX2NAVI_PLUGIN_STEAM_LOCAL_NAME` or "Player <port>";
+`NX2NAVI_PLUGIN_STEAM_LOCAL_FRIENDS=<port>,<port>` are its friends. Everything else is as with Steam: `status().local`
+is 1, the room a game makes has a room id of the usual form (made from its port), another game joins by it, an invite
+reaches the friend's game as `NX2_STEAM_EV_INVITED`, datagrams arrive (loopback loses none), a game that ends or
+leaves is seen to go. Not in the stand-in: Steam's own invite window, a lobby of another program, an owner handed
+over (when the maker's game goes the room is lost for the others, `NX2_STEAM_EV_LOST`).
+
+`ocarina --probe-plugins` checks the table and its refusals; with `NX2NAVI_PLUGIN_STEAM_PROBE=make:<seconds>` in one
+process and `join:<room id>:<seconds>` (or `invited:<seconds>`) in another, each with its own
+`NX2NAVI_PLUGIN_STEAM_LOCAL` port, it runs a room, an invite and fifty datagrams of every size between the two, and
+with `look:<seconds>` and no stand-in it signs in to Steam itself, makes a room and counts the friends (it prints
+counts only).
 
 ## Threads
 
@@ -563,14 +752,22 @@ Three threads call a plugin, and they run at the same time:
   return to `main+0x6e70fc` and `main+0x6e6ddc`), as the runtime's own menu page does since 2026-11-13 (until then
   `update_menu` made those calls at once, and a page updated at every typed character could stop the game).
 - **The presenting thread** (overlay callbacks). Draw from data your frame callback prepared, guarded by a lock or
-  atomics of your own. Do not call game functions here, and return quickly: the picture waits for you.
+  atomics of your own. Do not call game functions here, and return quickly: the picture waits for you. The drawing
+  calls of `Nx2Draw` (`image` and `text_font` too) work only here, inside the callback.
 - **The window's thread** (key and text callbacks). Queue the event for your frame callback and return.
 - **The game's thread that reads the controls** (pad callbacks): the same rule, queue and return. A title menu
   button's `on_select` comes with the frame callbacks, on their thread.
 - **The thread that ends the game** (exit callbacks): the window's, or one of the game's.
+- **The runtime's Steam thread** (Steam events, version 7): a thread of the runtime's own that exists from
+  `steam()->start` to `stop`. It is not a thread of the game: no `guest_call`, no game function. Queue the event
+  for your frame callback or your own thread and return; no other Steam event and no datagram is handed out while
+  the callback runs. The functions of `Nx2Steam` may be called from it and from any other thread.
 
-`game_info`, `log`, `read`, `write`, `map_range`, `on_*`, `hook_function`, `remove` and `capture_input` may be called
-from any thread, your own threads included.
+`game_info`, `log`, `read`, `write`, `map_range`, `on_*`, `hook_function`, `remove`, `capture_input` and, since
+version 6, `texture_create`, `texture_load`, `texture_free`, `font_load` and `font_free`, and since version 7 `steam`
+and every function of its table, may be called from any thread,
+your own threads included. A picture may be freed while the presenting thread draws with it: that picture still
+shows in the frame being drawn.
 
 A callback runs with the registers of the game saved: whatever a guest call leaves in them is undone when the frame
 callbacks return, and before a hooked function runs. The callee runs on the game thread's own stack below its stack

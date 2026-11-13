@@ -1202,6 +1202,7 @@ void plugins_exit(void) {
     int n = snapshot(KIND_EXIT, s);
     if (n) rt_log("plugins: the game ends: %d exit callback%s", n, n == 1 ? "" : "s");
     for (int i = 0; i < n; i++) ((Nx2ExitFn)s[i].fn)(s[i].user);
+    plugin_steam_shutdown();   // plugin_steam.c: a room a plugin left open is left, Steam signed out of
 }
 
 int plugins_overlay_wanted(void) {
@@ -1286,6 +1287,12 @@ static const Nx2PluginApi api = {
     .restart = api_restart,
     .camera_reset = plugin_camera_reset,
     .set_save_dir = api_set_save_dir,
+    .texture_create = plugin_texture_create,
+    .texture_load = plugin_texture_load,
+    .texture_free = plugin_texture_free,
+    .font_load = plugin_font_load,
+    .font_free = plugin_font_free,
+    .steam = plugin_steam,
 };
 
 // The executable's export (NX2_PLUGIN_API_EXPORT). Every version from 1, the first, up to this runtime's own is served

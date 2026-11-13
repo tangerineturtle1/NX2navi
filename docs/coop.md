@@ -134,6 +134,14 @@ player had done it, at most sixteen a frame. Nothing is read or set on the title
 changes. A game that starts to share asks the others for their whole state and sends its own. Games merge only when
 their tables of what is shared are the same (a sum over the table travels with every message).
 
+**Mods and Steam.** A mod's native library can use the same Steam code for a multiplayer of its own, through the plugin
+interface (`steam`, version 7: [plugins.md](plugins.md), "Steam"; `runtime/plugin_steam.c`). One of the two has Steam
+at a time: while co-op is on (`coop_steam = 1`) a mod's start is refused and says so, and while a mod has Steam, co-op
+turned on finds Steam in use until the mod stops (the Co-op tab then shows Steam as not available). A mod's rooms
+carry the note `nx2navi_plugin = <the mod's tag>` and never `nx2navi = 1`, and its datagrams travel on another channel
+of Steam's networking, so neither enters the other's rooms nor reads the other's messages. With no mod using Steam,
+co-op runs exactly as described here.
+
 **The host's part is small**: it decides who is in the room. Progress has no arbiter, because every shared value only
 ever rises: two games that set the same flag agree whatever the order.
 

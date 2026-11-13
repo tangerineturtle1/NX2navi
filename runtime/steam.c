@@ -20,6 +20,11 @@
 // Messages. ISteamNetworkingMessages sends datagrams to a Steam id; Steam opens the session, finds a direct path or
 // relays through its own network, encrypts, and vouches for the sender's id. A session a stranger opens is accepted
 // only when that id is in the room, and a message is handed out only when its sender is.
+//
+// One user at a time. The library is used from one thread: the thread whose steam_start succeeded holds Steam until
+// its steam_stop, and steam_start on another thread fails meanwhile (STEAM_WHY_IN_USE). Co-op (coop.c) and the plugin
+// interface's Steam (plugin_steam.c) are the two users; each sends and receives on a channel of its own
+// (steam_channel), so that a message of one is never read as the other's.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +71,8 @@ static struct {
     void *user, *friends, *mm, *utils, *msgs;
     uint64_t self, room, call;   // call: the CreateLobby or JoinLobby that has not answered yet
     int creating;
+    int channel;                 // the networking messages channel in use (steam_channel); 0, co-op's, unless set
+    volatile uint32_t holder;    // the id of the thread that holds Steam (steam_start), 0 nobody
     // the library
     void (*shutdown)(void);
     int32_t (*get_pipe)(void);
@@ -123,7 +130,20 @@ int steam_up(void) { return S.up; }
 uint64_t steam_self(void) { return S.self; }
 uint64_t steam_room(void) { return S.room; }
 
+void steam_channel(int channel) { S.channel = channel; }
+
+static int start_held(char *why, size_t cap, int *which);
+
 int steam_start(char *why, size_t cap, int *which) {
+    uint32_t me = plat_thread_id(), nobody = 0;
+    if (!__atomic_compare_exchange_n(&S.holder, &nobody, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && nobody != me)
+        return fail(why, cap, which, STEAM_WHY_IN_USE, "Steam is in use by another part of the game (co-op, or a mod's)");
+    int ok = start_held(why, cap, which);
+    if (!ok) __atomic_store_n(&S.holder, 0, __ATOMIC_RELEASE);
+    return ok;
+}
+
+static int start_held(char *why, size_t cap, int *which) {
     if (S.up) return 1;
     if (which) *which = STEAM_WHY_OK;
     if (!S.lib) {
@@ -202,6 +222,8 @@ void steam_stop(void) {
     steam_room_leave();
     S.shutdown();
     S.up = 0;
+    S.channel = CHANNEL;
+    __atomic_store_n(&S.holder, 0, __ATOMIC_RELEASE);
 }
 
 void steam_name_of(uint64_t id, char *out, size_t cap) {
@@ -309,7 +331,7 @@ int steam_send(uint64_t to, const void *data, size_t n, int reliable) {
     identity_of(ident, to);
     // a session that broke (the other player's connection dropped for a moment) is opened again by the next message
     int flags = (reliable ? SEND_RELIABLE : SEND_UNRELIABLE_NO_DELAY) | SEND_AUTO_RESTART;
-    return S.send(S.msgs, ident, data, (uint32_t)n, flags, CHANNEL) == RESULT_OK;
+    return S.send(S.msgs, ident, data, (uint32_t)n, flags, S.channel) == RESULT_OK;
 }
 
 static uint64_t u64_at(const uint8_t *p, size_t off) {
@@ -412,7 +434,7 @@ void steam_pump(void (*on)(const SteamEvent *e, void *user), void *user) {
     }
     for (;;) {
         void *batch[RECEIVE_BATCH];
-        int n = S.receive(S.msgs, CHANNEL, batch, RECEIVE_BATCH);
+        int n = S.receive(S.msgs, S.channel, batch, RECEIVE_BATCH);
         for (int i = 0; i < n; i++) {
             const uint8_t *msg = batch[i];
             const uint8_t *data;

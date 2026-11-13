@@ -8,7 +8,9 @@
 // Steam game the player has, launcher/steamlib.py); without the file, or without a running Steam client that is
 // signed in, steam_start fails and says why.
 //
-// Every function here is called from one thread (the co-op thread, coop.c): the library is used single-threaded.
+// Every function here is called from one thread: the library is used single-threaded. That thread is co-op's
+// (coop.c), or, while co-op is off, the one of the plugin interface's Steam (plugin_steam.c): whichever started Steam
+// holds it until it stops it, and the other's steam_start fails meanwhile with STEAM_WHY_IN_USE.
 #pragma once
 
 #include <stddef.h>
@@ -46,9 +48,12 @@ typedef struct {
 
 // Loads the library, signs in as app 480 and takes the interfaces. 1 when Steam is up; 0 with the reason in why (a
 // sentence for the log and the menu's status line; STEAM_WHY_* says which, for the menu's own text).
-enum { STEAM_WHY_OK, STEAM_WHY_NO_LIBRARY, STEAM_WHY_OLD_LIBRARY, STEAM_WHY_NO_CLIENT, STEAM_WHY_OTHER_OS };
+enum { STEAM_WHY_OK, STEAM_WHY_NO_LIBRARY, STEAM_WHY_OLD_LIBRARY, STEAM_WHY_NO_CLIENT, STEAM_WHY_OTHER_OS, STEAM_WHY_IN_USE };
 int steam_start(char *why, size_t cap, int *which);
 void steam_stop(void);   // leaves the room and signs out
+// The networking messages channel steam_send sends on and steam_pump receives from, until steam_stop: 0, co-op's,
+// unless set. Call it after steam_start, on the thread that holds Steam.
+void steam_channel(int channel);
 int steam_up(void);
 
 uint64_t steam_self(void);

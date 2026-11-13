@@ -13,6 +13,8 @@
 #include "platform/platform.h"
 #include "plugin_game_ui.h"
 #include "plugins.h"
+#include "steam.h"
+#include "save_zip.h"
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL plugins: %s\n", what); } } while (0)
@@ -272,6 +274,277 @@ static void probe_hooks(void) {
     plat_aligned_free(c);
 }
 
+// ---- version 6: pictures and fonts. No window here, so nothing reaches the GPU: the handles, the limits, and the PNG
+// reader on files made in memory.
+
+// A PNG file of w x h pixels from px (ch bytes a pixel at 8 bits, or one index a pixel packed at `depth` bits when
+// depth is under 8), row y stored with filter type filters[y % 5]; plte and trns are its palette and transparency
+// chunks or NULL. The checksums are left 0: the reader does not look at them. malloc'd, *n bytes.
+static void png_chunk(uint8_t *out, size_t *at, const char *type, const uint8_t *body, uint32_t len) {
+    uint8_t *q = out + *at;
+    q[0] = (uint8_t)(len >> 24), q[1] = (uint8_t)(len >> 16), q[2] = (uint8_t)(len >> 8), q[3] = (uint8_t)len;
+    memcpy(q + 4, type, 4);
+    if (len) memcpy(q + 8, body, len);
+    memset(q + 8 + len, 0, 4);
+    *at += 12 + len;
+}
+
+static uint8_t *png_make(uint32_t w, uint32_t h, int ctype, int depth, const uint8_t *px, const uint8_t *filters,
+                         const uint8_t *plte, uint32_t plte_n, const uint8_t *trns, uint32_t trns_n, size_t *n) {
+    uint32_t ch = ctype == 6 ? 4 : ctype == 2 ? 3 : ctype == 4 ? 2 : 1, bpp = depth < 8 ? 1 : ch;
+    size_t rb = ((size_t)w * ch * (size_t)depth + 7) / 8;
+    uint8_t *rows = calloc(h, rb), *raw = malloc(h * (rb + 1));
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            if (depth == 8) memcpy(rows + y * rb + x * ch, px + ((size_t)y * w + x) * ch, ch);
+            else rows[y * rb + x * (uint32_t)depth / 8] |= (uint8_t)(px[(size_t)y * w + x] << (8 - depth - (int)(x * (uint32_t)depth % 8)));
+        }
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *cur = rows + y * rb, *prev = y ? cur - rb : NULL;
+        uint8_t ft = filters[y % 5], *o = raw + y * (rb + 1);
+        *o++ = ft;
+        for (size_t i = 0; i < rb; i++) {
+            int a = i >= bpp ? cur[i - bpp] : 0, b = prev ? prev[i] : 0, c = prev && i >= bpp ? prev[i - bpp] : 0;
+            int pa = abs(b - c), pb = abs(a - c), pc = abs(a + b - 2 * c);
+            int pred = ft == 0 ? 0 : ft == 1 ? a : ft == 2 ? b : ft == 3 ? (a + b) / 2 : pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+            o[i] = (uint8_t)(cur[i] - pred);
+        }
+    }
+    size_t zn = 0, at = 8;
+    uint8_t *z = sz_deflate(raw, h * (rb + 1), &zn), *idat = malloc(zn + 6), *out = malloc(zn + 1200);
+    idat[0] = 0x78, idat[1] = 0x01;
+    memcpy(idat + 2, z, zn);
+    memset(idat + 2 + zn, 0, 4);
+    memcpy(out, "\x89PNG\r\n\x1a\n", 8);
+    uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 24), (uint8_t)(h >> 16),
+                        (uint8_t)(h >> 8), (uint8_t)h, (uint8_t)depth, (uint8_t)ctype, 0, 0, 0};
+    png_chunk(out, &at, "IHDR", ihdr, 13);
+    if (plte) png_chunk(out, &at, "PLTE", plte, plte_n);
+    if (trns) png_chunk(out, &at, "tRNS", trns, trns_n);
+    png_chunk(out, &at, "IDAT", idat, (uint32_t)(zn / 2 + 2));   // the data in two chunks, as a file may have it
+    png_chunk(out, &at, "IDAT", idat + zn / 2 + 2, (uint32_t)(zn + 6 - (zn / 2 + 2)));
+    png_chunk(out, &at, "IEND", NULL, 0);
+    free(rows), free(raw), free(z), free(idat);
+    *n = at;
+    return out;
+}
+
+static void probe_pictures(const Nx2PluginApi *api) {
+    CHECK(NX2_HAS(api, Nx2PluginApi, font_free) && api->texture_create && api->texture_load && api->texture_free &&
+          api->font_load && api->font_free, "the table's version 6 members");
+    // pictures: handles above 0, a limit, slots given back, a handle that went is nobody's
+    uint8_t px[5 * 7 * 4];
+    for (size_t i = 0; i < sizeof px; i++) px[i] = (uint8_t)(i * 37 + (i >> 3) * 11);
+    CHECK(!api->texture_create(0, 4, px, 0) && !api->texture_create(4, 0, px, 0) && !api->texture_create(4, 4, NULL, 0) &&
+          !api->texture_create(NX2_TEXTURE_SIDE_MAX + 1, 1, px, 0), "a picture without pixels or with a side out of range");
+    static int hs[NX2_TEXTURES_MAX + 1];
+    int made = 0, distinct = 1;
+    for (int i = 0; i <= NX2_TEXTURES_MAX; i++) made += (hs[i] = api->texture_create(5, 7, px, i & 1 ? NX2_TEXTURE_PIXELS : 0)) > 0;
+    for (int i = 1; i < NX2_TEXTURES_MAX; i++) distinct &= hs[i] != hs[i - 1];
+    CHECK(made == NX2_TEXTURES_MAX && !hs[NX2_TEXTURES_MAX] && distinct, "the pictures' handles and their limit");
+    api->texture_free(hs[3]), api->texture_free(hs[3]), api->texture_free(0), api->texture_free(-7);
+    int again = api->texture_create(1, 1, px, 0);
+    CHECK(again > 0 && again != hs[3], "a freed picture's slot is used again under a new handle");
+    api->texture_free(again);
+    for (int i = 0; i < NX2_TEXTURES_MAX; i++) api->texture_free(hs[i]);
+    uint32_t wh[2] = {9, 9};
+    CHECK(!api->texture_load("no-such-folder/no-such-picture.png", 0, wh) && !wh[0] && !wh[1] && !api->texture_load(NULL, 0, NULL) &&
+          !api->texture_load("romfs:no-such-archive.bntx", 0, NULL), "a picture from a file that is not there");
+    // the PNG reader: colour with alpha through each of the five row filters, then colour, grey with alpha, a
+    // palette of four colours at two bits with one of them transparent, and files that are not pictures
+    static const uint8_t filters[5] = {1, 2, 4, 3, 0}, plain[5] = {0, 0, 0, 0, 0};
+    const char *why = "";
+    uint32_t w = 0, h = 0;
+    size_t n = 0;
+    uint8_t *file = png_make(5, 7, 6, 8, px, filters, NULL, 0, NULL, 0, &n);
+    uint8_t *got = plugin_png_decode(file, n, &w, &h, &why);
+    CHECK(got && w == 5 && h == 7 && !memcmp(got, px, sizeof px), "a PNG with alpha, every row filter");
+    free(got);
+    CHECK(!plugin_png_decode(file, n - 20, &w, &h, &why) && !plugin_png_decode(file + 1, n - 1, &w, &h, &why) &&
+          !plugin_png_decode(file, 20, &w, &h, &why), "a cut-off PNG and a file that is none");
+    file[8 + 8 + 12] = 1;   // IHDR's interlace byte
+    CHECK(!plugin_png_decode(file, n, &w, &h, &why) && strstr(why, "interlaced"), "an interlaced PNG is refused");
+    free(file);
+    file = png_make(5, 7, 2, 8, px, filters, NULL, 0, NULL, 0, &n);
+    got = plugin_png_decode(file, n, &w, &h, &why);
+    int ok = got && w == 5 && h == 7;
+    for (int i = 0; ok && i < 35; i++) ok = !memcmp(got + i * 4, px + i * 3, 3) && got[i * 4 + 3] == 255;
+    CHECK(ok, "a PNG without alpha");
+    free(got), free(file);
+    file = png_make(5, 7, 4, 8, px, filters, NULL, 0, NULL, 0, &n);
+    got = plugin_png_decode(file, n, &w, &h, &why);
+    ok = got != NULL;
+    for (int i = 0; ok && i < 35; i++) ok = got[i * 4] == px[i * 2] && got[i * 4 + 2] == px[i * 2] && got[i * 4 + 3] == px[i * 2 + 1];
+    CHECK(ok, "a grey PNG with alpha");
+    free(got), free(file);
+    static const uint8_t plte[12] = {255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30}, trns[2] = {255, 0};
+    uint8_t idx[35];
+    for (int i = 0; i < 35; i++) idx[i] = (uint8_t)((i * 7 + i / 5) & 3);
+    file = png_make(5, 7, 3, 2, idx, plain, plte, 12, trns, 2, &n);
+    got = plugin_png_decode(file, n, &w, &h, &why);
+    ok = got != NULL;
+    for (int i = 0; ok && i < 35; i++) ok = !memcmp(got + i * 4, plte + idx[i] * 3, 3) && got[i * 4 + 3] == (idx[i] == 1 ? 0 : 255);
+    CHECK(ok, "a PNG with a palette of two bits and a transparent colour");
+    free(got), free(file);
+    // fonts: a size out of range, a file that is not there, a file that is not a font
+    char self[1024] = "";
+    plat_exe_path(self, sizeof self);
+    CHECK(!api->font_load("no-such-folder/no-such-font.ttf", 24, 0) && !api->font_load(NULL, 24, 0) &&
+          !api->font_load("romfs:no-such-font.bfotf", 24, NX2_FONT_EXACT) && !api->font_load(self, 2, 0) &&
+          !api->font_load(self, 500, NX2_FONT_EXACT),
+          "a font from a file that is not there, or at a size out of range");
+    api->font_free(0), api->font_free(12345);
+}
+
+// ---- Steam for plugins (plugin_steam.c). The checks that need no Steam run always. NX2NAVI_PLUGIN_STEAM_PROBE runs a
+// live one beside them, for two of these probes on one PC with the stand-in (NX2NAVI_PLUGIN_STEAM_LOCAL=<port>) or
+// one with Steam itself:
+//   make:<seconds>          makes a room, prints its id, invites its first friend, answers every datagram
+//   join:<room id>:<seconds>   joins it, sends datagrams, counts the answers
+//   invited:<seconds>       waits for an invite and joins its room, then as join
+//   look:<seconds>          signs in, makes a room and lists the friends: prints counts only, no id and no name
+static struct { volatile int state, entered, failed, joined, left, got, invited, lost; uint64_t room, invite_room; int echo; } sp;
+
+static void steam_probe_event(const Nx2SteamEvent *e, void *user) {
+    const Nx2Steam *s = user;
+    switch (e->kind) {
+    case NX2_STEAM_EV_STATE: sp.state++; break;
+    case NX2_STEAM_EV_ROOM_ENTERED: sp.room = e->a, sp.entered++; break;
+    case NX2_STEAM_EV_ROOM_FAILED: sp.failed = e->code; break;
+    case NX2_STEAM_EV_MEMBER_JOINED: sp.joined++; break;
+    case NX2_STEAM_EV_MEMBER_LEFT: sp.left++; break;
+    case NX2_STEAM_EV_INVITED: sp.invite_room = e->a, sp.invited++; break;
+    case NX2_STEAM_EV_LOST: sp.lost++; break;
+    case NX2_STEAM_EV_MESSAGE:
+        sp.got++;
+        if (sp.echo && e->n >= 1 && ((const uint8_t *)e->data)[0] == 'q') {
+            uint8_t back[NX2_STEAM_MESSAGE_MAX];
+            memcpy(back, e->data, e->n);
+            back[0] = 'a';
+            s->send(e->a, back, e->n, e->n & 1);
+        }
+        break;
+    }
+}
+
+static int steam_probe_wait(volatile int *what, int ms) {
+    for (int t = 0; t < ms && !*what; t += 10) plat_sleep_ms(10);
+    return *what != 0;
+}
+
+static void probe_steam(const Nx2PluginApi *api) {
+    CHECK(NX2_HAS(api, Nx2PluginApi, steam) && api->steam, "the table's version 7 member");
+    const Nx2Steam *s = api->steam();
+    CHECK(s && s == api->steam() && s->size == sizeof *s && s->start && s->stop && s->status && s->room_create && s->room_join &&
+          s->room_leave && s->room_code && s->members && s->friends && s->invite && s->send, "the Steam table");
+    Nx2SteamStatus st = {.size = sizeof st};
+    CHECK(s->status(&st) && st.state == NX2_STEAM_OFF && !st.room && !st.self, "Steam's state before any start");
+    Nx2SteamStatus small = {.size = 16, .local = 77};
+    CHECK(s->status(&small) && small.size == 16 && small.local == 0 && !s->status(NULL), "a status block of an older size");
+    CHECK(!s->start(NULL, steam_probe_event, NULL) && !s->start("", steam_probe_event, NULL) && !s->start("Upper", steam_probe_event, NULL) &&
+          !s->start("a tag that is far too long for a room's note", steam_probe_event, NULL) && !s->start("probe", NULL, NULL),
+          "a start with a tag out of the rule, or without a callback");
+    CHECK(s->status(&st) && st.state == NX2_STEAM_OFF && st.why == NX2_STEAM_WHY_OTHER && st.says[0], "a refused start says why");
+    // nothing works before start, and nothing faults
+    Nx2SteamMember members[NX2_STEAM_ROOM_MAX];
+    Nx2SteamFriend friends[4];
+    CHECK(!s->room_create(4) && !s->room_join("2222-2222") && !s->invite(1) && !s->send(0, "x", 1, 1) && !s->members(members, 8) &&
+          !s->friends(friends, 4), "rooms, invites and datagrams before start");
+    s->room_leave(), s->stop(), s->stop();
+    // room ids: the game's own co-op's format; a lobby's number has one, another number none
+    char code[NX2_STEAM_CODE_CAP] = "x";
+    uint64_t lobby = 0x01860000ull << 32 | 0x12345678u;
+    CHECK(s->room_code(lobby, code) && strlen(code) == 9 && code[4] == '-' && steam_code_parse(code) == lobby, "a room's id");
+    CHECK(!s->room_code(0x0110000100000001ull, code) && !code[0] && !s->room_code(lobby, NULL), "a number that is no room's has no id");
+
+    char mode[96];
+    if (!plat_getenv("NX2NAVI_PLUGIN_STEAM_PROBE", mode, sizeof mode) || !mode[0]) return;
+    char *arg = strchr(mode, ':'), *arg2 = NULL;
+    if (arg) *arg++ = 0, arg2 = strchr(arg, ':');
+    if (arg2) *arg2++ = 0;
+    int make = !strcmp(mode, "make"), look = !strcmp(mode, "look"), invited = !strcmp(mode, "invited"), join = !strcmp(mode, "join");
+    int seconds = atoi(join ? (arg2 ? arg2 : "10") : (arg ? arg : "10"));
+    memset(&sp, 0, sizeof sp);
+    sp.echo = make;
+    if (!s->start("nx2navi.probe", steam_probe_event, (void *)s)) {
+        // refused at once (the game's own co-op is on): the status says why, nothing was started
+        s->status(&st);
+        printf("steam probe: the start was refused, why %u: %s\n", st.why, st.says);
+        CHECK(st.state == NX2_STEAM_OFF && st.why && st.says[0] && !s->room_create(4), "a refused start says why");
+        return;
+    }
+    CHECK(!s->start("nx2navi.other", steam_probe_event, NULL), "a second start while the first has Steam");
+    steam_probe_wait(&sp.state, 15000);
+    s->status(&st);
+    printf("steam probe: state %u, why %u, stand-in %u%s%s\n", st.state, st.why, st.local, st.says[0] ? ": " : "", st.says);
+    if (st.state != NX2_STEAM_READY) {
+        CHECK(st.state == NX2_STEAM_UNAVAILABLE && st.why && st.says[0], "an unavailable Steam says why");
+        CHECK(!s->room_create(4), "a room without Steam");
+        s->stop();
+        return;
+    }
+    CHECK(st.self && st.name[0] && !st.room && !st.entering, "signed in: an id and a name, no room");
+    if (make || look) {
+        CHECK(s->room_create(4) && !s->room_create(4), "a room is asked for once");
+        CHECK(steam_probe_wait(&sp.entered, 15000), "the room was made");
+        s->status(&st);
+        CHECK(st.room == sp.room && st.owner == st.self && strlen(st.room_code) == 9 && st.members == 1, "the room's status");
+        CHECK(s->members(members, 8) == 1 && members[0].self && members[0].owner && members[0].name[0], "the room's one member");
+        if (st.local) printf("steam probe: room id %s\n", st.room_code);   // a stand-in's id is a port, nobody's secret
+        else printf("steam probe: room made, its id has %u characters\n", (unsigned)strlen(st.room_code));
+        fflush(stdout);
+    } else {
+        if (invited) {
+            CHECK(steam_probe_wait(&sp.invited, seconds * 1000), "an invite came");
+            CHECK(s->room_code(sp.invite_room, code), "the invite's room has an id");
+        } else {
+            snprintf(code, sizeof code, "%s", arg ? arg : "");
+        }
+        CHECK(!s->room_join("not a room id") && s->room_join(code), "a room joined by its id");
+        CHECK(steam_probe_wait(&sp.entered, 15000) || sp.failed, "the join answered");
+        if (!sp.entered) {
+            printf("steam probe: not entered, code %d\n", sp.failed);
+            s->stop();
+            return;
+        }
+        s->status(&st);
+        CHECK(st.room && st.owner && st.owner != st.self && st.members == 2, "the joined room's status");
+        CHECK(s->members(members, 8) == 2 && members[0].owner && !members[0].self && members[1].self && members[0].name[0],
+              "the joined room's members, the owner first");
+    }
+    static Nx2SteamFriend all[512];
+    int nf = 0, sent = 0, invited_one = 0;
+    for (int t = 0; t < seconds * 10; t++) {
+        plat_sleep_ms(100);
+        nf = s->friends(all, 512);
+        if (make && nf && !invited_one && sp.joined == 0 && t == 20) invited_one = s->invite(all[0].id);
+        if ((join || invited) && t < 50) {
+            uint8_t q[NX2_STEAM_MESSAGE_MAX];
+            memset(q, t, sizeof q);
+            q[0] = 'q';
+            // every size class, reliable and not; to the owner by id, and to "everyone else"
+            size_t n = t % 5 == 0 ? NX2_STEAM_MESSAGE_MAX : (size_t)(1 + t * 7);
+            sent += s->send(t & 2 ? 0 : st.owner, q, n, t & 1);
+        }
+        if (sp.lost) break;
+    }
+    s->status(&st);
+    printf("steam probe: %d friends, %u in the room, joined %d, left %d, datagrams sent %d, got %d, invites got %d, lost %d\n", nf,
+           st.members, sp.joined, sp.left, sent, sp.got, sp.invited, sp.lost);
+    if (join || invited) CHECK(sent == 50 && sp.got == 50, "every datagram was answered");
+    CHECK(!s->send(0, "x", 0, 1) && !s->send(0, NULL, 4, 1) && !s->send(0, all, NX2_STEAM_MESSAGE_MAX + 1, 1), "a datagram out of range");
+    s->room_leave();
+    for (int t = 0; t < 100; t++) {
+        plat_sleep_ms(10);
+        s->status(&st);
+        if (!st.room) break;
+    }
+    CHECK(!st.room && !st.room_code[0] && !s->members(members, 8) && !s->send(0, "x", 1, 1), "out of the room after room_leave");
+    s->stop();
+    s->status(&st);
+    CHECK(st.state == NX2_STEAM_OFF && !st.self, "off after stop");
+}
+
 int probe_plugins(void) {
     CHECK(!nx2navi_plugin_api(0) && !nx2navi_plugin_api(NX2_PLUGIN_API_VERSION + 1), "a version the table does not serve got one");
     api = nx2navi_plugin_api(NX2_PLUGIN_API_VERSION);
@@ -380,6 +653,8 @@ int probe_plugins(void) {
     api->capture_input(0);
     api->remove(ht);
 
+    probe_pictures(api);
+    probe_steam(api);
     probe_hooks();   // before a plugin of NX2NAVI_MOD_DLLS registers hooks of its own
     probe_title();
 
