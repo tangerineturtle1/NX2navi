@@ -496,6 +496,12 @@ and end a sprint, ZL, the button kept from the game only during play (the bottom
 Link the player does not control, and the set switched off with the button off but never over a start that kept it
 off. No game files.
 
+A change to the minimap toggle (`runtime/minimap.c`, the set `minimap` of `recomp/patches-v111.txt`, its call in
+`runtime/ov_input.c` `npad_states`) passes `python tests\minimap_check.py`, which builds `minimap.c` against a
+stand-in screen: the button's presses during gameplay and in menus, what the game gets from each poll, the drawn byte
+in the minimap's and the pause map's forms, the setting changed from the menu, and the set switched off with the
+button off. No game files.
+
 A change to the text speed (`runtime/text_speed.c`, the set `text_speed` of `recomp/patches-v111.txt`, its call in
 `runtime/ov_input.c` `npad_states`) passes `python tests\text_speed_check.py`, which lifts the set's replacement words
 with `recomp/lifter.py` and runs them with `text_speed.c` against a stand-in message window and typewriter: the page

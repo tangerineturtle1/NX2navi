@@ -54,6 +54,7 @@ extern "C" {
 #include "perfmon.h"
 #include "platform/platform.h"
 #include "save_share.h"
+#include "minimap.h"
 #include "sprint.h"
 #include "sysinfo.h"
 #include "text_speed.h"
@@ -1693,6 +1694,13 @@ static void tab_controls(float scale) {
         static const UiTextId sprint_mode[] = {UI_MENU_SPRINT_TOGGLE, UI_MENU_SPRINT_HOLD};
         opt_choice("NX2NAVI_SPRINT_BUTTON", UI_MENU_SPRINT_BUTTON, sprint_button, 3, UI_MENU_SPRINT_BUTTON_DESC);
         opt_choice("NX2NAVI_SPRINT_MODE", UI_MENU_SPRINT_MODE, sprint_mode, 2, UI_MENU_SPRINT_MODE_DESC);
+    }
+    // The minimap (minimap.c), where the game version has the patch set minimap; both rows are live, in cfg.c order.
+    if (minimap_available()) {
+        static const UiTextId minimap[] = {UI_MENU_MINIMAP_SHOWN, UI_MENU_MINIMAP_HIDDEN};
+        static const UiTextId minimap_button[] = {UI_MENU_MINIMAP_OFF, UI_MENU_MINIMAP_DOWN};
+        opt_choice("NX2NAVI_MINIMAP", UI_MENU_MINIMAP, minimap, 2, UI_MENU_MINIMAP_DESC);
+        opt_choice("NX2NAVI_MINIMAP_BUTTON", UI_MENU_MINIMAP_BUTTON, minimap_button, 2, UI_MENU_MINIMAP_BUTTON_DESC);
     }
     opt_slider("NX2NAVI_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
     opt_slider("NX2NAVI_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
