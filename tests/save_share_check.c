@@ -50,6 +50,12 @@ void rt_fatal(const char *fmt, ...) {
 
 const char *rt_log_path(void) { return getenv("SAVE_SHARE_CHECK_LOG"); }
 void *rt_config(void) { return NULL; }   // fs_host_set_profile names the profile first
+// players.c players_active: the player of this start, SAVE_SHARE_CHECK_PLAYER (unset: player 1)
+const char *cfg_value(const char *name) {
+    (void)name;
+    const char *p = getenv("SAVE_SHARE_CHECK_PLAYER");
+    return p ? p : "1";
+}
 void account_uid(uint64_t uid[2]) { uid[0] = 0x1111222233334444ull, uid[1] = 0x5555666677778888ull; }
 int folder_downloads(char *out, size_t cap) { (void)out, (void)cap; return 0; }
 

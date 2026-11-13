@@ -10,6 +10,8 @@ profile folder made here:
   the start says where the old save went; a second start changes nothing
 - refusals (no manifest, another game, a newer format, a path outside the save, a damaged member, no save files):
   nothing waits and the save stays; Cancel drops a waiting import
+- another player (players.c): with player = 3 the import waits in profile/players/3 and becomes that player's save,
+  player 1's save stays, and the export reads player 3's save
 
 Usage: save_share_check.py   (Python 3.12 or later; no game files)
 """
@@ -58,7 +60,7 @@ def main():
     libs = ['-lbcrypt', '-lws2_32', '-lwinmm', '-lpsapi', '-lshell32', '-lole32', '-luser32'] if os.name == 'nt' else \
         ['-lpthread', '-ldl', '-lm']
     subprocess.check_call([compiler(), '-std=gnu11', '-O1', '-g', '-w', '-I', str(rt), str(ROOT / 'tests' /
-                           'save_share_check.c'), *(str(rt / f) for f in ('fs_host.c', 'save_share.c', 'save_zip.c',
+                           'save_share_check.c'), *(str(rt / f) for f in ('fs_host.c', 'players.c', 'save_share.c', 'save_zip.c',
                                                                            *plat)), '-o', str(exe), *libs], env=env)
     bad = 0
 
@@ -68,8 +70,10 @@ def main():
             bad += 1
             print('FAIL', what)
 
-    def run(*args, log=None):
-        e = dict(env, SAVE_SHARE_CHECK_LOG=str(log)) if log else env
+    def run(*args, log=None, player=None):
+        e = dict(env, SAVE_SHARE_CHECK_LOG=str(log)) if log else dict(env)
+        if player:
+            e['SAVE_SHARE_CHECK_PLAYER'] = str(player)
         r = subprocess.run([str(exe), *map(str, args)], env=e, capture_output=True, text=True)
         if r.returncode:
             print(r.stdout, r.stderr)
@@ -187,6 +191,27 @@ def main():
     check(run('import', profile, shared).endswith('waiting 1'), 'import again')
     check(run('cancel', profile) == 'result 0 waiting 0', 'cancel')
     check(run('start', profile) == 'done  waiting 0' and tree(acct) == shared_save, 'a cancelled import stays out')
+
+    # another player: the same profile, saves of their own under players/3
+    p3 = profile / 'players' / '3'
+    check(run('export', profile, out, player=3).startswith('result 1 '), 'player 3 has no save to export yet')
+    check(p3.is_dir() and (p3 / 'save' / ACCOUNT).is_dir(), "the start made player 3's folders")
+    check(run('import', profile, shared, player=3).endswith('waiting 1'), 'import for player 3')
+    check(tree(p3 / 'save-import') == shared_save and not (profile / 'save-import').exists(),
+          "the import waits in player 3's folder")
+    check(run('start', profile, player=3).startswith('done ') and tree(p3 / 'save' / ACCOUNT) == shared_save,
+          "the import is player 3's save")
+    check(tree(acct) == shared_save and run('start', profile) == 'done  waiting 0',
+          "player 1's save is untouched")
+    (p3 / 'save' / ACCOUNT / 'option.sav').write_bytes(b'player 3 o')
+    m = re.match(r'result 0 path (.+)$', run('export', profile, out, player=3))
+    if m:
+        with zipfile.ZipFile(m.group(1)) as z:
+            check(z.read('save/option.sav') == b'player 3 o', "the export reads player 3's save")
+    else:
+        check(False, 'export for player 3')
+    check(run('start', profile, player='x').startswith('done ') and tree(acct) == shared_save,
+          'a player value that is no number plays as player 1')
 
     print('save_share_check:', 'FAILED' if bad else 'ok')
     return 1 if bad else 0

@@ -459,7 +459,9 @@ passes `python tests\save_zip_check.py` and `python tests\save_share_check.py`. 
 and checks its deflate, inflate, zip writer and reader against Python's zlib and zipfile both ways, and that the
 launcher imports a zip it wrote. The second builds `fs_host.c` and `save_share.c` with the rest of the runtime stubbed
 and runs each step as a start of the game on a profile it makes: the export, an import from a zip the launcher
-exported, its backup and swap at the next start, the zips it refuses and Cancel. No game files.
+exported, its backup and swap at the next start, the zips it refuses and Cancel, and the same for another player.
+No game files. A change to the players (`runtime/players.c`) passes `python tests\players_check.py` too: it builds
+`players.c` alone and adds, renames, lists and removes players on a profile it makes.
 
 A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarina_step`), or to the whole numbers the
 game's counters get out of it (`whole_take`, `frame_rate_day_host`, `frame_rate_water_host`, `frame_rate_sim_host`), passes

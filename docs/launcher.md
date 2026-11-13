@@ -367,6 +367,24 @@ copies the current save to `saves/backup <date time>` and makes the import the s
 (`runtime/fs_host.c` `import_pending`), and the menu says where the old save went. An import in the launcher replaces
 one still waiting from the menu.
 
+## Players
+
+Several people can play on one PC, each with saves of their own (`runtime/players.c`). The Players rows of the game's
+settings menu (Players tab, after Controls) choose the player, add one, rename one and remove one. A player is a folder
+holding the save folders the game uses (`save`, `save-tx`, `save-backup`, `save-import`):
+
+```
+profile/                                  player 1: the saves of a profile made before players existed
+profile/players/<n>/                      player n (2 and up)
+<player folder>/player-name.txt           the name the menu shows (UTF-8, one line); without it "Player <n>"
+profile/players-removed/<n> <UTC time>/   a removed player: their saves stay there until deleted by hand
+```
+
+The choice is nx2navi.ini's `player` key (`[player]`, a player number), read when the game first mounts its save: the
+game holds the save in memory, so the player changes at the next start (the menu's Restart). Add makes the next free
+number and chooses it; Remove refuses player 1 and the player in game. The menu's Export save and Import a save work
+on the player in game. The launcher's Saves rows still work on player 1 only.
+
 ## Mods
 
 Mods (home, under Saves; `launcher/mods.py`) is where the player puts the mods they download. The game reads the game

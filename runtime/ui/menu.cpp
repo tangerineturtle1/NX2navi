@@ -53,6 +53,7 @@ extern "C" {
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "players.h"
 #include "save_share.h"
 #include "sprint.h"
 #include "sysinfo.h"
@@ -515,7 +516,7 @@ static int fonts_up(float scale) {
         // what the title face shows in the CJK languages: the menu's title and tabs (Simplified Chinese menu text) and
         // the boot screen's title (the game's language)
         static const UiTextId titles[] = {UI_MENU_TITLE, UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                          UI_MENU_TAB_CONTROLS, UI_BOOT_TITLE};
+                                          UI_MENU_TAB_CONTROLS, UI_MENU_PLAYERS, UI_BOOT_TITLE};
         for (int i = 0; i < N; i++) {
             if (!data[i]) continue;
             ImFontGlyphRangesBuilder b;
@@ -583,7 +584,7 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 // Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_PLAYERS, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1453,6 +1454,175 @@ static void rows_saves(void) {
     if (line[0]) opt_text_str(line, warn);
 }
 
+// ---- the Players tab (players.c), after Controls: whose saves the next start loads, as the restart-only setting
+// NX2NAVI_PLAYER, and the list itself. Add makes a player and chooses them; Rename and Remove act on the player the
+// choice row shows. Rename's name field and Remove's confirmation are boxes over the menu like the Restart button's
+// (restart_confirm), drawn from here so that they open in the page's ID scope. The list is read again a second after the
+// last read and after every change: a few directory listings, not one per frame.
+static PlayerInfo g_players[PLAYERS_MAX];
+static int g_nplayers = -1;            // -1: read again
+static uint64_t g_players_read_ms;
+static bool g_player_modal;            // a box of this group is open: the menu keeps B / Esc and the tab keys
+static int g_player_box;               // 0 none, 1 the name field, 2 the removal's confirmation
+static int g_player_box_id;            // the player the open box is about
+static char g_player_name[PLAYER_NAME_MAX * 4 + 1];   // the name field; room for a paste cut down by players_clean_name
+static int g_player_text = -1;         // the last action's UiTextId, -1 none; a format that takes g_player_arg
+static char g_player_arg[PLAYER_NAME_MAX + 32];
+static bool g_player_warn;
+
+static void player_label(const PlayerInfo &p, char *out, size_t cap) {
+    if (p.name[0]) snprintf(out, cap, "%s", p.name);
+    else snprintf(out, cap, menu_text(UI_MENU_PLAYER_NUMBER), p.id);
+}
+
+static const PlayerInfo *player_find(int id) {
+    for (int i = 0; i < g_nplayers; i++)
+        if (g_players[i].id == id) return &g_players[i];
+    return nullptr;
+}
+
+static void player_done(int text, const char *arg, bool warn) {
+    g_player_text = text;
+    snprintf(g_player_arg, sizeof g_player_arg, "%s", arg ? arg : "");
+    g_player_warn = warn;
+    g_nplayers = -1;
+}
+
+// The player the choice row shows: NX2NAVI_PLAYER, 1 for a value that is no player number.
+static int player_chosen(void) {
+    const char *v = cfg_value("NX2NAVI_PLAYER");
+    int id = v && *v ? atoi(v) : 1;
+    return id >= 1 ? id : 1;
+}
+
+static void player_choose(int id) {
+    char v[16];
+    snprintf(v, sizeof v, "%d", id);
+    opt_apply("NX2NAVI_PLAYER", id == 1 ? "" : v);
+}
+
+// The open box of this group, if any: centred over the menu on the game's panel. Esc, and B outside the name field,
+// cancel; Cancel has the cursor first in the removal's confirmation, the name field in the other.
+static void player_box(float scale) {
+    const char *id = g_player_box == 1 ? "##player_name" : "##player_remove";
+    if (g_player_box && !ImGui::IsPopupOpen(id)) ImGui::OpenPopup(id);
+    g_player_modal = false;
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0);
+    const bool open = ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PopStyleVar();
+    if (!open) {
+        g_player_box = 0;
+        return;
+    }
+    g_player_modal = true;
+    const ImVec2 box = ImGui::GetWindowPos(), box_size = ImGui::GetWindowSize();
+    skin_panel(ImGui::GetWindowDrawList(), box, ImVec2(box.x + box_size.x, box.y + box_size.y), scale);
+    const PlayerInfo *p = player_find(g_player_box_id);
+    char name[PLAYER_NAME_MAX + 32];
+    if (p) player_label(*p, name, sizeof name);
+    else snprintf(name, sizeof name, menu_text(UI_MENU_PLAYER_NUMBER), g_player_box_id);
+    char line[256];
+    bool enter = false;
+    if (g_player_box == 1) {
+        snprintf(line, sizeof line, menu_text(UI_MENU_PLAYER_NAME_PROMPT), name);
+        ImGui::TextUnformatted(line);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(ImGui::CalcTextSize("M").x * 24);
+        enter = ImGui::InputText("##player_name_field", g_player_name, sizeof g_player_name,
+                                 ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    } else {
+        snprintf(line, sizeof line, menu_text(UI_MENU_PLAYER_REMOVE_CONFIRM), name);
+        ImGui::TextUnformatted(line);
+    }
+    ImGui::Spacing();
+    const char *yes = menu_text(g_player_box == 1 ? UI_MENU_PLAYER_NAME_OK : UI_MENU_PLAYER_REMOVE),
+               *no = menu_text(UI_MENU_RESET_NO);
+    const ImGuiStyle &st = ImGui::GetStyle();
+    float bw = fmaxf(ImGui::CalcTextSize(yes).x, ImGui::CalcTextSize(no).x) + st.FramePadding.x * 4;
+    bool close = skin_widget_button(no, ImVec2(bw, 0), scale);
+    if (ImGui::IsWindowAppearing() && g_player_box == 2) ImGui::SetItemDefaultFocus();
+    ImGui::SameLine(0, st.ItemSpacing.x + skin_cursor_reach(scale));
+    if (skin_widget_button(yes, ImVec2(bw, 0), scale) || enter) {
+        if (g_player_box == 1) {
+            if (players_rename(g_player_box_id, g_player_name)) player_done(-1, "", false);
+            else player_done(UI_MENU_PLAYER_FAILED, "", true);
+        } else if (players_remove(g_player_box_id)) {
+            if (player_chosen() == g_player_box_id) player_choose(players_active());
+            player_done(UI_MENU_PLAYER_REMOVED, name, false);
+        } else {
+            player_done(UI_MENU_PLAYER_FAILED, "", true);
+        }
+        close = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+        (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+        close = true, menu_sound_play(MENU_SOUND_CANCEL);
+    if (close) {
+        ImGui::CloseCurrentPopup();
+        opt_focus_key(g_player_box == 2 ? "NX2NAVI_PLAYER" : "##player_rename");
+        g_player_box = 0;   // g_player_modal stays for this frame: the Esc or B that closed the box keeps the menu open
+    }
+    ImGui::EndPopup();
+}
+
+static void rows_players(float scale) {
+    const uint64_t now = plat_now_ms();
+    if (g_nplayers < 0 || now - g_players_read_ms > 1000) {
+        g_nplayers = players_list(g_players, PLAYERS_MAX);
+        g_players_read_ms = now;
+    }
+    static char labels[PLAYERS_MAX][PLAYER_NAME_MAX + 32], values[PLAYERS_MAX][8];
+    const char *names[PLAYERS_MAX], *vals[PLAYERS_MAX];
+    for (int i = 0; i < g_nplayers; i++) {
+        player_label(g_players[i], labels[i], sizeof labels[i]);
+        snprintf(values[i], sizeof values[i], "%d", g_players[i].id);
+        names[i] = labels[i], vals[i] = values[i];
+    }
+    const int chosen = player_chosen(), active = players_active();
+    int cur = -1;
+    for (int i = 0; i < g_nplayers; i++)
+        if (g_players[i].id == chosen) cur = i;
+    const PlayerInfo *sel = cur >= 0 ? &g_players[cur] : nullptr;
+    // values[0] is "1", the table's default: choosing player 1 writes "1", which reads as the default
+    opt_choice_list("NX2NAVI_PLAYER", UI_MENU_PLAYER, vals, names, g_nplayers, UI_MENU_PLAYER_DESC, cur,
+                    sel && !sel->has_save ? menu_text(UI_MENU_PLAYER_NO_SAVE) : nullptr);
+    if (opt_button("##player_new", UI_MENU_PLAYER_NEW, UI_MENU_PLAYER_NEW_DESC)) {
+        int id = players_create("");
+        if (id) {
+            player_choose(id);
+            player_done(-1, "", false);   // the line below says who plays at the next start
+        } else {
+            player_done(UI_MENU_PLAYER_FAILED, "", true);
+        }
+    }
+    if (opt_button("##player_rename", UI_MENU_PLAYER_RENAME, UI_MENU_PLAYER_RENAME_DESC, sel ? labels[cur] : "")) {
+        snprintf(g_player_name, sizeof g_player_name, "%s", sel ? sel->name : "");
+        g_player_box = 1, g_player_box_id = chosen;
+    }
+    if (chosen == 1 || chosen == active) opt_disable_next(UI_MENU_PLAYER_REMOVE_NOT);
+    if (opt_button("##player_remove", UI_MENU_PLAYER_REMOVE, UI_MENU_PLAYER_REMOVE_DESC) && chosen != 1 &&
+        chosen != active)
+        g_player_box = 2, g_player_box_id = chosen;
+    if (g_player_box) player_box(scale);
+    else g_player_modal = false;
+    char line[256] = "";
+    bool warn = g_player_warn;
+    if (g_player_text >= 0) {
+        snprintf(line, sizeof line, menu_text((UiTextId)g_player_text), g_player_arg);
+    } else if (chosen != active && sel) {
+        snprintf(line, sizeof line, menu_text(UI_MENU_PLAYER_SWITCH), labels[cur]);
+        warn = false;
+    }
+    if (line[0]) opt_text_str(line, warn);
+}
+
+static void tab_players(float scale) {
+    opt_begin("##players", scale);
+    rows_players(scale);
+    opt_end();
+}
+
 static void rows_low_end(void);
 
 static void tab_game(float scale) {
@@ -1794,7 +1964,7 @@ static void rows_low_end(void) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_PLAYERS};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1881,7 +2051,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     }
 
     // a text field takes Q and E as letters, and a window of a page keeps the tab keys
-    const bool keeps_keys = g_modal || binds_modal() || ImGui::GetIO().WantTextInput;
+    const bool keeps_keys = g_modal || g_player_modal || binds_modal() || ImGui::GetIO().WantTextInput;
     int step = keeps_keys                                                                                ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
@@ -1915,6 +2085,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_PLAYERS: tab_players(scale); break;
             }
             ImGui::EndTabItem();
         }
@@ -1974,7 +2145,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     if (skin_widget_button(quit, ImVec2(bw, 0), scale)) g_confirm_quit = true, ImGui::OpenPopup("##confirm");
     restart_confirm(scale);
     menu_sounds_frame();
-    bool was_modal = g_modal || binds_modal() || ImGui::GetIO().WantTextInput;
+    bool was_modal = g_modal || g_player_modal || binds_modal() || ImGui::GetIO().WantTextInput;
     if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
         set_open(0);
     ImGui::End();
@@ -2232,6 +2403,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
         g_focus_page = g_tab_request >= 0 ? g_tab_request : g_tab;   // opening: the first row has the cursor
         if (GImGui->OpenPopupStack.Size) ImGui::ClosePopupToLevel(0, false);   // a confirmation left open on closing
         g_modal = false;
+        g_player_box = 0, g_player_modal = false;
     }
     io.DisplaySize = ImVec2((float)t->width, (float)t->height);
     double dt = g_last_ns ? (t0 - g_last_ns) / 1e9 : 1 / 60.0;

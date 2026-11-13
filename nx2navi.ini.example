@@ -808,6 +808,12 @@
 # it is none of them.
 # menu_lang = en
 
+[player]
+# Whose saves the game loads: a player number (read at start). Player 1's saves are the profile's save folders, player
+# n's are under <profile>/players/<n>; each may hold player-name.txt with the name the menu shows. The menu's Players tab
+# adds, renames and removes players.
+# player = 1
+
 [discord]
 # Rich Presence: "Playing NX2navi" with the play time in your Discord status while the game runs, through the
 # local IPC of a running Discord client; without one it does nothing. 0 = off. The Game tab of the settings menu (F1)

@@ -3,12 +3,15 @@
 // handles go to the read-only backend (romfs.c); save, temporary and cache storage are host directories under the
 // profile directory (rt_config()->profile, default build/profile):
 //
-//   <profile>/save/<uid hi><uid lo>/   committed application save data, created on first use as the system launcher
+// Each player (players.c) has these save folders under its own folder, <saves>: the profile for player 1,
+// <profile>/players/<n> for the others. The rest is the profile's.
+//
+//   <saves>/save/<uid hi><uid lo>/     committed application save data, created on first use as the system launcher
 //                                      does for titles that declare save data
-//   <profile>/save-tx/                 the save mount's working copy and Commit's staging (section "save
+//   <saves>/save-tx/                   the save mount's working copy and Commit's staging (section "save
 //                                      transactions")
-//   <profile>/save-backup/<time>/      the three committed saves before the current one
-//   <profile>/save-import/             a save the menu imported, made the save at the next start (section "a shared
+//   <saves>/save-backup/<time>/        the three committed saves before the current one
+//   <saves>/save-import/               a save the menu imported, made the save at the next start (section "a shared
 //                                      save")
 //   <profile>/temp/                    emptied at start
 //   <profile>/cache/<index>/           cache storage
@@ -25,6 +28,7 @@
 #include "host.h"
 #include "platform/platform.h"
 #include "romfs_path.h"
+#include "players.h"
 #include "save_share.h"
 
 #define NX2NAVI_APPLICATION_ID 0x0400486024dec000ull   // the game's title id, as svc.c PROGRAM_ID tells it
@@ -47,6 +51,9 @@ static File files[NFILES];
 static Dir dirs[NDIRS];
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static char profile[1024], save_root[1100], work_root[1100];
+// The player's save folder (players.c players_save_dir): the profile itself for player 1, <profile>/players/<n> for
+// another. save, save-tx, save-backup and save-import are under it; the lock, temp and cache stay in the profile.
+static char saves[1100];
 static volatile int32_t storage_ready;
 
 static void need(int c, const char *m) {
@@ -190,11 +197,11 @@ static int remove_tree_retry(const char *path) {
 // The save mount's root is a working copy, made from the newest save when the first save mount appears. Commit copies
 // it to a staging directory, which a rename makes a finished commit, and swaps that in for the committed save:
 //
-//   <profile>/save/<uid>/          committed save: what the next start loads when no finished commit waits
-//   <profile>/save-tx/work/        working copy, the save mount's root; deleted at the last Unmount and at start
-//   <profile>/save-tx/new/         Commit's staging copy of the working copy
-//   <profile>/save-tx/ready-<n>/   a finished commit not swapped in yet: the newest save
-//   <profile>/save-tx/old/         the committed save a Commit replaced, on its way to save-backup
+//   <saves>/save/<uid>/            committed save: what the next start loads when no finished commit waits
+//   <saves>/save-tx/work/          working copy, the save mount's root; deleted at the last Unmount and at start
+//   <saves>/save-tx/new/           Commit's staging copy of the working copy
+//   <saves>/save-tx/ready-<n>/     a finished commit not swapped in yet: the newest save
+//   <saves>/save-tx/old/           the committed save a Commit replaced, on its way to save-backup
 //
 // Commit: (1) copy work to new and flush every file (FlushFileBuffers) and directory, a file equal to the newest
 // save's as a hard link to it; (2) rename new to ready-<n>, the commit point, and delete the ready-<n> it supersedes;
@@ -602,7 +609,7 @@ void fs_save_crash_wait(void) {
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
     char root[1100];
     if (cap) out[0] = 0;
-    if (!*profile || snprintf(root, sizeof root, "%s/%s", profile, folder) >= (int)sizeof root) return 0;
+    if (!*saves || snprintf(root, sizeof root, "%s/%s", saves, folder) >= (int)sizeof root) return 0;
     make_dirs(root);
     uint64_t ns = plat_unix_time_ns();
     struct tm t;
@@ -699,8 +706,8 @@ static uint32_t save_commit(void) {
 
 // ---- a shared save (save_share.c): the export reads the newest save, the menu's import waits for the next start
 //
-//   <profile>/save-import/        a save the menu took from a zip: it becomes the save at the next start
-//   <profile>/save-import.part/   that save while the menu writes it; renamed to save-import when complete
+//   <saves>/save-import/       a save the menu took from a zip: it becomes the save at the next start
+//   <saves>/save-import.part/  that save while the menu writes it; renamed to save-import when complete
 //
 // The import cannot replace the save while the game runs: the game holds its progress in memory and writes it back
 // at its next save, over the imported files, and the save mount's working copy is made once per mount. So the start
@@ -713,8 +720,8 @@ static void ready(void);
 
 static void import_pending(void) {
     char imp[1100], part[1100];
-    snprintf(imp, sizeof imp, "%s/save-import", profile);
-    snprintf(part, sizeof part, "%s/save-import.part", profile);
+    snprintf(imp, sizeof imp, "%s/save-import", saves);
+    snprintf(part, sizeof part, "%s/save-import.part", saves);
     if (exists(part) && remove_tree(part)) rt_log("host save import: cannot delete the unfinished %s", part);
     if (plat_fs_kind(imp) != PLAT_FS_DIR) return;
     const char *cur = newest_save();
@@ -817,8 +824,8 @@ static int stage_file(const char *path, const uint8_t *data, size_t n) {
 int fs_save_import_stage(int count, const char *const *rel, const uint8_t *const *data, const size_t *size) {
     ready();   // the start's own import_pending has run: this one waits for the next start
     char imp[1100], part[1100];
-    snprintf(imp, sizeof imp, "%s/save-import", profile);
-    snprintf(part, sizeof part, "%s/save-import.part", profile);
+    snprintf(imp, sizeof imp, "%s/save-import", saves);
+    snprintf(part, sizeof part, "%s/save-import.part", saves);
     if (remove_tree_retry(part) || plat_fs_mkdir(part)) {
         rt_log("host save import: cannot make %s", part);
         return -1;
@@ -848,14 +855,14 @@ int fs_save_import_waiting(void) {
     // this is no reason to run it on the present thread
     if (!plat_cas32(&storage_ready, 0, 0)) return 0;
     char imp[1100];
-    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    snprintf(imp, sizeof imp, "%s/save-import", saves);
     return plat_fs_kind(imp) == PLAT_FS_DIR;
 }
 
 int fs_save_import_cancel(void) {
     ready();
     char imp[1100];
-    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    snprintf(imp, sizeof imp, "%s/save-import", saves);
     if (remove_tree_retry(imp)) return -1;
     rt_log("host save import: the import waiting for the next start was dropped");
     return 0;
@@ -884,13 +891,14 @@ static void storage_init(void *param) {
     char p[PATH_CAP];
     fs_host_lock_profile();
     account_uid(uid);
-    snprintf(p, sizeof p, "%s/save", profile);
+    need(players_save_dir(profile, saves, sizeof saves), "player save path");
+    snprintf(p, sizeof p, "%s/save", saves);
     make_dirs(p);
-    need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1],
+    need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", saves, (unsigned long long)uid[1],
                   (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
-    need(snprintf(tx_root, sizeof tx_root, "%s/save-tx", profile) < (int)sizeof tx_root, "save path");
+    need(snprintf(tx_root, sizeof tx_root, "%s/save-tx", saves) < (int)sizeof tx_root, "save path");
     snprintf(work_root, sizeof work_root, "%s/work", tx_root);
-    snprintf(backup_root, sizeof backup_root, "%s/save-backup", profile);
+    snprintf(backup_root, sizeof backup_root, "%s/save-backup", saves);
     make_dirs(tx_root);
     make_dirs(backup_root);
     snprintf(new_root, sizeof new_root, "%s/new", tx_root);
@@ -904,7 +912,7 @@ static void storage_init(void *param) {
     snprintf(p, sizeof p, "%s/cache", profile);
     make_dirs(p);
     plat_xchg32(&storage_ready, 1);
-    rt_log("host save storage: %s", save_root);
+    rt_log("host save storage: %s (player %d)", save_root, players_active());
     return;
 }
 
