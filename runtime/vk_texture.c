@@ -3068,6 +3068,10 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
     if (freed < COMMIT_EVICT_STEP) evict_disused(COMMIT_EVICT_STEP - freed);
 }
 
+#define PRESSURE_HARD_STEP (PRESSURE_STEP * 8)
+#define PRESSURE_HARD_PCT 95
+#define HARD_UNSAMPLED PRESENTS(30)
+
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("NX2NAVI_TEX_VRAM_PRESSURE");
@@ -3112,12 +3116,30 @@ static void sweep_pressure(void) {   // tex_lock held
         // stayed over its budget throughout; with this rule 34,699 went, a fifth fewer textures were made again, the
         // render thread waited a third less on textures, and 4 draws met a texture gone where 11 had.
         uint64_t freed = 0, now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP && now - e->rel_frame >= STALE_FRAMES; e = next) {
+        // At PRESSURE_HARD_PCT of the budget, while the shaders' marks are read (a shader that cannot be marked stops
+        // it), an entry that comes back intact goes once no shader sampled it for HARD_UNSAMPLED presents, however
+        // recently it was released and whether lookups still reach it or not, PRESSURE_HARD_STEP at a time until the
+        // overrun is covered. At an area change the game releases the textures of the area left behind, several GiB,
+        // while the next area's are made, and the texture pool keeps looking up the slots it holds for them: none was
+        // idle, PRESSURE_STEP went a check once STALE_FRAMES had passed, and the card stayed 2-3 GiB over its budget
+        // for seconds after each change while the driver moved memory out to the system's (an RTX 4090, a 2160p game
+        // resolution and ASTC decoded to RGBA8: released entries 7.6 GiB beside 11.8 of live ones, 5 to 15 fps). The
+        // load itself draws nothing, so waiting for the marks to show the scene again (marks_live) waited past it. A
+        // lookup is not a draw: such an entry that is drawn again is made again from its storage, as below the budget.
+        int hard = known && used > budget / 100 * PRESSURE_HARD_PCT && vk_pool_marks_enabled() &&
+                   !__atomic_load_n(&vk_pool_marks_missed, __ATOMIC_RELAXED);
+        static int hard_told;
+        if (hard && !hard_told++)
+            rt_log("vk: at %d%% of the video memory budget: released textures no shader sampled for %llu presents go, "
+                   "however recently released, lookups or not", PRESSURE_HARD_PCT, (unsigned long long)HARD_UNSAMPLED);
+        for (Tex *e = rel_head, *next; e && dropped < (hard ? PRESSURE_HARD_STEP : PRESSURE_STEP); e = next) {
             next = e->rel_next;
-            if (!comes_back_intact(e) || !idle(e, now)) continue;
+            if (!hard && now - e->rel_frame < STALE_FRAMES) break;   // in release order: the rest are younger
+            if (!comes_back_intact(e) || (hard ? now - e->samp_frame < HARD_UNSAMPLED : !idle(e, now))) continue;
             freed += e->bytes;
             drop_tex(e, DROP_VRAM);
             dropped++, n_pressure_drops++;
+            if (hard && freed >= over) break;
         }
         if (tex_evict && freed < over) freed += evict_idle(over - freed, used, budget, DROP_IDLE_VRAM);
         if (tex_evict && freed < over) evict_disused(over - freed);
