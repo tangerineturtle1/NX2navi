@@ -5,7 +5,7 @@
 **Join the official NX2navi update discord server: https://discord.com/invite/uf6gSrsPpq** 
 
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game
-version 1.1.1) into a native x86-64 application for Windows, with a Vulkan renderer
+version 1.1.1) into a native x86-64 application for Windows and Linux, with a Vulkan renderer
 ([docs/architecture.md](docs/architecture.md)).
 
 > [!IMPORTANT]
@@ -19,6 +19,9 @@ version 1.1.1) into a native x86-64 application for Windows, with a Vulkan rende
 Early development, playable. Kokiri Forest, Kakariko Village, Death Mountain Trail and its crater, the Temple of
 Time and the Great Fairy fountains play at 60 fps and above on current GPUs, from the title screen and from saves.
 Visual bugs and occasional crashes are still expected ([Known issues](#known-issues)).
+
+Linux support is in progress. Long play sessions and the Steam Deck itself are not verified yet; see
+[Linux status and requirements](docs/building.md#linux-in-progress). AMD FSR 3.1 and FSR 4 are currently Windows only.
 
 Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -60,6 +63,8 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Installing
 
+### Windows
+
 Download `NX2navi-Setup-<version>.exe` from the releases and start it next to your `.nup` dump. It is the only file
 you need. The launcher it
 installs finds the dump, downloads the build tools, builds the game on your PC (20 to 45 minutes, once) and starts
@@ -71,6 +76,20 @@ lists every key). Controls: [docs/controls.md](docs/controls.md).
 Requirements: Windows 10 or later; an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a faster build); 16 GB of RAM; about
 34 GB free for the game and 1.5 GB for the launcher and its tools; a GPU with Vulkan 1.3, `VK_EXT_external_memory_host`
 and `VK_EXT_mesh_shader`. The setup is not signed, so SmartScreen warns on its first start.
+
+### Linux (in progress)
+
+Download `NX2navi-Linux-<version>-x86_64.AppImage` from the releases, make it executable and start it. Its window lets
+you choose your `.nup` dump and the game folder, install or update the game, and play. It builds a native Linux
+executable on your PC from your dump; no game files are included and Wine or Proton is not needed.
+
+The AppImage includes Python and the shader translator, but requires the system's compiler and libraries; it checks
+for missing packages before starting the build. The first installation downloads `zbic`, the tool used to unpack the
+game's program files, unless it is already installed in the AppImage's dependency folder. The default game folder is
+`~/Games/Ocarina`, with `ocarina` and `play.sh` inside.
+
+Requirements include x86-64 Linux with kernel 6.7 or later and a Vulkan 1.3 driver with `VK_EXT_external_memory_host`.
+See [the Linux build kit instructions](docs/README-BuildKit.md#linux) for packages and platform-specific features.
 
 ## Known issues
 
@@ -93,7 +112,7 @@ of Zelda*, *Ocarina of Time* and *Nintendo Switch* are trademarks of Nintendo.
 ## Building from source
 
 [docs/building.md](docs/building.md) lists the toolchain and the steps. `tools/make_game.py` also builds the game
-natively on Linux ([docs/README-BuildKit.md](docs/README-BuildKit.md), "Linux"); the launcher and the setup are
-Windows only. Everything the build writes stays under
+natively on Linux ([docs/README-BuildKit.md](docs/README-BuildKit.md), "Linux"). The Windows launcher and setup use
+`.exe` files; the Linux AppImage has its own install, update and play window. Everything the build writes stays under
 `build\` and `generated\`, which git ignores, as it does the runtime's shaders the build compiles
 (`runtime\*_spv.h`; the repository holds their source only); run `tools/check_content.py` before a commit.
