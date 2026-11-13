@@ -24,13 +24,6 @@ unsigned cfg_version(void);
 int cfg_setenv(const char *name, const char *value);
 // 1 when the environment sets name: cfg_set cannot change what cfg_get returns (the menu greys the setting out).
 int cfg_from_env(const char *name);
-// The value of key, as nx2navi.ini spells it ("coop_accept"), in nx2navi.ini as the file is now: the file is read again,
-// for the few settings that act while the game runs without the menu (co-op's acceptance and the room maker's
-// remedies; everything else is read at start). Read as at start: a BOM is skipped, a repeated key's later line wins,
-// quotes go and "key =" sets nothing. 1 and the value in out when the file sets it, 0 when it does not, -1 when the
-// file cannot be read now or is empty (an editor saving it, a lock): the caller skips that reading.
-int cfg_ini_now(const char *key, char *out, size_t cap);
-int cfg_ini_read(const char *path, const char *key, char *out, size_t cap);   // the same, of the file at path
 // 1 when the player set name (the environment or nx2navi.ini), 0 when cfg_get gives a device profile's default or NULL.
 int cfg_is_set(const char *name);
 int cfg_low_end_active(void);   // the low-end GPU mode was on when the game started (cfg.c LOWEND)

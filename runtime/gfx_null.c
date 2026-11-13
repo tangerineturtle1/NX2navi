@@ -147,6 +147,7 @@ const GfxBackend gfx_null_backend = {
     .submit = null_submit,
     .fence_wait = null_fence_wait,
     .exec_wait = null_fence_wait,
+    .game_wait = null_fence_wait,
     .fence_done = null_fence_done,
     .present = null_present,
     .finish = null_finish,

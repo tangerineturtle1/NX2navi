@@ -62,6 +62,16 @@ static uint64_t live_last_of[LIVE_RING], live_last;
 // per value (index & LIVE_RING - 1): the newest value up to it whose completion hands results to the CPU (vk_exec_take_results)
 static uint64_t res_of[LIVE_RING], res_last;
 static uint8_t res_kinds[LIVE_RING];   // per value: its VK_RES_* kinds
+// The early tail (vk_exec.c "the early tail"), per value under st_lock: early_of holds the value when its part with
+// the write-backs signalled the executed timeline before its tail; empty_of when the submission handed the GPU nothing
+// and the CPU no results (a submission held at its first event wait: Ocarina's first of a frame in the field).
+static uint64_t early_of[LIVE_RING], empty_of[LIVE_RING];
+static VkCommandBuffer tail_cb;        // sub_lock: the tail's command buffer between hold and release
+// sub_lock: this submission's tail went behind its write-backs; the parts of it handed over before the last
+static int tail_early, sub_parts;
+static volatile uint64_t tail_ns;      // about how long the GPU takes for a tail (a moving average)
+static volatile uint64_t tail_t0, tail_val;   // the first early return for tail_val, for tail_ns
+static volatile uint64_t tail_n, tail_waits;  // since the last vk_sync_tail_stats: early tails; waits they ended
 static int res_mask = 0x1f;            // NX2NAVI_SUBMIT_FINISH_KINDS: the kinds the wait counts
 static int stop;
 static Pending *queue;            // side effects in the order they were added
@@ -915,6 +925,12 @@ static void completion_main(void *arg) {
             // finished submissions held (vk_mem_collect: upload batches, destroyed images, views and buffers, each
             // checked against the timeline itself) is nothing they read, and it takes cmd_lock, which the upload
             // path holds, so done waited behind uploads.
+            uint64_t tv = __atomic_load_n(&tail_val, __ATOMIC_ACQUIRE);
+            if (tv && reached >= tv) {   // the tail a wait went ahead of is through: how long it took from there
+                uint64_t d = kern_now_ns() - __atomic_load_n(&tail_t0, __ATOMIC_RELAXED), a = tail_ns;
+                if (d < 50000000ull) __atomic_store_n(&tail_ns, a ? (a * 7 + d) / 8 : d, __ATOMIC_RELAXED);
+                __atomic_compare_exchange_n(&tail_val, &tv, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            }
             uint64_t was = done;
             __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
             plat_cond_broadcast(&cv_done);
@@ -1192,6 +1208,63 @@ VkCommandBuffer vk_sync_worker_begin(int w) {
 
 void vk_sync_worker_end(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }
 static VkCommandBuffer split_part(int exec);
+
+// ---- the early tail (vk_exec.c "the early tail"). The replay cut the part where the tail began (vk_sync_cut), so the
+// chain holds what came before and the command buffer being recorded is the tail's. vk_sync_tail_hold sets that one
+// aside, ended and timed as a part of its own, and begins the one the write-backs are recorded into;
+// vk_sync_tail_release hands the chain and the write-backs to the queue with the executed timeline's signal
+// (split_part), and puts the tail into the chain for the submission's last part, which signals the timeline. The queue
+// runs them in that order, so the GPU's work is what it was with the write-backs moved before the tail.
+int vk_sync_tail_ok(void) { return !pre_cb && !tail_cb && exec_tl && exec_sig < cur_fence && nchain + 2 <= CHAIN_MAX; }
+
+VkCommandBuffer vk_sync_tail_hold(void) {
+    VkCtx *c = vk_ctx();
+    VkCommandBuffer cb = slots[cur_slot].cb;
+    vk_gpu_passes_part(cb, 1);
+    ts_end(cb, cur_fence);
+    if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);
+    tail_cb = cb;
+    CmdSlot *s = take_slot(c, cur_fence);   // the tail keeps its slot until the value is reached
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(s->cb, &bi);
+    ts_begin(s->cb);
+    rec_begin(s->cb, cur_fence);
+    vk_gpu_passes_part(s->cb, 0);
+    return s->cb;
+}
+
+VkCommandBuffer vk_sync_tail_release(void) {
+    VkCommandBuffer cb = split_part(1);
+    chain[nchain++] = tail_cb;
+    tail_cb = VK_NULL_HANDLE;
+    tail_early = 1;
+    return cb;
+}
+
+// The newest value up to `value` whose GPU work a wait of the game is for: the empty submissions after it are passed
+// over. *early: that one's write-backs went before its tail, so the executed timeline reaches it there.
+static uint64_t wait_target(uint64_t value, int *early) {
+    plat_mutex_lock(&st_lock);
+    uint64_t t = value;
+    while (t > done && empty_of[t & (LIVE_RING - 1)] == t) t--;
+    *early = t > done && early_of[t & (LIVE_RING - 1)] == t;
+    plat_mutex_unlock(&st_lock);
+    return t;
+}
+
+uint64_t vk_sync_tail_pending_ns(uint64_t value) {
+    plat_mutex_lock(&st_lock);
+    int pending = value > done && early_of[value & (LIVE_RING - 1)] == value;
+    plat_mutex_unlock(&st_lock);
+    return pending ? __atomic_load_n(&tail_ns, __ATOMIC_RELAXED) : 0;
+}
+
+void vk_sync_tail_stats(uint64_t *tails, uint64_t *waits, double *ms) {
+    *tails = __atomic_exchange_n(&tail_n, 0, __ATOMIC_RELAXED);
+    *waits = __atomic_exchange_n(&tail_waits, 0, __ATOMIC_RELAXED);
+    *ms = (double)__atomic_load_n(&tail_ns, __ATOMIC_RELAXED) / 1e6;
+}
 VkCommandBuffer vk_sync_split(void) { return split_part(0); }
 // The part that ends here is the last with the submission's own commands: it signals the executed timeline.
 VkCommandBuffer vk_sync_split_exec(void) { return split_part(1); }
@@ -1213,6 +1286,7 @@ static VkCommandBuffer split_part(int exec) {
         si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &esig, exec_sig = cur_fence;
     ts_submitted(cbi, ncb);
     queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
+    sub_parts++;
     vk_mem_lazy_handed();
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
@@ -1254,6 +1328,7 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
+    tail_early = sub_parts = 0;
     CmdSlot *s = take_slot(c, fence);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -1313,6 +1388,9 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     if (live) live_last = fence;
     live_last_of[fence & (LIVE_RING - 1)] = live_last;
     res_kinds[fence & (LIVE_RING - 1)] = (uint8_t)res;
+    early_of[fence & (LIVE_RING - 1)] = tail_early ? fence : 0;
+    empty_of[fence & (LIVE_RING - 1)] = !own && !sent && !sub_parts && !res ? fence : 0;
+    if (tail_early) __atomic_fetch_add(&tail_n, 1, __ATOMIC_RELAXED);
     if (res & res_mask) res_last = fence;
     res_of[fence & (LIVE_RING - 1)] = res_last;
     __atomic_store_n(&issued, fence, __ATOMIC_RELEASE);
@@ -1525,8 +1603,13 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     if (vk_device_is_lost()) return __atomic_load_n(&done, __ATOMIC_ACQUIRE) >= value;
     if (!vk_sync_wb_split()) return vk_sync_fence_wait(value, timeout_ns);
     if (__atomic_load_n(&done, __ATOMIC_ACQUIRE) >= value) return 1;
+    // The early tail: a value whose GPU work is that of an earlier submission with its write-backs before its tail (the
+    // submissions since handed the GPU nothing) is reached where that one's executed signal is, its tail still to run.
+    int early = 0;
+    uint64_t asked = value, target = wb_results ? wait_target(value, &early) : value;
+    if (early) value = target;
     uint64_t p0 = perf_begin();
-    hold_release(value, 0, 0);   // a held submission the waiter needs goes to the queue now
+    hold_release(asked, 0, 0);   // a held submission the waiter needs goes to the queue now
     VkCtx *c = vk_ctx();
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                               .pSemaphores = &exec_tl, .pValues = &value};
@@ -1540,6 +1623,13 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     if (r == VK_SUCCESS && wb_results) results_run(value);
     perf_end(PERF_FENCE, p0);
     perf_gpu_wait(p0);
+    if (r == VK_SUCCESS && early && __atomic_load_n(&done, __ATOMIC_ACQUIRE) < value) {
+        __atomic_fetch_add(&tail_waits, 1, __ATOMIC_RELAXED);
+        uint64_t none = 0;   // the first wait back for this tail starts its clock (the completion thread ends it)
+        if (__atomic_load_n(&tail_val, __ATOMIC_ACQUIRE) != value &&
+            __atomic_compare_exchange_n(&tail_val, &none, value, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+            __atomic_store_n(&tail_t0, kern_now_ns(), __ATOMIC_RELAXED);
+    }
     if (r == VK_SUCCESS) {
         __atomic_fetch_add(&exw_n, 1, __ATOMIC_RELAXED);
         if (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < value) {
@@ -1549,6 +1639,19 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
         }
     }
     return r == VK_SUCCESS;
+}
+
+// The game's own wait for a fence (nvn_api_core.c nvnSyncWait): the fence's wait, or with the early tail the wait for
+// the results of the submission the value's GPU work belongs to (vk_sync_exec_wait), when that one's tail is all the
+// GPU still has of it: the tail reads nothing the game can change and hands it nothing.
+int vk_sync_game_wait(uint64_t value, uint64_t timeout_ns) {
+    vk_sync_start();
+    if (vk_sync_wb_split() && wb_results && __atomic_load_n(&done, __ATOMIC_ACQUIRE) < value) {
+        int early = 0;
+        wait_target(value, &early);
+        if (early) return vk_sync_exec_wait(value, timeout_ns);
+    }
+    return vk_sync_fence_wait(value, timeout_ns);
 }
 
 uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUIRE); }

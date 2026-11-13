@@ -919,6 +919,7 @@ const GfxBackend gfx_vulkan_backend = {
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
     .exec_wait = vk_be_exec_wait,
+    .game_wait = vk_sync_game_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
     .frame_start = vk_dlssg_frame_start,

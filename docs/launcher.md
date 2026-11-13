@@ -65,6 +65,11 @@ Customize Launcher (on the home screen) makes the look the player's own:
   it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
   (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
 
+- Steam's library file for co-op (Windows, `launcher/steamlib.py`, [coop.md](coop.md)): before Play and before a start
+  from the Steam shortcut, when `steam_api64.dll` is not beside the game, the launcher copies one there: one a release
+  ships in its `bin` folder if it has one, else the newest one in the games of the player's Steam libraries that Valve
+  signed (WinVerifyTrust and the signer's name) and that has every call `runtime/steam.c` uses. Nothing is downloaded.
+  With no Steam or no suitable file the game starts as before and co-op says what is missing.
 - Add to Steam (Windows): the game in the player's Steam library as *The Legend of Zelda Ocarina of Time*, started
   from there without the launcher's window (`launcher/steam.py`). Its pictures are made from the player's game when
   the row is selected (`launcher/gameart.py`): Navi as the game's HUD draws her for the icon, the title screen's logo,

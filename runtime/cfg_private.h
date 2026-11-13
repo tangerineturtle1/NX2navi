@@ -1,5 +1,6 @@
-// Settings whose values stay on the player's PC: a co-op room's secret and the offer number made for it, the relay's
-// address, the player's name, the key a maker removes, and the menu's test hook (which can carry a secret). The log's
+// Settings whose values stay on the player's PC: the menu's test hook, and what the co-op of versions up to 0.9.2 kept
+// in nx2navi.ini, which a player's file may still hold (a room's secret and the offer number made for it, the relay's
+// address, the player's name, the key a maker removed). The log's
 // line of what nx2navi.ini sets (cfg.c log_file_settings), "Copy system info" (sysinfo.c) and the copy of nx2navi.ini a
 // bug report takes along (save_share.c; launcher/saves.py has the same list) show only that such a key is set.
 // Header only, so that the tests that build one of those files alone need nothing else.

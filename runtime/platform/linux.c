@@ -2374,7 +2374,7 @@ void plat_ipc_close(PlatIpc *p) {
     free(p);
 }
 
-// ---- UDP sockets (platform.h): the co-op layer's transport
+// ---- UDP sockets (platform.h)
 struct PlatUdp { int fd, v6; };
 
 static void addr_from_sockaddr(PlatAddr *out, const struct sockaddr_storage *ss) {

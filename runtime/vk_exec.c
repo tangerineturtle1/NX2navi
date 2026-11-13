@@ -1122,6 +1122,59 @@ static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 
+// ---- the early tail (NX2NAVI_TAIL_EARLY, default 0)
+// Standing in Hyrule Field with FSR 4 (RX 7900 XT, 2026-11-13) a frame's main submission ends with one part of 4.7 ms
+// of GPU time, the temporal upscaler and the interface drawn after it, and one of 1.4 ms, the write-backs of what the
+// shaders wrote into VRAM mirrors. The game waits for all of it before it writes the next frame's data (the wait after
+// a frame's first submission, nvn_api_core.c, and its own fence waits), about 7 ms in which the replay thread has
+// nothing to record. What the game reads of the submission is done before the upscaler runs: the occlusion and
+// counter reports, the event values, and the write-backs' bytes, which only came last. After it the stream holds two
+// timestamp reports, and inline uniform updates for the interface's draws (64 bytes into one mirrored block, some
+// thirty times), and nothing else the CPU sees.
+// So from the upscaler on (vk_dlaa.c evaluate) the replay records the tail into a command buffer of its own
+// (vk_sync_cut), without splits or parallel groups. An inline uniform update of a mirrored block in it takes no
+// write-back: the GPU copies the bytes into the mirror in stream order as ever, and guest memory gets them from the
+// CPU with the submission's results (vk_exec_draw.c op_update_ub, vk_exec_xfer.c vk_exec_tail_ub). At the submission's
+// end, when the tail turned out to hand the CPU nothing but timestamps (vk_exec_tail_results), to write no other pool
+// memory (vk_mem_gpu_wrote_count) and to bind no memory the GPU reads from the game's own pages (vk_mem_live_swap: a
+// pool without a mirror, a device address table),
+// the write-backs are recorded into a command buffer that goes to the queue before the tail's, with the executed
+// timeline's signal (vk_sync_tail_hold, vk_sync_tail_release): the GPU runs the same commands, the write-backs before
+// the tail. The mirror copies the tail's first uses queued go with that part too, so they read the game's pages before
+// the signal. The game's waits then end at that signal and the results the game reads (vk_sync.c vk_sync_exec_wait,
+// vk_sync_game_wait), and the GPU runs the tail while the game and the replay are at the next frame. A timestamp
+// reported in the tail is written then with the time the tail is expected to end at (vk_exec_xfer.c counter_cb), as
+// the game measures the frame's GPU time with it. A tail that fails a test goes as before, the write-backs after it.
+// Measured there, 150 s runs, each pair in one batch: 63.5 against 49.4 fps with three replay workers; without them
+// 50.7 against 42.5 standing and 56.0 against 45.9 along the field route, and with FSR 3.1, whose tail the GPU runs
+// for 1.2 ms where FSR 4's takes 3.5, 51.8 against 47.8 and 54.9 against 52.3. All but a few of the tails passed the
+// tests there; in area loads and some places a tail hands the CPU results and goes as before. The pictures matched
+// those without it standing, along the route and through warps to five areas. Not measured with the lazy write-back
+// (NVIDIA's and Intel's default), where a tail's uniform updates are noted as writes and no tail goes early.
+// Not with shadow storage, emulated mesh shaders, a frame dump or a pass capture, nor inside a chunk or a continuation.
+static struct {
+    int on;                  // the submission's tail is being recorded
+    int live0;               // vk_mem_live_swap's note from before it
+    uint64_t wrote0;         // vk_mem_gpu_wrote_count when it began
+    // since the last perf line: tails; those that went early; those refused by results, writes, late reads, other
+    uint64_t n, early, why[4];
+} TL;
+int vk_exec_tail_results(void);   // vk_exec_xfer.c
+void vk_sync_tail_stats(uint64_t *tails, uint64_t *waits, double *ms);
+int vk_gpu_passes_capturing(void);
+int vk_mesh_shader_native(void);   // vk_device.c
+int vk_exec_tail(void) { return TL.on; }
+
+static int tail_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_TAIL_EARLY");
+        if (on)
+            rt_log("vk: the write-backs go before a frame's tail, and the game's waits end there (NX2NAVI_TAIL_EARLY)");
+    }
+    return on;
+}
+
 int vk_exec_split_now(VkExec *ex) {
     int in_pass = ex->in_pass;
     if (in_pass) vk_exec_pass_end(ex);
@@ -1153,7 +1206,7 @@ static void maybe_split(VkExec *ex) {
                split_idle ? "; a first part at once while the GPU is idle" : "");
         split_at = split_n ? split_n : INT_MAX;
     }
-    if (!split_n) return;
+    if (!split_n || TL.on) return;   // the tail stays one command buffer (the early tail)
     if (Q.drained < Q.out) {   // groups the submitting thread went on past go into the part first, once done
         if (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < Q.out) return;   // split_draws stays: a later op asks again
         group_drain(ex, PW_SPLIT);
@@ -1783,7 +1836,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 }
 
 // ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread; the
-// Game tab's Replay workers row sets it)
+// Game tab's CPU helper threads row sets it)
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
 // Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
@@ -1876,6 +1929,8 @@ static const char *const pw_name[PW_N] = {"next group", "op", "pass hooks", "tur
 static struct {
     int n;                              // workers; 0 off, -1 not read yet
     int pipe;                           // NX2NAVI_REPLAY_PIPE: the groups out at once at most, 0 none
+    int small;                          // NX2NAVI_REPLAY_SMALL: the fewest draws of a group one worker takes whole
+    uint64_t small_groups, small_draws; // such groups and their draws since the last perf line
     void *help_dc;                      // the submitting thread's draw context for chunks it takes while it waits
     RwWorker *w[RW_MAX];
     const op_hdr *skip_to[CALL_DEPTH + 1];   // per call depth: the walk read ahead to this op, a group too small
@@ -2007,6 +2062,10 @@ static void rw_init(void) {
     int pipe = cfg_int("NX2NAVI_REPLAY_PIPE");   // the groups out at once
     RW.pipe = RW.n <= 0 || pipe <= 0 ? 0 : pipe > LIVE_GROUPS ? LIVE_GROUPS : pipe;
     if (RW.pipe) RW.help_dc = vk_exec_draw_ctx_new();
+    RW.small = RW.pipe ? cfg_int("NX2NAVI_REPLAY_SMALL") : 0;
+    if (RW.small > 0)
+        rt_log("vk: a group of %d draws or more goes whole to one replay worker (NX2NAVI_REPLAY_SMALL)", RW.small);
+    else RW.small = 0;
     if (RW.pipe)
         rt_log("vk: groups of %d draws or more are recorded by %d replay worker%s while the submitting thread goes on "
                "past them, %d at once at most (NX2NAVI_REPLAY_WORKERS, NX2NAVI_REPLAY_PIPE)", 2 * CHUNK_DRAWS, RW.n,
@@ -2318,7 +2377,14 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     int n = (int)(draws / CHUNK_DRAWS);
     if (n > RW.n + 1) n = RW.n + 1;
     if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
-    if (n < 2 || vk_dump_armed || !vk_sync_append_room(n)) {
+    // NX2NAVI_REPLAY_SMALL=N (default 0, with NX2NAVI_REPLAY_PIPE): a group of N draws or more that is too small to cut
+    // goes whole to one worker, and the submitting thread goes on with what follows it without taking the chunk
+    // itself. Kokiri Forest standing, 5 workers, 4 groups out, the early tail on (2026-11-13): about 700 draws a frame
+    // were in such groups, 3.6 ms of the submitting thread; with 16 the replay took 10.2 instead of 11.0 ms a frame
+    // (63.2 against 62.2 fps: the game then waits longer for the GPU, which is busy 83% of the frame there).
+    int small = RW.pipe && RW.small && n < 2 && draws >= (uint32_t)RW.small;
+    if (small) n = 1;
+    if (n < 1 + !small || vk_dump_armed || TL.on || !vk_sync_append_room(n)) {
         RW.skip_to[depth] = end, RW.serial_draws += draws, RW.small_end[why] += draws;
         return h;
     }
@@ -2392,7 +2458,8 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         // the submitting thread takes chunks too, as the workers wake up, and goes on once none is left to take: the
         // GPU waits for the group's part until its last chunk is done
         rw_behind = 1;
-        group_take(RW.n);
+        if (small) RW.small_groups++, RW.small_draws += draws;   // a worker takes it: this thread goes on at once
+        else group_take(RW.n);
         uint64_t to = kern_now_ns();
         RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.wait_ns += to - t0;
         return end;
@@ -2510,6 +2577,25 @@ static void rec_claim(void) {
     }
 }
 
+// The tail begins here (the early tail): what was recorded so far waits in the chain, the tail gets a command buffer of
+// its own. Not in a chunk or a continuation, nor with groups still out: the cut needs every piece of the part.
+void vk_exec_tail_begin(VkExec *ex) {
+    if (!tail_enabled() || TL.on || ex != x_cur || rw_chunk || evo_in) return;
+    if (Q.drained != Q.out) group_drain(ex, PW_OP);   // the cut needs every piece of the part
+    if (!vk_sync_wb_split() || !vk_mesh_shader_native() || vk_dump_armed || vk_gpu_passes_capturing()) return;
+    if (!vk_sync_tail_ok()) return;
+    if (ex->in_pass) vk_exec_pass_end(ex);
+    vk_exec_barrier(ex);   // the command buffer so far ends behind a full barrier, every image back in GENERAL
+    VkCommandBuffer cb = vk_sync_cut();
+    if (!cb) return;
+    ex->cb = cb;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    n_cuts++;
+    TL.on = 1, TL.live0 = vk_mem_live_swap(0), TL.wrote0 = vk_mem_gpu_wrote_count();
+    vk_exec_tail_results();
+}
+
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     if (vk_device_is_lost()) return 0;   // the run is ending (vk_device.c vk_device_lost_check): nothing is recorded
     uint64_t in_ns = kern_now_ns();
@@ -2527,6 +2613,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     nvn_pins_sweep(nvn_submit_count(), keep, 9);
     ex->cb = cb;
     ex->fence = fence;
+    TL.on = 0;
     ex->recorded = 0;
     ex->in_pass = 0;
     ex->mark = NULL;
@@ -2593,12 +2680,47 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     // NX2NAVI_WB_SPLIT: the write-backs in a part of their own, after one that signals the executed timeline
     // (vk_sync.c exec_tl): the wait after a frame's first submission then ends when the submission's passes are
     // through, not its write-backs. Off by default: vk_sync.c says what else that wait then leaves out.
-    if (synced && ex->recorded && vk_sync_wb_split() && vk_mem_mirror_wb_pending() && vk_exec_pool_split(ex->fence)) {
+    int tail = 0;   // the early tail: the write-backs go before the tail, with the executed timeline's signal
+    if (TL.on) {
+        int live = vk_mem_live_swap(0), res = vk_exec_tail_results();
+        vk_mem_live_swap(live | TL.live0);   // the submission's own note, as it would have been
+        int wrote = vk_mem_gpu_wrote_count() != TL.wrote0;
+        int other = !synced || !ex->recorded || vk_dump_armed || vk_gpu_passes_capturing() || !vk_sync_tail_ok();
+        TL.on = 0, TL.n++;
+        if (res) TL.why[0]++;
+        else if (wrote) TL.why[1]++;
+        else if (live) TL.why[2]++;
+        else if (other || !vk_exec_pool_split(ex->fence)) TL.why[3]++;
+        else tail = 1, TL.early++;
+        if (tail) {
+            ex->cb = vk_sync_tail_hold();
+            ex->dirty = VK_EXEC_DIRTY_ALL;
+            vk_exec_draw_new_cb();
+        }
+    }
+    if (!tail && synced && ex->recorded && vk_sync_wb_split() && vk_mem_mirror_wb_pending() &&
+        vk_exec_pool_split(ex->fence)) {
         ex->cb = vk_sync_split_exec();
         ex->dirty = VK_EXEC_DIRTY_ALL;
         vk_exec_draw_new_cb();
     }
     if (synced) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (tail) {
+        ex->cb = vk_sync_tail_release();
+        part_start = ex->recorded;   // the last command buffer holds nothing: the tail is in the chain before it
+    }
+    if ((rt_trace & RT_TRACE_PERF) && TL.n >= 600) {
+        uint64_t tails, waits;
+        double ms;
+        vk_sync_tail_stats(&tails, &waits, &ms);
+        rt_log("perf: early tail: %llu tails, %llu with the write-backs before them (refused: %llu handed the CPU "
+               "results, %llu wrote pool memory, %llu read guest memory late, %llu other); %llu waits of the game "
+               "ended before their tail, which the GPU runs for about %.2f ms",
+               (unsigned long long)TL.n, (unsigned long long)TL.early,
+               (unsigned long long)TL.why[0], (unsigned long long)TL.why[1], (unsigned long long)TL.why[2],
+               (unsigned long long)TL.why[3], (unsigned long long)waits, ms);
+        TL.n = TL.early = 0, memset(TL.why, 0, sizeof TL.why);
+    }
     views_release(ex, fence);
     ex->cb = VK_NULL_HANDLE;
     if (n) n_subs++;
@@ -2695,8 +2817,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
                 memset(RW.pw_n, 0, sizeof RW.pw_n), memset(RW.pw_ns, 0, sizeof RW.pw_ns);
                 memset(RW.pd_op, 0, sizeof RW.pd_op);
                 RW.behind_ns = 0;
+                if (RW.small)
+                    rt_log("perf: replay workers: groups one worker took whole (NX2NAVI_REPLAY_SMALL): %.2f per "
+                           "submission, %.1f draws each", (double)RW.small_groups / (double)n_subs,
+                           RW.small_groups ? (double)RW.small_draws / (double)RW.small_groups : 0.0);
             }
         }
+        RW.small_groups = RW.small_draws = 0;
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
         n_subs = n_parts = n_idle_parts = n_pass_splits = n_cuts = 0;

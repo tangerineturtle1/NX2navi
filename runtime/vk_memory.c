@@ -3303,7 +3303,11 @@ static uint64_t wb_skip(void) {
 }
 static int64_t m_wb_skipped;    // bytes wb_skip kept in mirrors since the last summary
 
+static volatile uint64_t n_gpu_wrote;   // vk_mem_gpu_wrote_count
+uint64_t vk_mem_gpu_wrote_count(void) { return __atomic_load_n(&n_gpu_wrote, __ATOMIC_RELAXED); }
+
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
+    __atomic_fetch_add(&n_gpu_wrote, 1, __ATOMIC_RELAXED);
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size || !wb_lazy()) {
         uint64_t skip = r && r->mstate == MS_ON && sp->buffer == r->mbuf ? wb_skip() : 0;
@@ -3678,6 +3682,9 @@ static uint64_t capture_cap(void) {
 }
 
 void vk_mem_note_live(void) { __atomic_store_n(&mirror_live, 1, __ATOMIC_RELAXED); }
+int vk_mem_live_swap(int v) { return __atomic_exchange_n(&mirror_live, v, __ATOMIC_RELAXED); }
+static int wb_lazy(void);
+int vk_mem_wb_lazy(void) { return wb_lazy(); }   // the lazy write-back runs (vk_exec_draw.c op_update_ub)
 
 int vk_mem_take_live(void) {
     int live = __atomic_exchange_n(&mirror_live, 0, __ATOMIC_RELAXED);

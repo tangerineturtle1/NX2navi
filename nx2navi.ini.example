@@ -66,11 +66,28 @@
 # of latency, and can show a dark or flickering frame now and then: the other thread reads vertex and buffer memory
 # the game has sometimes rewritten by then.
 # replay_async = 0
-# Record the large groups of draws of a submission on this many replay worker threads beside the submitting one, 0 to
-# 16. Default: 3 (Hyrule Field standing on an RX 7900 XT: 51.7 instead of 43.6 fps). 0: the replay records everything
-# on one thread, as before; try it if a picture looks wrong. With 1 a worker records each long run of draws while the
-# submitting thread waits for it: no faster, it checks that the pictures stay the same.
-# replay_workers = 3
+# EXPERIMENTAL. Record the large groups of draws of a submission on this many replay worker threads beside the
+# submitting one, 0 to 16. Default: 0, the replay records everything on one thread. 3 gave 51.7 instead of 43.6 fps
+# standing in Hyrule Field on an RX 7900 XT, and more than 3 gave nothing more; some players' games ended with a lost
+# graphics device with it on, so it is off unless you turn it on (also in the menu: Game, Testing, CPU helper threads).
+# With 1 a worker records each long run of draws while the submitting thread waits for it: no faster, it checks that
+# the pictures stay the same.
+# replay_workers = 0
+# EXPERIMENTAL. 1 lets the game start on its next frame while the graphics card still runs the end of the last one: the
+# upscaler (FSR 4, FSR 3.1 or DLSS) and the interface drawn after it. The graphics card runs the same work, with the
+# copies of what it wrote for the game moved before that end, and the game's waits end once those copies and the
+# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 0. Standing in
+# Hyrule Field on an RX 7900 XT with FSR 4: 50.7 instead of 42.5 fps, and 63.5 instead of 49.4 with replay_workers = 3.
+# Does nothing without one of those upscalers, nor with the lazy write-back (the default on NVIDIA and Intel cards).
+# Also in the menu: Game, Testing, Start next frame early.
+# tail_early = 0
+# EXPERIMENTAL, with replay_workers. replay_pipe = N (1 to 4, default 0): the submitting thread goes on past up to N
+# groups its workers still record. replay_small = N (default 0, needs replay_pipe): a group of N draws or more that is
+# too small to share out goes whole to one worker. Kokiri Forest standing on an RX 7900 XT with FSR 4, tail_early = 1,
+# replay_workers = 5, replay_pipe = 4 and replay_small = 16: 63 instead of 45 fps with all of them off. Also in the
+# menu: Game, Testing, Helpers work ahead (replay_pipe) and Helpers take small jobs (replay_small).
+# replay_pipe = 0
+# replay_small = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.
@@ -621,69 +638,19 @@
 # discord_image = nx2navi_512x512
 
 [coop]
-# Co-op: your own game and save, with the other players' progress shared through a relay (docs/coop.md). Positions are
-# not shared yet: you do not see the other players in your world.
-# The menu's Co-op tab sets the name, the relay and the rules below, and makes, joins, accepts and leaves a room.
-# 0 = off: no socket is opened, no name is looked up and nothing is sent. Takes effect at once.
-# coop = 0
-# Co-op is a beta: the menu shows its Co-op tab only with coop_beta = 1, which no menu row sets. Takes effect at once.
-# coop_beta = 0
-# Your name for the other players, at most 24 bytes. Default: Player- and four random hex digits.
-# coop_name =
-# The relay, host or host:port (default port 24680): run one with `python tools/coop_relay.py` and forward its UDP port, or
-# use one a friend runs. No default: with none set the session stays idle and the log says why.
-# coop_server =
-# The local UDP port, 0 = any. For a firewall rule or a port forward when testing on a LAN. Takes effect at the next start.
-# coop_port = 0
-# For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
-# room's secret of 18 characters from 23456789BCDFGHJKMNPRSTVWXYZ, XXXXXX-XXXXXX-XXXXXX; a create without it makes a new
-# one). While the session runs, a room the relay lost (a restart) is made again or waited for (asked for every 10 s; a
-# refusal for too many joins from your network waits a minute), and a create that finds the room open joins it. Joining
-# is not accepting: nothing from the room is applied before you accept it (coop_accept).
-# off = no session at launch.
-# coop_auto = off
-# coop_room =
-# Test: percent of received co-op datagrams thrown away, 0 to 100.
-# coop_drop = 0
-# The rules of a room you make (a room you join uses its maker's; the log names them). Take effect at once.
-# Story, world and dungeon progress: shared or own.
-# coop_progress = shared
-# Equipment, key items, upgrades; songs; medallions, stones and the other quest items: shared or own. Own only with
-# coop_progress = own: in a shared world a chest one player opened is empty for the others.
-# coop_items = shared
-# coop_songs = shared
-# coop_quest = shared
-# Small keys: pool = every key anyone picks up goes into the dungeon's pool and every door anyone opens takes one out of it;
-# own = keys stay with the player who picked them up (doors still open for everyone). Own with coop_progress = own.
-# coop_keys = pool
-# Rupees and ammunition: own, or pool = one count every player adds to and spends from.
-# coop_rupees = own
-# coop_ammo = own
-# Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
-# your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
-# offer with a number (eight hex digits, new at each start of the game); accept it on the menu's Co-op tab, or put that
-# number here while the game runs to accept that offer (this line as the file is now counts, before the one read at
-# start). A new member, other rules or another save loaded make a new offer with a new number (another save joins the
-# pools only once you accept it). A member who never says who it is keeps the room from being accepted. Your key pools
-# count only you and the players you accepted, among those the room's maker lets use them. Every message that can
-# change your save is signed by the player who sent it, so someone who knows the room's secret and runs the relay (or
-# sends from its address on your network) can read and disturb the room but not set flags in a player's name.
-# Accepting every room (always) is taken from the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file,
-# so an ini someone hands you cannot accept a room for you.
-# coop_accept = ask
-# The room's maker (the Co-op tab's Remove and Reset the pools do the same): coop_remove = a player's key fingerprint
-# (xxxx-xxxx-xxxx-xxxx, as the log and the tab show it beside each member; without dashes it may be all digits), in the
-# room or after it left; every game drops that key and what it took from the pools, and keys others brought while it
-# was in a pool stay theirs. A member number here is not taken: numbers pass to other players as members come and go.
-# coop_reset_pools = a new value (1, then 2, or 0 and then 1 again): every game joins the pools again with what they
-# held for the players in the room, and what each held counts from the reset on. A player who drained a pool and is
-# still in the room when you reset keeps what it took: remove it first, then reset (both in one save of this file act
-# in that order).
-# Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs
-# the rules of a room you made with is kept in the profile folder (coop-keys, readable by your account only), so a
-# restart keeps you the room's maker; never hand out a copy of the profile folder.
-# coop_remove =
-# coop_reset_pools =
+# Co-op, experimental: play with friends over Steam, each in their own game and save (docs/coop.md). The game signs in
+# to Steam as its test app, so Steam shows you as playing Spacewar; it needs Steam running and Steam's library file
+# steam_api64.dll beside ocarina.exe, which the launcher copies there from a Steam game you have installed. Rooms are
+# made and joined in the menu's Co-op tab, never from this file.
+# 0 = off, the game uses no network. Takes effect at once.
+# coop_steam = 0
+# In a room, share progress, items and songs with the other players; your save is copied to coop-backup in the profile
+# folder first. 0 = only names, positions and chat.
+# coop_share = 1
+# Show the other players' names where their Link stands (needs DLSS, FSR or TAA on).
+# coop_names = 1
+# Show new chat lines, and who joined or left, over the game while the menu is closed.
+# coop_chat = 1
 
 [audio]
 # none mixes without opening an audio device.
@@ -816,7 +783,7 @@
 # cheat_0123abcd = 1
 
 [diagnostics]
-# Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present, coop or all. The menu's
+# Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
 # Performance log sets perf (frame timings). Default: none.
 # trace = perf
 # A game thread that waits this many seconds for a lock, or for another thread to end, is logged once with the thread

@@ -447,7 +447,7 @@ int plat_is_wine(void);                                   // 1 when the Windows 
 // The file the process's stderr (the log) goes to, as a UTF-8 path; 0 when stderr is not a file (a console, a pipe).
 int plat_stderr_path(char *out, size_t cap);
 
-// ---- desktop: the in-game menu's "Copy system info", "Open log folder" and the Co-op tab's secret
+// ---- desktop: the in-game menu's "Copy system info" and "Open log folder"
 int plat_clipboard_set(const char *utf8);                 // replaces the clipboard's text; 1 on success
 // The clipboard's text as UTF-8 in out (cap bytes with the NUL; a longer text: "" on Windows, cut at a character
 // elsewhere); 1 when it had text. With SDL only on the window thread, as SDL asks: the menu goes through
@@ -526,7 +526,7 @@ int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms);
 int plat_ipc_write(PlatIpc *p, const void *buf, size_t n);   // 1 when all n bytes were written, 0 the connection broke
 void plat_ipc_close(PlatIpc *p);
 
-// ---- UDP sockets: the co-op layer's transport (coop.c). One unconnected datagram socket per PlatUdp; who a datagram
+// ---- UDP sockets. One unconnected datagram socket per PlatUdp; who a datagram
 // came from is checked by the protocol, not by the OS. On Windows the first call of any of these starts Winsock.
 // A PlatAddr is an IPv6 address (an IPv4 one as ::ffff:a.b.c.d), the port and the scope id in the same layout on every
 // OS, so two equal addresses compare equal bytewise (plat_addr_eq) whichever way the OS reported them.

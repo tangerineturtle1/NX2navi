@@ -16,6 +16,7 @@ extern "C" {
 int dbg_supported(void);               // this game build's structures are known (Ocarina of Time 1.1.1)
 
 int dbg_player_pos(float xyz[3]);      // Link's position in metres; 0 while there is no player
+int dbg_area(char out[64]);            // the area the game is in, by its name in the game's files; 0 unknown
 float dbg_speed_factor(void);          // the game's speed: 1 normal, 0.05 to 8 (frame_rate.c multiplies the game's step)
 void dbg_speed_set(float factor);
 

@@ -53,7 +53,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 
-from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
+from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, steamlib, toolchain, updater, versions, winsys  # noqa: E402
 from launcher.context import Context  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
 
@@ -3999,8 +3999,8 @@ class SaveShareTest(unittest.TestCase):
         self.assertEqual(len([n for n in names if n.startswith('save/')]), len(self.SAVE))
 
     def test_a_bug_report_keeps_the_private_settings_values_out(self):
-        """A co-op room's secret, the relay and the player's name are not in the nx2navi.ini a bug report carries;
-        every other byte of the file is."""
+        """The private settings' values (a room's secret, a relay and a name that an earlier version's co-op left in
+        the file) are not in the nx2navi.ini a bug report carries; every other byte of the file is."""
         ini = (b'\xef\xbb\xbf[coop]\r\ncoop = 1\r\n  Coop_Room = H7K3WM-BCDFGH-234567\r\ncoop_server=relay.example:24680\r\n'
                b'# coop_name = in a comment\r\ncoop_name =\r\ncoop_accept = 1a2b3c4d\nfps_limit = 60')
         self.game_with_save(self.game, self.SAVE)
@@ -4506,6 +4506,92 @@ def have_display():
 
 
 @unittest.skipUnless(have_display(), 'needs tkinter, numpy and a display')
+class SteamLibTest(Tmp):
+    """launcher/steamlib.py: Steam's library file for co-op, found in the player's Steam library and put beside the
+    game. The files here are made up: the bytes a library's exported names leave in it, no code."""
+
+    def lib(self, path, old=False, mtime=None):
+        names = list(steamlib.NEEDS) + [group[-1] for group in steamlib.ONE_OF]
+        if old:   # a library from before the networking messages interface
+            names = [n for n in names if b'NetworkingMessages' not in n]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'MZ' + bytes(64) + b'\x00'.join(names) + b'\x00')
+        if mtime:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def steam(self):
+        """A Steam folder with a second library elsewhere, as libraryfolders.vdf lists it (backslashes doubled)."""
+        steam = self.tmp / 'Steam'
+        other = self.tmp / 'Games Drive' / 'SteamLibrary'
+        (steam / 'steamapps' / 'common').mkdir(parents=True)
+        (other / 'steamapps' / 'common').mkdir(parents=True)
+        one = chr(92)
+        rows = ''.join('\t"%d"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n' % (i, str(p).replace(one, one + one))
+                       for i, p in enumerate((steam, other)))
+        (steam / 'steamapps' / 'libraryfolders.vdf').write_text('"libraryfolders"\n{\n' + rows + '}\n', encoding='utf-8')
+        return steam, other
+
+    def test_a_library_is_suitable_only_with_every_call_co_op_uses(self):
+        self.assertTrue(steamlib.suitable(self.lib(self.tmp / 'a' / steamlib.NAME)))
+        self.assertFalse(steamlib.suitable(self.lib(self.tmp / 'b' / steamlib.NAME, old=True)))
+        (self.tmp / 'c').mkdir()
+        (self.tmp / 'c' / steamlib.NAME).write_bytes(b'not a library at all')
+        self.assertFalse(steamlib.suitable(self.tmp / 'c' / steamlib.NAME))
+        self.assertFalse(steamlib.suitable(self.tmp / 'missing' / steamlib.NAME))
+
+    def test_the_newest_suitable_signed_library_of_any_steam_library_is_found(self):
+        steam, other = self.steam()
+        now = time.time()
+        self.lib(steam / 'steamapps' / 'common' / 'Old Game' / steamlib.NAME, old=True, mtime=now)
+        mid = self.lib(steam / 'steamapps' / 'common' / 'Mid Game' / 'bin' / steamlib.NAME, mtime=now - 5000)
+        new = self.lib(other / 'steamapps' / 'common' / 'Unity Game' / 'Game_Data' / 'Plugins' / 'x86_64' / steamlib.NAME,
+                       mtime=now - 100)
+        unsigned = self.lib(other / 'steamapps' / 'common' / 'Replaced' / steamlib.NAME, mtime=now - 10)
+        self.lib(other / 'steamapps' / 'common' / 'Deep' / 'a' / 'b' / 'c' / 'd' / 'e' / 'f' / steamlib.NAME, mtime=now)
+        self.assertEqual([p.parent.name for p in steamlib.libraries(steam)], ['Steam', 'SteamLibrary'])
+        self.assertEqual(steamlib.find(steam, lambda p: Path(p) != unsigned), new)   # not the old, unsigned or too deep one
+        self.assertEqual(steamlib.find(steam, lambda p: Path(p) == mid), mid)
+        self.assertIsNone(steamlib.find(steam, lambda p: False))
+        self.assertIsNone(steamlib.find(self.tmp / 'no steam here', lambda p: True))
+
+    def test_the_library_is_put_beside_the_game_once(self):
+        steam, other = self.steam()
+        src = self.lib(other / 'steamapps' / 'common' / 'Some Game' / steamlib.NAME)
+        game = self.tmp / 'game'
+        game.mkdir()
+        lines = []
+        self.assertEqual(steamlib.ensure(game, None, steam, lines.append, lambda p: True), 'copied')
+        self.assertEqual((game / steamlib.NAME).read_bytes(), src.read_bytes())
+        self.assertIn('Some Game', lines[-1])
+        self.assertEqual(steamlib.ensure(game, None, self.tmp / 'gone', lines.append, lambda p: False), 'there')
+        # a file beside the game that is not a library co-op can use is replaced
+        (game / steamlib.NAME).write_bytes(b'MZ old')
+        self.assertEqual(steamlib.ensure(game, None, steam, lines.append, lambda p: True), 'copied')
+        self.assertTrue(steamlib.suitable(game / steamlib.NAME))
+
+    def test_a_library_the_release_ships_comes_first_and_none_is_said_once(self):
+        steam, other = self.steam()
+        kit_bin = self.tmp / 'kit' / 'bin'
+        shipped = self.lib(kit_bin / steamlib.NAME)
+        shipped.write_bytes(shipped.read_bytes() + b'shipped')
+        self.lib(other / 'steamapps' / 'common' / 'Some Game' / steamlib.NAME)
+        game = self.tmp / 'game'
+        game.mkdir()
+        self.assertEqual(steamlib.ensure(game, kit_bin, steam, lambda line: None, lambda p: True), 'copied')
+        self.assertTrue((game / steamlib.NAME).read_bytes().endswith(b'shipped'))
+        # nothing suitable anywhere: said in the log once, and not searched again by this process
+        empty = self.tmp / 'empty game'
+        empty.mkdir()
+        lines = []
+        nothing = self.tmp / 'Steam without games'
+        (nothing / 'steamapps' / 'common').mkdir(parents=True)
+        self.assertEqual(steamlib.ensure(empty, None, nothing, lines.append, lambda p: True), 'none')
+        self.assertEqual(steamlib.ensure(empty, None, steam, lines.append, lambda p: True), 'none')
+        self.assertEqual(len(lines), 1)
+        self.assertFalse((empty / steamlib.NAME).exists())
+
+
 class SteamTest(Tmp):
     """launcher/steam.py on made-up Steam files: the binary shortcuts file read and written back unchanged, our
     shortcut added beside another and updated in place, its id as Steam computes it, the accounts that signed in."""

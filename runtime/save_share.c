@@ -119,9 +119,8 @@ static void add_file(Export *e, const char *name, const char *path) {
     free(data);
 }
 
-// nx2navi.ini for a bug report: as it is, except that the values of the private settings (cfg_private.h: a co-op
-// room's secret, the relay, the player's name) read "(set, not shown)". A report goes to people the player does not
-// know, and the secret lets anyone into the room.
+// nx2navi.ini for a bug report: as it is, except that the values of the private settings (cfg_private.h) read
+// "(set, not shown)". A report goes to people the player does not know.
 static void add_settings_file(Export *e, const char *name, const char *path) {
     uint64_t n = 0;
     uint8_t *data = plat_file_read(path, &n);

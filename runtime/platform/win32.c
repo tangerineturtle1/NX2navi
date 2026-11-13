@@ -2144,7 +2144,7 @@ void plat_ipc_close(PlatIpc *p) {
     free(p);
 }
 
-// ---- UDP sockets (platform.h): the co-op layer's transport. Winsock starts at the first call that needs it.
+// ---- UDP sockets (platform.h). Winsock starts at the first call that needs it.
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif

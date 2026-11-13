@@ -495,6 +495,8 @@ static int text_get(const char *name, char out[64]) {
 }
 
 // A text written into the entry's own buffers (game thread). 0: the game has no such text.
+int dbg_area(char out[64]) { return dbg_supported() && text_get("Sequence_CurrentBanc", out) && out[0]; }
+
 static int text_set(const char *name, const char *value) {
     uint64_t e = gmd_entry(GD_TEXT64, 0x108, hash_of(name)), text = e ? rd_ptr(e + 0x68) : 0, other = e ? rd_ptr(e + 0x18) : 0;
     int32_t room = 0;

@@ -379,6 +379,23 @@ int vk_mem_take_live(void);
 // for the newest such submission up to the one it waits for.
 enum { VK_RES_EVENT = 1, VK_RES_COUNTER = 2, VK_RES_OQ = 4, VK_RES_WRITE = 8, VK_RES_WRITEBACK = 16, VK_RES_KINDS = 5 };
 void vk_exec_note_results(int kind);   // VK_RES_*
+// The early tail (vk_exec.c "the early tail", NX2NAVI_TAIL_EARLY). vk_exec_tail: the replay is recording a submission's
+// tail. vk_sync.c: the tail's command buffer set aside for the write-backs' one (hold), then the part with the
+// write-backs handed over with the executed timeline's signal and the tail put behind it (release); whether a part can
+// take that order now (ok); the game's wait for a fence (game_wait); for a value whose tail the GPU still runs, about
+// how long that takes (tail_pending_ns, else 0).
+struct VkExec;
+void vk_exec_tail_begin(struct VkExec *ex);
+int vk_exec_tail(void);
+void vk_exec_tail_ub(uint64_t fence, uint64_t addr, const void *data, uint32_t size);   // vk_exec_xfer.c
+int vk_sync_tail_ok(void);
+VkCommandBuffer vk_sync_tail_hold(void);
+VkCommandBuffer vk_sync_tail_release(void);
+int vk_sync_game_wait(uint64_t value, uint64_t timeout_ns);
+uint64_t vk_sync_tail_pending_ns(uint64_t value);
+int vk_mem_live_swap(int v);              // vk_memory.c: the note of a late read of guest memory, exchanged
+uint64_t vk_mem_gpu_wrote_count(void);    // vk_memory.c: GPU writes of pool memory noted so far
+int vk_mem_wb_lazy(void);                 // vk_memory.c: the lazy write-back runs
 int vk_exec_take_results(void);        // the kinds noted since the last take
 void vk_mem_lazy_part_end(void);   // lazy write-back: a part ends (before its prologue), and it is handed over
 void vk_mem_lazy_handed(void);

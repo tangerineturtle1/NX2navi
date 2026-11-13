@@ -160,6 +160,10 @@ typedef struct {
     // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
     // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
     int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
+    // The game's own wait for a fence (nvnSyncWait): fence_wait, or where the back end knows the rest of the value's
+    // GPU work reads nothing the game can change and hands it nothing, until its results are there (vk_sync.c
+    // vk_sync_game_wait).
+    int  (*game_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.

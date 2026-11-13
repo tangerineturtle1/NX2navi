@@ -7201,7 +7201,14 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VK_MEM_PICK(sp);
     VkBufferCopy cp = {o, sp.offset, u->size};
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
-    vk_mem_gpu_wrote(&sp, u->size);
+    // In a submission's tail (vk_exec.c "the early tail") an update of a mirrored block reaches guest memory with the
+    // results the game reads, from the bytes here, and takes no write-back: one after the tail would land when the
+    // game is already writing the next frame's data. Not with the lazy write-back, where the block's pages may be
+    // armed and a store into them would wait for the GPU (memory.c lazy_fault): the update is noted as ever there,
+    // and the tail goes after the write-backs as before.
+    if (vk_exec_tail() && !vk_mem_wb_lazy() && vk_mem_mirrored(u->dst, u->size))
+        vk_exec_tail_ub(ex->fence, u->dst, u->data, u->size);
+    else vk_mem_gpu_wrote(&sp, u->size);
     vk_usnap_drop(u->dst, u->size);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);

@@ -2033,6 +2033,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
+    vk_exec_tail_begin(ex);   // NX2NAVI_TAIL_EARLY: from here on the frame's tail, in a command buffer of its own
     VkCommandBuffer cb = ex->cb;
     vk_exec_barrier(ex);   // what drew the scene is done (no pass is open here)
     vk_gpu_gap_note(VK_GAP_UPSCALER, (uint64_t)ow * oh);

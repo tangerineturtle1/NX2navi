@@ -393,8 +393,8 @@ def _fresh_file(folder, stem, suffix):
 NO_SAVE = 'the game has no save yet: play until it saves, then export'
 
 
-# Settings whose values stay on the player's PC (runtime/cfg_private.h has the same list): a co-op room's secret and
-# the offer number made for it, the relay's address, the player's name, the key a maker removes, the menu's test hook.
+# Settings whose values stay on the player's PC (runtime/cfg_private.h has the same list): the menu's test hook, and
+# what the co-op of versions up to 0.9.2 kept in nx2navi.ini, which a player's file may still hold.
 PRIVATE_SETTINGS = ('coop_room', 'coop_server', 'coop_name', 'coop_accept', 'coop_remove', 'menu_test_set')
 PRIVATE_SHOWN = b'(set, not shown)'
 

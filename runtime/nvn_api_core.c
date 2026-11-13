@@ -564,7 +564,7 @@ NVN_API(nvnSyncWait) {
     int ok;
     {
         NVN_BLOCKING();
-        ok = b->fence_wait(s->fence, timeout);
+        ok = b->game_wait(s->fence, timeout);
     }
     if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);

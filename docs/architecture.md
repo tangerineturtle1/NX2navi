@@ -45,8 +45,8 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
   everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
   (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
-- Co-op (`coop.c`, `coop_proto.c`, [coop.md](coop.md)): a host thread with a UDP socket to a relay (`tools/coop_relay.py`),
-  rooms of up to 8 players and a channel for messages between them; it never holds a virtual core.
+- Co-op (`coop.c`, `steam.c`, `coop_game.c`, [coop.md](coop.md)): a host thread that owns the Steam library and a room of
+  up to four players; the game side reads Link and the game's flags at the present. It never holds a virtual core.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
