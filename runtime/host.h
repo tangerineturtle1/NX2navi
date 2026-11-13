@@ -206,6 +206,9 @@ int mem_readable(uint64_t a, uint64_t n);                                       
 uint32_t mem_map_gen(void);   // changes with everything mem_readable answers from (mapping, heap, permissions)
 int mem_read_hold(uint64_t a, uint64_t n);   // mem_readable that keeps the range mapped until mem_read_release
 void mem_read_release(void);
+// The region around a that the guest's own code reads (write: and writes) with plain loads and stores, and so may any
+// code of the process until mem_map_gen moves on from *gen; 0 for anything else (memory.c).
+int mem_guest_span(uint64_t a, int write, uint64_t *lo, uint64_t *hi, uint32_t *gen);
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C
 uint32_t mem_unmap_physical(uint64_t a, uint64_t n);                            // 0x2D
 int mem_info(uint32_t id, uint64_t *out);                  // GetInfo memory ids 2-7, 12-17, 21, 22, 28; 0 if not a memory id

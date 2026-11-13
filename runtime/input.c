@@ -30,6 +30,9 @@ enum { STICK_MAX = 32767, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 100
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static int state;                    // 0 not started, 1 running, -1 disabled or SDL failed
 static volatile int32_t g_block, g_menu;   // text entry / host menu: 0 off, 1 open, 2 waiting for release
+static volatile int32_t g_plugin;          // a plugin took the input (input_plugin): the same three states
+static uint64_t g_pad_bits;                // input_pad_bits: what the gamepad alone held at the last poll
+uint64_t input_pad_bits(void) { return __atomic_load_n(&g_pad_bits, __ATOMIC_RELAXED); }
 // The device the player used last (input_kbm_last): 1 keyboard and mouse, 0 the gamepad. A pad counts once a button is
 // down or a stick is past half way (a drifting stick never switches), the mouse once it moved MOUSE_USED raw counts
 // within one poll (a slow deliberate move does; a desk bump does not), the keyboard with any key or mouse button.
@@ -251,7 +254,7 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
 
 void input_direct_mouse_sample(int enabled, int32_t *dx, int32_t *dy) {
     plat_mutex_lock(&lock);
-    enabled = enabled && !g_block && !g_menu;
+    enabled = enabled && !g_block && !g_menu && !g_plugin;
     *dx = script_mouse[0]; *dy = script_mouse[1];
     script_mouse[0] = script_mouse[1] = 0;
     if (!enabled) { *dx = *dy = 0; }
@@ -967,6 +970,9 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     if (state > 0) {
         binds_refresh();
         if (state == 1) pad_read(&b, sl, sr);
+        __atomic_store_n(&g_pad_bits, (b & 0xffff) | (sl[0] < -STICK_DIR ? 1ull << B_LEFT : 0) |
+                         (sl[0] > STICK_DIR ? 1ull << B_RIGHT : 0) | (sl[1] < -STICK_DIR ? 1ull << B_DOWN : 0) |
+                         (sl[1] > STICK_DIR ? 1ull << B_UP : 0), __ATOMIC_RELAXED);   // input_pad_bits
         int pad_used = b || abs(sl[0]) > PAD_USED || abs(sl[1]) > PAD_USED || abs(sr[0]) > PAD_USED ||
                        abs(sr[1]) > PAD_USED, kbm_used = 0;
         if (ikb_foreground()) {
@@ -1047,12 +1053,13 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
 // something held: an input that never reads as released (a button another program holds down, a key whose release
 // went to another window, a stick that rests outside its dead zone) would otherwise keep the game deaf until restart
 // (#462, #494). A press that closed the menu is let go well within the wait; one still held after it is meant.
-static volatile uint64_t g_block_closed, g_menu_closed;
+static volatile uint64_t g_block_closed, g_menu_closed, g_plugin_closed;
 #define RELEASE_WAIT_NS 1000000000ull
 
+int plugins_title_pointer(void);   // plugins.c: the pointer is free for a plugin's title menu buttons
 int input_cursor_allowed(void) {
     const char *in = cfg_get("NX2NAVI_INPUT");
-    return g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) && !menu_cursor_pointer();
+    return g_block != 1 && g_menu != 1 && g_plugin != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) && !menu_cursor_pointer() && !plugins_title_pointer();
 }
 
 void input_block(int on) {
@@ -1070,7 +1077,15 @@ void input_menu(int open) {
     ikb_cursor_update();
 }
 
-// 1 while flag (g_block, g_menu) blocks the game's input; state 2 ends at the first poll with nothing held, or with
+// A plugin's own text box (plugins.c api_capture_input) blocks the game's input the same way, with a flag of its own:
+// g_plugin 0 off, 1 taken, 2 given back, waiting for the release. The cursor is released while it is taken.
+void input_plugin(int on) {
+    if (!on) __atomic_store_n(&g_plugin_closed, plat_now_ns(), __ATOMIC_RELEASE);
+    plat_xchg32(&g_plugin, on ? 1 : 2);
+    ikb_cursor_update();
+}
+
+// 1 while flag (g_block, g_menu, g_plugin) blocks the game's input; state 2 ends at the first poll with nothing held, or with
 // something still held RELEASE_WAIT_NS after closed. A stick axis counts as held as well: with the walk key the
 // keyboard's sticks move part way without setting a direction bit, so a gate that watched the buttons alone would let
 // that movement through the moment the menu or the text entry closes.
@@ -1088,13 +1103,26 @@ static int blocked(volatile int32_t *flag, volatile uint64_t *closed, const char
     return 0;
 }
 
+// plugins.c: the plugins' pad callbacks and title menu buttons. A build without the plugin interface (the unit checks of
+// this file) has none.
+__attribute__((weak)) void plugins_pad(uint64_t buttons, int32_t lx, int32_t ly) { (void)buttons, (void)lx, (void)ly; }
+__attribute__((weak)) void plugins_title_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    (void)buttons, (void)lx, (void)ly, (void)rx, (void)ry;
+}
+__attribute__((weak)) int plugins_title_pointer(void) { return 0; }
+
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
-    if (!g_block && !g_menu) menu_cursor_poll(buttons);
+    plugins_pad(*buttons, *lx, *ly);   // plugins.c: the pad callbacks get the controls as they are, blocked or not
+    if (!g_block && !g_menu && !g_plugin) menu_cursor_poll(buttons);
     const int32_t axes[4] = {*lx, *ly, *rx, *ry};
     int text = blocked(&g_block, &g_block_closed, "text entry", *buttons, axes),
-        menu = blocked(&g_menu, &g_menu_closed, "menu", *buttons, axes);
-    if (!text && !menu) return;
+        menu = blocked(&g_menu, &g_menu_closed, "menu", *buttons, axes),
+        plugin = blocked(&g_plugin, &g_plugin_closed, "plugin's input capture", *buttons, axes);
+    if (!text && !menu && !plugin) {
+        plugins_title_poll(buttons, lx, ly, rx, ry);   // plugins.c: a plugin's title menu button has the selection
+        return;
+    }
     *buttons = 0; *lx = *ly = *rx = *ry = 0;
 }
 

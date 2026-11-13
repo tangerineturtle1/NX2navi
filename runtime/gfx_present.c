@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "audren.h"
 #include "cfg.h"
@@ -25,6 +26,7 @@
 #include "nvn_api.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "plugins.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "vk_fg.h"
@@ -89,6 +91,7 @@ void gfx_window_closed(void) {
     vk_pipeline_save_exit();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
+    plugins_exit();    // plugins.c: the plugins' exit callbacks, while the game's threads still run
     coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
     if (restart) {
@@ -1489,6 +1492,27 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
             next_ns = plat_now_ns() + (uint64_t)((every + (after ? atof(after) : 0)) * 1e9);
         }
         const char *dir = cfg_get("NX2NAVI_SHOT_DIR");
+        // NX2NAVI_SHOT_WALL=1: the shots are taken when the wall clock passes a multiple of s seconds and are
+        // named by that time (shot_w<seconds of the day>_<tenths>.png), so two games on one PC shoot the same
+        // instants and their pictures pair by name
+        static int wall = -1;
+        if (wall < 0) wall = cfg_get("NX2NAVI_SHOT_WALL") && !strcmp(cfg_get("NX2NAVI_SHOT_WALL"), "1");
+        if (wall && !menu_shot && every > 0 && dir && plat_now_ns() >= next_ns && n < 3000) {
+            static long long last_slot = -1;
+            struct timespec ts;
+            timespec_get(&ts, TIME_UTC);
+            double now_s = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+            long long slot_w = (long long)(now_s / every);
+            if (last_slot < 0) last_slot = slot_w;
+            if (slot_w != last_slot) {
+                last_slot = slot_w;
+                double t = (double)slot_w * every;
+                long long day = (long long)t % 86400;
+                snprintf(shot_path, sizeof shot_path, "%s/shot_w%05lld_%d.png", dir, day, (int)((t - (double)(long long)t) * 10 + 0.5));
+                menu_shot = shot_path;
+                n++;
+            }
+        } else
         if (!menu_shot && every > 0 && dir && plat_now_ns() >= next_ns && n < 200) {
             snprintf(shot_path, sizeof shot_path, "%s/shot_%03d.png", dir, n++);
             menu_shot = shot_path;

@@ -12,6 +12,7 @@
 extern "C" {
 #include "input.h"
 #include "input_sdl.h"
+#include "plugins.h"
 #include "ui/menu.h"
 }
 
@@ -39,8 +40,42 @@ static ImGuiKey key_of(SDL_Scancode sc) {
     }
 }
 
+// A key as the plugins name it (plugin_api.h NX2_KEY_*): letters and digits by their ASCII, the named keys, else 0.
+static unsigned plugin_key_of(SDL_Keycode k) {
+    if (k >= SDLK_A && k <= SDLK_Z) return 'A' + (unsigned)(k - SDLK_A);
+    if (k >= SDLK_0 && k <= SDLK_9) return '0' + (unsigned)(k - SDLK_0);
+    if (k >= SDLK_F1 && k <= SDLK_F12) return NX2_KEY_F1 + (unsigned)(k - SDLK_F1);
+    switch (k) {
+    case SDLK_BACKSPACE: return NX2_KEY_BACKSPACE;
+    case SDLK_TAB: return NX2_KEY_TAB;
+    case SDLK_RETURN: case SDLK_KP_ENTER: return NX2_KEY_ENTER;
+    case SDLK_LSHIFT: case SDLK_RSHIFT: return NX2_KEY_SHIFT;
+    case SDLK_LCTRL: case SDLK_RCTRL: return NX2_KEY_CTRL;
+    case SDLK_LALT: case SDLK_RALT: return NX2_KEY_ALT;
+    case SDLK_ESCAPE: return NX2_KEY_ESCAPE;
+    case SDLK_SPACE: return NX2_KEY_SPACE;
+    case SDLK_PAGEUP: return NX2_KEY_PAGE_UP;
+    case SDLK_PAGEDOWN: return NX2_KEY_PAGE_DOWN;
+    case SDLK_END: return NX2_KEY_END;
+    case SDLK_HOME: return NX2_KEY_HOME;
+    case SDLK_LEFT: return NX2_KEY_LEFT;
+    case SDLK_UP: return NX2_KEY_UP;
+    case SDLK_RIGHT: return NX2_KEY_RIGHT;
+    case SDLK_DOWN: return NX2_KEY_DOWN;
+    case SDLK_INSERT: return NX2_KEY_INSERT;
+    case SDLK_DELETE: return NX2_KEY_DELETE;
+    default: return 0;
+    }
+}
+
 extern "C" void menu_sdl_event(const SDL_Event *e) {
     float d = (float)gfx_window_sdl_density();
+    // The plugins see every key they have a name for (plugin_api.h on_key). One that keeps a key takes it from the
+    // keys below, but never while the menu is open.
+    if (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_KEY_UP) {
+        unsigned k = plugin_key_of(e->key.key);
+        if (k && plugins_key(k, e->type == SDL_EVENT_KEY_DOWN, e->key.repeat) && !menu_is_open()) return;
+    }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
         // Esc with the menu open (opened by F1 too) is not a toggle here: it goes to the menu, which closes itself
@@ -65,12 +100,14 @@ extern "C" void menu_sdl_event(const SDL_Event *e) {
         if (ImGuiKey k = key_of(e->key.scancode)) menu_event_key(k, e->type == SDL_EVENT_KEY_DOWN);
         return;
     case SDL_EVENT_TEXT_INPUT:   // UTF-8, between SDL_StartTextInput and SDL_StopTextInput (gfx_window_text_input)
-        if (!menu_is_open() || !e->text.text) return;
+        if (!e->text.text) return;
         for (const unsigned char *p = (const unsigned char *)e->text.text; *p;) {
             unsigned c = *p++, more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
             if (more) c &= 0x3f >> more;
             for (; more && (*p & 0xc0) == 0x80; more--) c = c << 6 | (*p++ & 0x3f);
-            if (!more && c >= 0x20 && c != 0x7f) menu_event_char(c);
+            if (more || c < 0x20 || c == 0x7f) continue;
+            if (menu_is_open()) menu_event_char(c);
+            else plugins_text(c);   // a plugin's text box, while it has the input
         }
         return;
     case SDL_EVENT_MOUSE_MOTION:

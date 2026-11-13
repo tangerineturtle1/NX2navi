@@ -380,7 +380,9 @@ instead of timing one. No game files.
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`; a change to the co-op layer (`runtime/coop*.c`,
-`tools/coop_relay.py`) passes `python tests\coop_relay_test.py` and `nx2navi.exe --probe-coop` ([coop.md](coop.md)).
+`tools/coop_relay.py`) passes `python tests\coop_relay_test.py` and `nx2navi.exe --probe-coop` ([coop.md](coop.md));
+a change to the plugin interface (`runtime/plugins.c`, `runtime/plugin_api.h`) passes `nx2navi.exe --probe-plugins`
+([plugins.md](plugins.md)).
 
 A change to the action prompt's diamond of face buttons (`runtime/action_prompt.c`) or to the SARC and zstd dictionary
 helpers (`runtime/sarc.c`) passes `python tests\action_prompt_check.py`. It builds them alone, with the

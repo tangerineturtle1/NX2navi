@@ -53,6 +53,7 @@ extern "C" {
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "plugins.h"
 #include "save_share.h"
 #include "sysinfo.h"
 #include "ui/menu.h"
@@ -2085,7 +2086,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !toast) {
+        } else if (!g_perf_mode && !toast && !plugins_overlay_wanted()) {
             return 0;
         }
     }
@@ -2150,6 +2151,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     } else if (open) {
         layout_menu(t->width, t->height, scale);
     }
+    plugins_overlay_imgui((float)t->width, (float)t->height, scale, open);   // the plugins' drawing, under all of ours
     perf_draw(t, scale);
     if (!open && toast) coop_toast_draw((float)t->width, (float)t->height, scale);
     ImGui::Render();
@@ -2178,7 +2180,9 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
 // and on Windows the input method attached to the game window, until the menu opened again.
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     int r = overlay_frame(frame, t, shot);
-    menu_text_input_follow(g_ctx_ok && g_open.load(std::memory_order_relaxed) && ImGui::GetIO().WantTextInput);
+    // ... or a plugin's own text box has the input (plugin_api.h capture_input)
+    menu_text_input_follow((g_ctx_ok && g_open.load(std::memory_order_relaxed) && ImGui::GetIO().WantTextInput) ||
+                           plugins_capturing());
     return r;
 }
 

@@ -34,7 +34,7 @@ static int save_ok = 1;                         // the last cfg_save_to wrote (o
 // Every name the runtime reads (and the patch sets in generated/), without the prefix. A file key outside this list is
 // logged as unknown. A new variable goes here too, or its ini key logs a harmless "unknown key" line.
 static const char *const known[] = {
-    "CORES", "TM_DISPATCH", "NVN2_CS_TABLE", "SKIP_SHADERS", "MOVIE_DEBAND", "MOVIE_FPS", "MOVIE_SKIP", "MOVIE_OVERLAY", "MOVIES", "NPLN", "NVN2_PROGRAMS", "NVN_TRAP", "OCARINA_REALTIME", "ONESHOT_BUDGET", "ONESHOT_WAIT_MS", "OCARINA_STEP", "PHYSICS_STEPS", "PICKUP_COUNT", "STEP_STEADY", "VI_HZ", "VI_VRR", "TIME_DUMP", "SHADER_DUMP", "SHOT_AFTER", "SHOT_DIR", "SHOT_EVERY",   // Switch 2 port: movie skip (romfs.c), NVN2 proc traps (nvn_procs.c)
+    "CORES", "TM_DISPATCH", "NVN2_CS_TABLE", "SKIP_SHADERS", "MOVIE_DEBAND", "MOVIE_FPS", "MOVIE_SKIP", "MOVIE_OVERLAY", "MOVIES", "NPLN", "NVN2_PROGRAMS", "NVN_TRAP", "OCARINA_REALTIME", "ONESHOT_BUDGET", "ONESHOT_WAIT_MS", "OCARINA_STEP", "PHYSICS_STEPS", "PICKUP_COUNT", "STEP_STEADY", "VI_HZ", "VI_VRR", "TIME_DUMP", "SHADER_DUMP", "SHOT_AFTER", "SHOT_WALL", "SHOT_DIR", "SHOT_EVERY",   // Switch 2 port: movie skip (romfs.c), NVN2 proc traps (nvn_procs.c)
     "AA", "AA_LOG", "AB", "AMIIBO_DIR", "ANISO", "APP_POOL", "ASPECT", "ASPECT_PATCH", "ASSUME_FOCUS", "ASTC", "ASTC_BC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_CHANNELS", "AUDIO_DEVICE", "AUDIO_GAME_PRIO", "AUDIO_OFF", "AUDIO_PREFILL_MS", "AUDIO_STATS",
     "BARRIER_GAME", "MESH_AHEAD", "MESH_FALLBACK", "MESH_FALLBACK_MB", "MESH_FALLBACK_WORKERS", "PROBE_MESHFB_DIR",
     "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT", "BIND_LSTICK_DOWN", "BIND_LSTICK_LEFT",

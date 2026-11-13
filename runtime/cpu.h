@@ -18,7 +18,10 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
     uint64_t excl_val_hi;    // 336: upper half of a 128-bit exclusive pair (LDXP/LDAXP of two X registers)
-    uint8_t _pad[512 - 344];
+    uint64_t fn_pass;        // 344: the function start whose next entry is not hooked (plugins.c: a hook's own call of
+                             // the function it hooks), else 0
+    uint64_t fn_hooks;       // 352: plugin hook callbacks running on this Cpu now (they may make guest calls)
+    uint8_t _pad[512 - 360];
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -27,6 +30,7 @@ _Static_assert(offsetof(Cpu, pc) == 264, "pc");
 _Static_assert(offsetof(Cpu, nzcv) == 272, "nzcv");
 _Static_assert(offsetof(Cpu, fpcr) == 320, "fpcr");
 _Static_assert(offsetof(Cpu, fpsr) == 328, "fpsr");
+_Static_assert(offsetof(Cpu, fn_pass) == 344, "fn_pass");
 _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
@@ -69,10 +73,23 @@ typedef uint32_t __attribute__((aligned(1), may_alias)) u32u;
 typedef uint64_t __attribute__((aligned(1), may_alias)) u64u;
 typedef uint8_t __attribute__((may_alias)) u8a;
 
-// Function-entry profiler (runtime/fnprof.c, LARECOMP_FNPROF): one predictable branch per call when off.
+// Function-entry hook: the first statement of every lifted function, one predictable branch per call while nothing
+// asks for it (g_fnprof 0). Two things ask (main.c rt_fn_want): resolution.c, for every function until the game has set
+// its render size (RT_FN_ALL), and the plugins' function hooks (plugins.c, RT_FN_HOOKS), for the functions whose byte
+// in rt_fn_filter is not 0. The byte's index is a constant of the function, so a function no hook is near costs a
+// second branch and one load from a 4 KiB table while hooks exist. fnprof_hit returns 1 when the call is over (a hook
+// ran the function itself, or left it out): the function then returns to its caller with the Cpu as the hook left it.
 extern volatile int g_fnprof;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
-#define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
+enum { RT_FN_ALL = 1, RT_FN_HOOKS = 2, RT_FN_FILTER = 4096 };
+extern uint8_t rt_fn_filter[RT_FN_FILTER];
+#define RT_FN_SLOT(a) ((unsigned)((a) >> 2) & (RT_FN_FILTER - 1))
+int fnprof_hit(uint64_t addr, Cpu *c);
+void rt_fn_want(int bit, int on);   // main.c: sets or clears RT_FN_ALL or RT_FN_HOOKS in g_fnprof
+#define FN_ENTER(a)                                                                                                    \
+    do {                                                                                                               \
+        if (__builtin_expect(g_fnprof, 0) && ((g_fnprof & RT_FN_ALL) || rt_fn_filter[RT_FN_SLOT(a)]) && fnprof_hit(a, c)) \
+            return;                                                                                                    \
+    } while (0)
 
 #define LD8(a)  (*(const u8a *)(uintptr_t)(a))
 #define LD16(a) (*(const u16u *)(uintptr_t)(a))

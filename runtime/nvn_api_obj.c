@@ -18,6 +18,7 @@
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
 #include "platform/platform.h"
+#include "plugins.h"
 
 // ---------- Descriptor pools
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
@@ -876,6 +877,7 @@ NVN_API(nvnQueuePresentTexture) {
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
     coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
+    plugins_frame(c); // plugins.c: the plugins' frame callbacks and their guest calls, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);

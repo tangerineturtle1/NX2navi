@@ -39,7 +39,7 @@
 enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SAVE_RO };   // M_SAVE: the working copy; M_SAVE_RO: the committed save
 
 typedef struct { int kind; char name[32]; char root[1024]; } Mount;
-typedef struct { PlatFile *h; int mode, save; } File;   // h NULL = free; save: on a save-data mount
+typedef struct { PlatFile *h; int mode, save, kind; } File;   // h NULL = free; save: a writer on a save-data mount; kind: the mount's
 typedef struct { char *name; int kind; uint64_t size; } Listed;
 typedef struct { Listed *e; int n, next, mode, used; } Dir;   // the directory's entries at open; used 0 = free
 
@@ -605,6 +605,10 @@ int fs_profile_path(const char *rel, char *out, size_t cap) {
     return *profile && snprintf(out, cap, "%s/%s", profile, rel) < (int)cap;
 }
 
+const char *fs_profile_dir(void) { return *profile ? profile : rt_config()->profile ? rt_config()->profile : ""; }
+
+const char *fs_save_dir(void) { return plat_cas32(&storage_ready, 0, 0) ? save_root : ""; }
+
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
     char root[1100];
     if (cap) out[0] = 0;
@@ -884,23 +888,47 @@ void fs_host_lock_profile(void) {
     if (held < 0) rt_log("fs: cannot make %s; a second copy of the game would not be stopped", p);
 }
 
-static void storage_init(void *param) {
-    (void)param;
+// The folders of the saves under root: the committed save of the account, the commit's working folders, the backups.
+static void save_roots(const char *root) {
     uint64_t uid[2];
     char p[PATH_CAP];
-    fs_host_lock_profile();
     account_uid(uid);
-    snprintf(p, sizeof p, "%s/save", profile);
+    snprintf(p, sizeof p, "%s/save", root);
     make_dirs(p);
-    need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1],
+    need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", root, (unsigned long long)uid[1],
                   (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
-    need(snprintf(tx_root, sizeof tx_root, "%s/save-tx", profile) < (int)sizeof tx_root, "save path");
+    need(snprintf(tx_root, sizeof tx_root, "%s/save-tx", root) < (int)sizeof tx_root, "save path");
     snprintf(work_root, sizeof work_root, "%s/work", tx_root);
-    snprintf(backup_root, sizeof backup_root, "%s/save-backup", profile);
+    snprintf(backup_root, sizeof backup_root, "%s/save-backup", root);
     make_dirs(tx_root);
     make_dirs(backup_root);
     snprintf(new_root, sizeof new_root, "%s/new", tx_root);
     snprintf(old_root, sizeof old_root, "%s/old", tx_root);
+}
+
+static char save_base[1024];             // the folder the saves are under when it is not the profile (NX2NAVI_SAVE_DIR,
+                                         // fs_save_dir_set), else empty
+static volatile int32_t save_dir_gen;    // counts fs_save_dir_set's changes of save_root
+
+static void storage_init(void *param) {
+    (void)param;
+    char p[PATH_CAP];
+    fs_host_lock_profile();
+    // NX2NAVI_SAVE_DIR (the environment only, for whoever starts the game: a mod's launcher add-on that gives the
+    // player another save than their own): the committed save, the commit's working folders and the save backups live
+    // under that folder instead of the profile's, as <folder>/save/<account>, save-tx and save-backup. Everything else
+    // stays the profile's: the account, the cache, the settings menu's import folder. One game per such folder, as per
+    // profile: both would write into one working copy.
+    char *base = save_base;
+    const char *root = profile;
+    if (plat_getenv("NX2NAVI_SAVE_DIR", base, sizeof save_base) && *base) {
+        make_dirs(base);
+        snprintf(p, sizeof p, "%s/instance.lock", base);
+        if (!plat_lock_file(p)) rt_fatal("fs: another copy of the game is running with the save folder %s; close it first", base);
+        root = base;
+        rt_log("fs: NX2NAVI_SAVE_DIR: the saves are kept under %s, not under the profile", base);
+    } else *base = 0;
+    save_roots(root);
     save_recover();   // before save_root is created: an absent save_root means a commit to complete
     import_pending();
     make_dirs(save_root);
@@ -918,6 +946,80 @@ static void ready(void) {
     static PlatOnce once = PLAT_ONCE_INIT;
     plat_once(&once, storage_init, NULL);
 }
+
+// plugin_api.h set_save_dir: the saves move to another folder under a running game, as NX2NAVI_SAVE_DIR places them at
+// the start (folder NULL or "": back under the profile). What makes it possible at all: the game reaches its save only
+// through its save mount, whose host folder is the working copy (work_root), a copy made of the committed save when
+// the mount is made; so the roots are set to the new folder, an interrupted commit found there is recovered as at a
+// start, a new working copy is made of the save there, and the mount is pointed at it. The game's next open of a save
+// file reads the new save. What cannot be made right from here is refused: a file of the save open (its handle is of
+// the old working copy), save data written and not committed, a commit under way, the process ending, a folder another
+// game holds. What the game holds in its own memory is the caller's business (plugin_api.h: on the title screen only).
+// Returns 1 when the folder is in use (also when it already was), else 0 with *why naming the reason.
+int fs_save_dir_set(const char *folder, const char **why) {
+    char base[1024] = "", p[PATH_CAP], old_work[1100];
+    const char *no = NULL;
+    ready();
+    if (folder && *folder) {
+        if (snprintf(base, sizeof base, "%s", folder) >= (int)sizeof base) no = "the folder's path is too long";
+        for (size_t n = strlen(base); n > 1 && (base[n - 1] == '/' || base[n - 1] == '\\'); ) base[--n] = 0;
+        if (!strcmp(base, profile)) *base = 0;
+    }
+    plat_mutex_lock(&pend_lock);
+    if (exiting) no = "the game is closing";
+    else if (commit_pending) no = "a save commit is under way";
+    plat_mutex_unlock(&pend_lock);
+    if (!no && (plat_cas32(&save_writers, 0, 0) > 0 || plat_cas32(&save_dirty, 0, 0)))
+        no = "the game has save data open for writing or written and not committed";
+    if (no) {
+        if (why) *why = no;
+        return 0;
+    }
+    plat_mutex_lock(&tx_lock);
+    plat_mutex_lock(&lock);
+    for (int i = 0; i < NFILES && !no; i++)
+        if (files[i].h && (files[i].kind == M_SAVE || files[i].kind == M_SAVE_RO)) no = "the game has a file of the save open";
+    plat_mutex_unlock(&lock);
+    if (!no && (plat_cas32(&commit_pending, 0, 0) || plat_cas32(&save_dirty, 0, 0))) no = "a save commit is under way";
+    if (!no && strcmp(base, save_base)) {
+        if (*base) {
+            make_dirs(base);
+            snprintf(p, sizeof p, "%s/instance.lock", base);
+            if (plat_fs_kind(base) != PLAT_FS_DIR) no = "the folder cannot be made";
+            else if (!plat_lock_file(p)) no = "another running game uses the folder";
+        }
+        if (!no) {
+            if (*save_base) {   // the folder left: its lock is given back (the profile's own stays held)
+                snprintf(p, sizeof p, "%s/instance.lock", save_base);
+                plat_unlock_file(p);
+            }
+            snprintf(old_work, sizeof old_work, "%s", work_root);
+            snprintf(save_base, sizeof save_base, "%s", base);
+            plat_xchg32(&storage_ready, 0);   // fs_save_dir answers "" while the roots change
+            save_roots(*base ? base : profile);
+            save_recover();
+            make_dirs(save_root);
+            if (save_mounts) {
+                work_create();
+                plat_mutex_lock(&lock);
+                for (int i = 0; i < NMOUNTS; i++) {
+                    if (mounts[i].kind == M_SAVE) snprintf(mounts[i].root, sizeof mounts[i].root, "%s", work_root);
+                    if (mounts[i].kind == M_SAVE_RO) snprintf(mounts[i].root, sizeof mounts[i].root, "%s", save_root);
+                }
+                plat_mutex_unlock(&lock);
+                if (remove_tree(old_work)) rt_log("fs: the old save working copy %s was not fully deleted", old_work);
+            }
+            plat_inc32(&save_dir_gen);
+            plat_xchg32(&storage_ready, 1);
+            rt_log("fs: the saves are kept under %s from now on (a plugin's set_save_dir): %s", *base ? base : profile, save_root);
+        }
+    }
+    plat_mutex_unlock(&tx_lock);
+    if (no && why) *why = no;
+    return !no;
+}
+
+int fs_save_dir_gen(void) { return (int)plat_cas32(&save_dir_gen, 0, 0); }
 
 void fs_host_set_profile(const char *dir) {
     if (plat_cas32(&storage_ready, 0, 0)) rt_fatal("fs_host_set_profile after the first storage use");
@@ -1187,7 +1289,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {
-            files[i] = (File){f, mode, save_writer};
+            files[i] = (File){f, mode, save_writer, kind};
             *out = FILE_BASE + (uint64_t)i;
             plat_mutex_unlock(&lock);
             if (save_writer) {

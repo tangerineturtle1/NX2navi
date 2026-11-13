@@ -9,6 +9,7 @@
 #include "fs.h"
 #include "host.h"
 #include "kernel.h"
+#include "plugins.h"
 #include "vk.h"
 #include "platform/platform.h"
 
@@ -244,6 +245,7 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
                    // profile saved, logs flushed, exit code 0
         char at[160];
         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
+        plugins_exit();    // plugins.c: the plugins' exit callbacks
         coop_shutdown();   // LEAVE and BYE to the room, before the process ends
         fs_save_flush();
         vk_pipeline_prewarm_marker_clear();   // as the window's close (gfx_present.c gfx_window_closed)
