@@ -722,6 +722,9 @@ extern volatile uint32_t vk_pool_kinds_used;        // bit k: a pipeline was mad
 // Texture pool marks (vk_pipeline.c spirv_pool_mark, vk_exec_draw.c "pool marks"): set 2, this binding, a uint per pool
 // slot that shaders set to 1 when they index the slot.
 #define VK_POOL_MARK_BINDING (VK_POOL_KINDS + 1)
+// the marks buffer's word past the spare: set by a shader whose ring of noted slots overflowed (vk_pipeline.c
+// spirv_pool_mark), so that the read treats every slot as sampled (vk_texture.c vk_pool_marks_read)
+#define VK_POOL_MARK_OVERFLOW (VK_POOL_TEX + 1)
 int vk_pool_marks_enabled(void);                     // NX2NAVI_TEX_DISUSE: modules get the marks
 extern volatile int32_t vk_pool_marks_missed;        // modules indexing the pool that could not be marked
 void vk_pool_marks_read(const uint32_t *marks, uint32_t n);   // vk_texture.c: slots marked since the last read

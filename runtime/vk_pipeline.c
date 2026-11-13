@@ -2389,6 +2389,7 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
            EM_EARLY_FRAGMENT_TESTS = 9, BI_SAMPLE_MASK = 20, BI_FRAG_DEPTH = 22, BI_FRAG_STENCIL_REF = 5014,
            SC_STORAGE_BUFFER = 12, DEC_BLOCK = 2, DEC_ARRAY_STRIDE = 6, DEC_OFFSET_ = 35, OP_TYPE_BOOL = 20,
            OP_LOAD_ = 61, OP_BITCAST = 124, OP_SELECT_ = 169, OP_INOT_EQUAL = 171, OP_LOOP_MERGE = 246, OP_LABEL_ = 248,
+           OP_IEQUAL_ = 170, OP_ISUB_ = 130, OP_UGREATER_THAN_ = 172,
            OP_RETURN = 253, OP_RETURN_VALUE = 254, SC_PRIVATE = 6, LOOP_DEPTH = 64, OP_TYPE_ARRAY_ = 28, OP_IADD = 128,
            OP_BITWISE_AND = 199, OP_ULESS_THAN = 176, OP_BRANCH = 249, OP_BRANCH_CONDITIONAL = 250, OP_PHI = 245 };
     *status = 0, *why = NULL;
@@ -2483,6 +2484,20 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
         i += l;
     }
     if (marked || !sites) return POOL_MARK_FREE(), NULL;
+    // NX2NAVI_POOL_MARK_SHARED (default 1): the module's ring sites share one ring and its count, and an access notes
+    // its slot only when it differs from the slot noted just before it (consecutive repeats take no entry). With a ring
+    // per site, a shader with many pool accesses in a loop (the castle moat's water: 69 shadow taps of one light's map
+    // per iteration) carried 69 rings of 8 dynamically indexed words and stored up to 552 marks per fragment where it
+    // ended: the water's draw took 7.4 ms per frame on an RTX 5080, 0.3 ms without the marks. The shared ring keeps the
+    // last RING runs of slots, which for such a loop is one per light, where a site's ring held its last RING accesses,
+    // all the same slot. It is not the union of what per-site rings held: an access order can push out a slot that a
+    // site's own ring kept. So a shader that noted more than RING runs sets the overflow word at its exits
+    // (VK_POOL_MARK_OVERFLOW), and the read that sees it counts every slot as sampled, for every use of the marks
+    // (vk_texture.c vk_pool_marks_read).
+    static int shared = -1;
+    if (shared < 0) shared = rt_knob("POOL_MARK_SHARED", "1") != 0;
+    uint64_t ring_sites = rings;
+    if (shared && rings > 1) rings = 1;
     uint64_t stores = deferred + rings;   // what each way out stores: a variable, or a ring's entries in a loop
     if (stores && (!exits || exits * (deferred + 3 * rings) > 8192))   // no way out to store at, or code that would grow
         memset(site_def, 0, sites), deferred = rings = stores = 0;           // too much
@@ -2500,7 +2515,7 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
     // a word per entry point and variable, 80 words of types and constants, then per site its variables and the store of
     // its slot (ring: 10 + 29), and per way out 29 words a variable and 8 * 29 a ring (its loop is 83)
     uint64_t on = n + 3 + (uint64_t)entries * (1 + deferred + 2 * rings) + 20 + 30 + 9 * sites + 80 + deferred * 12 +
-                  rings * 40 + (deferred * 29 + rings * RING * 29) * exits;
+                  ring_sites * 64 + 8 + (deferred * 29 + rings * (RING * 29 + 25)) * exits;
     uint32_t *o = malloc(on * 4);
     if (!o) return POOL_MARK_FREE(), *status = -1, *why = "no memory", NULL;
     uint32_t next = bound;
@@ -2508,12 +2523,12 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
     uint32_t rta = next++, st = next++, ptr_st = next++, var = next++, new_ptr_u = ptr_u ? 0 : (ptr_u = next++);
     // deferred: the types, constants and variables (pv0: one per site; ra0, rc0: a ring and its count per ring site)
     uint32_t new_bool = 0, ptr_pv = 0, c_none = 0, c_spare = 0, pv0 = 0, ring_t = 0, ptr_ring = 0, ring_none = 0,
-             cr[RING] = {0}, c_ring = 0, ra0 = 0, rc0 = 0;
+             cr[RING] = {0}, c_ring = 0, c_over = 0, ra0 = 0, rc0 = 0;
     if (stores) {
         new_bool = bool_t ? 0 : (bool_t = next++);
         ptr_pv = next++, c_none = next++, c_spare = next++, pv0 = next, next += (uint32_t)deferred;
         if (rings) {
-            ring_t = next++, ptr_ring = next++, ring_none = next++, c_ring = next++;
+            ring_t = next++, ptr_ring = next++, ring_none = next++, c_ring = next++, c_over = next++;
             for (int j = 0; j < RING; j++) cr[j] = next++;
             ra0 = next, next += (uint32_t)rings, rc0 = next, next += (uint32_t)rings;
         }
@@ -2557,6 +2572,7 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
         if (rings) {
             for (int j = 0; j < RING; j++) o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = cr[j], o[p++] = (uint32_t)j;
             o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c_ring, o[p++] = RING;
+            o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c_over, o[p++] = VK_POOL_MARK_OVERFLOW;
             o[p++] = 4u << 16 | OP_TYPE_ARRAY_, o[p++] = ring_t, o[p++] = uint_t, o[p++] = c_ring;
             o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_ring, o[p++] = SC_PRIVATE, o[p++] = ring_t;
             o[p++] = (3u + RING) << 16 | SPV_OP_CONSTANT_COMPOSITE, o[p++] = ring_t, o[p++] = ring_none;
@@ -2590,6 +2606,14 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
     } while (0)
             for (uint32_t k = 0; k < deferred; k++) POOL_MARK_STORE(pv0 + k);
             for (uint32_t r = 0; r < rings; r++) {
+                {   // more slots noted than the ring holds: the overflow word, else the spare (VK_POOL_MARK_OVERFLOW)
+                    uint32_t oc = next++, og = next++, oi = next++, oa = next++;
+                    o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = oc, o[p++] = rc0 + r;
+                    o[p++] = 5u << 16 | OP_UGREATER_THAN_, o[p++] = bool_t, o[p++] = og, o[p++] = oc, o[p++] = c_ring;
+                    o[p++] = 6u << 16 | OP_SELECT_, o[p++] = uint_t, o[p++] = oi, o[p++] = og, o[p++] = c_over, o[p++] = c_spare;
+                    o[p++] = 6u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_u, o[p++] = oa, o[p++] = var, o[p++] = c0, o[p++] = oi;
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = oa, o[p++] = c1;
+                }
                 if (op == OP_DEMOTE_TO_HELPER) {   // not the block's end: every entry, without a loop
                     for (int j = 0; j < RING; j++) {
                         uint32_t from = next++;
@@ -2630,7 +2654,23 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
             if (d) {   // the slot noted for the stores at the end
                 uint32_t ix = w[i + 4];
                 if (d & 2) o[p++] = 4u << 16 | OP_BITCAST, o[p++] = uint_t, o[p++] = next, o[p++] = ix, ix = next++;
-                if (d & 4) {   // ring[count % RING] = slot, count + 1
+                if ((d & 4) && shared) {   // the shared ring: a slot other than the last noted goes in, count + 1
+                    uint32_t ra = ra0, rc = rc0, cnt = next++, cm1 = next++, jl = next++, pl = next++, last = next++,
+                             same = next++, jn = next++, js = next++, at = next++, inc = next++, c2 = next++;
+                    o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = cnt, o[p++] = rc;
+                    o[p++] = 5u << 16 | OP_ISUB_, o[p++] = uint_t, o[p++] = cm1, o[p++] = cnt, o[p++] = c1;
+                    o[p++] = 5u << 16 | OP_BITWISE_AND, o[p++] = uint_t, o[p++] = jl, o[p++] = cm1, o[p++] = cr[RING - 1];
+                    o[p++] = 5u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_pv, o[p++] = pl, o[p++] = ra, o[p++] = jl;
+                    o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = last, o[p++] = pl;
+                    o[p++] = 5u << 16 | OP_IEQUAL_, o[p++] = bool_t, o[p++] = same, o[p++] = last, o[p++] = ix;
+                    o[p++] = 5u << 16 | OP_BITWISE_AND, o[p++] = uint_t, o[p++] = jn, o[p++] = cnt, o[p++] = cr[RING - 1];
+                    o[p++] = 6u << 16 | OP_SELECT_, o[p++] = uint_t, o[p++] = js, o[p++] = same, o[p++] = jl, o[p++] = jn;
+                    o[p++] = 5u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_pv, o[p++] = at, o[p++] = ra, o[p++] = js;
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = at, o[p++] = ix;
+                    o[p++] = 5u << 16 | OP_IADD, o[p++] = uint_t, o[p++] = inc, o[p++] = cnt, o[p++] = c1;
+                    o[p++] = 6u << 16 | OP_SELECT_, o[p++] = uint_t, o[p++] = c2, o[p++] = same, o[p++] = cnt, o[p++] = inc;
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = rc, o[p++] = c2;
+                } else if (d & 4) {   // ring[count % RING] = slot, count + 1
                     uint32_t ra = ra0 + k_ring, rc = rc0 + k_ring++, cnt = next++, j = next++, at = next++, inc = next++;
                     o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = cnt, o[p++] = rc;
                     o[p++] = 5u << 16 | OP_BITWISE_AND, o[p++] = uint_t, o[p++] = j, o[p++] = cnt, o[p++] = cr[RING - 1];

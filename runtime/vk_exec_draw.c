@@ -2144,15 +2144,15 @@ static VkDescriptorSetLayout pool_layout_make(void) {
 
 static void pool_marks_make(void) {
     VkCtx *c = vk_ctx();
-    // a uint past the slots: the spare that a fragment shader's marks of accesses it did not reach go to
-    // (vk_pipeline.c spirv_pool_mark); it is never read back
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)(VK_POOL_TEX + 1) * 4,
+    // two uints past the slots: the spare that a fragment shader's marks of accesses it did not reach go to, never
+    // read, and the overflow word, read with the slots (VK_POOL_MARK_OVERFLOW; vk_pipeline.c spirv_pool_mark)
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)(VK_POOL_TEX + 2) * 4,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateBuffer(c->vma, &bi, &ai, &PL.marks, &PL.marks_alloc, NULL) != VK_SUCCESS)
         rt_fatal("vk: the texture pool marks buffer failed");
-    bi.size = (VkDeviceSize)VK_POOL_TEX * 4, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.size = (VkDeviceSize)(VK_POOL_TEX + 2) * 4, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VmaAllocationCreateInfo hi = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     for (int i = 0; i < MARKS_RB; i++) {
@@ -2204,7 +2204,7 @@ void vk_exec_pool_marks(VkExec *ex) {
          .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT}};
     VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = mb};
     vkCmdPipelineBarrier2(cb, &dep);
-    VkBufferCopy region = {0, 0, (VkDeviceSize)VK_POOL_TEX * 4};
+    VkBufferCopy region = {0, 0, (VkDeviceSize)(VK_POOL_TEX + 2) * 4};   // the slots, the spare and the overflow word
     vk_gpu_gap_note(VK_GAP_POOL_MARKS, region.size);
     vkCmdCopyBuffer(cb, PL.marks, PL.rb[i].buf, 1, &region);
     mb[0] = (VkMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,

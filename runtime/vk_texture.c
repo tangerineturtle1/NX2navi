@@ -3180,10 +3180,19 @@ void vk_pool_marks_read(const uint32_t *marks, uint32_t n) {
     lock();
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int trace = (rt_trace & RT_TRACE_PERF) != 0;
+    // A shader whose ring of noted slots overflowed (VK_POOL_MARK_OVERFLOW) sampled slots this read does not name:
+    // every registered slot counts as sampled then, so that no texture in use is taken for unused.
+    int over = n == VK_POOL_TEX && marks[VK_POOL_MARK_OVERFLOW] != 0;
+    if (over) {
+        static uint64_t overflows;
+        if (!(overflows++ % 1000))
+            rt_log("vk: texture pool marks: a shader noted more slots than its ring holds; this read counts every "
+                   "slot as sampled (%llu such reads)", (unsigned long long)overflows);
+    }
     if (n > (uint32_t)ntslots) n = (uint32_t)ntslots;
     uint32_t marked = 0;
     for (uint32_t id = 0; id < n; id++) {
-        if (!marks[id]) continue;
+        if (!marks[id] && !(over && tslots[id].used)) continue;
         if (!tslots[id].used) {   // sampled, and not a registered slot now: what it showed is not known here
             if (flight_on) flight_tex(FLIGHT_TEX_UNREG, 0, 0, 0, 0, 0, 0, 0, id);
             continue;
