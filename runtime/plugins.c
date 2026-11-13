@@ -247,17 +247,52 @@ static int span_ok(uint64_t addr, size_t n, int write) {
     return 1;
 }
 
+// Ranges known to be unreadable (a free or inaccessible region of the guest's address space, as memory.c names
+// them), per thread, with the mapping generation they were named at. A plugin's scan that follows words which only
+// might be pointers (the co-op mod's search of the running event) asks for thousands of such addresses a frame, and
+// each one took memory.c's region query and the slow checks of api_read: 1 to 3 s a frame on the Game Over and at
+// loads. Once a region is named here, a read or map_range inside it fails with one compare.
+typedef struct { uint64_t lo, hi; uint32_t gen; } NoSpan;
+enum { NOSPANS = 16 };
+static _Thread_local NoSpan nospans[NOSPANS];
+static _Thread_local unsigned nospan_next;
+
+static int known_unreadable(uint64_t addr, size_t n) {
+    uint32_t gen = mem_map_gen();
+    for (int i = 0; i < NOSPANS; i++) {
+        const NoSpan *s = &nospans[i];
+        if (s->hi && s->gen == gen && addr >= s->lo && addr + n <= s->hi) return 1;
+    }
+    return 0;
+}
+
+// After span_ok said no: when the region around addr is free or inaccessible, it is remembered as unreadable.
+static int note_unreadable(uint64_t addr, size_t n) {
+    if (!fast_mem()) return 0;
+    uint32_t gen = mem_map_gen();
+    RtMemoryInfo r;
+    mem_query(addr, &r);
+    if ((r.state != 0 && r.state != 0x10) || addr < r.base || addr + n > r.base + r.size) return 0;
+    nospans[nospan_next++ % NOSPANS] = (NoSpan){r.base, r.base + r.size, gen};
+    return 1;
+}
+
 static void *api_map_range(uint64_t addr, size_t n, int writable) {
-    return n && span_ok(addr, n, writable != 0) ? (void *)(uintptr_t)addr : NULL;
+    if (!n || known_unreadable(addr, n)) return NULL;
+    if (span_ok(addr, n, writable != 0)) return (void *)(uintptr_t)addr;
+    note_unreadable(addr, n);
+    return NULL;
 }
 
 static int api_read(uint64_t addr, void *buf, size_t n) {
     if (!n) return 1;
     if (!buf || addr + n < addr) return 0;
+    if (known_unreadable(addr, n)) return 0;
     if (span_ok(addr, n, 0)) {
         memcpy(buf, (const void *)(uintptr_t)addr, n);
         return 1;
     }
+    if (note_unreadable(addr, n)) return 0;
     if (mem_host_readable(addr, n)) {
         memcpy(buf, (const void *)(uintptr_t)addr, n);
         return 1;
