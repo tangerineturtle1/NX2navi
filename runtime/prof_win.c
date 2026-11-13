@@ -29,6 +29,7 @@
 #include "host.h"
 #include "perfmon.h"
 #include "prof.h"
+#include "prof_syms.h"
 
 #define render_tid prof_render_tid
 #define main_tid prof_main_tid
@@ -355,7 +356,21 @@ void prof_sampler_write(void) {
         fputc('\n', f);
     }
     if (stacks_dropped) fprintf(f, "stacks_dropped %llu\n", (unsigned long long)stacks_dropped);
+    // the exe's own symbol table names the addresses above, so the profile needs no link map
+    size_t na = 0, ca = (size_t)cnt + 1;
+    for (int i = 0; i < ns && i < PROF_STACKS; i++) ca += stacks[i].depth;
+    uint64_t *addrs = malloc(ca * sizeof *addrs);
+    char exe[MAX_PATH];
+    int named = -1;
+    if (addrs && GetModuleFileNameA(NULL, exe, sizeof exe)) {
+        for (int i = 0; i < cnt && i < PROF_TOP; i++) addrs[na++] = table[i].rip;
+        for (int i = 0; i < ns && i < PROF_STACKS; i++)
+            for (uint32_t d = 0; d < stacks[i].depth; d++) addrs[na++] = stacks[i].rip[d];
+        named = prof_syms_write(f, exe, (uint64_t)(uintptr_t)GetModuleHandleW(NULL), addrs, na);
+    }
+    free(addrs);
     fclose(f);
+    if (named < 0) rt_log("prof: no symbol table in the exe: the addresses stay unnamed");
     rt_log("prof: %llu samples, %d Rips -> %s", (unsigned long long)total, cnt, out_path);
 }
 

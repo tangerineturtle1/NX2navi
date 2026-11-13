@@ -4,8 +4,10 @@ A game folder records every graphics pipeline a run builds in pipeline-keys.bin 
 keys": the pipeline state with its shaders named by input id) and every shader variant in shader-answers.bin
 (runtime/gfx_shader.c "answers met in play": stage, code hash, input id, translator answers). The next start of that
 folder builds its recorded pipelines ahead of play; another install, or the same one after its caches were removed,
-meets each of them in play first. A mesh pipeline met that way has no stage libraries to be linked from, so its draws
-are left out of the picture for its whole compile, 0.2 to 1.1 s.
+meets each of them in play first. A mesh pipeline met that way is compiled then, 0.2 to 1.1 s with its draws left out
+of the picture: all of it where mesh pipelines have no stage libraries, and otherwise the library of its task and
+mesh stages, which is most of it and which only a pipeline record names (runtime/vk_pipeline.c "mesh pipelines' stage
+libraries ahead of their draws").
 
 This tool folds the two files of any number of game folders into one list file; a list file made before can stand
 in for a folder, so a list grows by the folders played since. Beside the shader variants the pipelines name, the list

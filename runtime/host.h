@@ -25,8 +25,8 @@ void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
-       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256, RT_TRACE_COOP = 512 };
-extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,coop (or all)
+       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
+extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
 // prof_win.c: NX2NAVI_PROFILE=<path> sampling profiler; NX2NAVI_TRACE=perf frame timing (waits of the render thread)
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
@@ -102,6 +102,7 @@ void perf_cpu_start(void);   // the process's logical processors (NX2NAVI_CACHE_
 int perf_cpu_on_cache_die(void);   // 1 while the process runs on the die with the largest L3 cache alone (perf.c cpu_placement)
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
+void gfx_window_closed(void);                   // gfx_present.c (gfx_wsys.h): the end of a closed window; does not return
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
 // GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
 // since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.
@@ -196,6 +197,9 @@ int mem_start_note(int probe);                             // a game's start: a 
                                                            // below the game's need (mem_need.h); 1 when it is
 void mem_guest_census(uint64_t frame);   // NX2NAVI_TRACE=perf: committed bytes per guest region
 void mem_lazy_heap_report(uint64_t frame);   // NX2NAVI_TRACE=perf: the lazy heap's faults since the last line
+// The game's own memory for the memory report (vk_memory.c owner_log): its heap's size, the part of it committed (the
+// size itself unless the heap is lazy), and the physical memory it mapped. No lock: a log may read a figure late.
+void mem_guest_usage(uint64_t *heap, uint64_t *heap_committed, uint64_t *phys_maps);
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);                      // 0x01
 uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm);             // 0x02
 uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at); // 0x03
@@ -220,6 +224,8 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+int mem_watched(uint64_t addr, uint64_t size);             // [addr, addr+size) lies inside one of those two ranges, so
+                                                           // one mem_written_pages call can answer for all of it
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
@@ -245,6 +251,7 @@ int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t o
 int mem_lazy_armed(uint64_t a, uint64_t n);
 // Copies the ranges src[i] = {address, bytes} of guest memory whose pages read without a fault to dst[i], ok[i] set.
 int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok);
+int mem_lazy_touches(uint64_t a, uint64_t n);   // 0: the CPU can read [a, a + n) without a fault now
 void mem_lazy_window(int open);
 void mem_lazy_release(uint64_t a, uint64_t n);
 void mem_lazy_report(uint64_t frame, uint64_t skipped);
@@ -356,11 +363,19 @@ uint64_t res_heap_extra_kib(void);                         // added to the HeapD
 int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);   // the HeapDef table (.byml.zs) with
                                                            // the grown heaps, malloc'd; 0 = cannot (logged)
 void res_heapdef_served(void);                             // romfs.c serves the grown table
+int res_heapdef_ok(void);                                  // 1 once it does; 0 after fs_init: the game has the shipped heaps
 void wide_init(void);
 void wide_present(void);                                    // each present: DLSS's render scale (res_fixed)                                      // after rt_patches_init: widescreen.c, NX2NAVI_GAME_ASPECT
 int wide_available(void);                                  // the generated C has the widescreen sets
 void wide_picture(unsigned *w, unsigned *h);               // the picture the game draws (its scene is never larger)
+int wide_scene_settable(void);                             // the generated C has res_fixed: the scene's share can be set
+double wide_scene_share(void);                             // the scene's share of the picture now (0: the game's own)
+double wide_scene_wanted(void);                            // ... what the settings ask for, before the heap's limit
+int wide_scene_restart(void);                              // a restart gives the larger scene the settings ask for
 uint64_t wide_heap_extra_kib(void);                        // the texture heap's growth for the widescreen picture
+// The most res_heap_extra_kib may be (memory.c): with more the application pool passes the heap region and the
+// game's own SetHeapSize is refused. A whole number of 2 MiB.
+uint64_t mem_heap_extra_max_kib(void);
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 float res_dlss_lod_bias(void);                             // NX2NAVI_DLSS upscaling: texture LOD bias (<= 0)
 int res_dlss_mode(const char *mode);                       // NX2NAVI_DLSS changed while running: new scene size
@@ -394,6 +409,10 @@ int frame_free_running(void);                             // no fps60/realtime p
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
 double frame_step_game_hz(void);                          // the rate the game draws at under the limit; 0 unknown
 void frame_rate_day_host(Cpu *c);                         // the time of day's seconds a frame (set ostep, page +0xf60)
+void frame_rate_water_host(Cpu *c);                       // the water's ripple steps a frame (set ostep, page +0xf50)
+void frame_rate_sim_host(Cpu *c);                         // water and floor surfaces' fixed steps (set owater, page +0xf20)
+void frame_rate_sound_gate_host(Cpu *c);                  // the sound job at whole steps (set osound, page +0xf10)
+void frame_rate_sound_step_host(Cpu *c);                  // the step the sound job hands on (set osound, page +0xf00)
 float frame_step_frames(void);                            // the 60 Hz frames the game steps per update (set ostep), else 1
 void frame_step_flight(float *page, float *game, uint64_t *presents);   // flight.c: the step at a host present
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
@@ -452,6 +471,9 @@ int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --w
 int vk_pipeline_prepare_pipelines(void);                   // vk_pipeline.c: --prepare-pipelines (the shared pipeline list)
 int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
 int vk_pipeline_probe_buildgate(void);                     // vk_pipeline.c: --probe-buildgate
+// main.c crash_handler: a fault while the boot builds pipelines or stage libraries leaves a note, which tells the
+// next start that the marker or journal it finds is a crash's and not a stopped start's (vk_pipeline.c pm_skipped).
+void vk_pipeline_crash_note(void);
 int vk_ffx_probe_cache(void);                              // vk_ffx.cpp: --probe-ffx-cache
 // vk_device.c: the drivers' own shader caches beside the exe (MESA_SHADER_CACHE_DIR, on NVIDIA's Linux driver
 // __GL_SHADER_DISK_CACHE_PATH and _SIZE) in the environment, once; before any thread can load a Vulkan driver

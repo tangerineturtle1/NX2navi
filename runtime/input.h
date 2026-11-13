@@ -2,6 +2,8 @@
 #pragma once
 #include <stdint.h>
 
+#include "rumble_hd.h"
+
 // Bits of HidNpadButton (A=0 B=1 X=2 Y=3 StickL=4 StickR=5 L=6 R=7 ZL=8 ZR=9 Plus=10 Minus=11 Left=12 Up=13 Right=14
 // Down=15) and the stick directions (StickLLeft..Down 16-19, StickRLeft..Down 20-23, derived from the sticks).
 // Sticks are -32767..32767, up is +y. NX2NAVI_INPUT=none reports no input. Callable from any thread.
@@ -69,7 +71,7 @@ void input_map_snapshot(struct InputMap *m);
 int input_capture(int reset, int *id);
 // The character on a punctuation key (KEY_MINUS..KEY_GRAVE) in the keyboard layout in use, 0 for another key.
 uint32_t input_key_char(int key);
-// F8, the flight recorder's key (no KEY_ id), held while the game window is in front.
+// F8, the bug capture's key (bugcap.c; no KEY_ id), held while the game window is in front.
 int input_flight_key(void);
 // Insert, the frame dump's key (vk_dump.c, NX2NAVI_DUMP=key), held. On Windows also while another window is in front:
 // a player on a gamepad often leaves the focus elsewhere. Unbound in the game's default layout.
@@ -88,6 +90,19 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms);
 uint16_t rumble_motor(float a, float curve, float strength);
 // NX2NAVI_RUMBLE_TRIGGERS=1: input_rumble also drives the impulse triggers (Xbox) with the high motor's value.
 int input_rumble_triggers_enabled(void);
+// HD rumble (input.c "HD rumble", rumble_hd.h): the game's vibration values as they are, for a gamepad with linear
+// actuators (a Switch Pro Controller, a Joy-Con or a pair of them). All callable from any thread.
+// input_rumble_hd_available: the gamepad the game reads is one of these (the menu's row).
+// input_rumble_hd_on: ... and NX2NAVI_RUMBLE_HD is 1 (live) and NX2NAVI_RUMBLE is not 0: input_rumble then leaves that
+// gamepad's motors alone, and the caller posts every new value with input_rumble_hd.
+// input_rumble_hd: the game's newest value per side (v[0] left, v[1] right; live[s] 0: that side is at rest), the
+// amplitudes scaled by strength (1 = as they are). Returns at once: a thread of input.c writes the reports, the newest
+// value only, and the neutral value once the game stops posting.
+// input_rumble_hd_stop: before the process ends, the neutral value for a controller that is still vibrating.
+int input_rumble_hd_available(void);
+int input_rumble_hd_on(void);
+void input_rumble_hd(const RumbleHdValue v[2], const int live[2], float strength);
+void input_rumble_hd_stop(void);
 
 // Motion (NX2NAVI_MOTION=0 turns it off, live). input_motion_start starts the sensor thread once: every 4 ms it reads the
 // gamepad's gyro and accelerometer (when it has them) and feeds motion_global(). Callable from any thread.

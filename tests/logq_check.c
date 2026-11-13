@@ -115,7 +115,33 @@ static size_t run(Prod *pr, int n, int lines, int pad) {
     return bytes + (size_t)n * (size_t)lines * (size_t)pad;
 }
 
-int main(void) {
+// ---- the end of a process: `logq_check exit <file>` and `logq_check fatal <file>`, which tests/logq_check.py runs
+// after the checks and whose file it reads. The process logs END_LINES lines together, through the queue and into the
+// file, and ends at once, while the log thread is still gathering them: "exit" as a run ends (plat_exit, whose hook is
+// logq_sync, as main.c log_open sets it), "fatal" as a fatal error ends one (dispatch.c fatal_end: logq_sync, then its
+// own line, then _Exit). Every line has to be in the file, and the fatal line after them.
+#define END_LINES 200
+static PlatAppend *end_file;
+static void end_sink(const char *p, size_t n) { plat_append_write(end_file, p, n); }
+static int end_run(const char *how, const char *path) {
+    end_file = plat_append_open(path);
+    if (!end_file) return 3;
+    logq_init(end_sink);
+    plat_exit_hook = logq_sync;
+    if (!logq_async()) return 3;
+    for (int i = 0; i < END_LINES; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 0 %d \n", i);
+        logq_write(line, (size_t)n);
+    }
+    if (!strcmp(how, "exit")) plat_exit(0);
+    logq_sync();
+    logq_write("FATAL: the end\n", 15);
+    _Exit(70);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3) return end_run(argv[1], argv[2]);
     setvbuf(stdout, NULL, _IONBF, 0);
     out = malloc(OUT_CAP);
     if (!out) return 3;
@@ -227,18 +253,67 @@ int main(void) {
     at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
-    // 7. logq_sync: what is queued is written before it returns, and later lines are written by their own thread.
+    // 7. The log thread gathers: lines logged together are written together, LOGQ_GATHER_NS after the first of them
+    //    and not before. The clock says whether this thread logged its lines and looked at the output within half that
+    //    time; on a machine too busy for that, the two checks that need it are left out.
+    int calls = sink_calls;
+    uint64_t g0 = plat_now_ns();
+    for (int i = 0; i < 20; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 0 %d \n", i);
+        logq_write(line, (size_t)n);
+    }
+    size_t early = out_n - at;
+    int in_time = plat_now_ns() - g0 < LOGQ_GATHER_NS / 2;
+    if (in_time) CHECK(!early, "%zu bytes were written before the gathering time was up", early);
+    for (int i = 0; i < 60000 && out_n == at; i++) plat_sleep_ms(1);
+    uint64_t gathered = plat_now_ns() - g0;
+    settle();
+    CHECK(gathered >= LOGQ_GATHER_NS, "a batch was written %.1f ms after its first line, before the gathering time was up",
+          gathered / 1e6);
+    CHECK(check_lines(at, next, &notes) == 20, "lines lost from a gathered batch");
+    if (in_time) CHECK(sink_calls == calls + 1, "%d writes for 20 lines logged together", (int)sink_calls - calls);
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 8. A queue that is half full is written at once, not when the gathering time is up, so a burst that filled one
+    //    half has the other for what it logs next. Each try logs over half the queue's size together and sees how soon
+    //    a write came; on a busy machine the log thread may get its processor late, so one try in three has to show it.
+    int prompt = 0, burst = 0;
+    for (int tries = 0; tries < 3 && !prompt; tries++) {
+        settle();
+        size_t b0 = out_n;
+        uint64_t h0 = plat_now_ns();
+        pr[0] = (Prod){.id = 0, .lines = 2100, .pad = 250, .first = burst};   // 2100 x 260 bytes: 546,000 of 1,048,576
+        producer(&pr[0]);
+        burst += 2100;
+        for (int i = 0; i < 60000 && out_n == b0; i++) plat_sleep_ms(1);
+        prompt = plat_now_ns() - h0 < LOGQ_GATHER_NS / 2;
+    }
+    settle();
+    CHECK(prompt, "a half-full queue was written only when the gathering time was up, three times in a row");
+    CHECK(check_lines(at, next, &notes) == burst, "lines lost at a half-full queue");
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 9. logq_sync: what is queued is written before it returns, and later lines are written by their own thread. The
+    //    lines are logged together just before it, so the log thread is still gathering them (the clock says whether
+    //    this thread was in time for that): the batch a fatal error, a crash or the end of the process finds queued.
     __atomic_store_n(&sink_ms, 20, __ATOMIC_RELEASE);
+    uint64_t s0 = plat_now_ns();
     for (int i = 0; i < 50; i++) {
         char line[64];
         int n = snprintf(line, sizeof line, "t 1 %d \n", i);
         logq_write(line, (size_t)n);
     }
+    early = out_n - at;
+    in_time = plat_now_ns() - s0 < LOGQ_GATHER_NS / 2;
     logq_sync();
     __atomic_store_n(&sink_ms, 0, __ATOMIC_RELEASE);
+    if (in_time) CHECK(!early, "%zu bytes were written before logq_sync, inside the gathering time", early);
     CHECK(check_lines(at, next, &notes) == 50, "logq_sync returned before the queued lines were written");
     at = out_n;
-    int calls = sink_calls;
+    calls = sink_calls;
     logq_write("t 2 0 \n", 7);
     CHECK(out_n == at + 7 && sink_calls == calls + 1, "a line after logq_sync was not written at once");
     logq_sync();   // a second call does nothing

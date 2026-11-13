@@ -9,7 +9,9 @@
 //
 // Back-edge pacing: the present thread submits the blit at once, then holds the host present (vkQueuePresentKHR) until
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
-// replay took. The blit is already on the queue, so the wait blocks no submission.
+// replay took. The blit is already on the queue, so the wait blocks no submission. While a driver's low latency holds
+// the frames where they start (vk_lowlat.c), the pacer's display time is the time of the game's present, and the host
+// present goes out as soon as the blit is submitted.
 //
 // Asynchronous replay (NX2NAVI_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
 // and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
@@ -24,6 +26,7 @@
 #include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
+#include "motion_owner.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "perfmon.h"
@@ -33,6 +36,7 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
+#include "vk_lowlat.h"
 
 #define WEAK __attribute__((weak))
 
@@ -85,6 +89,7 @@ static void present_main(void *arg) {
         plat_mutex_unlock(&pl);
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
+        vk_lowlat_present_frame(j.frame);   // the frame's number for the blit's submit and the present's markers
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
@@ -261,13 +266,104 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (rdoc_active()) { vk_present_drain(); rdoc_after_present(frame); }
 }
 
+// ---- Registrations in submit order
+// The console's GPU reads the texture and sampler pools as it runs a submission, right after the submit, so a draw sees
+// the slots as they were at about its submit (docs/maxwell.md 4.9). The replay takes longer than that, and writes the
+// submission's bindless set as it goes; the set is read when the submission runs. A registration applied at once while
+// a submission is being recorded (made by another of the game's threads, or by the game ahead of a replay on its own
+// thread) therefore reaches that submission's draws, the ones recorded before it too: they sample the slot's next
+// texture, which the game registered for a later frame. Ocarina registers a round of 30 to 60 streamed textures every
+// four or five frames in a town. So a registration takes effect between submissions, in the order the game made it:
+//  - replay on the submitting thread: one made while a submission is being recorded (reg_replaying, set by vk_sync.c
+//    submit around the replay) waits in regq, and so does any made behind it; the submitting thread applies them once
+//    the submission has gone to the queue (vk_reg_replay_end). With no submission being recorded it is applied at once.
+//  - replay on its own thread: every one waits in regq and goes into the replay queue ahead of the next item queued
+//    (regs_queue_locked), so the replay applies it where the game made it among its submits, as it does a release.
+// A texture finalized while its own registration waits is released at once as before, and once more behind that
+// registration (RG_RELEASE): vk_texture_release marks the slots the texture object registered, which the first call
+// could not see. NX2NAVI_REG_ORDER=0: every registration at once, as before.
+enum { RG_TEX, RG_SAMP, RG_RELEASE };
+typedef struct {
+    int kind, id, has_view;
+    tex_t t;      // RG_TEX, RG_RELEASE: a copy (the game may reuse the object's memory)
+    view_t v;
+    samp_par s;   // RG_SAMP
+} RegItem;
+static PlatMutex regl = PLAT_MUTEX_INIT;   // regq and the order of what is applied at once; taken before the texture lock
+static RegItem *regq;
+static int regn, regcap;
+static int reg_replaying;   // atomic
+static uint64_t reg_waited, reg_rounds;   // under regl: registrations that waited for a submission, and the times some did
+
+static int reg_order_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("REG_ORDER", "1") != 0;
+        rt_log("vk: texture and sampler registrations take effect %s (NX2NAVI_REG_ORDER=%d)",
+               on ? "between submissions, in the order the game made them" : "at once", on);
+    }
+    return on;
+}
+
+static void reg_apply(const RegItem *q, int n) {
+    for (int i = 0; i < n; i++) {
+        if (q[i].kind == RG_TEX) vk_texture_register(q[i].id, &q[i].t, q[i].has_view ? &q[i].v : NULL);
+        else if (q[i].kind == RG_SAMP) vk_sampler_register(q[i].id, &q[i].s);
+        else vk_texture_release(&q[i].t);
+    }
+}
+
+static void reg_push(const RegItem *r) {   // regl held
+    if (regn == regcap) {
+        int n = regcap ? regcap * 2 : 256;
+        RegItem *p = realloc(regq, sizeof *p * (size_t)n);
+        if (!p) rt_fatal("vk: out of memory (registrations)");
+        regq = p, regcap = n;
+    }
+    regq[regn++] = *r;
+}
+
+// A registration from the game: applied now, or kept for its place among the submissions.
+static void reg_add(const RegItem *r) {
+    plat_mutex_lock(&regl);
+    if (gfx_replay_async() || regn || __atomic_load_n(&reg_replaying, __ATOMIC_ACQUIRE)) reg_push(r);
+    else reg_apply(r, 1);   // under regl: in call order with the other threads' registrations
+    plat_mutex_unlock(&regl);
+}
+
+// vk_sync.c submit, around the replay of a submission of the game's commands, under its submit lock.
+void vk_reg_replay_begin(void) {
+    if (gfx_replay_async() || !reg_order_on()) return;
+    __atomic_store_n(&reg_replaying, 1, __ATOMIC_RELEASE);
+}
+
+// The submission has gone to the queue with its set: what waited is applied, before the next submission is recorded.
+void vk_reg_replay_end(uint64_t fence) {
+    if (gfx_replay_async() || !reg_order_on()) return;
+    plat_mutex_lock(&regl);
+    __atomic_store_n(&reg_replaying, 0, __ATOMIC_RELEASE);
+    int n = regn;
+    if (n) {
+        reg_apply(regq, n);   // under regl: a registration made meanwhile comes after these
+        regn = 0;
+        reg_waited += (uint64_t)n, reg_rounds++;
+        if (reg_rounds <= 8 || reg_rounds % 1024 == 0)
+            rt_log("vk: %d registrations made while submission %llu was being replayed took effect after it (frame %llu; "
+                   "%llu so far, %llu times)", n, (unsigned long long)fence,
+                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+                   (unsigned long long)reg_waited, (unsigned long long)reg_rounds);
+    }
+    plat_mutex_unlock(&regl);
+}
+
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_REGS };
 typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued;
     uint64_t *h;
     const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
+    RegItem *regs;      // RI_REGS: n registrations the item owns, in the order the game made them
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -302,8 +398,13 @@ int vk_replay_async(void) {
 }
 
 // With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
-static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
+static int vk_be_gpu_wait(uint64_t value, uint64_t timeout_ns) {
     return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
+}
+// The submit wait (nvn_api_core.c NX2NAVI_SUBMIT_FINISH): the GPU's only where the submission reads guest memory on the
+// GPU (vk_sync_recorded_wait).
+static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
+    return vk_sync_recorded_wait(value, timeout_ns, vk_be_gpu_wait);
 }
 
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
@@ -427,15 +528,19 @@ static void replay_main(void *arg) {
             vk_present_drain();
             vk_texture_release(it.tex);
             free((void *)it.tex);
+        } else if (it.kind == RI_REGS) {
+            reg_apply(it.regs, it.n);
+            free(it.regs);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
+            vk_lowlat_submitted(frame);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
             sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
-        else r_presents_done++;
+        else if (it.kind != RI_REGS) r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
@@ -465,22 +570,42 @@ static void core_back_unlocked(int *away) {
     plat_mutex_lock(&rl);
 }
 
-// Queues an item (waits while the queue is full) and returns its value, reserved under rl so values follow queue order.
-static uint64_t replay_enqueue(ReplayItem *it) {
-    plat_mutex_lock(&rl);
+// rl held: the replay thread runs, and the queue has room for `room` items (waits while it has not).
+static void rq_room(int room) {
     if (!r_started) {
         if (!plat_thread_spawn(replay_main, NULL, "vk replay", 0)) rt_fatal("vk: cannot start the replay thread");
         r_started = 1;
     }
     // rl is dropped while the core is taken back, and another thread may fill the queue again meanwhile: check again.
-    while (rq_n == RQ_CAP) {
+    while (rq_n > RQ_CAP - room) {
         uint64_t p0 = perf_begin();
         dr_calls[DR_FULL]++, dr_tcalls[DR_FULL]++;
         int away = core_away_unlocked();
-        while (rq_n == RQ_CAP) plat_cond_wait(&rcv, &rl);
+        while (rq_n > RQ_CAP - room) plat_cond_wait(&rcv, &rl);
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
+}
+
+// rl held, with room for an item (rq_room): the registrations made since the last queued item go into the queue, to
+// be applied before whatever is queued next ("registrations in submit order"). Taken and queued without letting go of
+// rl, so two threads' lists keep their order.
+static void regs_queue_locked(void) {
+    plat_mutex_lock(&regl);
+    ReplayItem ri = {.kind = RI_REGS, .n = regn, .regs = regq};
+    regq = NULL, regn = regcap = 0;
+    plat_mutex_unlock(&regl);
+    if (!ri.n) return;
+    rq[(rq_head + rq_n) % RQ_CAP] = ri;
+    rq_n++;
+    plat_cond_broadcast(&rcv);
+}
+
+// Queues an item (waits while the queue is full) and returns its value, reserved under rl so values follow queue order.
+static uint64_t replay_enqueue(ReplayItem *it) {
+    plat_mutex_lock(&rl);
+    rq_room(2);   // the item, and the registrations made before it
+    regs_queue_locked();
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
@@ -494,6 +619,10 @@ static void replay_drain(int why) {
     if (!gfx_replay_async()) return;
     plat_mutex_lock(&rl);
     dr_calls[why]++, dr_tcalls[why]++;
+    if (__atomic_load_n(&regn, __ATOMIC_RELAXED)) {   // this thread's own registrations are in: replayed too
+        rq_room(1);
+        regs_queue_locked();
+    }
     if (rq_n || r_busy) {
         uint64_t p0 = perf_begin();
         int away = core_away_unlocked();
@@ -535,12 +664,15 @@ void gfx_exit_log(void) {
 }
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    motion_owner_present();
     vk_sync_start();
     gfx_tl_present();
     vk_dlssg_game_present();
+    vk_lowlat_game_present();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
+        vk_lowlat_submitted(frame);
         vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
@@ -590,8 +722,20 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
-static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
+// Both take effect between submissions ("registrations in submit order").
+static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) {
+    vk_sync_start();
+    if (!t || !reg_order_on()) { vk_texture_register(id, t, v); return; }
+    RegItem r = {.kind = RG_TEX, .id = id, .has_view = v != NULL, .t = *t};
+    if (v) r.v = *v;
+    reg_add(&r);
+}
+static void vk_be_sampler_register(int id, const samp_par *s) {
+    vk_sync_start();
+    if (!s || !reg_order_on()) { vk_sampler_register(id, s); return; }
+    RegItem r = {.kind = RG_SAMP, .id = id, .s = *s};
+    reg_add(&r);
+}
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
@@ -600,6 +744,19 @@ static void vk_be_texture_release(const tex_t *t) {
     if (!gfx_replay_async()) {
         vk_present_drain();
         vk_texture_release(t);
+        // Its own registration still waits for the submission being replayed: released again behind it, which marks
+        // the slot that registration fills ("registrations in submit order").
+        if (t && t->mem && __atomic_load_n(&regn, __ATOMIC_RELAXED)) {
+            plat_mutex_lock(&regl);
+            int mine = 0;
+            for (int i = 0; i < regn && !mine; i++)
+                mine = regq[i].kind == RG_TEX && regq[i].t.serial == t->serial && regq[i].t.mem == t->mem;
+            if (mine) {
+                RegItem r = {.kind = RG_RELEASE, .t = *t};
+                reg_push(&r);
+            }
+            plat_mutex_unlock(&regl);
+        }
         return;
     }
     if (!t || !t->mem) return;
@@ -616,6 +773,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    vk_lowlat_submit_start();   // a frame's first submission: its simulation is over (nothing while low latency is off)
     if (!gfx_replay_async()) {
         vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
         return submit_sync(handles, n);
@@ -757,6 +915,15 @@ static void vk_be_cpu_synced(uint64_t fence) {
     vk_texture_write_back_small(fence);
 }
 
+// A frame of the game starts. DLSS Frame Generation's low latency sleeps at the acquire (vk_dlssg.c); the direct path
+// (vk_lowlat.c) at the acquire or the pad read, whichever the game makes first in the frame. At most one of the two
+// is in effect in a run, and each returns at once while it is not.
+static void vk_be_frame_start(void) {
+    vk_dlssg_frame_start();
+    vk_lowlat_frame_start(0);
+}
+static void vk_be_input_read(void) { vk_lowlat_frame_start(1); }
+
 const GfxBackend gfx_vulkan_backend = {
     .name = "vulkan",
     .pool_init = vk_be_pool_init,
@@ -769,9 +936,12 @@ const GfxBackend gfx_vulkan_backend = {
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
     .exec_wait = vk_be_exec_wait,
+    .game_wait = vk_sync_game_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
-    .frame_start = vk_dlssg_frame_start,
+    .frame_start = vk_be_frame_start,
+    .input_read = vk_be_input_read,
+    .frame_paced = vk_lowlat_pace,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,

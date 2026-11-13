@@ -222,9 +222,9 @@ LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lws2_32', '-luser32', '-lgdi32', '-ld
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c and ov_zstd.c
 # the patches.h of the player's game version (its patch page is the page after that version's main; ov_zstd.c's host
-# functions sit on it, and patches.c registers the debug menu's free camera there). mouse_direct.c also registers
-# host callbacks relative to that version's patch page.
-INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c', 'mouse_direct.c'}
+# functions sit on it, and patches.c registers the debug menu's free camera there). mouse_direct.c and sprint.c also
+# register host callbacks relative to that version's patch page.
+INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c', 'mouse_direct.c', 'sprint.c'}
 LIB_NAME = 'libnx2navirt.a'
 AR = UCRT / 'llvm-ar.exe' if WIN else on_path('llvm-ar')
 WINDRES = UCRT / 'windres.exe'   # runtime/nx2navi.rc: the manifest of nx2navi.exe
@@ -358,7 +358,7 @@ def runtime_sources(skip=()):
     """Every runtime/*.c, *.cpp, platform/*.c, *.rc, the in-game menu (ui/*.cpp) and Dear ImGui of this OS except the
     names in skip, so a task adds a file without editing this script."""
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
-            'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c')
+            'third_party/imgui/backends/*.cpp')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip and not other_os(p.name))
 
 

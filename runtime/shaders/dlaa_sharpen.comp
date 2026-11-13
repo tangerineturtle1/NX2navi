@@ -1,0 +1,51 @@
+// A second pass of AMD's robust contrast-adaptive sharpening (RCAS) over FSR 3.1's picture in its scaling modes
+// (runtime/vk_dlaa.c fsr3_sharpen). ffx/ffx_a.h and ffx/ffx_fsr1.h are AMD's headers, unmodified (MIT,
+// ffx/LICENSE.txt). The picture is linear scene light without an upper bound, and RCAS limits its sharpening by each
+// channel's distance from 0 and from 1: every texel is taken through c / (1 + max(c)) on the way in, which keeps hue
+// and maps any light into 0..1, and through the inverse on the way out.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 size;   // width, height, sharpness in stops (0 = most), unused
+} pc;
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx/ffx_a.h"
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) {
+    vec4 c = texelFetch(src, p, 0);
+    c.rgb = max(c.rgb, vec3(0.0));
+    c.rgb /= 1.0 + max(c.r, max(c.g, c.b));
+    return c;
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx/ffx_fsr1.h"
+
+void put(AU2 p, AU4 con) {
+    if (p.x >= uint(pc.size.x) || p.y >= uint(pc.size.y)) return;
+    AF3 c;
+    FsrRcasF(c.r, c.g, c.b, p, con);
+    c = clamp(c, vec3(0.0), vec3(1.0));
+    c /= max(1.0 - max(c.r, max(c.g, c.b)), 1.0 / 16384.0);   // light up to 16,383 comes back as it went in
+    imageStore(dst, ivec2(p), vec4(c, 1.0));
+}
+
+void main() {
+    AU4 con;
+    FsrRcasCon(con, pc.size.z);
+    AU2 p = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    put(p, con);
+    p.x += 8u;
+    put(p, con);
+    p.y += 8u;
+    put(p, con);
+    p.x -= 8u;
+    put(p, con);
+}

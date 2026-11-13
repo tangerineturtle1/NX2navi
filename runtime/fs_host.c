@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "coop_game.h"
 #include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -600,11 +599,6 @@ void fs_save_crash_wait(void) {
            (unsigned long long)(plat_now_ms() - t0));
 }
 
-int fs_profile_path(const char *rel, char *out, size_t cap) {
-    if (cap) out[0] = 0;
-    return *profile && snprintf(out, cap, "%s/%s", profile, rel) < (int)cap;
-}
-
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
     char root[1100];
     if (cap) out[0] = 0;
@@ -1169,7 +1163,6 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) {
-        coop_game_rom_open(path);   // coop_game.c: the title screen's start
         return romfs_open(out, path, mode);
     }
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
@@ -2076,10 +2069,10 @@ static void probe_storage(void) {
 
     // copies of the save: the first one, prefixed, outlasts the rotation of the later ones
     char first[PLAT_PATH_MAX], later[PLAT_PATH_MAX];
-    int copies = fs_save_snapshot("coop-backup", "first-", 3, first, sizeof first);
-    for (int i = 0; i < 6; i++) copies += fs_save_snapshot("coop-backup", NULL, 3, later, sizeof later);
+    int copies = fs_save_snapshot("save-copies", "first-", 3, first, sizeof first);
+    for (int i = 0; i < 6; i++) copies += fs_save_snapshot("save-copies", NULL, 3, later, sizeof later);
     char backup[PLAT_PATH_MAX * 3 + 96];
-    snprintf(backup, sizeof backup, "%s/coop-backup", dir);
+    snprintf(backup, sizeof backup, "%s/save-copies", dir);
     Listing bl;
     int dated = 0, prefixed = 0;
     if (!list_dir(backup, &bl)) {

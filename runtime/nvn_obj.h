@@ -142,7 +142,7 @@ typedef struct { int32_t mode; int32_t pad; uint64_t addr; } p_render_cond;   //
 typedef struct { int32_t enable; uint32_t index; } p_prim_restart;   // SetPrimitiveRestart: indexed strips restart at index
 typedef struct { float n, f; } p_depth_range;
 typedef struct { const prog_t *prog; int32_t stages; } p_bind_program;
-typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind: 0 blend 1 color 2 chmask 3 ms 4 poly 5 ds 6 point size (float)
+typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind: 0 blend 1 color 2 chmask 3 ms 4 poly 5 ds 6 point size (float) 7 line width (float)
 typedef struct { int32_t first, n; uint32_t st[16]; } p_bind_vattr;
 typedef struct { int32_t first, n; vs_st st[16]; } p_bind_vstream;
 typedef struct { int32_t first, n; NVNbufferRange r[16]; } p_bind_vbuf;

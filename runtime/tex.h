@@ -17,6 +17,10 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
                   size_t dst_pitch);
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch,
                 void *dst_storage);
+// nvn_deswizzle with a large level's block-linear copy split over the par_jobs pool (tex_bl_copy_mt): the same bytes.
+// For the texture upload, which runs on a drawing thread; the caller keeps the storage mapped until it returns.
+int nvn_deswizzle_mt(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear,
+                     size_t dst_pitch);
 // One box of a level and layer, [x, x + wb) bytes by [y, y + h) block rows of slice z (3D textures), between the storage
 // and caller rows of pitch bytes, touching nothing else of the level: ReadTexels / WriteTexels of a region cost the
 // region, not the level. Same textures as nvn_deswizzle; -1 for others and for a box outside the level.
@@ -30,6 +34,9 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer, uin
 // The copy loop on its own, for callers that know the level geometry (bl points at the level's first byte).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear);
+// tex_bl_copy with a level of 1 MiB or more split into bands of rows over the par_jobs pool; the same bytes.
+void tex_bl_copy_mt(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
+                    unsigned th, unsigned td, int to_linear);
 
 // ---- tex_astc.c ----
 // ASTC LDR 2D to RGBA8, bit-exact with astcenc's 8-bit decode. blocks: row-major 16-byte blocks covering

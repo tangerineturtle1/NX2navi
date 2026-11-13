@@ -28,7 +28,7 @@ extern "C" int vk_fg4_failed(void) { return 0; }
 extern "C" const char *vk_fg4_name(void) { return ""; }
 extern "C" int vk_fg4_active(void) { return 0; }
 extern "C" int vk_fg4_generating(void) { return 0; }
-extern "C" void vk_fg4_queues(VkQueue, VkQueue) {}
+extern "C" void vk_fg4_queues(VkQueue, uint32_t, VkQueue, uint32_t) {}
 extern "C" VkResult vk_fg4_create_swapchain(const VkSwapchainCreateInfoKHR *, VkSwapchainKHR *) {
     return VK_ERROR_FEATURE_NOT_PRESENT;
 }
@@ -40,6 +40,7 @@ extern "C" uint64_t vk_fg4_presents(VkSwapchainKHR) { return 0; }
 extern "C" PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void) { return nullptr; }
 extern "C" void vk_fg4_frame(VkCommandBuffer, VkSwapchainKHR, VkFormat, VkExtent2D, VkImage, const int *) {}
 extern "C" void vk_fg4_release(void) {}
+extern "C" uint64_t vk_fg4_vram(void) { return 0; }
 #else
 #include <windows.h>
 #include <mutex>
@@ -68,6 +69,7 @@ namespace {
 
 struct {
     VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
+    uint32_t pfam = 0, afam = 0;   // their queue families
     ffxContext sc = nullptr;   // the swapchain context
     ffxContext fg = nullptr;   // the frame generation context
     VkSwapchainKHR handle = VK_NULL_HANDLE;   // the swapchain the context made: remade in place, destroyed after the context
@@ -88,6 +90,7 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg4_generating)
+    uint64_t vram = 0;   // the frame generation context's video memory as the library reported it
 } F;
 
 std::mutex g_lock;       // the probe: the menu asks from its thread, the present from its own
@@ -200,7 +203,9 @@ extern "C" int vk_fg4_failed(void) { return F.failed; }
 
 extern "C" const char *vk_fg4_name(void) { return g_fg_name; }
 
-extern "C" void vk_fg4_queues(VkQueue present, VkQueue acquire) { F.present = present, F.acquire = acquire; }
+extern "C" void vk_fg4_queues(VkQueue present, uint32_t present_family, VkQueue acquire, uint32_t acquire_family) {
+    F.present = present, F.acquire = acquire, F.pfam = present_family, F.afam = acquire_family;
+}
 
 // The SDK's swapchain is in place: the window's swapchain handle is its object, and every swapchain call has to go
 // through its functions, after a failure too, until the present code has taken it down.
@@ -230,8 +235,8 @@ extern "C" VkResult vk_fg4_create_swapchain(const VkSwapchainCreateInfoKHR *ci, 
     F.sc_desc.createInfo.oldSwapchain = VK_NULL_HANDLE;
     F.sc_desc.gameQueue = {c->gfx_queue, c->gfx_family, submit_game};
     F.sc_desc.asyncComputeQueue = {VK_NULL_HANDLE, c->gfx_family, nullptr};
-    F.sc_desc.presentQueue = {F.present, c->gfx_family, nullptr};
-    F.sc_desc.imageAcquireQueue = {F.acquire, c->gfx_family, nullptr};
+    F.sc_desc.presentQueue = {F.present, F.pfam, nullptr};
+    F.sc_desc.imageAcquireQueue = {F.acquire, F.afam, nullptr};
     // the version this code was built against, which the SDK asks for with every context, and a test's version
     F.sc_ver = {};
     F.sc_ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_VK;
@@ -341,6 +346,7 @@ extern "C" void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt
         mq.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
         mq.gpuMemoryUsageFrameGeneration = &mem;
         vk_ffx4_api_query(&F.fg, &mq.header);
+        F.vram = mem.totalUsageInBytes;
         rt_log("fg4: AMD FSR frame generation %s for %ux%u%s, render size up to %ux%u, made in %.0f ms, %.0f MiB of video memory",
                provider(&F.fg), ext.width, ext.height, hdr_format(fmt) ? " (HDR)" : "", max_render.width, max_render.height,
                (double)(plat_now_ns() - t0) / 1e6, (double)mem.totalUsageInBytes / 1048576.0);
@@ -431,5 +437,10 @@ extern "C" void vk_fg4_release(void) {
         if (h && F.fn.pOutDestroySwapchainFFXAPI) F.fn.pOutDestroySwapchainFFXAPI(vk_ctx()->device, h, nullptr, nullptr);
     }
     F.fn = {};
+}
+
+// The frame generation context's video memory, for the memory report (vk_fg.cpp vk_fg_vram).
+extern "C" uint64_t vk_fg4_vram(void) {
+    return __atomic_load_n(&F.fg, __ATOMIC_RELAXED) ? __atomic_load_n(&F.vram, __ATOMIC_RELAXED) : 0;
 }
 #endif   // _WIN32

@@ -3,7 +3,7 @@
     python tools/make_launcher.py --xlate build/xlate [--ffx amd_fidelityfx_vk.dll] [--dlss nvngx_dlss.dll | --no-dlss]
                                   [--ffx4 FOLDER]
                                   [--prompt-art FOLDER [FOLDER ...]] [--out build/launcher-release]
-                                  [--feed owner/name]
+                                  [--pgo build/pgo/pgo-v111.profdata] [--feed owner/name]
                                   [--notes notes.md] [--publish]
 
 Needs Python 3.14 (tarfile and zstd for the MSYS2 packages), uv on PATH, network access on the first run, and
@@ -28,6 +28,9 @@ The release folder (--out) holds:
                                   downloaded from NVIDIA's Streamline SDK release and checked, or --streamline; their
                                   licences and a notice),
                                   lib/libnx2navirt.a (the runtime, prebuilt with the release's compiler),
+                                  data/pgo-v111.profdata and .json with --pgo (the execution profile make_game.py
+                                  compiles the lifted code and the runtime with, the prebuilt runtime included, and
+                                  its record: tools/pgo.py merge),
                                   prompt-art/ with --prompt-art (the button art make_game.py draws the Xbox,
                                   PlayStation, Steam Deck and keyboard and mouse prompts from, tools/prompt_art.py art_files),
                                   toolchain.lock.json (the MSYS2 packages of today, pinned), feed.json, VERSION, the
@@ -41,6 +44,11 @@ The release folder (--out) holds:
 --prompt-art names the button art: folders that hold XGamepad, P5Gamepad and Keyboard_Mouse, or those three folders
 themselves. Only the pictures tools/pad_prompts.py reads are copied; the art stays out of the repository. Without it
 the release has no prompt-art folder and builds the game with the game's own prompts only.
+
+--pgo names the execution profile of a play session (docs/building.md, "Profile-guided build"). It is derived from
+the game's code and stays out of the repository; its record must name this checkout's recomp/, or the release stops
+(tools/pgo.py fitting). Without it the release builds the game as before, the lifted code at -O1. The profile is
+part of NX2navi-app-<version>.zip, so an update brings it and the launcher's next build of the game compiles with it.
 
 --publish uploads the four files as GitHub release v<version> of the --feed repository with the gh CLI (a draft
 first is wiser: add --draft). check_content runs over everything before it is packed: the release holds no game data.
@@ -62,6 +70,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import build_shaders  # noqa: E402
 import check_content  # noqa: E402
 import dlss_pin  # noqa: E402
+import pgo  # noqa: E402
 import prompt_art  # noqa: E402
 import streamline_pin  # noqa: E402
 from launcher import toolchain  # noqa: E402
@@ -179,7 +188,8 @@ def build_python(py):
 
 # ---------------------------------------------------------------- app/<version>/
 
-def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None, pipelines=None, ffx4=None):
+def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None, pipelines=None, ffx4=None,
+              pgo_profile=None):
     # The runtime's own shaders are source in the repository and SPIR-V headers in a release: a player's PC compiles
     # runtime/ (make_game.py) and has no shader compiler. Build the missing and the stale ones before the copy.
     build_shaders.build(ROOT / 'runtime')
@@ -216,6 +226,11 @@ def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, d
         (app / 'tools' / 'data').mkdir(parents=True, exist_ok=True)
         shutil.copy2(pipelines, app / 'tools' / 'data' / 'pipeline_list.bin')
         say(f'pipeline list: {pipelines.stat().st_size / 1e6:.1f} MB')
+    if pgo_profile:   # make_game.py compiles with it (pgo_file); here before the prebuilt runtime is built with it
+        placed = pgo.place(pgo_profile, app / 'data')
+        say(f'execution profile: {placed.stat().st_size / 1e6:.1f} MB')
+    else:
+        say('execution profile: none (--pgo): the game\'s code is built without one, at -O1')
     (app / 'toolchain.lock.json').write_text(json.dumps(lock, indent=1), encoding='utf-8')
     (app / 'feed.json').write_text(json.dumps({'type': 'github', 'repo': feed_repo}, indent=1), encoding='utf-8')
 
@@ -263,6 +278,12 @@ def build_runtime_lib(folder, ver, out, wine):
         return
     if not (app / 'lib' / 'libnx2navirt.a').is_file():
         sys.exit('the prebuilt runtime was not written')
+    # The release's compiler is the one players build with (toolchain.lock.json): a profile it left out of the
+    # runtime (make_game.py pgo_profile says why in the lines above) their builds would leave out too
+    built = json.loads((app / 'lib' / 'runtime-lib.json').read_text(encoding='utf-8'))
+    if (app / 'data' / 'pgo-v111.profdata').is_file() and not built.get('pgo'):
+        sys.exit('the prebuilt runtime was compiled without the release\'s execution profile (the build above says '
+                 'why): the players\' builds would leave the profile out as well')
 
 
 def build_native(work, cc, windres):
@@ -340,6 +361,10 @@ def main():
                     help='the button art: folders holding XGamepad, P5Gamepad and Keyboard_Mouse, or those folders')
     ap.add_argument('--pipeline-list', type=Path, metavar='FILE',
                     help='the shared pipeline list to carry (tools/pipeline_list.py merge writes it; it is derived from game data and stays out of the repository)')
+    ap.add_argument('--pgo', type=Path, metavar='FILE',
+                    help='the execution profile to carry, with its record beside it (tools/pgo.py merge writes '
+                         'build/pgo/pgo-v111.profdata and .json; derived from the game\'s code, they stay out of the '
+                         'repository)')
     ap.add_argument('--out', type=Path, default=MAIN_ROOT / 'build' / 'launcher-release')
     ap.add_argument('--feed', default=DEFAULT_FEED, help='the GitHub repository the launcher looks for releases in')
     ap.add_argument('--notes', type=Path, help='release notes (markdown) for the manifest and the GitHub release')
@@ -357,6 +382,8 @@ def main():
         ver, build = a.version, a.version + build[len(ver):]
     if a.prompt_art:
         prompt_art.art_files(a.prompt_art)   # the art is all there before anything is downloaded or built
+    if a.pgo:
+        pgo.fitting(a.pgo)   # the profile fits this checkout's recomp/ before anything is downloaded or built
     out = a.out
     shutil.rmtree(out, ignore_errors=True)
     folder = out / 'NX2navi'
@@ -376,7 +403,8 @@ def main():
         import pipeline_list
         if pipeline_list.unpack(a.pipeline_list.read_bytes()) is None:
             sys.exit(f'{a.pipeline_list} is not a pipeline list (tools/pipeline_list.py merge writes one)')
-    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss, a.prompt_art, dlssg, a.pipeline_list, a.ffx4)
+    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss, a.prompt_art, dlssg, a.pipeline_list, a.ffx4,
+              a.pgo)
     (folder / 'app' / 'current.txt').write_text(ver + '\n', encoding='utf-8')
     build_python(folder / 'python')
     cc, windres = native_compiler(lock)

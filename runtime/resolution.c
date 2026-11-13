@@ -284,6 +284,7 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
 }
 
 void res_heapdef_served(void) { R.heapdef_ok = 1; }
+int res_heapdef_ok(void) { return R.heapdef_ok; }
 
 // ---- sun shadow map size: each frame the engine sizes its shadow cascades to the area they cover, down to about 400 near
 // the ground, which draws foliage shadows blocky, and each change of size moves the shadow texels, so leaf shadows jump.

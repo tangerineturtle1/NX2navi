@@ -379,16 +379,12 @@ NVN_API(nvnVertexStreamStateGetStride) { ret_x(c, ST(vs_st)->stride); }
 NVN_API(nvnVertexStreamStateGetDivisor) { ret_x(c, ST(vs_st)->divisor); }
 #undef ST
 
-// ---------- rasterisation state without a host equivalent: lines are 1 pixel wide and point size comes from the vertex
-// shader. Non-default values are reported once; the drawing proceeds without them.
+// ---------- rasterisation state without a host equivalent. Non-default values are reported once; the drawing proceeds
+// without them.
 #define ONCE(...) do { static int once_; if (!once_++) rt_log("nvn: " __VA_ARGS__); } while (0)
-// void nvnCommandBufferSetLineWidth / SetPointSize(NVNcommandBuffer *cmd, float value)
-NVN_API(nvnCommandBufferSetLineWidth) {
-    float w = arg_s(c, 0);
-    if (w != 1.0f) ONCE("SetLineWidth %g: lines are drawn 1 pixel wide", w);
-}
-// SetPointSize is recorded in nvn_api_cmd.c (OP_BIND_STATE kind 6): the replay feeds it to the vertex shaders through the
-// support buffer (translator patch 0008).
+// SetPointSize and SetLineWidth are recorded in nvn_api_cmd.c (OP_BIND_STATE kinds 6 and 7): the replay feeds the point
+// size to the vertex shaders through the support buffer (translator patch 0008) and sets the line width for the draws
+// of lines (vk_pipeline.c vk_pipeline_line_width).
 // void nvnCommandBufferSetConservativeRasterEnable(NVNcommandBuffer *cmd, NVNboolean enable)
 NVN_API(nvnCommandBufferSetConservativeRasterEnable) {
     if (nvn_arg_bool(c, 1)) ONCE("conservative rasterisation requested: drawn normally");

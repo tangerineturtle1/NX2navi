@@ -28,6 +28,7 @@ extern "C" {
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_ffx.h"
+#include "vk_fg.h"
 }
 
 namespace {
@@ -127,6 +128,7 @@ struct Up {
     uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
     bool drs = false;                          // made for dynamic resolution (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)
     uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
+    uint64_t vram = 0;                         // its video memory as the library reported it at its creation, 0 not told
 } U[4];
 uint64_t up_tick;
 // A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
@@ -158,6 +160,27 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     ci.arrayLayers = 1;
     ci.usage = i->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
     return ffxApiGetResourceVK((void *)i->image, ffxApiGetImageResourceDescriptionVK(i->image, ci, usage), state);
+}
+
+// NX2NAVI_FFX_KEYS=<key>:<value>[,...] (test): FSR 3.1's tuning constants for each new context (ffx_upscale.h
+// FfxApiConfigureUpscaleKey: 0 velocity factor, 1 reactiveness scale, 2 shading change scale, 3 accumulation added per
+// frame, 4 minimum disocclusion accumulation). The library reads the value through the pointer.
+void configure_keys(ffxContext *ctx) {
+    const char *e = cfg_get("NX2NAVI_FFX_KEYS");
+    static float value[8];
+    for (int n = 0; e && *e && n < 8; n++) {
+        unsigned key = 0;
+        float v = 0;
+        if (sscanf(e, "%u:%f", &key, &v) != 2) break;
+        value[n] = v;
+        ffxConfigureDescUpscaleKeyValue d = {};
+        d.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+        d.key = key, d.ptr = &value[n];
+        ffxReturnCode_t r = A.configure(ctx, &d.header);
+        rt_log("ffx: FSR 3.1 key %u = %g (%s)", key, (double)v, r == FFX_API_RETURN_OK ? "set" : "refused");
+        e = strchr(e, ',');
+        if (e) e++;
+    }
 }
 
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
@@ -218,9 +241,16 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         return nullptr;
     }
     slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh, slot->drs = drs, slot->used = up_tick, slot->used_ns = now;
+    configure_keys(&slot->ctx);
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
+    // its video memory, for the memory report (vk_ffx_vram); a provider that does not know the query leaves it 0
+    FfxApiEffectMemoryUsage mem = {};
+    ffxQueryDescUpscaleGetGPUMemoryUsage mq = {};
+    mq.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+    mq.gpuMemoryUsageUpscaler = &mem;
+    if (A.query(&slot->ctx, &mq.header) == FFX_API_RETURN_OK) slot->vram = mem.totalUsageInBytes;
     rt_log("ffx: FSR 3.1 upscaling to %ux%u from render sizes up to %ux%u (%s)", ow, oh, mw, mh,
            v.versionName ? v.versionName : "provider unknown");
     return slot;
@@ -274,7 +304,8 @@ extern "C" int vk_ffx_available(void) {
 #endif
 }
 
-extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available(); }   // the same library, its API calls
+// the same library, its API calls; and a queue for the frame generation swapchain's presents (vk_fg_has_queues)
+extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available() && vk_fg_has_queues(); }
 
 // NX2NAVI_FSR4 (default 0, live): FSR 4 where it runs (vk_ffx4.cpp) and has not failed in a row, else FSR 3.1.
 extern "C" int vk_ffx_fsr4(void) { return cfg_bool("NX2NAVI_FSR4") && vk_ffx4_available() && !vk_ffx4_failed(); }
@@ -321,10 +352,13 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.motionVectorScale = {1.0f, 1.0f};
     d.renderSize = {color->width, color->height};
     d.upscaleSize = {out->width, out->height};
-    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1
+    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1. Below a render scale of three
+    // quarters it goes towards the maximum, all the way from Performance down, where FSR 3.1 is soft (vk_dlaa.c
+    // "FSR 3.1's second sharpening pass", which has the measurements); 0 still turns it off.
     int sharp = cfg_int("NX2NAVI_SHARPNESS");
     d.enableSharpening = sharp > 0;
     d.sharpness = sharp > 100 ? 1.0f : sharp / 100.0f;
+    if (sharp > 0) d.sharpness += (1.0f - d.sharpness) * vk_dlaa_fsr3_boost(color->width, out->width);
     d.frameTimeDelta = dt_ms;
     d.preExposure = 1.0f;
     d.reset = reset != 0;
@@ -404,9 +438,39 @@ extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDes
     return A.ok ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
+// The upscaler is off (vk_dlaa.c retire_idle; the device is idle): FSR 3.1's and FSR 4's upscale contexts go, made again
+// at the next upscale. Frame generation's contexts are not these.
+extern "C" int vk_ffx_holds(void) {
+    for (Up &u : U)
+        if (u.ctx) return 1;
+    return vk_ffx4_holds();
+}
+extern "C" void vk_ffx_release_idle(void) {
+    vk_ffx4_release();
+    if (!A.ok) return;
+    for (Up &u : U)
+        if (u.ctx) destroy_up(&u, "the upscaler is off");
+}
+
 extern "C" void vk_ffx_release(void) {
     vk_ffx4_release();
     if (!A.ok) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u.ctx = nullptr;
+}
+
+// The memory report's FSR figures (vk_memory.c outside_log): the video memory of the upscaling contexts that exist,
+// FSR 3.1's here and FSR 4's (vk_ffx4_vram), as the library reported each at its creation, with their count; and
+// frame generation's (vk_fg_vram). The library allocates it itself, outside VMA. Read without a lock: a context made or
+// destroyed meanwhile shows in the next report.
+extern "C" uint64_t vk_ffx_vram(int *contexts, uint64_t *fg) {
+    uint64_t bytes = 0;
+    int n = 0;
+    for (Up &u : U)
+        if (__atomic_load_n(&u.ctx, __ATOMIC_RELAXED)) n++, bytes += __atomic_load_n(&u.vram, __ATOMIC_RELAXED);
+    int n4 = 0;
+    bytes += vk_ffx4_vram(&n4);
+    *contexts = n + n4;
+    *fg = vk_fg_vram();
+    return bytes;
 }

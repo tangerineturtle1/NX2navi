@@ -61,6 +61,18 @@ uint64_t gfx_shader_async_done(void);                      // translations finis
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (NX2NAVI_TRACE=perf)
 void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
                                                      // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
+// The shader caches' host memory for the memory report (vk_memory.c system_log), at report time, in bytes: the memory
+// cache of translated shaders (shaders entries), the use masks, the cache pack's index, the play records' sets and
+// pending appends. The memory cache's SPIR-V (gfx_shader.c "SPIR-V at rest"): spv_held bytes held, plain copies and
+// compressed frames together, against spv_full uncompressed; spv_packed shaders held compressed alone; compress 1 on,
+// -1 off, 0 no shader yet. The decodes readers' pins made, and those on the drawing threads (count, time, longest).
+typedef struct {
+    uint64_t shaders, cache, use, pack, records;
+    uint64_t spv_held, spv_full, spv_packed;
+    uint64_t decodes, decode_ns, draw_decodes, draw_decode_ns, draw_decode_max_ns;
+    int compress;
+} GfxShaderRam;
+void gfx_shader_ram(GfxShaderRam *r);
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
                          int bda);
@@ -103,7 +115,17 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorde
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
-const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
+// A shader's SPIR-V may be held compressed while nobody reads it (gfx_shader.c "SPIR-V at rest"). A reader pins it:
+// gfx_shader_spirv_pin returns the plain SPIR-V (decoded first if need be), valid until the matching
+// gfx_shader_spirv_unpin; every pin needs its unpin, and the pointer is not used after it. Any thread.
+const uint32_t *gfx_shader_spirv_pin(const GfxShader *s, uint64_t *words);
+void gfx_shader_spirv_unpin(const GfxShader *s);
+uint64_t gfx_shader_words(const GfxShader *s);              // the SPIR-V's length in words, without reading it
+// FNV-1a (64-bit, over the bytes) of the SPIR-V: worked out once per shader and kept, so it decodes nothing on a
+// compressed shader (NX2NAVI_SKIP_SHADERS, vk_dump.c and vk_dlaa.c name shaders by it).
+uint64_t gfx_shader_spirv_fnv(const GfxShader *s);
+// The values of the module's OpDecorate Binding instructions, in module order, in *b (kept with the shader).
+uint32_t gfx_shader_bindings(const GfxShader *s, const uint32_t **b);
 const char *gfx_shader_res_json(const GfxShader *s);        // the translator's .res.json text
 int gfx_shader_write_code(const GfxShader *s, const char *path);   // the guest program, from the stored inputs
 // A shader of the runtime's own (SPIR-V and a .res.json text as the translator writes them), outside the cache and
@@ -142,6 +164,10 @@ uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input 
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);
 uint32_t gfx_shader_omap(const GfxShader *s);   // FS: colour components it writes, 4 bits per target (SPH omap); 0 unknown
 uint32_t gfx_shader_mvprev_banks(const GfxShader *s);   // a last-frame variant: the banks (bit n: cn) its position reads   // Output Locations (VS varyings, FS colour targets)
+// VS: the matrix palette its skinning reads (gfx_shader.c reflect_palette, which states the rule). 0: none. Else the
+// bytes of one bone matrix (48 or 64), *slot the uniform bank c[slot] it is read from, or with *storage 1 the storage
+// buffer index, and *joints the input Locations whose integer values pick the matrices.
+int gfx_shader_palette(const GfxShader *s, int *slot, int *storage, uint32_t *joints);
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: the LocalSize execution mode; 1, 1, 1 otherwise
 
 // ---- back end (gfx_null.c, vk_*.c). Called by the NVN front end (nvn_api_*.c, nvn_ext.c) on guest threads.
@@ -160,6 +186,10 @@ typedef struct {
     // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
     // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
     int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
+    // The game's own wait for a fence (nvnSyncWait): fence_wait, or where the back end knows the rest of the value's
+    // GPU work reads nothing the game can change and hands it nothing, until its results are there (vk_sync.c
+    // vk_sync_game_wait).
+    int  (*game_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.
@@ -168,6 +198,14 @@ typedef struct {
     // and the GPU's): the back end may hold it longer (vk_dlssg.c vk_dlssg_frame_start, Reflex's sleep for DLSS Frame
     // Generation). NULL: nothing to do.
     void (*frame_start)(void);
+    // The game is about to read its pad (ov_input.c npad_states), several times a frame: where the pad read is the
+    // first thing a frame does, the back end holds the frame's start here, before the input is sampled (vk_lowlat.c
+    // vk_lowlat_frame_start). NULL: nothing to do.
+    void (*input_read)(void);
+    // nvnQueuePresentTexture, with the pacer's period in ns (0: it holds nothing): 1 when the back end holds the next
+    // frame's start to that period itself (vk_lowlat.c vk_lowlat_pace, a driver's low-latency sleep), so the pacer
+    // waits for neither the present's slot nor the window image. NULL: never.
+    int (*frame_paced)(uint64_t period_ns);
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);

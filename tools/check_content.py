@@ -108,6 +108,14 @@ def recorded_in_play(path: Path, data: bytes | None) -> bool:
     return data[:8] in RECORD_MAGICS
 
 
+def execution_profile(path: Path) -> bool:
+    """The counts an instrumented game wrote (.profraw) or their merged profile (.profdata, tools/pgo.py): they name
+    the lifted functions and count their branches, so they are derived from the game's code. A launcher release or
+    an installer release may carry a profile (data/pgo-<version>.profdata), so make_launcher.py and make_release.py,
+    which call problems_for, are not held to this."""
+    return path.suffix.lower() in (".profdata", ".profraw")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--staged", action="store_true", help="check staged files only")
@@ -123,6 +131,8 @@ def main() -> int:
             problems.append("compiled shader: the repository holds the source, tools/build_shaders.py builds this")
         if recorded_in_play(path, data):
             problems.append("recorded from a game folder (shaders, answers, pipeline keys or a pipeline list)")
+        if execution_profile(path):
+            problems.append("execution profile of the game's code: it stays in build/ (tools/pgo.py)")
         for problem in problems:
             print(f"{path}: {problem}")
             failed = True

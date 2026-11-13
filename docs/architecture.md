@@ -41,12 +41,11 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
 - Log: in a game run the lines go through a queue to a thread that writes them (`runtime/logq.c`), so a stalled
-  write to the log file or the console does not hold the thread that logged. A thread's lines reach the log in the
-  order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
-  everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
-  (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
-- Co-op (`coop.c`, `coop_proto.c`, [coop.md](coop.md)): a host thread with a UDP socket to a relay (`tools/coop_relay.py`),
-  rooms of up to 8 players and a channel for messages between them; it never holds a virtual core.
+  write to the log file or the console does not hold the thread that logged. The log thread gathers the lines of
+  a quarter of a second, or half a queue, into one write, so the log is up to that much behind the game. A thread's
+  lines reach the log in the order it logged them: a line waits for the queue's lock, and one that finds the queue
+  full is written after everything queued before it. A fatal error, the crash report and the end of the process write
+  the queue out first (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
@@ -114,8 +113,17 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   `menu_boot_frame`). With the graphics pipeline library the boot builds recorded pipelines in record order for at
   most 20 s after the shaders are ready and leaves the rest to the pipeline workers below normal priority; a draw
   that meets one before it is built gets a fast-linked pipeline (`vk_pipeline.c` `PREWARM_PIPE_MS`).
-  `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
-  the whole wait, after which the rest finishes in the background.
+  `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. A start that finds the
+  pipeline cache written by another GPU or driver waits for the whole warm on that screen, since nothing is built
+  then and all of it would compile beside the game: every recorded pipeline, the compute pipelines, and the
+  prepared shader variants built into the driver's own cache when a sample says it lacks them (`vk_pipeline.c`
+  `bf_decide`, `bf_wait`). `boot-warm-owed.txt` next to the caches lets a start go on with a warm that an earlier
+  one began and did not end, three starts at most, and says when the warm for a GPU and driver is done
+  (`runtime/boot_warm.h`); it waits `NX2NAVI_PREWARM_FULL_S` seconds at most (600), after which the rest is built
+  beside the game, and `NX2NAVI_PREWARM_FULL=0` turns it off. A start that dies in the boot's builds leaves a
+  marker or a journal; the crash handler's note (`vk_pipeline_crash_note`) tells the next start whether that was
+  a crash, which skips the prebuild or the variants, or a start that was closed or stopped, which skips nothing.
+  `NX2NAVI_PREWARM_WAIT_MS` caps the whole wait, after which the rest finishes in the background.
 - Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
   previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
   lists the translators it holds translations of, and a shader the new translator has not translated yet uses the
@@ -175,7 +183,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   linked on several threads while the pool is inside optimised builds (`lib_worker`, `fast_take`); and the first
   draw of a submission that misses has the rest of the submission read ahead, which queues the stage libraries of
   every pipeline the later draws need before the replay reaches them (`runtime/vk_exec.c` `vk_exec_ahead`,
-  `vk_pipeline_hint`). Mesh pipelines have no libraries and are built whole. Compute pipelines
+  `vk_pipeline_hint`). Mesh pipelines are linked the same way (`gpl_mesh`, `vk_pipeline.c` `mesh_lib_init`): the task
+  and mesh stages make one pre-rasterization library, no vertex input library is linked (a mesh pipeline has no such
+  state), and the fragment shader and fragment output libraries are the vertex pipelines' where their keys allow (a
+  mesh pipeline's fragment library differs where the mesh stage leaves an input unwritten, and on a device that
+  sets a shading rate per draw). Their libraries need the mesh and task stage together, so they are made from the
+  pipeline records and not from the single prepared shaders: the preparation and every boot build those of the
+  listed and recorded mesh pipelines into the caches (`mesh_pre_note`). With `gpl_mesh = 0`, and wherever the start's
+  log says so, a mesh pipeline has no libraries and is built whole, 0.2 to 1.1 s the first time. Compute pipelines
   are compiled outside the pipeline lock, and one compile serves every thread that needs it. The boot builds the
   pipeline of every compute shader play recorded or the shader preparation listed, but keeps only those of the shaders
   dispatched most recently (`compute-used.bin`, `compute_keep`): the others go into the pipeline cache and are
@@ -189,8 +204,12 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   into the large one at a start once it reached `pipeline_cache_play_mb`, and by every preparation; the stage
   libraries the library warm builds in play go to the driver's own cache alone (`runtime/vk_pipeline.c`, "the play
   cache", `cache_save`).
-- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
-  (EASU, RCAS) on the present when the window is larger than the picture.
+- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`), which enlarges the scene
+  with FSR 1's edge-adaptive filter (`NX2NAVI_STANDIN_FILTER`, `bilinear` for the plain one) unless DLSS or FSR 3.1
+  scales it; `NX2NAVI_NATIVE_TENSOR=1` runs the game's own network programs instead (`vk_exec_draw.c` `native_tensor`,
+  off by default). Without DLSS or FSR the scene is `scene_share` of the picture (`widescreen.c` `plain_share`, the
+  game's own 3/4 by default); at 1, the Upscaling row's Native, it is the picture's size and the pass only decodes it,
+  texel for texel. `vk_fsr.c` runs AMD FSR 1 (EASU, RCAS) on the present when the window is larger than the picture.
 - Anti-aliasing (`vk_aa.c`, `NX2NAVI_AA`): the game anti-aliases with its own SMAA, three compute passes after the bloom
   composite (edges, blending weights, composition into the scene target as square-rooted RGB9E5 words). `off`, `fxaa`
   and `smaa` leave out the first two and replace the composition with `shaders/aa_post.comp` or SMAA at its Ultra preset
@@ -198,6 +217,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   `taa` is DLSS or FSR at the scene's size with the game's SMAA. While DLSS or FSR runs (`dlaa`, any mode), the other
   values still choose the pass: in the native modes it smooths the upscaler's picture after the bloom, in the scaling
   modes it runs on the scene before the upscaler scales it.
+  DLSS and FSR 3.1 read the bloom composite's output, which the game has already exposed and tonemapped;
+  `NX2NAVI_DLSS_PREBLOOM=1` (a test, off by default) runs them at the bloom chain's first pass on the scene's linear
+  light instead, and draws the lens flares and the bloom composite after them at the picture's size (`vk_dlaa.c`,
+  "before the bloom").
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
@@ -213,6 +236,19 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   while the swapchain is SDR, and a change of the setting makes the swapchain again in the other format
   (`gfx_present.c` `window_settings_live`). Only `native` waits for a restart, as the game asks about the display
   once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
+- Low latency (`vk_lowlat.c`, `NX2NAVI_LOW_LATENCY`, off by default): the graphics driver holds each frame's start, so
+  the pad is read as late as the picture's time allows and no finished picture waits. NVIDIA's mode runs through
+  `VK_NV_low_latency2`: the window's swapchain is made with the latency mode, the frame sleeps in the driver before its
+  first pad read or window image acquire, whichever the game makes first, and its stages are marked with the frame's
+  number, on the guest thread up to the first submission, on the replaying thread at the end of its submissions and on
+  the present thread around the host present. AMD's runs through `VK_AMD_anti_lag`: its input stage where the frame
+  starts, its present stage before the host present. While the mode is in effect the driver's sleep keeps the frame
+  limit and the pacer holds nothing (`nvn_api_obj.c` `nvnQueuePresentTexture`, `vk_lowlat_pace`); the pacer takes the
+  limit back while a movie plays, while no present goes out, and for the rest of the run when the frames show that the
+  driver does not hold it. DLSS Frame Generation brings its own low latency (`vk_dlssg.c`), and the direct path is off
+  in such a run; NVIDIA's is also off while another frame generation presents the frames.
+  The device gets the drivers' extensions only in a run that starts with the setting on (`vk_device.c`
+  `create_device`): turning it on takes a restart, and with it off the device is made as it was before the mode.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
 - Texture detail (`texture_detail`, `vk_texture.c` "texture detail"): on a card with little video memory the large
@@ -221,9 +257,58 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   starts at, and uploads, views and sampler LOD clamps count from there. A texture a shader reads by texel position, or
   whose size it uses, is made whole (`gfx_shader.c` `reflect_exact`). `auto` picks by the device-local budget.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
+- Holes in video memory: the allocator takes device memory in blocks and gives a block back only when it is empty,
+  so a long session leaves textures scattered between holes the driver still counts. The log's `mem: holes` line
+  says how much that is and how much could come back (`vk_memory.c` `holes_log`). With `NX2NAVI_TEX_COMPACT=1`
+  (off by default) textures no shader sampled for ten seconds are copied on the GPU out of the emptiest blocks into
+  the holes of fuller ones, a few per frame and only in frames with time to spare; which blocks is decided from a
+  table of what lies in them (`vk_tex_compact.h`), and the old image of a moved texture stays until no descriptor
+  set and no submission can still name it (`vk_texture.c`, "the pass").
+- Memory report: beside each `mem: holes` line, `mem: by owner` splits the device-local memory the driver counts into
+  VMA's allocations by the file that made them (`vk_vma_budget.c`, "owners"; the textures further by the texture
+  cache's census), the free space inside VMA's blocks and what VMA never allocated (pipelines, descriptor memory, the
+  swapchain, DLSS and frame generation features); `mem: host` gives the host-visible allocations, the process's
+  commit and working set and the game's heap; `vk: released textures` how often released textures came back and how
+  old they were, and how many were made again after a drop (`vk_memory.c` `owner_log`). A figure that only climbs over
+  a session is a leak. Three lines follow at the same period (`vk_memory.c` `beyond_log`): `mem: outside VMA` gives the
+  driver's usage and budget per heap against VMA's blocks in it, and counts what the runtime made outside VMA where the
+  driver gives no size (graphics pipelines whole, fast-linked and optimised, those no draw used for ten minutes and
+  those none did, stage libraries by kind, compute pipelines, layouts, descriptor pools) beside the swapchain's pixels
+  and DLSS's and FSR's figures; `mem: system` splits the process's commit into the game's heap and physical maps, the
+  device-local memory (Windows charges it to the process), VMA's host-visible blocks, the C runtime heap with the shares
+  the runtime can name (shader caches, with their SPIR-V as held against uncompressed and the decompressions, pipeline
+  tables, the texture cache and its decode temporaries, the log queue, the flight recorder), the data of the driver's
+  pipeline caches (asked once a minute on the autosave thread) and the rest;
+  `mem: growth` names what grew by more than 64 MiB since the report before and since the first report in play. Every
+  ten minutes of play and at exit, `mem: growth ranking` ranks the categories by their growth since play began and
+  marks those that only climbed (`mem_growth.h`).
+- Released textures by age: the game releases a texture when what uses it leaves the view and takes it back when that
+  returns; the cache keeps the released image so that the take-back finds it. In play the take-backs came within a
+  minute of the release or never, so a released texture goes once it has gone unused for a hold of three minutes, six
+  for content only the GPU made (`vk_texture.c` `drop_aged`, `vk_tex_release.h`, `tex_released_hold`). The size bound
+  (a quarter of the video memory budget) stays as the safety net for a burst of area changes, and young textures may
+  pass it, up to twice it, while the card and the system's commit have room. Times are wall seconds from a clock of
+  the presents, not present counts. What a switched-off upscaler or SMAA held is freed after it has gone unused for a
+  while (`vk_dlaa.c` `idle_release`, `vk_fsr.c` `idle_note`, `vk_aa.c` `work_idle`).
+- Translated shaders at rest: the shader memory cache keeps every shader for the whole session, but a shader's SPIR-V
+  is read only while modules are made of it. A background thread compresses (zstd, checked by decoding it) the SPIR-V
+  of each shader no reader used for `shader_compress_idle_s` seconds (30) and frees the plain copy; a reader pins it
+  and gets it decoded back, about 60 us for a mean module (`runtime/gfx_shader.c` "SPIR-V at rest",
+  `runtime/spv_store.h`). The SPIR-V keeps about a quarter of its size. What the drawing thread compares at pipeline
+  misses and draws (the module's hash and its Binding decorations) is kept apart and needs no decode; a compute
+  pipeline created at a dispatch and a mesh shader's first pipeline key decode on that thread, which the memory report
+  counts. `shader_compress = 0` keeps it plain.
+- Room levels: a thread samples every two seconds how much room the card and the system have and turns each into a
+  level, roomy (over 40% free), normal (over 20%), tight (over 8%) or critical, with five points of hysteresis upward
+  (`runtime/mem_budget.h`, `mem_budget.c`): the card's from the driver's budget against this process's use, the
+  system's from the lower of the commit's headroom and the physical memory free. A change is logged, and the memory
+  report's `mem: system` line ends with both levels. The SPIR-V at rest is compressed after 5 s unused while the system
+  is tight and after 1 s while it is critical. `mem_budget_test_vram_mb` and `mem_budget_test_ram_mb` pretend a side is
+  that small, to test what gives memory back on a large machine; they leave the texture cache's own rules alone.
 - Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`NX2NAVI_DUMP`,
-  `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`) and a flight recorder
-  (`NX2NAVI_FLIGHT`). RenderDoc cannot capture, because it hides `VK_EXT_external_memory_host` from the application.
+  `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`), a flight recorder
+  (`NX2NAVI_FLIGHT`) and bug captures, which a player's F8 writes and a test run starts from (`bugcap.c`,
+  [bug-capture.md](bug-capture.md)). RenderDoc cannot capture, because it hides `VK_EXT_external_memory_host` from the application.
 
 Maxwell behaviour the back end has to match: [maxwell.md](maxwell.md).
 

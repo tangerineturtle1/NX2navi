@@ -34,9 +34,19 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 
 // ---- registers: VREG = whole V register as a vector type; VQ = source with the upper half cleared when
 // Q=0; VW = write, zeroing the upper half when Q=0. Scalar views of lane 0: VS8..VS64, VSF32/VSF64.
+// A write is one 16-byte store, also where the instruction sets a scalar (the bits above it become zero) or a single
+// lane (the other lanes stay): a V register written as two 8-byte halves or as one lane makes the next 16-byte load
+// of it wait until those stores have left the store buffer, because the processor forwards a store to a load only
+// when the one store covers the load. Assigning a zero-extended u128 to c->v[d] compiles to the two halves, so the
+// writes go through a vector type:
+// VSET = a scalar of at most 64 bits in the low bits, zero above; VSET128 = all 128 bits of an integer value;
+// VINS = lane i replaced by x, the other lanes kept.
 #define VREG(T, n) (*(T *)&c->v[n])
 #define VQ(T, Q, n) ((T)((Q) ? c->v[n] : (u128)(uint64_t)c->v[n]))
-#define VW(T, Q, d, e) do { T _w = (e); c->v[d] = (Q) ? (u128)_w : (u128)(uint64_t)(u128)_w; } while (0)
+#define VSET(d, x) (VREG(vu64, d) = (vu64){(uint64_t)(x), 0})
+#define VSET128(d, x) (VREG(vu64, d) = (vu64)(u128)(x))
+#define VW(T, Q, d, e) do { T _w = (e); VREG(vu64, d) = (Q) ? (vu64)_w : (vu64){((vu64)_w)[0], 0}; } while (0)
+#define VINS(T, d, i, x) do { T _l = VREG(T, d); _l[i] = (x); VREG(vu64, d) = simd_whole((vu64)_l); } while (0)
 #define VS8(n) (*(uint8_t *)&c->v[n])
 #define VS16(n) (*(sa16 *)&c->v[n])
 #define VS32(n) (*(sa32 *)&c->v[n])
@@ -44,6 +54,12 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define VSF32(n) (*(saf32 *)&c->v[n])
 #define VSF64(n) (*(saf64 *)&c->v[n])
 #define VHI64(n) (((sa64 *)&c->v[n])[1])
+// v, with where it came from hidden from the compiler: a load of a V register, a change of one lane and a store of
+// the 16 bytes would otherwise be compiled as a store of that lane alone.
+SI vu64 simd_whole(vu64 v) {
+    __asm__("" : "+x"(v));
+    return v;
+}
 #define LD128(a) (*(const u128u *)(uintptr_t)(a))
 #define ST128(a, v) (*(u128u *)(uintptr_t)(a) = (u128)(v))
 #define SHUF __builtin_shufflevector
@@ -384,8 +400,8 @@ SI float simd_h2s(Cpu *c, uint16_t h) {
 }
 
 // ---- scalar FP instructions (FP data processing)
-#define FP_SETS(d, x) (c->v[d] = fb_s(x))
-#define FP_SETD(d, x) (c->v[d] = fb_d(x))
+#define FP_SETS(d, x) VSET(d, fb_s(x))
+#define FP_SETD(d, x) VSET(d, fb_d(x))
 SI void fp_op_s(Cpu *c, int op, int d, int n, int m) { FP_SETS(d, op_s(c, op, VSF32(n), VSF32(m), 0)); }
 SI void fp_op_d(Cpu *c, int op, int d, int n, int m) { FP_SETD(d, op_d(c, op, VSF64(n), VSF64(m), 0)); }
 // FMADD family: neg_a / neg_n negate the addend / first factor before the fused op
@@ -568,7 +584,7 @@ SI void sl_gen(Cpu *c, int op, int sz, int ne, int d, int szd, int offd, int kee
         uint64_t y = m < 0 ? bimm : lget(&b, szm, bidx >= 0 ? bidx : offm + i);
         lset(&r, szd, offd + i, lop(op, sz, lget(&a, szn, offn + i), y, lget(&o, szd, offd + i)));
     }
-    c->v[d] = r;
+    VSET128(d, r);
 }
 // SADDLP/UADDLP/SADALP/UADALP
 SI void sl_addlp(Cpu *c, int u, int acc, int Q, int sz, int d, int n) {
@@ -578,7 +594,7 @@ SI void sl_addlp(Cpu *c, int u, int acc, int Q, int sz, int d, int n) {
         uint64_t s = u ? x + y : (uint64_t)(lsx(x, sz) + lsx(y, sz));
         lset(&r, sz + 1, i, s + (acc ? lget(&o, sz + 1, i) : 0));
     }
-    c->v[d] = r;
+    VSET128(d, r);
 }
 // ADDV, SADDLV/UADDLV, SMAXV/UMAXV, SMINV/UMINV (op 0..3; u = unsigned)
 SI void sl_across(Cpu *c, int op, int u, int Q, int sz, int d, int n) {
@@ -591,12 +607,12 @@ SI void sl_across(Cpu *c, int op, int u, int Q, int sz, int d, int n) {
         else if (op == 2) acc = u ? ((uint64_t)x > (uint64_t)acc ? x : acc) : (x > acc ? x : acc);
         else acc = u ? ((uint64_t)x < (uint64_t)acc ? x : acc) : (x < acc ? x : acc);
     }
-    c->v[d] = (uint64_t)acc & lmask(op == 1 ? sz + 1 : sz);
+    VSET(d, (uint64_t)acc & lmask(op == 1 ? sz + 1 : sz));
 }
 // PMULL2/PMULL 1Q (64x64 -> 128 carry-less)
 SI void sl_pmull64(Cpu *c, int part, int d, int n, int m) {
     uint64_t hi, lo = pmul64(((sa64 *)&c->v[n])[part], ((sa64 *)&c->v[m])[part], &hi);
-    c->v[d] = ((u128)hi << 64) | lo;
+    VSET128(d, ((u128)hi << 64) | lo);
 }
 
 // ---- FP vector helpers: lanes of the 64-bit form are computed on a zero upper half
@@ -611,7 +627,7 @@ SI double pair_d(Cpu *c, int op, double a, double b) { return op_d(c, op, a, b, 
 // FMAXV/FMINV/FMAXNMV/FMINNMV (4S): pairwise tree
 SI void sv_fred_s(Cpu *c, int op, int d, int n) {
     vf32 v = VREG(vf32, n);
-    c->v[d] = fb_s(pair_s(c, op, pair_s(c, op, v[0], v[1]), pair_s(c, op, v[2], v[3])));
+    VSET(d, fb_s(pair_s(c, op, pair_s(c, op, v[0], v[1]), pair_s(c, op, v[2], v[3]))));
 }
 // lane-wise FP conversions
 SI vu32 vtoint_s(Cpu *c, vf32 v, int rm, int fbits, int uns) {
@@ -656,7 +672,7 @@ SI void sv_fcvtl(Cpu *c, int sz, int part, int d, int n) {
         for (int i = 0; i < 2; i++) o[i] = simd_s2d(c, fv_s((uint32_t)lget(&a, 2, 2 * part + i)));
         r = (u128)o;
     }
-    c->v[d] = r;
+    VSET128(d, r);
 }
 SI void sv_fcvtn(Cpu *c, int sz, int part, int odd, int d, int n) {
     u128 a = c->v[n], r = part ? (uint64_t)c->v[d] : 0;
@@ -668,7 +684,7 @@ SI void sv_fcvtn(Cpu *c, int sz, int part, int odd, int d, int n) {
             lset(&r, 2, 2 * part + i, fb_s(odd ? simd_d2s_odd(c, x) : simd_d2s(c, x)));
         }
     }
-    c->v[d] = r;
+    VSET128(d, r);
 }
 
 // TBL / TBX with len+1 table registers
@@ -680,7 +696,7 @@ SI void sv_tbl(Cpu *c, int Q, int len, int tbx, int d, int n, int m) {
         unsigned k = (unsigned)lget(&idx, 0, i);
         lset(&r, 0, i, k < 16u * (len + 1) ? tab[k] : tbx ? lget(&o, 0, i) : 0);
     }
-    c->v[d] = r;
+    VSET128(d, r);
 }
 
 // ---- CRC32 / CRC32C (bytes = 1, 2, 4, 8)
@@ -716,7 +732,7 @@ SI void sv_aes(Cpu *c, int op, int d, int n) { // 0 AESE, 1 AESD, 2 AESMC, 3 AES
         }
     }
     memcpy(&v, r, 16);
-    c->v[d] = v;
+    VSET128(d, v);
 }
 SI uint32_t rol32_(uint32_t x, int s) { return (x << s) | (x >> (32 - s)); }
 SI uint32_t ror32_(uint32_t x, int s) { return (x >> s) | (x << (32 - s)); }
@@ -779,7 +795,7 @@ SI void sv_sha_misc(Cpu *c, int op, int d, int n, int m) { // 0 SHA1SU0, 1 SHA1S
         break;
     }
     default:
-        c->v[d] = rol32_(b[0], 30);
+        VSET(d, rol32_(b[0], 30));
         return;
     }
     memcpy(&c->v[d], r, 16);
@@ -809,7 +825,7 @@ SI void sl_ldm(Cpu *c, int Q, int sz, int selem, int rpt, int t, uint64_t ea) {
     for (int k = 0; k < rpt; k++)
         for (int e = 0; e < ne; e++)
             for (int s = 0; s < selem; s++, ea += 1 << sz) lset(&r[k + s], sz, e, simd_ld(ea, sz));
-    for (int i = 0; i < rpt + selem - 1; i++) c->v[(t + i) & 31] = r[i];
+    for (int i = 0; i < rpt + selem - 1; i++) VSET128((t + i) & 31, r[i]);
 }
 SI void sl_stm(Cpu *c, int Q, int sz, int selem, int rpt, int t, uint64_t ea) {
     u128 r[4];
@@ -822,9 +838,13 @@ SI void sl_stm(Cpu *c, int Q, int sz, int selem, int rpt, int t, uint64_t ea) {
 // single structure: lane idx of selem registers; LDnR replicates into every lane
 SI void sl_lds(Cpu *c, int sz, int selem, int idx, int t, uint64_t ea) {
     for (int s = 0; s < selem; s++) {
-        u128 v = c->v[(t + s) & 31];
-        lset(&v, sz, idx, simd_ld(ea + (s << sz), sz));
-        c->v[(t + s) & 31] = v;
+        uint64_t x = simd_ld(ea + (s << sz), sz);
+        switch (sz) {
+        case 0: VINS(vu8, (t + s) & 31, idx, (uint8_t)x); break;
+        case 1: VINS(vu16, (t + s) & 31, idx, (uint16_t)x); break;
+        case 2: VINS(vu32, (t + s) & 31, idx, (uint32_t)x); break;
+        default: VINS(vu64, (t + s) & 31, idx, x); break;
+        }
     }
 }
 SI void sl_sts(Cpu *c, int sz, int selem, int idx, int t, uint64_t ea) {
@@ -836,6 +856,6 @@ SI void sl_ldr(Cpu *c, int Q, int sz, int selem, int t, uint64_t ea) {
     for (int s = 0; s < selem; s++) {
         u128 v = 0;
         for (int e = 0; e < (8 << Q) >> sz; e++) lset(&v, sz, e, x[s]);
-        c->v[(t + s) & 31] = v;
+        VSET128((t + s) & 31, v);
     }
 }

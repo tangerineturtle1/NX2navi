@@ -28,9 +28,11 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer, const VkFfxImage *, const VkFfxI
     return 0;
 }
 extern "C" void vk_ffx4_release(void) {}
+extern "C" int vk_ffx4_holds(void) { return 0; }
 extern "C" int vk_ffx4_failed(void) { return 0; }
 extern "C" void vk_ffx4_retry(void) {}
 extern "C" void vk_ffx4_trim(uint64_t) {}
+extern "C" uint64_t vk_ffx4_vram(int *contexts) { return *contexts = 0, 0; }
 #else
 #include <windows.h>
 #include <atomic>
@@ -195,6 +197,7 @@ struct Up {
     ffxCreateBackendVKDesc backend = {};
     ffxOverrideVersion version = {};
     ffxCreateContextDescUpscaleVersion built = {};
+    uint64_t vram = 0;                         // its video memory as the library reported it at its creation
 } U[4];
 uint64_t up_tick;
 const uint64_t UP_RECENT = 8;   // contexts used this recently may sit in a command buffer not submitted yet
@@ -259,6 +262,7 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh, bool dr
     mq.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
     mq.gpuMemoryUsageUpscaler = &mem;
     A.query(&slot->ctx, &mq.header);
+    slot->vram = mem.totalUsageInBytes;
     rt_log("ffx4: FSR %s upscaling to %ux%u from render sizes up to %ux%u, made in %.0f ms, %.0f MiB of video memory",
            v.versionName ? v.versionName : "4", ow, oh, mw, mh, (double)(plat_now_ns() - t0) / 1e6,
            (double)mem.totalUsageInBytes / 1048576.0);
@@ -434,9 +438,25 @@ extern "C" ffxReturnCode_t vk_ffx4_api_dispatch(ffxContext *ctx, const ffxDispat
     return A.dispatch ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
+extern "C" int vk_ffx4_holds(void) {
+    for (Up &u : U)
+        if (u.ctx) return 1;
+    return 0;
+}
+
 extern "C" void vk_ffx4_release(void) {
     if (!A.destroy) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u = Up();
+}
+
+// FSR 4's upscaling contexts that exist and their video memory, for the memory report (vk_ffx.cpp vk_ffx_vram).
+extern "C" uint64_t vk_ffx4_vram(int *contexts) {
+    uint64_t bytes = 0;
+    int n = 0;
+    for (Up &u : U)
+        if (__atomic_load_n(&u.ctx, __ATOMIC_RELAXED)) n++, bytes += __atomic_load_n(&u.vram, __ATOMIC_RELAXED);
+    *contexts = n;
+    return bytes;
 }
 #endif   // _WIN32

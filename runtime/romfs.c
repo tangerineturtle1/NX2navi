@@ -42,6 +42,7 @@
 #include "platform/platform.h"
 #include "restbl.h"
 #include "sha256.h"
+#include "stutter_map.h"
 
 #include <zstd.h>
 
@@ -1183,7 +1184,8 @@ static void open_note(uint64_t i, const char *path) {
                "(romfs-check.json lists the files found damaged)", path);
 }
 
-// NX2NAVI_TRACE=perf: an area's static placement, Banc/<area>/<area>_<age>_Static.bcett.byml.zs, is read once when the
+// NX2NAVI_TRACE=perf and the stutter map (stutter_map.c): an area's static placement,
+// Banc/<area>/<area>_<age>_Static.bcett.byml.zs, is read once when the
 // area loads (the game streams a neighbouring area the same way): perf_scene names it.
 static int area_name(const char *p, char *name, size_t cap) {
     static const char tail[] = "_Static.bcett.byml";
@@ -1241,7 +1243,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
         return FS_R_PATH_NOT_FOUND;
     }
     open_note(i, p);
-    if (rt_trace & RT_TRACE_PERF) scene_note(p);
+    if ((rt_trace & RT_TRACE_PERF) || stutter_map_on) scene_note(p);   // the stutter map counts hitches by area
     if (!strcasecmp(p, CAMPACK)) cam_pack_opened();   // its values come into memory at the start's factor (camera_speed.c)
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;

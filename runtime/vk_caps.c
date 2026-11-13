@@ -41,6 +41,12 @@ void vk_caps_features(VkPhysicalDeviceFeatures *f) {
     vk_caps.float64 = f->shaderFloat64;
 }
 
+static int amd_proprietary;   // AMD's own Windows driver (any branch): gfx_shader.c patch_vec_index
+
+// gfx_shader.c patch_vec_index: the driver reads uniform vector components at computed indices wrongly (Ryujinx's
+// HasVectorIndexingBug, which it sets for AMD's Windows drivers).
+int vk_caps_vec_index_bug(void) { return amd_proprietary; }
+
 void vk_caps_driver(VkPhysicalDevice p) {
     VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
@@ -51,6 +57,7 @@ void vk_caps_driver(VkPhysicalDevice p) {
     // "26.10.1 (AMD proprietary shader compiler)" where the RDNA 3 and 4 driver names LLPC.
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
     vk_caps.amd_llpc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !vk_caps.amd_sc;
+    amd_proprietary = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
     vk_caps.mesa = drv.driverID == VK_DRIVER_ID_MESA_RADV || drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
                    drv.driverID == VK_DRIVER_ID_MESA_NVK;
 }

@@ -113,10 +113,19 @@ static ZSTD_DDict *dict_for(uint64_t guest, uint64_t content, uint64_t size) {
     return dd;
 }
 
+// A thread's one-shot decoder context (host_decode), freed when the thread ends (plat_thread_end_hook): the game
+// makes and ends threads all through play, and each that had decoded left its context behind, about 100 KiB.
+static __thread ZSTD_DCtx *dctx;
+static volatile int32_t dctx_hooked;
+
+static void dctx_thread_end(void) {
+    if (dctx) ZSTD_freeDCtx(dctx);
+    dctx = NULL;
+}
+
 // Decodes on this thread's host context. Returns libzstd's result; *ok 0 when the inputs cannot be taken.
 static size_t host_decode(uint64_t dst, uint64_t cap, uint64_t src, uint64_t size, uint64_t dict, uint64_t dict_size,
                           uint64_t ddict, int *ok) {
-    static __thread ZSTD_DCtx *dctx;
     *ok = 0;
     if ((cap && !dst) || !src || src + size > RT_ADDRESS_LIMIT) return 0;   // dst: decode() checks a guest one
     ZSTD_DDict *dd = NULL;
@@ -139,7 +148,10 @@ static size_t host_decode(uint64_t dst, uint64_t cap, uint64_t src, uint64_t siz
     } else if (dict && dict_size) {
         if (!(dd = dict_for(0, dict, dict_size))) return 0;
     }
-    if (!dctx && !(dctx = ZSTD_createDCtx())) return 0;
+    if (!dctx) {
+        if (!plat_xchg32(&dctx_hooked, 1)) plat_thread_end_hook(dctx_thread_end);
+        if (!(dctx = ZSTD_createDCtx())) return 0;
+    }
     *ok = 1;
     return dd ? ZSTD_decompress_usingDDict(dctx, gp(dst), (size_t)cap, gp(src), (size_t)size, dd)
               : ZSTD_decompressDCtx(dctx, gp(dst), (size_t)cap, gp(src), (size_t)size);

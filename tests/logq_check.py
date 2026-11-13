@@ -2,6 +2,9 @@
 platform layer linked and a destination of the test's own. No game files: the module layout the runtime includes is a
 stand-in written to the test's build folder.
 
+After its checks the program is run twice more as a process that logs to a file and ends at once, by an exit and as
+a fatal error does, while the log thread is still gathering its lines (ends): each file has to hold every line.
+
 Usage: logq_check.py
 """
 import os
@@ -45,7 +48,29 @@ def main():
                            '-march=x86-64-v3', '-I', str(rt), '-I', str(work),
                            str(ROOT / 'tests' / 'logq_check.c'), *map(str, plat), '-o', str(exe), '-lm', *libs],
                           env=env)
-    return subprocess.run([str(exe)], env=env, timeout=300).returncode
+    failed = subprocess.run([str(exe)], env=env, timeout=300).returncode
+    return ends(exe, work, env) or failed
+
+
+END_LINES = 200   # tests/logq_check.c END_LINES
+
+
+def ends(exe, work, env):
+    """The end of a process whose lines the log thread is still gathering (tests/logq_check.c end_run): the exit code
+    is the one the process ended with, and its file holds every line it logged, the fatal line last."""
+    bad = 0
+    for how, code in (('exit', 0), ('fatal', 70)):
+        path = work / f'end_{how}.log'
+        path.unlink(missing_ok=True)
+        rc = subprocess.run([str(exe), how, path.name], cwd=work, env=env, timeout=60).returncode
+        want = ''.join(f't 0 {i} \n' for i in range(END_LINES)) + ('FATAL: the end\n' if how == 'fatal' else '')
+        got = path.read_bytes() if path.exists() else b''
+        if rc != code or got != want.encode():
+            print(f'FAIL: a process ended by "{how}": exit code {rc}, want {code}; its log holds {len(got)} bytes, '
+                  f'{"the" if got == want.encode() else "not the"} {len(want)} it logged')
+            bad = 1
+    print(f'logq_check: the end of a process: {"FAILED" if bad else "ok"}')
+    return bad
 
 
 if __name__ == '__main__':

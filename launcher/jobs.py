@@ -3,11 +3,13 @@ staging of an update. Each job is a list of steps the window shows as rows; the 
 timer (rev changes on every change) and never blocks on it. The same jobs run headless from launcher/cli.py.
 BackgroundUpdate decides when a staged update installs."""
 import collections
+import json
+import os
 import threading
 import time
 import traceback
 
-from . import build, feed, gamefiles, net, toolchain, updater, versions, winsys
+from . import build, feed, gamefiles, locks, net, paths, toolchain, updater, versions, winsys
 
 RECHECK = 3600   # seconds between update checks while the launcher stays open, hidden during play included
 
@@ -15,7 +17,30 @@ PENDING, RUNNING, DONE, SKIPPED, FAILED = 'pending', 'running', 'done', 'skipped
 
 # Failures whose message says all there is to say: the log gets one line for them (failure_line), not a traceback.
 # A refused update check wrote 22 lines of two tracebacks into launcher.log each time.
-PLAIN_FAILURES = (feed.FeedError, build.BuildError)
+PLAIN_FAILURES = (feed.FeedError, build.BuildError, locks.Busy)
+
+
+# data/job-running.json: the job that is writing into the game folder, from its start to its end (Job._main). A job
+# that ends, also by Cancel or an error, removes it and has told its result on screen. One the launcher was stopped
+# in (closed by the system, a power cut, a crash) leaves it, and the next start says so (interrupted).
+MARKER = 'job-running.json'
+
+
+def interrupted(ctx):
+    """The job the launcher was stopped in, as it wrote it ({'task', 'kind', 'game_dir', 'started'}), or None. The
+    marker is removed: it is told once. Call it while this process holds the launcher folder's lock and runs no
+    job, or the marker read is a running job's."""
+    path = ctx.layout.data / MARKER
+    try:
+        with open(path, encoding='utf-8') as f:
+            left = json.load(f)
+    except (OSError, ValueError):
+        left = None
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return left if isinstance(left, dict) and left.get('task') else None
 
 
 def failure_line(e):
@@ -102,6 +127,12 @@ class Step:
 class Job:
     kind = 'job'
     title = ''
+    # What the job changes while it runs, for the lock between jobs (launcher/locks.py claim): 'game' is the game
+    # folder and the build tools, 'app' the app folder's versions and the downloads. A job with claims also holds the
+    # launcher folder's lock between processes while it runs; one without (the update check) changes no file and
+    # runs beside anything.
+    claims = ()
+    task = ''   # the job as the holder of a lock is named (doing)
 
     def __init__(self, ctx, step_ids, ver=''):
         self.ctx = ctx
@@ -116,7 +147,10 @@ class Job:
         self.finished = None
         self.after = None           # what the window does next ('restart', ...)
         self.note = ''              # a sentence for the home screen after the job (note_scan)
-        self._lock = threading.Lock()
+        # Held for every change of a step and of rev, and by a reader that wants the steps as one change left them
+        # (locked). The worker, the thread that reads the build's output and the window's thread (cancel) all change
+        # the job. Reentrant: progress() begins a step, and every change ends in _touch().
+        self._lock = threading.RLock()
 
     # ---- state the window reads
     def step(self, sid):
@@ -169,47 +203,68 @@ class Job:
     def elapsed(self):
         return (self.finished or time.time()) - self.started
 
+    def locked(self):
+        """The lock to read the steps under (`with job.locked():`): they are then as one change left them, a step's
+        state with the value and fraction that belong to it. Held only to copy what is read, never across a
+        wait."""
+        return self._lock
+
     # ---- changes, from the worker
     def _touch(self):
-        self.rev += 1
+        # Under the lock: "rev += 1" from two threads at once can write an older count back, and a reader that had
+        # seen the newer one then takes the next change for one it has drawn already. The job's last change is its
+        # result, so the window stayed on the job screen of a job that had ended.
+        with self._lock:
+            self.rev += 1
 
     def log(self, line):
-        self.lines.append(line)
-        self.ctx.log(line)
+        with self._lock:
+            self.lines.append(line)
+        self.ctx.log(line)   # outside the lock: it waits for the disk
         self._touch()
 
+    def last_lines(self, n):
+        """The last n lines of the job's output, copied under the lock: the thread that reads the build's output
+        appends while the window draws them, and a deque changed while it is read raises."""
+        with self._lock:
+            return list(self.lines)[-n:]
+
     def begin(self, sid, detail=''):
-        s = self.step(sid)
-        if s and s.state != RUNNING:
-            s.state, s.fraction, s.detail, s.t0, s.value = RUNNING, 0.0, detail, time.time(), '0%'
-            s.pace.clear()
-            self._touch()
+        with self._lock:
+            s = self.step(sid)
+            if s and s.state != RUNNING:
+                s.state, s.fraction, s.detail, s.t0, s.value = RUNNING, 0.0, detail, time.time(), '0%'
+                s.pace.clear()
+                self._touch()
 
     def progress(self, sid, fraction, detail=''):
-        s = self.step(sid)
-        if s:
-            if s.state == PENDING:
-                self.begin(sid)
-            s.fraction = max(0.0, min(1.0, fraction))
-            s.pace.append((time.time(), s.fraction))
-            s.value = f'{int(s.fraction * 100)}%'
-            if detail:
-                s.detail = detail
-            self._touch()
+        with self._lock:
+            s = self.step(sid)
+            if s:
+                if s.state == PENDING:
+                    self.begin(sid)
+                s.fraction = max(0.0, min(1.0, fraction))
+                s.pace.append((time.time(), s.fraction))
+                s.value = f'{int(s.fraction * 100)}%'
+                if detail:
+                    s.detail = detail
+                self._touch()
 
     def finish(self, sid, value=None):
-        s = self.step(sid)
-        if s:
-            s.seconds = time.time() - s.t0 if s.t0 else 0.0
-            s.state, s.fraction = DONE, 1.0
-            s.value = value or f'Done · {mmss(s.seconds)}'
-            self._touch()
+        with self._lock:
+            s = self.step(sid)
+            if s:
+                s.seconds = time.time() - s.t0 if s.t0 else 0.0
+                s.state, s.fraction = DONE, 1.0
+                s.value = value or f'Done · {mmss(s.seconds)}'
+                self._touch()
 
     def skip(self, sid, value='Unchanged'):
-        s = self.step(sid)
-        if s:
-            s.state, s.value = SKIPPED, value
-            self._touch()
+        with self._lock:
+            s = self.step(sid)
+            if s:
+                s.state, s.value = SKIPPED, value
+                self._touch()
 
     def cancelled(self):
         return self.cancel_flag.is_set()
@@ -229,8 +284,48 @@ class Job:
         self._main()
         return self
 
-    def _main(self):
+    def doing(self):
+        """The job in a few words ("the rebuild of the game"), for the one a lock refuses because of it."""
+        return self.task or f'a {self.kind} job'
+
+    def _hold(self):
+        """Take what the job needs to itself before it runs (launcher/locks.py): the launcher folder against other
+        processes, then its claims against the other jobs of this one. locks.Busy, with nothing held, when either is
+        taken. Returns what _main lets go of when the job has ended."""
+        if not self.claims:
+            return None, None
+        layout = self.ctx.layout
         try:
+            file = locks.FileLock(layout.instance_lock, self.doing(), where=layout.root)
+        except locks.Busy as e:
+            raise locks.Busy(f'{e}. Close it, or wait until it is done, and try again') from None
+        try:
+            return file, locks.claim(layout.root, self.claims, self.doing())
+        except locks.Busy:
+            file.release()
+            raise
+
+    def _mark(self):
+        """Leave MARKER for the time the job writes into the game folder; True when it was written."""
+        if 'game' not in self.claims:
+            return False
+        try:
+            path = self.ctx.layout.data / MARKER
+            tmp = path.with_name(path.name + '.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'task': self.doing(), 'kind': self.kind, 'game_dir': str(getattr(self, 'game_dir', '')),
+                           'started': time.time()}, f)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            return False
+
+    def _main(self):
+        file = claimed = None
+        marked = False
+        try:
+            file, claimed = self._hold()
+            marked = self._mark()
             self.run()
             self.result = 'ok'
         except net.Cancelled:
@@ -242,10 +337,19 @@ class Job:
                 self.result, self.error = 'failed', str(e) or type(e).__name__
                 self.ctx.log(failure_line(e) if isinstance(e, PLAIN_FAILURES) else traceback.format_exc())
         finally:
-            for s in self.steps:
-                if s.state == RUNNING:
-                    s.state = FAILED if self.result == 'failed' else PENDING
-                    s.value = 'Stopped' if self.result == 'failed' else 'Cancelled'
+            with self._lock:
+                for s in self.steps:
+                    if s.state == RUNNING:
+                        s.state = FAILED if self.result == 'failed' else PENDING
+                        s.value = 'Stopped' if self.result == 'failed' else 'Cancelled'
+            if marked:
+                try:
+                    (self.ctx.layout.data / MARKER).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            locks.release_claim(claimed)
+            if file:
+                file.release()
             self.finished = time.time()
             self._touch()
 
@@ -359,6 +463,8 @@ class Job:
 class InstallJob(Job):
     kind = 'install'
     title = 'Installing'
+    claims = ('game',)
+    task = 'the installation of the game'
 
     def __init__(self, ctx, dump, game_dir):
         super().__init__(ctx, ['tools', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', *prompt_rows(ctx),
@@ -375,6 +481,9 @@ class InstallJob(Job):
         return build.install_args(self.ctx.layout, self.dump, self.game_dir)
 
     def run(self):
+        too_long = paths.long_path_problem(self.game_dir)   # the window asks first (begin_install); the command line here
+        if too_long:
+            raise build.BuildError(too_long)
         self.ensure_tools('tools')
         self.make_game(self.args(),
                        {s: s for s in ('check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'scan')})
@@ -392,6 +501,8 @@ class InstallJob(Job):
 class RebuildJob(Job):
     kind = 'rebuild'
     title = 'Rebuilding'
+    claims = ('game',)
+    task = 'the rebuild of the game'
     retune = True   # Rebuild the Game: the game's code for this processor's level (build.rebuild_args)
 
     def __init__(self, ctx, game_dir, dump=''):
@@ -431,22 +542,24 @@ class ModsRebuildJob(RebuildJob):
 class UpdateDownloadJob(Job):
     """Before the restart: download, check and stage the release, then switch app/current.txt to it."""
     kind = 'update'
+    claims = ('app',)
 
     def __init__(self, ctx, release):
         ver = versions.display(release.version)
         super().__init__(ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders'], ver)
         self.release, self.ver = release, ver
         self.title = f'Updating to {ver}'
+        self.task = f'the update to {ver}'
 
     def run(self):
         layout = self.ctx.layout
         self.begin('download')
         prog = lambda d, t: self.progress('download', d / max(t, 1), f'{d / 1e6:.1f} of {t / 1e6:.1f} MB')  # noqa: E731
         folder = updater.stage_app(layout, self.release, progress=prog, cancel=self.cancelled,
-                                   version=self.ctx.version)
+                                   version=self.ctx.version, log=self.log)
         if updater.runtime_needed(layout, self.release):
             updater.stage_runtime(layout, self.release, progress=prog, cancel=self.cancelled,
-                                  version=self.ctx.version)
+                                  version=self.ctx.version, log=self.log)
         self.finish('download')
         self.begin('verify')
         if not (folder / 'launcher' / 'start.pyw').is_file():
@@ -463,12 +576,14 @@ class ContinueUpdateJob(RebuildJob):
     """After the restart, in the new version: bring the tools to its lock and rebuild the game."""
     retune = False   # an update keeps the compiled game's level, so it compiles only what changed
     kind = 'update'
+    claims = ('game', 'app')   # the rebuild, then updater.prune in the app folder
 
     def __init__(self, ctx, game_dir, old, dump=''):
         Job.__init__(self, ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders',
                                  *prompt_rows(ctx), 'scan'], ctx.layout.version)
         self.game_dir, self.dump, self.old = str(game_dir), dump, old
         self.title = f'Updating to {versions.display(ctx.layout.version)}'
+        self.task = f'the update to {versions.display(ctx.layout.version)}'
         for sid, value in (('download', 'Done'), ('verify', 'Checksum OK')):
             self.step(sid).state, self.step(sid).value, self.step(sid).fraction = DONE, value, 1.0
 
@@ -507,17 +622,20 @@ class StageJob(Job):
     (updater.stage), while the launcher runs and the game too. Its thread runs at background priority, so the game
     shares only the network with it. No screen shows it: the home screen's Updates row reads it."""
     kind = 'stage'
+    claims = ('app',)
 
     def __init__(self, ctx, release):
         ver = versions.display(release.version)
         super().__init__(ctx, ['download'], ver)
         self.release, self.ver = release, ver
+        self.task = f'the background download of {ver}'
 
     def run(self):
         winsys.background_thread()
         self.begin('download')
         prog = lambda d, t: self.progress('download', d / max(t, 1), f'{d / 1e6:.1f} of {t / 1e6:.1f} MB')  # noqa: E731
-        updater.stage(self.ctx.layout, self.release, progress=prog, cancel=self.cancelled, version=self.ctx.version)
+        updater.stage(self.ctx.layout, self.release, progress=prog, cancel=self.cancelled, version=self.ctx.version,
+                      log=self.log)
         self.finish('download')
 
 

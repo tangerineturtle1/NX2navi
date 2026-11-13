@@ -24,6 +24,7 @@ A whole save is account.sav, option.sav and the folders slot_00 to slot_05, each
 folder with progress.sav at its top is one slot: it replaces that slot (the slot named by its folder, else slot_00) and
 the rest of the current save stays, as the game reads progress.sav only inside a slot folder.
 """
+import contextlib
 import json
 import os
 import re
@@ -220,6 +221,64 @@ def game_running(game):
     return running(game)
 
 
+RUNNING = 'the game is running: quit it first, it keeps its save open while it runs'
+
+
+@contextlib.contextmanager
+def profile_lock(game):
+    """The game's own lock on its profile, held while the save is replaced. The game takes
+    <game>/profile/instance.lock when it starts and keeps it until it ends (runtime/fs_host.c fs_host_lock_profile):
+    on Windows by opening the file without sharing, elsewhere with flock. Taken here the same way, it says for
+    certain whether the game runs (SaveError when it does), and a game started while it is held ends at once with
+    its "another copy is running" message instead of mounting a save that is half replaced. game_running() alone,
+    asked before the player picked a file, left the whole time of that dialog and of the copy for the game to
+    start in. A lock file that cannot be opened for another reason locks nothing: the import goes on as before."""
+    prof = Path(game) / 'profile'
+    path = prof / 'instance.lock'
+    try:
+        prof.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                  wintypes.DWORD, wintypes.HANDLE]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        # read and write access, no sharing, made when missing: platform/win32.c plat_lock_file's own call
+        h = k.CreateFileW(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+        if h in (None, wintypes.HANDLE(-1).value):
+            h = None
+            if ctypes.get_last_error() == 32:   # ERROR_SHARING_VIOLATION: the game has it open
+                raise SaveError(RUNNING)
+        try:
+            yield
+        finally:
+            if h is not None:
+                k.CloseHandle(h)
+        return
+    f = None
+    try:
+        f = open(path, 'a+b')
+    except OSError:
+        pass
+    try:
+        if f is not None:
+            import fcntl
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # platform/linux.c plat_lock_file's own call
+            except BlockingIOError:
+                raise SaveError(RUNNING) from None
+            except OSError:   # a file system without locks
+                pass
+        yield
+    finally:
+        if f is not None:
+            f.close()
+
+
 def pending_import(game):
     """The save the game's menu took from a shared zip and left in <game>/profile/save-import for its next start
     (runtime/fs_host.c import_pending), or None."""
@@ -275,7 +334,13 @@ def _put_away(game, names, stamp):
 def _replace(game, src, files, slot, stamp, log):
     """Copy the files of src (relative paths) into the game's save: the whole save, or with slot only that slot folder
     and the rest of the current save kept. The save the game would load now goes to saves/backup <stamp> first.
-    Returns (account folder, backup folder or None)."""
+    Returns (account folder, backup folder or None). The game's profile lock is held meanwhile (profile_lock):
+    SaveError when the game runs."""
+    with profile_lock(game):
+        return _replace_held(Path(game), src, files, slot, stamp, log)
+
+
+def _replace_held(game, src, files, slot, stamp, log):
     account = account_dir(game)
     saves = ensure_saves_dir(game)
     backup = None
@@ -393,8 +458,8 @@ def _fresh_file(folder, stem, suffix):
 NO_SAVE = 'the game has no save yet: play until it saves, then export'
 
 
-# Settings whose values stay on the player's PC (runtime/cfg_private.h has the same list): a co-op room's secret and
-# the offer number made for it, the relay's address, the player's name, the key a maker removes, the menu's test hook.
+# Settings whose values stay on the player's PC (runtime/cfg_private.h has the same list): the menu's test hook, and
+# what the co-op of versions up to 0.9.2 kept in nx2navi.ini, which a player's file may still hold.
 PRIVATE_SETTINGS = ('coop_room', 'coop_server', 'coop_name', 'coop_accept', 'coop_remove', 'menu_test_set')
 PRIVATE_SHOWN = b'(set, not shown)'
 

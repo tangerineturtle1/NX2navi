@@ -11,6 +11,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "motion_owner.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
@@ -235,9 +236,22 @@ NVN_API(nvnDeviceRegisterFastClearDepth) { ret_x(c, 0); }
 NVN_API(nvnDeviceGetImageHandle) { ret_x(c, (uint64_t)(int64_t)(int)arg_x(c, 1)); }
 // NVNtextureHandle nvnDeviceGetTextureHandle(const NVNdevice *d, int texture_id, int sampler_id):
 // texture id (20 bits) | sampler id << 20, the encoding the replay decodes (NVN_HANDLE_TEX / NVN_HANDLE_SAMP)
+// An id out of range (-1: the game had no texture to give, as when its render-target heap is full) gets texture
+// slot 0 and sampler slot 0: the first 256 slots of both pools are reserved (nvnDeviceGetInteger 0x11 and 0x12 above)
+// and no game registers into them, so slot 0 holds the stand-in. That holds for a draw that binds the handle, where
+// handle 0 is "no texture" (vk_exec_draw.c), and for a shader that takes the handle out of a uniform buffer and
+// indexes the pool arrays with it: slot 0 is inside their VK_POOL_TEX entries, which a slot past them is not.
+// Ending the game here turned one missing texture into a crash.
 NVN_API(nvnDeviceGetTextureHandle) {
     int tid = (int)arg_x(c, 1), sid = (int)arg_x(c, 2);
-    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) rt_fatal("nvn: texture handle ids out of range %d/%d", tid, sid);
+    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) {
+        static int said;
+        if (said < 8 && ++said)
+            rt_log("nvn: texture handle asked for with ids out of range (texture %d, sampler %d): the handle of the "
+                   "reserved slot 0 is given, which draws the stand-in", tid, sid);
+        if (tid < 0 || tid >= (1 << 20)) tid = 0;
+        if (sid < 0 || sid >= (1 << 12)) sid = 0;
+    }
     ret_x(c, (uint64_t)tid | (uint64_t)sid << 20);
 }
 // NVNtextureHandle nvnDeviceGetTexelFetchHandle(const NVNdevice *d, int texture_id)
@@ -289,10 +303,24 @@ NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags =
 // Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
 // loader threads, which held a virtual core through it while job workers waited (NX2NAVI_CORE_DIAG). The thread gives
 // the core up, as for any blocking host call.
+static void pool_finalize(pool_t *o);
+
 NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
+    // A pool object initialized again without Finalize: the back end's record of the old pool (its import, a VRAM
+    // mirror, a physical pool's device-local memory, its device address table record and its GPU address range) was
+    // left behind for good, since nothing names it any more. It is finalized first, as nvnTextureInitialize does
+    // for a texture; the back end lets the memory go once the GPU is past the submissions that may use it.
+    if (o->magic == NVN_POOL_MAGIC) {
+        static uint64_t again;
+        uint64_t n = __atomic_add_fetch(&again, 1, __ATOMIC_RELAXED);
+        if (n <= 4 || !(n & (n - 1)))
+            rt_log("nvn: MemoryPoolInitialize: pool %p (%#llx bytes) initialized again without Finalize, finalized first "
+                   "(%llu so far)", (void *)o->mem, (unsigned long long)o->size, (unsigned long long)n);
+        pool_finalize(o);
+    }
     memset(o, 0, sizeof *o);
     o->magic = NVN_POOL_MAGIC;
     o->flags = s->flags;
@@ -319,16 +347,20 @@ NVN_API(nvnMemoryPoolInitialize) {
     ret_x(c, ok);
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolFinalize) {
-    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
-    pool_t *o = arg_p(c, 0);
+static void pool_finalize(pool_t *o) {
     if (o->magic != NVN_POOL_MAGIC) return;
+    motion_owner_forget_range((uint64_t)(uintptr_t)o->mem,o->size);
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
+}
+
+NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
+    pool_finalize(arg_p(c, 0));
 }
 static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
 
@@ -411,6 +443,7 @@ static int check_request(const pool_t *v, const nvn_mapping_t *r, int i) {
 NVN_API(nvnMemoryPoolMapVirtual) {
     NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *v = arg_p(c, 0);
+    motion_owner_forget_range((uint64_t)(uintptr_t)v->mem,v->size);
     int n = (int)arg_x(c, 1);
     const nvn_mapping_t *r = arg_p(c, 2);
     if (v->magic != NVN_POOL_MAGIC || !(v->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || !v->mem) {
@@ -458,11 +491,12 @@ NVN_API(nvnBufferInitialize) {
         ret_x(c, 0);
         return;
     }
+    motion_owner_forget((uintptr_t)o);
     *o = (buf_t){BUF_MAGIC, s->pool, s->off, s->size};
     ret_x(c, 1);
 }
 // void nvnBufferFinalize(NVNbuffer *b)
-NVN_API(nvnBufferFinalize) { memset(arg_p(c, 0), 0, sizeof(buf_t)); }
+NVN_API(nvnBufferFinalize) { motion_owner_forget((uintptr_t)arg_p(c, 0)); memset(arg_p(c, 0), 0, sizeof(buf_t)); }
 static uint64_t buf_address(const buf_t *o) { return o->pool && o->pool->mem ? (uintptr_t)o->pool->mem + (uint64_t)o->off : 0; }
 // The mapping of a buffer with no pool behind it (no buffer, or one whose nvnBufferInitialize failed): memory of its
 // own, zero at first, instead of address 0, since the game's scene-loading thread has been seen filling such a mapping
@@ -496,7 +530,12 @@ NVN_API(nvnBufferMap) {
     ret_x(c, nvn_gpu_only(a) ? 0 : a);
 }
 // NVNbufferAddress nvnBufferGetAddress(const NVNbuffer *b)
-NVN_API(nvnBufferGetAddress) { ret_x(c, buf_address(arg_p(c, 0))); }
+NVN_API(nvnBufferGetAddress) {
+    const buf_t *b = arg_p(c, 0);
+    uint64_t address = buf_address(b);
+
+    ret_x(c, address);
+}
 // NVNmemoryPool *nvnBufferGetMemoryPool(const NVNbuffer *b)
 NVN_API(nvnBufferGetMemoryPool) { ret_x(c, (uintptr_t)((const buf_t *)arg_p(c, 0))->pool); }
 // ptrdiff_t nvnBufferGetMemoryOffset(const NVNbuffer *b)
@@ -555,7 +594,7 @@ NVN_API(nvnSyncWait) {
     int ok;
     {
         NVN_BLOCKING();
-        ok = b->fence_wait(s->fence, timeout);
+        ok = b->game_wait(s->fence, timeout);
     }
     if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
@@ -741,6 +780,9 @@ NVN_API(nvnQueueSubmitCommands) {
     // point). Copies of the data at submit made it worse, a mix of two frames' versions.
     // NX2NAVI_SUBMIT_FINISH=<mask>: bit i waits after the i-th submission of a frame (default 0x1); a plain 1 waits
     // after every submission, 0 never.
+    // Since the staged mirror uploads (vk_memory.c) the copies of guest memory a submission reads are taken while the
+    // replay records it, and the wait ends once the replay has submitted it (vk_sync_recorded_wait); the GPU's wait
+    // below remains for a submission whose GPU reads guest memory itself.
     // The wait (exec_wait, vk_sync.c vk_sync_exec_wait) ends when the GPU has run the submission's passes and the
     // results the game reads once it goes on are in its memory, the last frame's occlusion counts among them; the
     // write-backs and the completion thread's other side effects are not waited for. NX2NAVI_WB_SPLIT=0 makes it

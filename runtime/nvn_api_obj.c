@@ -12,7 +12,6 @@
 
 #include "gfx.h"
 #include "cfg.h"
-#include "coop_game.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
@@ -875,7 +874,6 @@ NVN_API(nvnQueuePresentTexture) {
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
-    coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
@@ -893,6 +891,11 @@ NVN_API(nvnQueuePresentTexture) {
     }
     if (hitch_every && o->presents % (uint64_t)hitch_every == 0) plat_wait_ns((uint64_t)hitch_ms * 1000000);
     uint64_t period = present_period(o), now = kern_now_ns();
+    // A driver's low-latency sleep (vk_lowlat.c) holds the next frame to the period where the frame starts, before
+    // its pad read, so this pacer holds nothing: the present goes out as soon as it is drawn and the image is free at
+    // once. A wait here as well would be a second one, after the picture is drawn. Not while a movie plays: its slots
+    // are kept through a late frame (pace), which only this pacer does, so the back end is told there is no period.
+    if (gfx_backend()->frame_paced && gfx_backend()->frame_paced(frame_step_movie_hz() > 0 ? 0 : period)) period = 0;
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;

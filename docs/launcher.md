@@ -117,7 +117,9 @@ python/                  python.org's embeddable Python 3.14.9 with tkinter, num
 app/current.txt          the version the stub starts; app/previous.txt the one before it
 app/<version>/           launcher/, runtime/, recomp/, tools/, bin/nx2navi_xlate.exe, VERSION,
                          toolchain.lock.json (the pinned build tools), feed.json (where updates come from), and in a
-                         release made with --prompt-art, prompt-art/ (the button art the prompts are drawn from); a
+                         release made with --prompt-art, prompt-art/ (the button art the prompts are drawn from);
+                         in one made with --pgo, data/pgo-v111.profdata and .json (the execution profile the game's
+                         code is compiled with, and its record); a
                          release staged in the background also holds staged.json and the Python it brings,
                          python.staged/, until it installs
 pydeps/                  zbic, downloaded from PyPI on this PC
@@ -132,6 +134,12 @@ game/                    the built game, unless another folder was chosen (its l
 
 A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the toolchain then goes to
 `C:\NX2navi\toolchain` instead (`launcher/paths.py`).
+
+Windows and the build tools stop at 260 characters for a file's whole path, and the files of a built game need up to
+128 below the game folder (the prompt folders' resource table is the longest). Begin Installation and the install
+job therefore refuse a game folder whose own path is longer than 130 characters, with both lengths
+(`paths.long_path_problem`). Longer paths are not supported: the launcher does not use Windows' long path form, and
+the compiler, the linker and `tar` would not take it.
 
 ## Installing
 
@@ -161,6 +169,12 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
      (it reads UCRT64's headers; `make_game.py` `fast_clang` checks that both report the same version and target).
    - The lifted code is compiled for the processor's own level, x86-64-v3 (AVX2, FMA) or v2 (`cpu_level`): the game
      runs on the PC that builds it, and a generic build would do every fused multiply-add of the game in software.
+   - A version with an execution profile (`app/<version>/data/pgo-v111.profdata`) compiles the lifted code at -O2
+     with it, and the runtime files it compiles here too (`pgo_profile`; the prebuilt runtime was compiled with it
+     when the release was made). The first build after the update that brings a profile, or another one, compiles
+     every file again. The profile is left out, and the code is built as without one, when its record names another
+     `recomp/` than the version's or the compiler cannot read it, which one trial compile finds out before the
+     others start ([building.md](building.md), "Profile-guided build").
 3. **Prepare the Shaders**: make_game.py translates every shader of the game, in its default bind state,
    into the game's shader cache and builds its stage library or compute pipeline into the driver's own cache
    (`tools/prepare_shaders.py`), so play stops for them far less often. Variants met in play with another bind state are
@@ -287,9 +301,11 @@ The stub swaps `python.next` in while no Python runs, then starts the new versio
    list was prepared from another shader seed than the one this kit writes: `shader-prepared.bin` carries the digests
    of the two seed files and the translator identity (`runtime/prp_file.h`), the step writes the seed first
    (`prepare_shaders.py --no-run`, seconds) and compares (`make_game.py` `seed_changed`); a list from before it
-   recorded its seed is prepared again once. Another translator alone does not prepare again. The step still builds
-   the prepared shaders into the graphics driver's cache again (`make_game.py` `warm_driver_cache`): seconds while
-   the driver has them, 20 minutes on a player's PC when the update changed what they are built with. Its bar
+   recorded its seed is prepared again once. Another translator alone does not prepare again. The step then asks
+   the graphics driver's cache whether it still has the prepared shaders (`make_game.py` `warm_driver_cache`,
+   `nx2navi.exe --warm-shaders`: a sample of twelve, as the game checks at every start) and builds them all into it
+   again only when it does not: nothing more while the driver has them, 6 to 20 minutes on a player's PC after a
+   driver update or an update that changed what they are built with. Its bar
    follows that count from 0 to 100 %, and the Updates row says an update takes from a few minutes to half an hour
    or more (`launcher/ui/app.py` `UPDATE_TAKES`).
 8. **Draw the Button Prompts**, with button art in the new version: only when the art, the prompt tools or the key
@@ -338,6 +354,11 @@ zip's save replaces the whole save, every slot, as a save folder does (below): t
 to `saves/backup <date time>` first. It refuses while the game runs. A zip taken from the saves folder moves to
 `saves/imported <date time>`.
 
+"While the game runs" is the game's own lock: the game holds `profile/instance.lock` from its start to its end
+(`runtime/fs_host.c` `fs_host_lock_profile`), and an import takes the same lock the same way for the time it copies
+the backup and swaps the save in (`saves.profile_lock`). A running game refuses the import; a game started in the
+middle of one ends at once with its message that the profile is in use, and starts normally after.
+
 The game's menu imports at the next start instead of at once: the game keeps its progress in memory and writes it back
 at its next save, over files replaced under it, and the save's working copy is made when the game mounts its save.
 Import a save checks the zip as the launcher does and puts its save in `profile/save-import`; the row then reads "at
@@ -359,8 +380,14 @@ A mod goes in as it came. Play first puts the folder in order (`mods.prepare`): 
 that folder is there already, and the archive stays; a mod folder whose files sit one or more folders down (an archive
 that held the mod's own folder) gets them moved up; a `romfs`, `romfslite`, `exefs` or `cheats` folder put straight into
 the mods folder becomes a mod of its own, *Unnamed mod*. An archive that would write outside its folder is refused.
+So is, on Windows, one that holds a file Windows cannot keep under its name (`mods.windows_name_problem`): a device's
+name such as `CON.pchtxt`, a name ending in a dot or a space, or one with a colon or another character Windows does
+not allow. Unpacked anyway such a file is lost, renamed or a hidden stream, and the game misses it without a word; the
+refusal names the file.
 Nothing is deleted. Add a Mod and Add a Mod Folder do the same for an archive or folder the player picks, which is
-unpacked or copied into the mods folder under a free name; Open Mods Folder opens it.
+unpacked or copied into the mods folder under a free name; Open Mods Folder opens it. The picked mod is put together
+in a folder beside the mods folder (`.adding-mod`) and moves in with one rename once it is complete, so a copy that
+stops halfway (a full disk, the launcher closed) leaves no half mod for the game to load (`mods.add`).
 
 Each mod has an On/Off row; its description says what it changes (how many game files, code patches, cheats), which
 other mod changes the same files and which of the two wins, and why the game leaves it off when it does: a code module
@@ -409,6 +436,18 @@ default proxy handling, which reads `HTTPS_PROXY` and `HTTP_PROXY` (and `NO_PROX
 them, the proxy set in Windows' Internet settings. Only HTTP proxies work; a SOCKS proxy does not. An address that needs
 a user name and password takes them in the variable, as in `HTTPS_PROXY=http://user:password@host:port`.
 
+Before a download writes its first byte the disk is asked for room (`net.space_problem`): the rest of the file, by
+its expected size or else the length the server names, and 32 MB beyond it. The same is asked before the build tools
+are fetched (their downloads and their unpacked size, from the lock), before an update's archive is unpacked and
+before a mod's zip is. Without room the step stops with how much is needed and how much is free, and a part file
+stays for when there is room. A disk that fills in the middle of a download is named as full at once, not tried
+again four times.
+
+A cut download is resumed from its part file, `<name>.part`, only as a part of the same file: `<name>.part.of`
+beside it names the file the part was begun for, by the expected sha256, so the same file is resumed from any
+server. A part begun for other bytes under the same name (a release published again) is deleted with a line in
+`launcher.log` and the download starts over; a part without the note, from an older launcher, is resumed as before.
+
 ## Uninstalling
 
 Settings > Uninstall NX2navi, or Settings > Apps > NX2navi (which runs `NX2navi.exe --uninstall`): what the launcher
@@ -423,6 +462,28 @@ game folder is the default `<launcher>\game`. The dump is never touched.
 `python\python.exe app\<version>\launcher\cli.py`): `check`, `update`, `tools`, `install --dump F --game D`,
 `rebuild [--game D]`, `fonts`. `NX2navi.exe --desktop-shortcut on|off` and `--shortcuts on|off` are the stub's own.
 `NX2navi-Setup.exe` takes `--dest DIR`, `--no-shortcuts`, `--no-launch` and `--quiet`.
+
+## One launcher, one job
+
+One process works in a launcher folder at a time (`launcher/locks.py`). The window holds the folder's lock,
+`data/launcher.lock`, while it is open, every command of `launcher/cli.py` but `check` holds it while it runs, and a
+job that changes files takes it too (the window's own jobs share the window's). The operating system keeps the lock
+(`msvcrt.locking` on Windows, `flock` elsewhere) and lets go of it when the process ends, however it ends; who holds
+it is written to `data/launcher.lock.owner`. A second window says who holds the folder in a message box and closes;
+a command prints it and ends with exit code 1; a job fails with it before its first step.
+
+Within one process, a job names what it changes (`jobs.Job.claims`: `game`, the game folder and the build tools;
+`app`, the app folder's versions and the downloads), and a second job on the same thing fails at once with the first
+one's name. An install, a rebuild and the rebuild of an update claim `game`; an update's download and the background
+download claim `app`; the update check claims nothing and runs beside anything. Two launcher folders that share one
+game folder are not kept apart: the lock belongs to the launcher folder.
+
+A job that claims `game` leaves `data/job-running.json` (what it is, the game folder, when it started) from its start
+to its end. A job that ends removes it, also after Cancel or an error, which the job screen has told. A launcher that
+was stopped in the middle (closed by the system, a power cut) leaves it: the next start logs it and says on the home or
+first screen which job did not finish and what finishes it (`jobs.interrupted`), once. Nothing is rolled back: the
+build keeps the old `ocarina.exe` until the new one is linked and records each finished step, so the game folder
+stays playable and Rebuild the Game, or Begin Installation, goes on from the steps that were done.
 
 ## Releases
 
@@ -453,6 +514,12 @@ game folder is the default `<launcher>\game`. The dump is never touched.
    the archive's size and sha256 and each file's sha256, and writes `dlssg-NOTICE.txt` with the two licence texts;
    `make_game.py` copies the whole set beside the game. `--streamline SDK` takes an SDK folder on disk instead (its
    files must be the pinned ones).
+
+   `--pgo FILE` puts an execution profile and its record in the release (`app/<version>/data`), and the prebuilt
+   runtime is compiled with it; the release stops when the record names another `recomp/` than the checkout's, and
+   when the release's compiler, the one players build with, cannot read the profile
+   ([building.md](building.md), "Profile-guided build"). The profile is derived from the game's code and never goes
+   into the repository.
 
    `--prompt-art FOLDER ...` puts the button art in the release (`app/<version>/prompt-art`): folders that hold
    `XGamepad`, `P5Gamepad` and `Keyboard_Mouse` (the Source folders of button prompt art packs), or those three
@@ -497,7 +564,9 @@ folder, refusals), the shared save's zip (export of the save the game would load
 files, the import of a zip with its backup, a zip in the saves folder, the menu's waiting import dropped, the zips it
 refuses: no manifest, another format or game, a newer format, paths outside the save, links, damage), the install
 job with a fake
-`make_game.py` (with and without the prompts row), and the window's selftest when a display is there.
+`make_game.py` (with and without the prompts row), the folder's lock (a second launcher process refused and told who
+holds it, the lock gone when its holder is killed, a job and the command line refused while another process holds
+it, two jobs on one folder), and the window's selftest when a display is there.
 
 What goes wrong around a build is tested the same way, on made-up folders and stand-in processes: an update that
 stops in its compile (the game stays installed, home says how to finish, the install goes on from the unpacked

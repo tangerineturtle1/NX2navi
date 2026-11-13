@@ -12,7 +12,8 @@ static int fails, wake_all;
 // ---- the runtime kernel.c reaches
 unsigned rt_trace;
 uint64_t rt_guest_start_ns;
-volatile uint32_t prof_replay_tid;
+volatile uint32_t prof_replay_tid, prof_main_tid;
+int mem_readable(uint64_t a, uint64_t n) { (void)a, (void)n; return 0; }   // NX2NAVI_SVC_WAITS walks guest frames: off here
 const char *cfg_get(const char *name) { return !strcmp(name, "NX2NAVI_SYNC_WAKE_ALL") && wake_all ? "1" : NULL; }
 const char *cfg_value(const char *name) { (void)name; return "0"; }   // no asynchronous preemption, no slow-service log
 int cfg_bool(const char *name) { (void)name; return 0; }

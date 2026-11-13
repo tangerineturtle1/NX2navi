@@ -304,17 +304,19 @@ void tab_world(void) {
         if (ImGui::RadioButton("The camera stays where it is, the pad plays the game", sticks == 0)) sticks = 0, changed = true;
         ImGui::SetNextItemWidth(-1);
         if (ImGui::SliderFloat("##camspeed", &cam_speed, 1.0f, 100.0f, "%.0f metres a second", ImGuiSliderFlags_Logarithmic)) changed = true;
+        bool avoid = dbg_freecam_avoid() != 0;
+        if (ImGui::Checkbox("Ground avoidance: stay a metre above the ground", &avoid)) dbg_freecam_avoid_set(avoid);
         if (ImGui::Button("Back to the game's view")) dbg_freecam_reset();
         ImGui::SameLine();
         ImGui::TextDisabled("x %.1f   y %.1f   z %.1f", at[0], at[1], at[2]);
     }
     if (changed) dbg_freecam_set(on, sticks, cam_speed);
-    ImGui::TextWrapped("Close this menu to fly: the left stick moves level, ahead and sideways, the right stick turns, ZR and ZL "
-                       "go up and down, R is four times as fast and L four times as slow. The height changes only with ZR "
-                       "and ZL, and with DLSS, DLAA or FSR 3.1 or 4 on the camera rises where the ground ahead or below comes "
-                       "within a few metres. The game goes on meanwhile and draws what the camera sees; the game speed above "
-                       "slows it down. Without those upscalers it does not stop at hills: below the ground the picture shows "
-                       "the void under the map, not a missing floor.");
+    ImGui::TextWrapped("Close this menu to fly: the left stick moves where the camera looks and sideways, the right stick "
+                       "turns, ZR and ZL go up and down, R is four times as fast and L four times as slow. Nothing stops the "
+                       "camera: it goes through walls, objects and the ground, and below the ground the picture shows the "
+                       "void under the map, not a missing floor. With ground avoidance on (it needs DLSS, DLAA or FSR 3.1 or "
+                       "4) it stays a metre above fields and gentle hills; objects and walls never push it. The game goes on "
+                       "meanwhile and draws what the camera sees; the game speed above slows it down.");
 }
 
 // ---- memory

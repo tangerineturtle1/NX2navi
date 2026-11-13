@@ -47,6 +47,10 @@ typedef struct AudrenStats {
         upd_hold_max_ns;
     // voices (under the lock)
     uint64_t dry, late[3], late_max;   // next buffer late by 1-2 passes, 3-8, 9-AS_LATE_PASSES
+    uint64_t ramp_passes, ramps;       // the mixer's volume ramp counts at the window's start (audio_mixer_ramp_stats)
+    // catch-up (render_thread, under the lock): frames rendered and dropped; gaps over AUDIO_CATCHUP_MAX_MS, which
+    // are left as they are
+    uint64_t caught_up, gave_up;
     int events;
     uint64_t voices_ns;                // the game's update (under the lock): the last voice census line
     int voices_most;                   // the most voices in use a census found
@@ -132,6 +136,7 @@ static void voice_reset(ServerVoice *v) {
     memset(&v->adpcm, 0, sizeof v->adpcm);
     memset(v->biquad_state, 0, sizeof v->biquad_state);
     v->dry_pass = 0;
+    v->ramp_pass = 0;   // a new voice starts at its volumes: no ramp from what the slot's last voice was mixed with
 }
 
 static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
@@ -406,7 +411,8 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
 }
 
 // ---- render tick: one frame each time the output device has taken the ring below its target (audio_mixer_pace_ns),
-// or every sample_count / sample_rate seconds of the host clock without a device, while stopped or while it stalls
+// or every sample_count / sample_rate seconds of the host clock without a device, while stopped or while it stalls;
+// after a stall the frames that are owed are rendered and dropped (render_thread, "Catch-up")
 static void advance_voice(AudioRenderer *r, ServerVoice *v) {
     if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate) return;
     uint64_t samples = audio_voice_consumed(r, v, (int)r->param.sample_count);
@@ -471,7 +477,9 @@ static void stats_report(AudioRenderer *r, uint64_t now, uint64_t lock_ns, uint6
     int dev = audio_mixer_out_stats(r, &o);
     char event[320] = "";
     int window = 0;
+    uint64_t ramp_passes, ramps;
     plat_mutex_lock(&r->lock);
+    audio_mixer_ramp_stats(r, &ramp_passes, &ramps);
     if (dev && o.pull_gap_max_ns > st->pull_gap_max_ns) st->pull_gap_max_ns = o.pull_gap_max_ns;
     if (dev && o.underruns > st->seen_underruns) {
         if (st->events < AS_EVENTS) {
@@ -490,6 +498,7 @@ static void stats_report(AudioRenderer *r, uint64_t now, uint64_t lock_ns, uint6
         st->window_ns = now;
         st->out_underruns = o.underruns, st->out_missing = o.missing_frames, st->out_skipped = o.skipped_frames;
         st->out_overruns = o.overruns;
+        st->ramp_passes = ramp_passes, st->ramps = ramps;
     }
     if (now - st->window_ns >= AS_WINDOW_NS) {
         snap = *st;
@@ -500,9 +509,11 @@ static void stats_report(AudioRenderer *r, uint64_t now, uint64_t lock_ns, uint6
         st->queue_min = UINT64_MAX;
         st->out_underruns = o.underruns, st->out_missing = o.missing_frames, st->out_skipped = o.skipped_frames;
         st->out_overruns = o.overruns;
+        st->ramp_passes = ramp_passes, st->ramps = ramps;
         st->upd_n = 0;   // upd_last_ns and upd_pass_last stay: the next gap is measured from the last update
         st->upd_gap_max_ns = st->upd_gap_frame = st->upd_gaps_over = st->upd_passes_max = st->upd_hold_max_ns = 0;
         st->dry = st->late[0] = st->late[1] = st->late[2] = st->late_max = 0;
+        st->caught_up = st->gave_up = 0;
     }
     plat_mutex_unlock(&r->lock);
     if (*event) rt_log("%s", event);
@@ -510,13 +521,15 @@ static void stats_report(AudioRenderer *r, uint64_t now, uint64_t lock_ns, uint6
     const double rate = r->param.sample_rate;
     const uint64_t under = o.underruns - snap.out_underruns;
     const int bad = under || o.overruns != snap.out_overruns || o.skipped_frames != snap.out_skipped ||
-                    snap.gaps_over || snap.locks_over || snap.upd_gaps_over || snap.dry;
+                    snap.gaps_over || snap.locks_over || snap.upd_gaps_over || snap.dry || snap.caught_up ||
+                    snap.gave_up;
     if (!bad && snap.windows % 6 != 5) return;
     rt_log("audio: stats %.0f s to game frame %llu: device underruns %llu (%.1f ms silent), skipped %.1f ms, dropped "
            "frames %llu, ring at least %.1f ms, longest device request gap %.1f ms; render passes %llu, gaps over %llu "
            "ms %llu (longest %.1f ms), lock waits over %llu ms %llu (longest %.2f ms); game updates %llu, gaps over "
            "%llu ms %llu (longest %.1f ms at game frame %llu, %llu passes), longest held the lock %.2f ms; voices ran "
-           "dry %llu, next buffer late by 1-2 passes %llu, 3-8 %llu, 9-%d %llu (most %llu)",
+           "dry %llu, next buffer late by 1-2 passes %llu, 3-8 %llu, 9-%d %llu (most %llu); render passes that ramped "
+           "a volume %llu (%llu ramps); catch-up frames rendered and dropped %llu, gaps over %d ms not caught up %llu",
            (now - snap.window_ns) / 1e9, (unsigned long long)game_frame(), (unsigned long long)under,
            (o.missing_frames - snap.out_missing) * 1000.0 / rate, (o.skipped_frames - snap.out_skipped) * 1000.0 / rate,
            (unsigned long long)(o.overruns - snap.out_overruns),
@@ -527,7 +540,9 @@ static void stats_report(AudioRenderer *r, uint64_t now, uint64_t lock_ns, uint6
            (unsigned long long)snap.upd_gaps_over, snap.upd_gap_max_ns / 1e6, (unsigned long long)snap.upd_gap_frame,
            (unsigned long long)snap.upd_passes_max, snap.upd_hold_max_ns / 1e6, (unsigned long long)snap.dry,
            (unsigned long long)snap.late[0], (unsigned long long)snap.late[1], AS_LATE_PASSES,
-           (unsigned long long)snap.late[2], (unsigned long long)snap.late_max);
+           (unsigned long long)snap.late[2], (unsigned long long)snap.late_max,
+           (unsigned long long)(ramp_passes - snap.ramp_passes), (unsigned long long)(ramps - snap.ramps),
+           (unsigned long long)snap.caught_up, AUDIO_CATCHUP_MAX_MS, (unsigned long long)snap.gave_up);
 }
 
 static void render_thread(void *p) {
@@ -547,33 +562,58 @@ static void render_thread(void *p) {
 #else
     const uint64_t gap_ns = 0;
 #endif
-    uint64_t next = kern_now_ns(), last = 0;
+    // Catch-up (NX2NAVI_AUDIO_CATCHUP, default 1). The console's audio hardware takes a frame every 5 ms whatever the
+    // rest of the system does, so the game's sound keeps its place against the picture. Here a frame that is not
+    // rendered when it is due is time the sound loses for good: the device plays silence meanwhile, rendering goes on
+    // where it stopped, and everything after the gap is heard that much later than the picture it belongs to. So after
+    // a stall the frames that are owed are rendered and dropped: mixed in full, which moves the voices, the effects
+    // and what the game reads back on as if they had been heard, and not queued for the device, whose queue is then
+    // filled as before. While the device paces, it says what is owed: the silence it played for want of frames
+    // (audio_mixer_owed), asked before anything is waited for or queued, so the dropped frames come right after the
+    // gap. On the timer a frame is owed when its deadline passed a whole frame ago. A gap of more than
+    // AUDIO_CATCHUP_MAX_MS (a debugger, the PC asleep) is not caught up: the sound goes on from now. With the setting
+    // off nothing is dropped, and the timer queues frames up to 100 ms late back to back and skips a longer gap.
+    const int catchup = cfg_bool("NX2NAVI_AUDIO_CATCHUP");
+    const uint64_t late_max_ns = catchup ? AUDIO_CATCHUP_MAX_MS * 1000000ull : 100000000ull;
+    uint64_t next = kern_now_ns(), last = 0, gave_up = 0;
     while (plat_cas32(&r->running, 0, 0)) {
         uint64_t now = kern_now_ns();
         int64_t pace = audio_mixer_pace_ns(r, now);
-        if (pace > 0) {
+        int drop = 0;
+        if (catchup && pace >= 0) {
+            int owed = audio_mixer_owed(r);
+            drop = owed > 0;
+            gave_up += owed < 0;
+        }
+        if (pace > 0 && !drop) {
             plat_wait_ns((uint64_t)pace);
             continue;
         }
-        if (pace == 0 && last && now - last < gap_ns) {
+        if (pace == 0 && !drop && last && now - last < gap_ns) {
             plat_wait_ns(gap_ns - (now - last));
             continue;
         }
-        if (pace == 0) {
+        if (pace >= 0) {
             next = now + frame_ns;   // where the timer goes on if the device stops pacing
         } else {
             if (next > now) plat_wait_ns(next - now);
-            else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
+            else if (now - next > late_max_ns) next = now, gave_up += catchup;   // fell far behind: resynchronise
+            else if (catchup && now - next >= frame_ns) drop = 1;
             next += frame_ns;
         }
         const uint64_t prev = last;
         last = kern_now_ns();
         plat_mutex_lock(&r->lock);
         const uint64_t lock_ns = kern_now_ns() - last;
-        if (r->stats && r->state == 0) stats_pass(r, last, lock_ns, pace == 0);
+        if (r->stats && r->state == 0) {
+            stats_pass(r, last, lock_ns, pace >= 0);
+            r->stats->caught_up += drop;
+            r->stats->gave_up += gave_up;
+            gave_up = 0;
+        }
         if (r->state == 0) {
             voices_prepare(r);
-            audio_mixer_render(r, frame);
+            audio_mixer_render(r, frame, drop);
             for (int i = 0; i < r->param.voice_count; i++) advance_voice(r, &r->voices[i]);
             r->elapsed_frames++;
             uint64_t given = r->stop_released + r->empty_played + r->flushed;
@@ -687,12 +727,13 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         const char *gp = cfg_get("NX2NAVI_AUDIO_GAME_PRIO");
         g_game_prio = gp && *gp ? atoi(gp) : 0;
         if (g_game_prio < 0 || g_game_prio > 2) g_game_prio = 0;
-        rt_log("audio: stats %s (NX2NAVI_AUDIO_STATS); the game's audio thread %s (NX2NAVI_AUDIO_GAME_PRIO=%d)",
+        rt_log("audio: stats %s (NX2NAVI_AUDIO_STATS); the game's audio thread %s (NX2NAVI_AUDIO_GAME_PRIO=%d); frames "
+               "owed after a stall are %s (NX2NAVI_AUDIO_CATCHUP)",
                r->stats ? "on" : "off",
                g_game_prio == 2   ? "runs above normal priority, at the highest while its update is read"
                : g_game_prio == 1 ? "runs at the highest priority while its update is read"
                                   : "keeps its own priority",
-               g_game_prio);
+               g_game_prio, cfg_bool("NX2NAVI_AUDIO_CATCHUP") ? "rendered and dropped" : "not caught up");
         r->running = 1;
         audio_mixer_open(r);
         r->thread = plat_thread_new(render_thread, r, "audren");

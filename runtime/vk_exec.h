@@ -80,6 +80,7 @@ typedef struct VkExec {
     float depth_range[2];                // OP_DEPTH_RANGE: overrides the viewports' near and far
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];   // OP_STENCIL per face (0 front, 1 back): compare mask, write mask, ref
     float point_size;                    // OP_BIND_STATE kind 6: NVN point size for the support buffer; 0 = never set = 1
+    float line_width;                    // OP_BIND_STATE kind 7: NVN line width in pixels; 0 = never set = 1
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp
     p_prim_restart prim_restart;         // OP_PRIM_RESTART: applied to indexed strip and fan draws (op_draw_idx)
     float blend_color[4];                // OP_BLEND_COLOR
@@ -126,6 +127,8 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    uint32_t pre_pass;                   // the pass (pass_serial) the part's pre-pass command buffer serves (vk_sync_pre;
+                                         // vk_exec_draw.c mesh emulation); a pass begins after it with another serial
 } VkExec;
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
@@ -141,6 +144,9 @@ void vk_exec_barrier(VkExec *ex);
 void vk_exec_barrier_dispatch(VkExec *ex);
 // NX2NAVI_TRACE=perf, every 600 frames: the barriers per frame by kind.
 void vk_exec_barrier_log(uint64_t frame);
+// Ends the open pass and the part without handing it to the queue (vk_sync_cut): the next draw begins the pass again
+// at the start of a new command buffer, which the part's pre-pass command buffer precedes. 0 when no more can wait.
+int vk_exec_split_now(VkExec *ex);
 // vk_texture.c (NX2NAVI_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
@@ -254,6 +260,10 @@ void vk_dump_init(void);                 // reads the environment; vk_exec_recor
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
 // after a draw's binds; mesh: a mesh draw (s->vs is its mesh stage, s->ts its task stage or NULL)
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int mesh);
+enum { SK_DISABLED, SK_SCISSOR, SK_NO_PROGRAM, SK_NO_VERTEX_STAGE, SK_SHADER_PENDING, SK_SHADER_FAILED, SK_DLAA,
+       SK_PIPE_PENDING, SK_PIPE_FAILED, SK_POOL_OFF, SK_PROG_FILTER, SK_SHADER_FILTER, SK_COUNT };
+extern const char *const vk_draw_skip_names[SK_COUNT];
+void vk_dump_draw_skipped(const VkExec *ex, int mesh, int why);
 // Around a mesh draw of the dumped frame (after vk_dump_draw): a primitives-generated query, listed in mesh_prims.txt.
 // begin returns the query, or -1 when none was begun; end takes that value.
 int vk_dump_mesh_begin(VkExec *ex);
@@ -305,6 +315,10 @@ void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
 void vk_exec_evt(char what, const void *event, uint32_t value);
 void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged
+// The memory report's descriptor pools (vk_memory.c outside_log): the replay's pools, spare ones included, the sets
+// each holds, and the texture pool's sets (0 before it exists).
+typedef struct { uint64_t pools, spare, sets_each, tex_sets; } VkDescMem;
+void vk_exec_desc_mem(VkDescMem *d);
 int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
 int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img

@@ -16,11 +16,11 @@
 
 #include "cfg.h"
 #include "cheats.h"
-#include "coop.h"
 #include "fs.h"
 #include "kernel.h"
 #include "ipc.h"
 #include "gfx.h"
+#include "input.h"
 #include "mods.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
@@ -324,9 +324,10 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
-    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
+    input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value before the exit
     fs_save_flush();
     vk_pipeline_prewarm_marker_clear();   // an orderly end, not a driver crash in the boot's builds (vk_pipeline.c pm_skipped)
+    vk_mem_exit_log();         // the memory report's ranking of the session
     vk_pipeline_save_exit();   // no-op without the Vulkan back end
     prof_write();
     rtss_limit_restore();
@@ -380,6 +381,7 @@ static void boot_wait(PlatThread *warm, uint64_t cap_ms) {
         if ((cap_ms && now - t0 >= cap_ms) || now - moved >= BOOT_STALL_MS) {
             plat_thread_detach(warm);
             vk_pipeline_prewarm_marker_clear();
+            vk_pipeline_prewarm_detach();
             rt_log("boot: the prewarm goes on in the background after %llu ms (%s)", (unsigned long long)(now - t0),
                    cap_ms && now - t0 >= cap_ms ? "NX2NAVI_PREWARM_WAIT_MS" : "no progress for 60 s");
             break;
@@ -423,9 +425,11 @@ void rt_boot(void) {
     uint64_t held = plat_now_ms();
     // The guest waits for all of the prewarm (boot_wait): a warm start is ready in about half a second; a cold one (a new
     // translator, GPU or driver) translated 2,987 shaders in about 11 s and then builds the recorded pipelines, with the
-    // boot screen showing its progress. Started early instead, the game would meet those shaders in play and wait for
-    // each one there. NX2NAVI_PREWARM_WAIT_MS caps the wait (0, the default: none); past it the prewarm goes on in the
-    // background. A --shot image waits for all of it without the screen, so that it does not depend on build timing.
+    // boot screen showing its progress; after a driver change also the compute pipelines and the driver's cache of
+    // stage libraries (vk_pipeline.c bf_decide). Started early instead, the game would meet those shaders in play and
+    // wait for each one there. NX2NAVI_PREWARM_WAIT_MS caps the wait (0, the default: none); past it the prewarm goes
+    // on in the background. A --shot image waits for all of it without the screen, so that it does not depend on build
+    // timing.
     const char *pw = cfg_get("NX2NAVI_PREWARM_WAIT_MS");
     uint64_t wait_ms = pw && *pw ? strtoull(pw, NULL, 10) : 0;
     if (warm && rt_config()->shot) plat_thread_join(warm);

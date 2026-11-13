@@ -2372,7 +2372,66 @@ HOST_OVERRIDE(KERN_SYM_GET_CURRENT_FIBER, kern_fiber_current);
 // NX2NAVI_SVC_SLOW_MS (default 0, off): logs each kernel service that blocks longer than that, with the service number.
 // A stalled frame shows up as time in the replay; this says whether the guest was waiting in a service, and which one,
 // instead of leaving it to a sampler to find.
+// NX2NAVI_SVC_WAITS=1 (diagnosis, default 0): the guest main thread's time in each kernel service, per service and the
+// guest call chain that made it (the lr and up to three callers from the guest's frame records), logged every 10 s as
+// milliseconds per second with the chain named (ldr_describe: the SDK's symbols). What the game's main thread waits for
+// between frames: standing in Hyrule Field on an RX 580 it spent about a fifth of its time blocked in one service call.
+#define SW_N 256
+#define SW_DEPTH 4
+static struct { uint64_t key, lr[SW_DEPTH], ns, n; uint32_t imm; } svw[SW_N];
+static uint64_t svw_t0;
+
+static void svc_wait_note(const Cpu *c, uint32_t imm, uint64_t ns) {
+    uint64_t lr[SW_DEPTH] = {c->x[30]}, fp = c->x[29], key = imm * 0x9E3779B97F4A7C15ull ^ c->x[30];
+    for (int d = 1; d < SW_DEPTH && fp && !(fp & 7) && mem_readable(fp, 16); d++) {
+        uint64_t next = *(const volatile uint64_t *)(uintptr_t)fp, ret = *(const volatile uint64_t *)(uintptr_t)(fp + 8);
+        lr[d] = ret, key = (key ^ ret) * 0x100000001B3ull;
+        if (next <= fp) break;
+        fp = next;
+    }
+    if (!key) key = 1;
+    for (uint32_t k = 0; k < 32; k++) {
+        typeof(svw[0]) *e = &svw[(key + k) % SW_N];
+        if (e->key && e->key != key) continue;
+        if (!e->key) e->key = key, e->imm = imm, memcpy(e->lr, lr, sizeof lr);
+        e->ns += ns, e->n++;
+        break;
+    }
+    uint64_t now = kern_now_ns();
+    if (!svw_t0) svw_t0 = now;
+    if (now - svw_t0 < 10000000000ull) return;
+    double secs = (now - svw_t0) / 1e9;
+    svw_t0 = now;
+    for (int top = 0; top < 6; top++) {
+        int best = -1;
+        for (int i = 0; i < SW_N; i++)
+            if (svw[i].key && svw[i].ns && (best < 0 || svw[i].ns > svw[best].ns)) best = i;
+        if (best < 0) break;
+        char d[SW_DEPTH][96];
+        for (int k = 0; k < SW_DEPTH; k++) {
+            if (svw[best].lr[k]) ldr_describe(svw[best].lr[k], d[k], sizeof d[k]);
+            else d[k][0] = 0;
+        }
+        rt_log("kernel: main thread in service %#x: %.1f ms/s over %llu calls (%.2f ms each) from %s < %s < %s < %s",
+               svw[best].imm, svw[best].ns / 1e6 / secs, (unsigned long long)svw[best].n, svw[best].ns / 1e6 / (double)svw[best].n,
+               d[0], d[1], d[2], d[3]);
+        svw[best].ns = 0;   // listed: out of this round
+    }
+    memset(svw, 0, sizeof svw);
+}
+
 int kern_svc(Cpu *c, uint32_t imm) {
+    static int waits = -1;
+    if (waits < 0) {   // no settings row: cfg_bool only on a set value (an unset key is fatal there)
+        const char *v = cfg_get("NX2NAVI_SVC_WAITS");
+        waits = v && *v && cfg_bool("NX2NAVI_SVC_WAITS");
+    }
+    if (waits && plat_thread_id() == prof_main_tid) {
+        uint64_t w0 = kern_now_ns();
+        int r = kern_svc_inner(c, imm);
+        svc_wait_note(c, imm, kern_now_ns() - w0);
+        return r;
+    }
     static double lim = -1;
     if (lim < 0) lim = strtod(cfg_value("NX2NAVI_SVC_SLOW_MS"), NULL);
     if (lim <= 0) return kern_svc_inner(c, imm);

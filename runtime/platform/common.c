@@ -159,3 +159,20 @@ int plat_addr_str(const PlatAddr *a, char *out, size_t cap) {
     memcpy(out, s, (size_t)n + 1);
     return n;
 }
+
+// ---- what a thread keeps for itself (platform.h plat_thread_end_hook)
+static void (*end_hooks[PLAT_THREAD_END_HOOKS])(void);
+static volatile int32_t n_end_hooks;
+
+void plat_thread_end_hook(void (*fn)(void)) {
+    int32_t i = __atomic_fetch_add(&n_end_hooks, 1, __ATOMIC_ACQ_REL);
+    if (i < PLAT_THREAD_END_HOOKS) __atomic_store_n(&end_hooks[i], fn, __ATOMIC_RELEASE);
+}
+
+void plat_thread_end_run(void) {
+    int32_t n = __atomic_load_n(&n_end_hooks, __ATOMIC_ACQUIRE);
+    for (int32_t i = 0; i < n && i < PLAT_THREAD_END_HOOKS; i++) {
+        void (*fn)(void) = __atomic_load_n(&end_hooks[i], __ATOMIC_ACQUIRE);
+        if (fn) fn();
+    }
+}

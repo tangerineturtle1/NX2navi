@@ -126,6 +126,9 @@ _Static_assert(__builtin_offsetof(AudrenAuxParam, send_info) == 64, "auxiliary e
 #define AUDREN_WORK_BUFFER_BYTES 0x10000u                     // the host keeps its state in host memory
 #define AUDREN_BEHAVIOR_OUT 0xb0u
 #define AUDREN_RENDER_INFO_OUT 0x10u
+// Catch-up after a stall (NX2NAVI_AUDIO_CATCHUP; audren.c render_thread, audio_mixer.c audio_mixer_owed): a gap longer
+// than this is not caught up, the sound goes on from now.
+#define AUDIO_CATCHUP_MAX_MS 3000
 
 // Server-side voice: the DSP's view of one client voice.
 typedef struct {
@@ -147,6 +150,15 @@ typedef struct {
     float biquad_state[2][6][2];   // filter, channel: transposed direct-form II delays
     uint64_t dry_pass;             // NX2NAVI_AUDIO_STATS: 1 + the render pass in which the voice ran out of queued
                                    // buffers before its end of stream (audren.c advance_voice), 0 otherwise
+    // Volume ramps (audio_mixer.c audio_mixer_render): what the voice was mixed with in its last render pass. The pass
+    // after it starts every gain there and reaches the new volumes at its end; voice_reset (audren.c) forgets it.
+    uint64_t ramp_pass;            // 1 + the render pass the voice was last mixed in, 0 when it has none to ramp from
+    int32_t ramp_mix;              // the mix and
+    uint32_t ramp_splitter;        // the splitter it went to then, and
+    uint32_t ramp_channels;        // its channel count: a pass with another of these starts at the new volumes
+    int32_t ramp_buffers;          // into a mix: how many of the mix's buffers ramp_gain holds
+    float ramp_volume;             // into a splitter: the voice's volume then (the destinations keep their own)
+    float ramp_gain[6][24];        // into a mix: the gain channel c went into buffer b with (NaN: nothing went in)
 } ServerVoice;
 enum { SV_STOPPED, SV_STARTED, SV_PAUSED, SV_STOPPING };
 
@@ -182,15 +194,26 @@ void audio_mixer_update_routing(AudioRenderer *r, const uint8_t *splitters, uint
 void audio_mixer_update_effects(AudioRenderer *r);
 void audio_mixer_effect_result(AudioRenderer *r, int id, void *output, unsigned size);
 uint32_t audio_mixer_sink_written(AudioRenderer *r, int id);
-void audio_mixer_render(AudioRenderer *r, double seconds);   // after audio_voices_prepare, before voices advance
+// After audio_voices_prepare, before voices advance. `drop`: a catch-up frame (audren.c render_thread). It is mixed in
+// full, so the voices' filters, the effects and the sinks the game reads back advance as for any frame, and nothing
+// of it is queued for the device.
+void audio_mixer_render(AudioRenderer *r, double seconds, int drop);
 // Device pacing for the render thread at kern_now_ns `now`: 0 renders the next frame now, a positive value waits that
 // many ns (the ring is at its target), -1 leaves the pace to the render thread's timer (no device, renderer stopped,
 // device stalled).
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now);
+// Catch-up for the frames the device paces (render thread, lock not held). 1: the device has played at least one render
+// frame of silence for want of rendered sound that is not made up for yet; that frame is taken off what is owed and
+// the caller renders one frame with `drop` set. 0: nothing is owed. -1: more than AUDIO_CATCHUP_MAX_MS was owed and is
+// forgotten.
+int audio_mixer_owed(AudioRenderer *r);
 // NX2NAVI_AUDIO_STATS: the output's counters since it opened, and the longest gap between two device requests since
 // the last call (which starts that measure again). False without a device.
 typedef struct { uint64_t underruns, missing_frames, skipped_frames, overruns, queued_frames, pull_gap_max_ns; } AudioOutStats;
 int audio_mixer_out_stats(AudioRenderer *r, AudioOutStats *o);
+// NX2NAVI_AUDIO_STATS: the render passes in which at least one volume was ramped (NX2NAVI_AUDIO_RAMP), and the ramps (one
+// source channel into one mix buffer), since the mixer opened.
+void audio_mixer_ramp_stats(const AudioRenderer *r, uint64_t *passes, uint64_t *ramps);
 uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames);   // source samples over one frame; advances v->fraction
 int audio_buffer_empty(const AudrenWaveBuffer *b);   // no samples to decode: played as soon as it is reached
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // IAudioDevice

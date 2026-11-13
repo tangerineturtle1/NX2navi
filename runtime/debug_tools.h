@@ -16,6 +16,11 @@ extern "C" {
 int dbg_supported(void);               // this game build's structures are known (Ocarina of Time 1.1.1)
 
 int dbg_player_pos(float xyz[3]);      // Link's position in metres; 0 while there is no player
+int dbg_player_rot(float m[9]);        // Link's rotation, a 3x3 matrix by rows; 0 while there is no player
+int dbg_area(char out[64]);            // the area the game is in, by its name in the game's files; 0 unknown
+// Every 64-character text of the game data (the area among them) with the hash of its name; returns their number.
+int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx);
+uint32_t dbg_name_hash(const char *name);   // the hash the game knows a flag or a text by
 float dbg_speed_factor(void);          // the game's speed: 1 normal, 0.05 to 8 (frame_rate.c multiplies the game's step)
 void dbg_speed_set(float factor);
 
@@ -36,6 +41,8 @@ int dbg_places(void);
 const char *dbg_place_area(int i);
 const char *dbg_place_pos(int i);      // never "": a teleport without a listed position takes the area's first
 void dbg_warp(const char *area, const char *pos);
+// The start position of area nearest to xyz (metres) among those with coordinates: its name and distance; 0 none.
+int dbg_place_nearest(const char *area, const float xyz[3], char name[64], float *dist);
 int dbg_events(void);
 const char *dbg_event_name(int i);
 void dbg_event_start(const char *name);
@@ -48,8 +55,25 @@ int dbg_freecam_available(void);       // the build has the camera's patch set
 void dbg_freecam_set(int on, int sticks, float speed);
 void dbg_freecam_reset(void);          // back to the game's view, free again from there
 int dbg_freecam(int *sticks, float *speed, double pos[3]);   // on or off
-int dbg_freecam_flying(void);          // on, with the sticks: vk_dlaa.c reads the ground's distance back for it
-void dbg_freecam_ground(const float *dist, int n);   // the replay's thread: view distances in the lower view, 0 sky
+void dbg_freecam_angles(float *yaw, float *pitch);           // radians: it looks along (cos p sin y, sin p, cos p cos y)
+// The game's thread: the free camera, which is on, put at a place and direction outright.
+void dbg_freecam_place(const double pos[3], float yaw, float pitch);
+// The game's own camera, before the free camera stands in for it: dbg_camera_watch(1) has the game's camera update
+// report it (it does anyway while the free camera is on), dbg_camera_seen gives the last position, target and up vector
+// of the camera that follows Link (which 0) or of the events' camera (1) and how many updates were seen so far.
+void dbg_camera_watch(int on);
+uint64_t dbg_camera_seen(int which, double pos[3], double at[3], float up[3]);
+// The game's thread: Link runs to a point of the area (x, z in metres), reached within near_m. dbg_route_state: 1 on
+// his way, 0 there or no route, 2 given up.
+void dbg_route_to(float x, float z, float near_m);
+int dbg_route_state(void);
+void dbg_route_stop(void);             // the game's thread: the route ends where Link is
+int dbg_freecam_flying(void);          // on, with the sticks and ground avoidance: vk_dlaa.c reads the ground's distances back
+void dbg_freecam_avoid_set(int on);    // ground avoidance (off by default): the camera stays a metre above ground-like surfaces
+int dbg_freecam_avoid(void);
+// The replay's thread: nine view distances of the lower view (three rows of three, the top row first; 0 sky), with the
+// tangent of half the view's vertical angle and its width over its height
+void dbg_freecam_ground(const float *dist, int n, float tan_half_y, float aspect);
 
 // Memory: values of 1, 2 or 4 bytes in the game's heap.
 int dbg_search_new(uint32_t value, int size);       // returns the number of places

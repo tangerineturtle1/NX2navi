@@ -75,9 +75,10 @@ int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswer
     if (!s) return 0;
     if (stage == GFX_STAGE_VS) {
         uint64_t words = 0;
-        const uint32_t *w = gfx_shader_spirv(s, &words);
+        const uint32_t *w = gfx_shader_spirv_pin(s, &words);
         GfxShaderIo io[32];
         uint32_t ints = w ? int_read_inputs(w, words) & gfx_shader_inputs(s, io) : 0;
+        gfx_shader_spirv_unpin(s);
         for (int l = 0; l < 32; l++)
             if (ints >> l & 1 && out->attr_type[l] == GFX_TYPE_FLOAT) out->attr_type[l] = GFX_TYPE_UINT;
     } else if (stage == GFX_STAGE_CS) {

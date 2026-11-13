@@ -206,30 +206,115 @@ folder. The folder holds code and data derived from your game: for your own mach
 
 ### Profile-guided build
 
-`build_game.py --pgo <file>.profdata` compiles the generated code at -O2 with an execution profile, and the runtime
-with it too: hot paths laid out straight, hot calls inlined, code that never ran compiled for size. On 1.4.3 the fight
-bench ran 12-15% faster per frame and a fight outside the training about 6%. The installer builds with
-`data/pgo-<ver>.profdata` of the release when the update has one, else at -O1.
+A build with an execution profile compiles the lifted code at -O2 with the counts of a play session, and the runtime
+with them too: hot paths laid out straight, hot calls inlined, functions that never ran compiled for size. On 1.4.3
+the fight bench ran 12-15% faster per frame and a fight outside the training about 6%. Game 1.1.1 has no profile yet
+and no measurement: "Training a profile for 1.1.1" below is the session that makes both.
 
-A profile only fits the generated C it was trained on: functions are matched by name and control-flow hash, so a
-function whose C changes loses its counts without a warning. Retrain after a lifter or generator change, from a clean
-`recomp/`. The instrumented build needs llvm-mingw, as MSYS2's clang has no profile runtime:
+Game 1.1.1 is built by `tools/make_game.py`, on the player's PC through the launcher. It compiles with
+`data\pgo-v111.profdata` of its kit (`app\<version>\data\` of a launcher release, which `make_launcher.py --pgo
+<file>` puts there and builds the prebuilt runtime with; `build\pgo\` in a source checkout) and says so in the
+compile step's log. The profile is left out, and the build is the one a kit without a profile makes (the lifted code
+at -O1), when:
 
-```powershell
-$llvm = "toolchain\llvm-mingw-<date>\llvm-mingw-<date>-ucrt-x86_64"
-.venv\Scripts\python tools\build_game.py --version v143 --out build\v143-pgogen --toolchain $llvm --pgo gen
-```
+- the kit has no profile, or `NX2NAVI_PGO=off` is in the environment (`make_game.py --pgo off`);
+- its record (`pgo-v111.json`) is missing or names another `recomp/` than the kit's (`make_game.py` `pgo_record`).
+  Functions are matched by name and control-flow hash, so a function whose C changed loses its counts without a
+  warning; the record holds `recomp/` by content (the lifter's `.py` files and `patches-v111.txt`), and any change
+  there means a new training;
+- the compiler cannot read the file: one trial compile at the start of the compile step, by each compiler that will
+  read it (`pgo_trial`). The log then names what the compiler said.
 
-Play `build\v143-pgogen\nx2navi.exe` through varied scenes (fights, towns, riding, building, underground, menus) for 20-30
-minutes; it is slower than a normal build. It writes `build\v143-pgogen\pgo\*.profraw` every minute and at exit.
-Scripted runs from saves (`tools/run_game.py`) add to the same file. Then:
+A profile is written by the `llvm-profdata` of one LLVM release and read by the clang of the build tools, which a
+release pins in `toolchain.lock.json` (clang 23.1.5 in 0.9.2). The same release or a newer clang reads it; an older
+one than the file's format refuses it with an error in every compile, which is what the trial compile is for. Train
+with the compiler the release pins: then the instrumented game, the merge and the players' build are one LLVM release.
 
-```powershell
-.venv\Scripts\python tools\pgo.py merge build\v143-pgogen --version v143
-```
+An instrumented build links the compiler's profile runtime, which MSYS2 packs apart from clang and neither
+`C:\msys64` (after the packages above) nor the launcher's build tools hold: the package
+`mingw-w64-ucrt-x86_64-compiler-rt` in the version of the clang it goes with, unpacked into the `msys64` folder of
+those build tools (`pacman -S` for `C:\msys64`; for the launcher's `toolchain\msys64`, the package file from the
+MSYS2 repository unpacked there). `make_game.py` links a test program first and names the package when it is not
+there (`pgo_gen_check`). The merge needs `llvm-profdata` of the same LLVM release: MSYS2's
+`mingw-w64-ucrt-x86_64-llvm-tools`, or the `bin\` of an LLVM installation of that release.
 
-writes `build\pgo\pgo-v143.profdata` and its record (`.json`: the `recomp/` tree it fits). `make_release.py` ships every
-profile of `build\pgo` in `data\` and warns when a record names another `recomp/` tree than the one released.
+#### Training a profile for 1.1.1
+
+`<game>` is a game folder `make_game.py` built (the launcher's `game\`, or one built from a checkout), `<ucrt64>` the
+UCRT64 folder of the build tools with the profile runtime, `python` a Python with numpy and lz4 (`.venv`). A
+checkout also needs the shader translator in `build\xlate` (step 4 of "Build"). Run every step from one commit with
+a clean `recomp/`.
+
+1. Measure the build without a profile (step 6) while the game folder still holds it.
+2. Build the instrumented game into the same folder. In a folder this checkout built only the compile step runs: the
+   lifted code at -O2, every runtime file (the prebuilt runtime counts nothing), and the link.
+
+   ```powershell
+   python tools\make_game.py --rebuild --out <game> --msys <ucrt64> --pgo gen
+   ```
+
+   From the launcher instead: start `NX2navi.exe` with `NX2NAVI_PGO=gen` in its environment and choose Rebuild the
+   Game; the launcher hands the variable on to its build.
+3. Delete `<game>\pgo\*.profraw` left from an earlier instrumented build, then play: start `<game>\ocarina.exe` (or
+   Play in the launcher) and play for 20 to 30 minutes with the settings players have by default. Cover the title
+   screen and the file select, Kokiri Forest, Hyrule Field on foot and on horseback, a town, a dungeon with fights and
+   a boss, the menus and the map, a cutscene, a save and several area changes. What is not played counts as never
+   run and is compiled for size. The game is slower than a normal build. Several sessions add up.
+4. The game adds its counts to `<game>\pgo\default_<id>.profraw` every minute and when it ends
+   (`runtime/platform/win32.c` `pgo_flush_thread`, `plat_exit`), so a crash loses at most a minute; look for the
+   file after the first minute of play. `<game>\pgo\training.json` names the `recomp/` and the compiler the game was
+   built from. The game's own runs inside a build (the shader preparation) count into
+   `<game>\build-cache\pgo-build\` and are not merged.
+5. Merge, with the `llvm-profdata` of the LLVM release that built the game:
+
+   ```powershell
+   python tools\pgo.py merge <game> --version v111 --toolchain <folder with bin\llvm-profdata.exe>
+   ```
+
+   This writes `build\pgo\pgo-v111.profdata` and its record `pgo-v111.json`, and stops when the checkout's
+   `recomp/` is not the one the game was built from. Then build with it; the log must say `built with the execution
+   profile pgo-v111.profdata`, or it says why not:
+
+   ```powershell
+   python tools\make_game.py --rebuild --out <game> --msys <ucrt64>
+   ```
+
+6. Compare the two builds with the runtime's own profiler (`runtime/prof.h`, `runtime/prof_win.c`), in the same
+   place from the same save, the camera left alone, with the same settings. In `<game>\nx2navi.ini` (or as
+   `NX2NAVI_TRACE`, `NX2NAVI_PROFILE` and `NX2NAVI_PROFILE_FRAMES` in the environment):
+
+   ```ini
+   trace = perf
+   profile = <game>\logs\before.prof
+   profile_frames = 7200-10800
+   ```
+
+   `profile` (`NX2NAVI_PROFILE`) samples every thread each millisecond; `profile_frames` limits that to the presented
+   frames 7200 to 10800, the third minute at 60 frames a second, and the profile is written when the window ends, so
+   be in place before it starts. Use `after.prof` for the second build. Then, for each, before the next build
+   replaces `ocarina.map` (the report names the functions from the map of the build that was sampled):
+
+   ```powershell
+   python tools\prof_report.py <game>\logs\before.prof <game>\build-cache\ocarina.map
+   python tools\perf_summary.py <game>\logs\nx2navi.log 7200 10800
+   ```
+
+   At the default 60 frames a second both builds draw the same frames, so the sample counts of `guest (f_*)` (the
+   lifted code) and `runtime host (exe)` in the report are processor time for the same work: the profile's gain is
+   how far they fall. For the frame time itself set `fps_limit = unlimited` and compare the `interval avg` of the
+   `perf:` lines in a place the processor bounds, such as a town at a low `render_scale`. Measure a place that was
+   in the training and one that was not.
+
+The profile and the raw counts are derived from the game's code: they stay under `build\` and in the game folder,
+`tools/check_content.py` refuses them in a commit, and a release carries the profile only as `make_launcher.py --pgo`
+puts it there. `python tests\pgo_build_test.py` checks which flags a build takes for a kit with and without a
+profile, for a record of another tree and for a profile the compiler refuses, with a stand-in for the compiler.
+
+The other game versions build with `tools/build_game.py`: `--pgo gen` with an llvm-mingw toolchain makes the
+instrumented `nx2navi.exe`, which writes `<out>\pgo\*.profraw`; `tools\pgo.py merge <out> --version <ver>` merges
+them, and `--pgo build\pgo\pgo-<ver>.profdata` compiles with the result. `make_release.py` ships every profile of
+`build\pgo` in `data\`, where the installer's build takes the one of its update, and warns when a record names
+another `recomp/` tree than the one released.
 
 ## Linux (in progress)
 
@@ -279,7 +364,8 @@ folder can be deleted; `ocarina --warm-shaders` fills it again.
 
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,
 re-protecting imported memory invalidates the driver's userptr buffer on every submit (about 1.3 ms per 16 MiB on
-amdgpu), and importing pins the pages, which drops their write protection. Each CPU-visible pool therefore gets a
+amdgpu), and importing pins the pages, which drops their write protection. Where guest memory cannot be imported as
+dma-bufs (below), each CPU-visible pool therefore gets a
 host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wrote go in before each submit, and the GPU's
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
@@ -294,6 +380,30 @@ imports instead (`NX2NAVI_SHADOW=1` brings the copies back): it imports guest me
 copies are only the slower path. In Kokiri Forest on 0.7.1 (RTX 4090, driver 615.78), imports with VRAM mirrors ran at
 51.9 frames a second and the copies at 27.4; on that version the copies also flickered between two looks almost every
 frame, which the wait for the write-backs under shadow storage (`vk_sync_exec_wait`) has since addressed.
+
+On Linux the pools are imports after all where the system allows dma-bufs of guest memory (`runtime/platform/linux.c`,
+"Guest memory as a memfd's"; `runtime/vk_memory.c`, "dma-buf imports"). The watched reservations are then shared
+mappings of one memfd, `/dev/udmabuf` makes dma-bufs of page ranges of it, and the device imports those
+(`VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`). A dma-buf pins its pages once and is not tied to the
+process's page tables, so the write watch and the freezes leave the GPU's mapping alone, and nothing is copied. RADV
+puts every imported memory object into every submission (about 0.6 us each), and the game keeps over 4,000 pools, so
+pools share their imports: guest addresses are cut into spans of 64 MiB (`NX2NAVI_DMABUF_MB`), and a pool is a buffer
+bound into its span's memory at its offset. A new span is cut back at the spans already there, so spans overlap only
+where a pool itself lies across an older span's edge: amdgpu counts every span's pages in its GTT use, an overlap twice.
+A span pins all of its pages, those the game never touched included, until some frames after its last pool is gone. It
+takes `/dev/udmabuf` readable and writable by the player (recent systemd gives it to the logged-in user with its
+`uaccess` tag; elsewhere it is often `root` and group `kvm` only), udmabuf's `size_limit_mb`
+(`/sys/module/udmabuf/parameters/size_limit_mb`) at 1024 or more, since the largest pools need about 300 MiB in one
+dma-buf (where it is lower, `udmabuf.size_limit_mb=1024` on the kernel command line raises it), a device with both
+extensions, and NVIDIA's kernel module not loaded: NVIDIA's own driver imports host pointers without amdgpu's cost, as
+above. A start-up probe imports one page of guest memory as the pools will be; where anything is missing or refused, the
+pools keep their shadow copies and the log says why (`mem: dma-buf imports off`, `mem: guest memory is not a memfd's`).
+`NX2NAVI_DMABUF=0` keeps the copies, and `NX2NAVI_DMABUF=1` makes guest memory a memfd's even where NVIDIA's module is
+loaded; both only from the environment, since the reservations are made before `nx2navi.ini` is read. `NX2NAVI_SHADOW=1`
+still forces the copies. In Kokiri Forest (1.1.1, RX 6800 XT, Mesa 26.2) the imports ran at 60.7 frames a second and the
+copies at 40.3, in Hyrule Field at 55.7 and 42.4; the spans then held 8.0 to 9.6 GiB, and amdgpu counted 8.6 to 10.1 GiB
+of its 15.8 GiB host heap in use, against 5.2 to 5.6 GiB with the copies, which are memory of their own beside guest
+memory.
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
@@ -315,12 +425,13 @@ write-backs landed on pages the CPU had written since their copy-in, and what th
 plain CPU write and a guest submission that does not bind the table, and hold the written `0x2468ACE0` after one that
 does; and with `NX2NAVI_SHADOW_TABLE_STORES=1` the store: a GPU
 write into a shadow page that nothing notes must survive the CPU's writes of that page and reach guest memory. On
-Linux, run it for each backing:
+Linux, run it for each backing (with `NX2NAVI_DMABUF=1` and `NX2NAVI_SHADOW=0` the pools are dma-buf imports, with
+`NX2NAVI_DMABUF=0` and `NX2NAVI_SHADOW=0` host-pointer imports):
 
 ```sh
-for shadow in 0 1; do for memory in import mirror; do
-    NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
-done; done
+for dmabuf in 0 1; do for shadow in 0 1; do for memory in import mirror; do
+    NX2NAVI_DMABUF=$dmabuf NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
+done; done; done
 ```
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
@@ -350,10 +461,47 @@ launcher imports a zip it wrote. The second builds `fs_host.c` and `save_share.c
 and runs each step as a start of the game on a profile it makes: the export, an import from a zip the launcher
 exported, its backup and swap at the next start, the zips it refuses and Cancel. No game files.
 
-A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarina_step`) passes
+A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarina_step`), or to the whole numbers the
+game's counters get out of it (`whole_take`, `frame_rate_day_host`, `frame_rate_water_host`, `frame_rate_sim_host`), passes
 `python tests\frame_step_check.py`, which builds `frame_rate.c` with the rest of the runtime stubbed and feeds it
 display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
-frame, uneven frame times one steady step, and game time follows the clock. No game files.
+frame, uneven frame times one steady step, and game time follows the clock. It calls the two hooks as their patch
+sites do: at 144 fps each of 64 water objects gets its ripple steps and the day its seconds, at 120, 144 and 240 fps
+the water managers and floors of the set `owater` get 60 fixed steps a second with only s0 changed, and a step of one
+frame gives what the game computes. It also checks that each of those sites in `recomp/patches-v111.txt` ends in one
+`bl` to its page slot, and runs the physics solver step count's words of the original and the sets `osolver` and
+`osolverfull` (`physics_steps` 0, 1 and 2), lifted as the generator lifts them: the game's 4 and 8 at 60 and 30 fps
+for all three, rounded up by `osolver` and at least 4 every update by `osolverfull` above 60 fps. For the set `ofollow`
+(`floor_carry`) it checks the two words of each of the three floor-carry gates and runs the gate's compare with the
+game's words and the set's: the page's cut is 100 at 60 and 30 fps, and from 90 to 240 fps the set cuts a floor's
+velocity at the time scales where the game cuts it at 60 fps and nowhere else. No game files.
+
+A change to how the mixer applies volumes (`runtime/audio_mixer.c` `accumulate_ramp`, the voice and splitter paths
+of `audio_mixer_render`) or to what it owes the device after a stall (`ring_pull`, `audio_mixer_owed`) passes
+`python tests\audio_mixer_check.py`, which builds `audio_mixer.c` with the rest of the runtime stubbed. It mixes
+voices of one constant sample, so a mix buffer shows the gain sample by sample: a
+volume stepped from 0 to 1 rises in equal steps across the next 5 ms frame and holds after it, for a voice into a mix,
+a voice into a splitter destination and a submix into one; a voice that starts, was silent in the frame before or was
+moved to another mix, a destination that is new or was moved, and the first frame after the renderer starts take the
+new volume at once; `NX2NAVI_AUDIO_RAMP=0` applies every volume at once. It also makes the device's requests by
+hand: the silence of an underrun, up to the prefill's return, is owed in whole render frames, which are rendered and
+not queued; the silence before the first prefill and across a stop is not owed, and more than 3 seconds of it is given
+up. The render thread's own timing (`runtime/audren.c` `render_thread`) is not built by it. No game files and no audio
+device.
+
+A change to the sprint button (`runtime/sprint.c`, the set `sprint` of `recomp/patches-v111.txt`, its call in
+`runtime/ov_input.c` `npad_states`) passes `python tests\sprint_check.py`, which builds `sprint.c` with the rest of the
+runtime stubbed and plays frames against a stand-in Link: toggle and hold on each kind of button, the states that keep
+and end a sprint, ZL, the button kept from the game only during play (the bottom button only while Link moves) and a
+Link the player does not control, and the set switched off with the button off but never over a start that kept it
+off. No game files.
+
+A change to the text speed (`runtime/text_speed.c`, the set `text_speed` of `recomp/patches-v111.txt`, its call in
+`runtime/ov_input.c` `npad_states`) passes `python tests\text_speed_check.py`, which lifts the set's replacement words
+with `recomp/lifter.py` and runs them with `text_speed.c` against a stand-in message window and typewriter: the page
+words each setting writes and the set it switches, the skip site's decide bit and typewriter word for a message the
+player may skip and one the game keeps from skipping, the speed site's factor for that typewriter and no other, the
+registers and flags both sites leave alone, and a start that kept the set off. No game files.
 
 A change to the mouse camera (`runtime/mouse_direct.c`, the mouse path of `runtime/input.c`, the set `mouse_direct` of
 `recomp/patches-v111.txt` or `patches-v143.txt`) passes `python tests\mouse_direct_check.py --cc <clang> --deps
@@ -369,18 +517,35 @@ waits on its event and leaves the others asleep, a wait on several handles repor
 the wait on it, timed waits keep their time, a cancel ends any wait, and 4,000 signals to eight looping waiters are
 each seen. It runs a second time with `NX2NAVI_SYNC_WAKE_ALL=1`. No game files.
 
+A change to what a host thread gives back when it ends (`runtime/platform/win32.c` `thread_main`,
+`plat_thread_end_hook`) passes `python tests\thread_end_check.py`, which builds the platform layer alone: 416 threads
+sleep, read a file and end, half joined and half detached; the end hook runs once on each, and on Windows the process
+holds as many handles afterwards as before (each thread's sleep timer and read event are closed). No game files.
+
+A file a detached thread writes piece by piece (the flight recorder's dump, `runtime/flight.c` `dump_main`) goes
+through `runtime/part_file.h`: it is written as `<name>.part` and renamed when complete, because the window's close
+ends the process under such a thread and a file cut short there would read as a whole one. A file made in memory
+first uses `plat_file_write_cached` or `plat_file_write_atomic`, which do the same in one call. A change to the
+helper passes `python tests\part_file_check.py`, which builds it with the platform layer: nothing stands under the
+name while a file is written, an older file stays until the new one is complete and after a write that was given up,
+and a writer killed in the middle leaves the older file whole and the half as `.part`. No game files.
+
 A change to the log queue (`runtime/logq.c`) passes `python tests\logq_check.py`, which builds it with the platform
 layer and a destination of its own: 160,000 lines from eight threads arrive whole and in each thread's order, a line
 logged while the queue's lock is taken waits and does not pass the lines queued before it, a destination that takes
 30 ms a write does not hold the threads that log, the line about slow writes comes once in ten seconds, a destination
-that stops while four times the queue's size is logged loses nothing, and `logq_sync` returns with everything written.
-The test passes on a busy machine too: it waits for the queue to empty instead of for a time, and counts slow lines
-instead of timing one. No game files.
+that stops while four times the queue's size is logged loses nothing, lines logged together are written in one write
+a quarter of a second after the first and not before, a queue that is half full is written at once, and `logq_sync`
+returns with everything written, the lines the log thread was still gathering included. The program then runs twice
+more as a process that logs 200 lines to a file and ends at once, by an exit and as a fatal error does: each file
+holds every line, and the fatal line last.
+The test passes on a busy machine too: it waits for the queue to empty instead of for a time, counts slow lines
+instead of timing one, leaves out a check its own thread was too late for, and tries the half-full write three times.
+No game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
-files); a change to the settings passes `nx2navi.exe --probe-cfg`; a change to the co-op layer (`runtime/coop*.c`,
-`tools/coop_relay.py`) passes `python tests\coop_relay_test.py` and `nx2navi.exe --probe-coop` ([coop.md](coop.md)).
+files); a change to the settings passes `nx2navi.exe --probe-cfg`.
 
 A change to the action prompt's diamond of face buttons (`runtime/action_prompt.c`) or to the SARC and zstd dictionary
 helpers (`runtime/sarc.c`) passes `python tests\action_prompt_check.py`. It builds them alone, with the
@@ -409,6 +574,19 @@ loss at the same moment end the process with exit code 72, one device report and
 device and opens no window; the device is not really lost, so what a driver answers after a loss is not covered.
 `device_lost_at = <n>` in `nx2navi.ini` ends a real run the same way at its n-th hand-over to the GPU queue.
 
+A change to how a fault ends the process (`runtime/main.c` `crash_handler`, `mode_done`) passes
+`python tests\exit_fault_check.py <game exe>`, which runs two crash probes: a fault inside a library while a mode runs
+is a crash (one FATAL line, exit code 71), and the same fault after the mode has returned, while the process is ending,
+leaves the mode's own exit code and one `exit:` line. The second is what a library another program put into the
+process does when it faults in its detach: an injector's Vulkan layer did so at the end of every shader preparation on
+a player's PC, and the launcher took each finished preparation for a failed one. No game files, no GPU.
+
+A change to the movie timestamp sites of `recomp/patches-v111.txt` (set `omovie`) passes
+`python tests\movie_timeline_check.py --cc <clang>` (`.venv`, Unicorn): it lifts the twelve replacement words on
+their own and compares them with Unicorn over repeated, skipped and rounded timestamps, registers, flags and memory.
+It does not cover the sites as `gen.py` emits them inside their two functions, nor the add and store after them:
+a regenerate of the game code and a compile of the chunk that holds main+0x3b5c7c4 and main+0x3b5c908 does.
+
 A change to the memory gate of the background pipeline builds (`runtime/vk_build_gate.h`, `runtime/vk_pipeline.c`
 `gate_enter`) passes `python tests\build_gate_check.py [<game exe>]`, which builds the header alone and checks what it
 admits and refuses and that builds under way count through their reservations. With the executable it also runs
@@ -434,6 +612,15 @@ A change to the start's memory warning (`runtime/mem_need.h`, `runtime/memory.c`
 `python tests\mem_need_check.py [<game exe>]`, which builds the header alone and checks when the game's need counts
 as short. With the executable it also runs `--probe-memneed` (it prints the machine's commit and the answer and
 starts nothing) with `mem_need_mb` at 0, at 1 and at a value no machine has, and reads the warning line of the last.
+A change to when a start does the whole warm on the boot screen (`runtime/boot_warm.h`, `runtime/vk_pipeline.c`
+`bf_decide`) passes `python tests\boot_warm_check.py`, which builds the header alone: the warm after a driver change,
+its continuation by a later start, the end of the tries, no second warm once one is done, and what a marker left by
+a start that ended in the boot's builds means with and without the crash handler's note. The warm itself shows
+in `--probe-prewarm` on a copy of an install's caches whose `pipeline-cache.bin` has another driver's header (bytes
+8 to 15 of the file are the vendor and device ids, the 16 after them the driver's cache id): the log names the whole
+warm, the compute pipelines on every core and the library warm's answer, and `boot-warm-owed.txt` ends as "done".
+Run under an exe name the driver has not seen, the probe compiles everything, as after a real driver update. What
+the boot screen shows, and the builders' step down when the wait is cut short, need a start of the game.
 A change to how `pipeline-cache.bin` is read (`runtime/vk_cache_file.h`, `runtime/vk_pipeline.c` `cache_load`) passes
 `python tests\pipeline_cache_file_check.py`, which builds the header alone and reads a sparse file just over 2 GB
 through it: measured and read whole without a size limit, refused by its real size under one. No game files, no GPU;
@@ -462,6 +649,14 @@ files.
 A change to how a gamepad's axes are read (`runtime/input.c` `pad_axis`: an axis counts once it has been seen at rest)
 passes `python tests\pad_rest_check.py`, which builds that function with stand-ins for SDL. No game files.
 
+A change to HD rumble's encoding or report schedule (`runtime/rumble_hd.c`: a vibration value as the bytes of a Switch
+controller's rumble report, and which reports are written when) passes `python tests\rumble_hd_check.py`, which builds
+that file alone: known values and the neutral one, the frequency and amplitude clamps (no amplitude step above the
+actuators' safe maximum), a report's data for two actuators and for one, and a batch of values reduced to the reports
+written (the newest value at once, a held one again every 30 ms, the neutral value three times once the game stops).
+The script then decodes a sweep of encoded values with formulae of its own. No game files, no SDL, no controller: what
+a controller does with the reports is not covered.
+
 A change to how a mesh pipeline's fragment module gets the inputs no mesh output feeds (`runtime/vk_pipeline.c`
 `spirv_mesh_outputs`, `spirv_fs_fill_inputs`) passes `python tests\fs_fill_inputs_check.py`, which builds both
 functions and runs them on mesh and fragment shaders it compiles with glslang, then validates the result. No game
@@ -472,6 +667,30 @@ skipped while its pipeline builds, a draw into any other waits) passes `python t
 builds the header alone and replays an area change after a loading screen from a player's log: the scene, probe and
 half-resolution passes are per-frame again at once, a lookup table, a volume's slices and an icon capture still wait,
 and an image taken over by another texture starts without the history of the one before. No GPU, no game files.
+
+A change to how the holes in the allocator's blocks are counted or to which blocks a texture compaction empties
+(`runtime/vk_tex_compact.h`: `tcp_tally`, `tcp_stats`, `tcp_plan`) passes `python tests	ex_compact_check.py`, which
+builds the header alone: a block with one allocation that stays is never chosen, the block that takes the fewest moved
+bytes goes first, what moves fits the free bytes outside the chosen blocks, a plan under its smallest gain is no plan,
+and 400 random tables keep those rules. The part of `runtime/vk_texture.c` that builds the table and moves the images
+(`NX2NAVI_TEX_COMPACT`) is not built by it. No GPU, no game files.
+
+A change to which entry of the upscaler stand-in's scratch images serves a new size (`runtime/vk_scratch_lru.h`,
+`runtime/vk_exec_draw.c` `fallback_scratch`) passes `python tests\scratch_lru_check.py`, which builds the header alone
+and checks that a match is a hit, a ninth size takes a free entry or the one used longest ago instead of being
+refused, and two images of one frame never evict each other. No GPU, no game files.
+
+A change to which frames FSR 3.1 frame generation is told are camera cuts (`runtime/vk_fg_reset.h`, `runtime/vk_fg.cpp`
+`generate` and `vk_fg_frame`) passes `python tests\fg_reset_check.py`, which builds the header alone and checks that each
+frame id gets its own frame's cut, that an id never noted or no longer held counts as a cut, and that a slot rewritten
+on another thread never answers an old id with a newer frame's value. No GPU, no game files.
+
+A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
+`flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
+thumbnails' size and checks that a patch or a whole frame shown once is a flash, that a camera cut, a fade, a pan and
+shapes crossing the picture at any speed are none, where each of the test's rules decides, and that a frame beside one
+without a thumbnail is not judged. With `time` it prints what the cell means of one thumbnail cost. No GPU, no game
+files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:

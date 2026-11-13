@@ -37,8 +37,9 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, mods, saves, steam, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, mods, saves, steam, versions, winsys
 from ..context import Context
+from ..paths import long_path_problem
 from . import art, picture, sound
 
 W, H = 1000, 640
@@ -755,6 +756,11 @@ class App:
             self.settings.save()
         if self.ctx.zstd_missing:   # told at once, not when Begin Installation stops at the build tools
             self.message = self.ctx.zstd_missing
+        left = None if a.selftest else jobs.interrupted(self.ctx)   # before any job of this start leaves its own
+        if left:
+            self.ctx.log(f'the launcher was stopped during {left["task"]} (started '
+                         f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(left.get("started") or 0))}, game folder '
+                         f'{left.get("game_dir") or "none"})')
         for old in self.layout.root.glob('python.old*'):   # the Python an update replaced (launcher/native/nx2navi.c)
             shutil.rmtree(old, ignore_errors=True)
         if gd or self.settings.get('dump'):
@@ -771,6 +777,12 @@ class App:
             # build from before the update and Rebuild the Game finishes it, not the first-run screen and its dump
             self.show('home')
             self.after_update_notice()
+            if left and not self.message:
+                # make_game.py keeps the old exe until the new one is linked and records each finished step, so the
+                # game folder is playable and a rebuild goes on from there; the player is told that it is due
+                self.message = (f'NX2navi was closed or stopped during {left["task"]}, which did not finish. Play '
+                                'starts the last finished build; Rebuild the Game finishes what was left.')
+                self.render()
             if self.install_staged('a staged update waited for the launcher to start'):
                 return
             if a.play:   # Play from Steam with a mod's code to build in first (play_only)
@@ -779,6 +791,9 @@ class App:
             if self.settings.get('auto_check'):
                 self.check_now()
         else:
+            if left and not self.message:
+                self.message = (f'NX2navi was closed or stopped during {left["task"]}, which did not finish. Begin '
+                                'Installation goes on from the steps that were done.')
             self.show('first_run')
             self.find_dumps()
 
@@ -894,8 +909,17 @@ class App:
         menu keeps it; the game reads it when it starts. On unless the file says 0, as the game reads it (cfg_bool,
         default on)."""
         def on(v):
+            # Not while the game runs, as the mods' switches (switch_mod): the game writes the same file when a menu
+            # setting changes. Each side reads the file, changes its own lines and puts a new file in place, so of
+            # two changes in the same moment the second drops the first. The game reads this setting only when it
+            # starts, and its own menu switches it meanwhile.
+            if self.game_busy(game_dir):
+                self.message = ('Quit the game first, or switch Discord Status in the game\'s menu (Game tab): the '
+                                'game writes its settings file while it runs.')
+                return
             try:
                 gameini.put(game_dir, 'discord', 'discord_rpc', '1' if v else '0')
+                self.message = ''
             except OSError as e:
                 self.message = f'The game\'s settings could not be written: {e}'
 
@@ -943,6 +967,11 @@ class App:
             self.choose_dump()
             return
         gd = self.game_dir()
+        too_long = long_path_problem(gd)   # told here, not as a missing file halfway through the build
+        if too_long:
+            self.message = App.friendly(too_long)
+            self.render()
+            return
         drop_partial_image(gd)   # before the free space is measured
         if free_gb(gd) < 34 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file():
             self.message = f'{drive_of(gd)} has {free_gb(gd):.0f} GB free; the game needs about 34 GB.'
@@ -2045,15 +2074,17 @@ class App:
     def rows_job(self):
         j = self.job
         rows = []
-        for st in j.steps:
-            if st.state == jobs.RUNNING:
-                rows.append(Row('progress', st.label, fraction=st.fraction, value=f'{int(st.fraction * 100)}%',
+        with j.locked():   # each step as one change of the worker left it, not a state with the value before it
+            steps = [(st.id, st.label, st.state, st.value, st.fraction) for st in j.steps]
+        for sid, label, state, value, fraction in steps:
+            if state == jobs.RUNNING:
+                rows.append(Row('progress', label, fraction=fraction, value=f'{int(fraction * 100)}%',
                                 focus_value=True, desc=None))
             else:
-                style = {jobs.DONE: 'normal', jobs.SKIPPED: 'dim', jobs.PENDING: 'dim', jobs.FAILED: 'salmon'}[st.state]
-                rows.append(Row('value', st.label, st.value, style, check=st.state == jobs.DONE, desc=None,
-                                focus_value=st.state == jobs.FAILED))
-            if st.id in ('romfs', 'verify') and st is not j.steps[-1]:
+                style = {jobs.DONE: 'normal', jobs.SKIPPED: 'dim', jobs.PENDING: 'dim', jobs.FAILED: 'salmon'}[state]
+                rows.append(Row('value', label, value, style, check=state == jobs.DONE, desc=None,
+                                focus_value=state == jobs.FAILED))
+            if sid in ('romfs', 'verify') and sid != steps[-1][0]:
                 rows.append(Row('divider'))
         if j.result is None:
             label = {'install': 'Cancel Installation', 'update': 'Cancel Update'}.get(j.kind, 'Cancel')
@@ -2076,7 +2107,7 @@ class App:
     def job_desc(self):
         j = self.job
         cur = j.current()
-        lines = [ln for ln in j.lines if ln.strip() and not ln.startswith('@@')][-6:]
+        lines = [ln for ln in j.last_lines(200) if ln.strip() and not ln.startswith('@@')][-6:]
         if j.result == 'failed':
             return {'title': 'The Build Stopped' if j.kind != 'update' or cur.id not in ('download', 'verify')
                     else 'The Update Stopped',
@@ -2136,7 +2167,7 @@ class App:
         j = self.job
         report = [f'NX2navi {self.layout.version} ({"checkout" if self.layout.dev else "release"}), {sys.platform}',
                   f'Job: {j.kind}, step: {j.current().label}', f'Error: {j.error}', '', 'Last lines:']
-        report += [ln for ln in list(j.lines)[-60:]]
+        report += j.last_lines(60)
         self.root.clipboard_clear()
         self.root.clipboard_append('\n'.join(report))
         self.message = 'Report copied.'
@@ -2673,28 +2704,26 @@ def parse_args(argv):
 
 
 def single_instance(layout, wait):
-    """An exclusive lock on data/launcher.lock for this process's life, or None when another launcher holds it after
-    wait seconds (the one an update restart replaces may still be closing)."""
-    path = layout.data / 'launcher.lock'
-    deadline = time.time() + wait
-    while True:
-        try:
-            f = open(path, 'a+')
-            try:
-                if os.name == 'nt':
-                    import msvcrt
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return f
-            except OSError:
-                f.close()
-                raise
-        except OSError:
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.25)
+    """The launcher folder's lock (launcher/locks.py) for this window's life. locks.Busy, naming the holder, when
+    another launcher or a command of launcher/cli.py still holds it after wait seconds (the launcher an update
+    restart replaces may still be closing)."""
+    return locks.FileLock(layout.instance_lock, 'the launcher window', wait=wait, where=layout.root)
+
+
+def tell(text):
+    """A sentence for the player before the window is up: a message box that waits for OK."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, NAME, 0x40)
+        else:
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(NAME, text, parent=root)
+            root.destroy()
+    except Exception:   # no display, no toolkit: the terminal that started it
+        print(text, file=sys.stderr)
 
 
 def play_only(ctx):
@@ -2743,14 +2772,23 @@ def main(argv=None):
             return code
     lock = None
     if not a.selftest:
-        lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)
-        if lock is None:
-            ctx.log('another launcher is running')
+        try:
+            lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)
+        except locks.Busy as e:
+            # A second window on the same folder would run its own jobs into the same game folder and settings. The
+            # first one may be out of sight (hidden while the game runs), so the player is told who holds the folder
+            ctx.log(f'not started: {e}')
+            tell(f'NX2navi is already running: {e}.\n\nIts window may be hidden while the game runs; it comes back '
+                 'when you quit the game.')
             return 0
-    root = tk.Tk(className='NX2navi')
-    app = App(root, ctx, a)
-    if a.selftest:
-        from .selftest import run
-        root.after(300, lambda: run(app, a.shots))
-    root.mainloop()
+    try:
+        root = tk.Tk(className='NX2navi')
+        app = App(root, ctx, a)
+        if a.selftest:
+            from .selftest import run
+            root.after(300, lambda: run(app, a.shots))
+        root.mainloop()
+    finally:
+        if lock:
+            lock.release()
     return 0

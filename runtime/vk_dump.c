@@ -8,7 +8,7 @@
 //   ..._tm.png                                       float formats: x/(1+x) of the same image (the plain one clamps);
 //                                                    in both, a pixel with a NaN channel is magenta
 //   passes.txt   per pass or dispatch: targets, draws, each distinct pipeline + texture set with its shaders' SPIR-V
-//                hashes (sh_<hash>.spv written once) and the bound textures with their samplers
+//                hashes (sh_<hash>.spv written once) and the bound textures with their samplers; draw preparation rejections by reason while the capture ran
 //   images.txt   per image: channel min/max, distinct texel values over the image and over its top quarter
 // Sampled 8-bit 2D textures up to TEX2D_CAP texels are copied once each as pass_<seq>_tex<id>_... at the end of the pass
 // that samples them; texture lines carry the storage address, mirror state, upload count and the image's and slot's
@@ -26,6 +26,9 @@
 // (the terrain decals draw one pass each into the G-buffer and would use up both caps).
 // NX2NAVI_DUMP_SHADERS=<hash>,...: copy images only for passes using those shader hashes; metadata covers the whole frame.
 // NX2NAVI_DUMP_RAW=1: also save each copied image's native texel bytes as .bin, for numerical analysis.
+// NX2NAVI_DUMP_KEY=<key> (Windows): each press of that key in the game window dumps the next frame to
+// NX2NAVI_DUMP_DIR/f<frame>. Keys: pause (also 1), scrolllock, insert, home, end, pageup, pagedown, f2-f7, f9, f12 (F1, F8,
+// F10 and F11 are the menu, the bug capture, the overlay and fullscreen). The game still gets a key it has bound.
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -44,6 +47,9 @@ uint64_t vk_exec_cs_storage_addr(const VkExec *ex, const GfxShaderRes *r);   // 
 uint64_t vk_exec_storage_addr(const VkExec *ex, int st, const GfxShaderRes *r);   // vk_exec_draw.c
 int vk_exec_raw_9e5(VkImage img, VkFormat f);                               // vk_exec_draw.c
 #include "platform/platform.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define MAX_PASSES 400
 #define PNG_CAP (2ull << 30)
@@ -59,6 +65,8 @@ static char base_dir[400];             // NX2NAVI_DUMP_DIR; with NX2NAVI_DUMP_WH
 static uint64_t white_last;            // NX2NAVI_DUMP_WHITE: the frame dumped last (0: none), checked 3 presents on
 static int white_tries, white_caught;
 static uint64_t dump_after;             // NX2NAVI_DUMP_AFTER
+static int dump_key;                    // NX2NAVI_DUMP_KEY: the Windows virtual-key code, 0 off
+static const char *dump_key_name;
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
 static int skip_runs, dump_ubo;        // NX2NAVI_DUMP_SKIP_RUNS, NX2NAVI_DUMP_UBO (vec4 per block, 0 for none)
@@ -474,6 +482,32 @@ static int active(void) {   // passes_f is NULL before a dump that opens its fil
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
+// A draw can be rejected before it opens a render pass. Count it against the captured frame as a whole.
+static struct { uint64_t count, first_prog; } skipped[2][SK_COUNT];
+
+void vk_dump_draw_skipped(const VkExec *ex, int mesh, int why) {
+    plat_mutex_lock(&rec_lock);
+    if (!finished && passes_f && frame_now() == dump_frame) {
+        if (!skipped[mesh][why].count) skipped[mesh][why].first_prog = ex->prog ? ex->prog->serial : 0;
+        skipped[mesh][why].count++;
+    }
+    plat_mutex_unlock(&rec_lock);
+}
+
+static void write_skipped(uint64_t frame) {
+    uint64_t total = 0;
+    for (int m = 0; m < 2; m++) for (int k = 0; k < SK_COUNT; k++) {
+        uint64_t n = skipped[m][k].count;
+        if (!n) continue;
+        fprintf(passes_f, "  skipped %s: %llu (%s, first program %llu)\n", m ? "mesh" : "vertex",
+                (unsigned long long)n, vk_draw_skip_names[k], (unsigned long long)skipped[m][k].first_prog);
+        total += n;
+    }
+    fprintf(passes_f, "frame %llu: %llu draws rejected during draw preparation while capture was active\n",
+            (unsigned long long)frame, (unsigned long long)total);
+    memset(skipped, 0, sizeof skipped);
+}
+
 typedef struct { char *s; size_t n, cap; } Str;
 
 __attribute__((format(printf, 2, 3))) static void sp(Str *b, const char *fmt, ...) {
@@ -500,14 +534,13 @@ static uint64_t shader_hash(const GfxShader *s) {
     if (!s) return 0;
     for (int i = 0; i < n; i++)
         if (tab[i].s == s) return tab[i].h;
-    uint64_t words = 0, h = 0xcbf29ce484222325ull;
-    const uint32_t *w = gfx_shader_spirv(s, &words);
-    const uint8_t *b = (const uint8_t *)w;
-    for (uint64_t i = 0; i < words * 4; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    uint64_t words = 0, h = gfx_shader_spirv_fnv(s);
+    const uint32_t *w = gfx_shader_spirv_pin(s, &words);
     char path[600];
     snprintf(path, sizeof path, "%s/sh_%016llx.spv", dir, (unsigned long long)h);
     FILE *f = fopen(path, "wb");
     if (f) fwrite(w, 4, (size_t)words, f), fclose(f);
+    gfx_shader_spirv_unpin(s);
     snprintf(path, sizeof path, "%s/sh_%016llx.code", dir, (unsigned long long)h);   // the guest program it came from
     gfx_shader_write_code(s, path);
     if (n < 1024) tab[n].s = s, tab[n].h = h, n++;
@@ -1159,10 +1192,21 @@ void vk_dump_init(void) {
     key_mode = e && !strcmp(e, "key");
     const char *df = cfg_get("NX2NAVI_DUMP_FILE");
     if (df && *df) snprintf(dump_file, sizeof dump_file, "%s", df);
+    // NX2NAVI_DUMP_KEY: a key of ours, also outside NX2NAVI_DUMP=key
+    {
+        static const struct { const char *n; int vk; } keys[] = {
+            {"1", 0x13}, {"pause", 0x13}, {"scrolllock", 0x91}, {"insert", 0x2d}, {"home", 0x24}, {"end", 0x23},
+            {"pageup", 0x21}, {"pagedown", 0x22}, {"f2", 0x71}, {"f3", 0x72}, {"f4", 0x73}, {"f5", 0x74}, {"f6", 0x75},
+            {"f7", 0x76}, {"f9", 0x78}, {"f12", 0x7b}};
+        const char *k = cfg_get("NX2NAVI_DUMP_KEY");
+        for (size_t i = 0; k && *k && i < sizeof keys / sizeof *keys; i++)
+            if (!strcasecmp(k, keys[i].n)) dump_key = keys[i].vk, dump_key_name = i ? keys[i].n : "pause";
+        if (k && *k && strcmp(k, "0") && !dump_key) rt_log("vk_dump: NX2NAVI_DUMP_KEY=%s: not a key this knows (pause, scrolllock, insert, home, end, pageup, pagedown, f2-f7, f9, f12)", k);
+    }
     if (dump_white || dump_after) {
         dump_frame = UINT64_MAX;
         vk_thumbs_enable(16);
-    } else if (movie_k || key_mode || dump_file[0]) {
+    } else if (movie_k || key_mode || dump_file[0] || dump_key) {
         dump_frame = UINT64_MAX;
     } else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("NX2NAVI_DUMP_LOG");
@@ -1207,10 +1251,27 @@ void vk_dump_init(void) {
         if (!bd_w || !bd_h) bd_stride = 0;
         snprintf(path, sizeof path, "%s/bufs.txt", dir);
         // a dump named as the run goes opens it with its folder (open_files); a named frame's folder exists already
-        if (bd_size && !dump_white && !movie_k && !key_mode && !dump_file[0] && !(bufs_f = fopen(path, "w"))) bd_size = 0;
+        if (bd_size && !dump_white && !movie_k && !key_mode && !dump_file[0] && !dump_key && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
     vk_dump_armed = 1;
-    rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    if (dump_key) rt_log("vk_dump: %s dumps the next frame to %s/f<frame>", dump_key_name, base_dir);
+    else rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+}
+
+// NX2NAVI_DUMP_KEY: its key went down since the last present (the game window has the focus).
+static int key_pressed(void) {
+#ifdef _WIN32
+    static int was;
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    int down = pid == GetCurrentProcessId() && (GetAsyncKeyState(dump_key) & 0x8000) != 0;
+    int pressed = down && !was;
+    was = down;
+    return pressed;
+#else
+    return 0;
+#endif
 }
 
 // The thumbnail of frame f is blank white left of the overlay and above the dialogue box: -1 not available, 0 no, 1 yes.
@@ -1226,6 +1287,15 @@ static int thumb_white(uint64_t f) {
     return bright * 100 > n * 97;
 }
 
+// Publish the selected frame and its output files together to the recording hooks.
+static void open_frame(uint64_t frame) {
+    plat_mutex_lock(&rec_lock);
+    snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)frame);
+    open_files();
+    dump_frame = frame;
+    plat_mutex_unlock(&rec_lock);
+}
+
 static void white_check(uint64_t frame) {
     static int run;   // consecutive white thumbnails: white runs are mostly 1-2 frames, too short for a dump 4 frames on
     if (frame < 1800) return;
@@ -1234,9 +1304,7 @@ static void white_check(uint64_t frame) {
     run = w ? run + 1 : 0;
     if (run >= 3) {   // frames frame-5..frame-3 white: the run is likely still on 4 frames later
         run = 0;
-        dump_frame = frame + 1;
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)dump_frame);
-        open_files();
+        open_frame(frame + 1);
         rt_log("vk_dump: frames %llu-%llu were white; frame %llu goes to %s", (unsigned long long)(frame - 5),
                (unsigned long long)(frame - 3), (unsigned long long)dump_frame, dir);
     }
@@ -1251,18 +1319,14 @@ void vk_dump_present(uint64_t frame) {
     }
     if (dump_white && !white_caught && !white_last && dump_frame == UINT64_MAX) white_check(frame);
     if (movie_k && dump_frame == UINT64_MAX && __atomic_exchange_n(&movie_req, 0, __ATOMIC_ACQ_REL)) {
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-        open_files();   // before the frame is named: its passes write to them
-        dump_frame = frame + 1;
+        open_frame(frame + 1);
         rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
     }
     if (key_mode && dump_frame == UINT64_MAX) {   // NX2NAVI_DUMP=key: a new press of Insert names the next frame
         static int held;
         int now = input_dump_key();
         if (now && !held) {
-            snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-            open_files();   // before the frame is named: its passes write to them
-            dump_frame = frame + 1;
+            open_frame(frame + 1);
             rt_log("vk_dump: Insert: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
         }
         held = now;
@@ -1274,14 +1338,20 @@ void vk_dump_present(uint64_t frame) {
         free(txt);
         file_more = n > 8 ? 7 : n > 1 ? n - 1 : 0;
         plat_file_delete(dump_file);
+        open_frame(frame + 1);
+        rt_log("vk_dump: %s found: frame %llu goes to %s", dump_file, (unsigned long long)dump_frame, dir);
+    }
+    if (dump_key && dump_frame == UINT64_MAX && key_pressed()) {   // NX2NAVI_DUMP_KEY: our key names the next frame
+        file_more = 0;
         snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
         open_files();   // before the frame is named: its passes write to them
         dump_frame = frame + 1;
-        rt_log("vk_dump: %s found: frame %llu goes to %s", dump_file, (unsigned long long)dump_frame, dir);
+        rt_log("vk_dump: %s: frame %llu goes to %s", dump_key_name, (unsigned long long)dump_frame, dir);
     }
     if (frame != dump_frame) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
+    write_skipped(frame);
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
     mq_write();
@@ -1294,7 +1364,7 @@ void vk_dump_present(uint64_t frame) {
     passes_f = NULL;
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
-    if (dump_white || movie_k || key_mode || dump_file[0]) {   // ready for another dump (vk_dump_present checks a white one's thumbnail 3 presents on)
+    if (dump_white || movie_k || key_mode || dump_file[0] || dump_key) {   // ready for another dump (vk_dump_present checks a white one's thumbnail 3 presents on)
         if (dump_white) white_last = frame;
         plat_mutex_lock(&rec_lock);
         seq = copied = 0, last_targets = 0, pass_skip = NULL, png_bytes = 0;
@@ -1305,9 +1375,7 @@ void vk_dump_present(uint64_t frame) {
     }
     if (file_more > 0) {   // NX2NAVI_DUMP_FILE with a count: the next frame too
         file_more--;
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-        open_files();
-        dump_frame = frame + 1;
+        open_frame(frame + 1);
         rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
     }
 }

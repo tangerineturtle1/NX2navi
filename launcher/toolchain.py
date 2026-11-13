@@ -251,6 +251,14 @@ def install(layout, lock, progress=None, cancel=None, log=print, version='dev'):
                                     and (layout.pkgs / p['filename']).stat().st_size == p['csize'])]
     total = sum(p['csize'] for p in need)
     log(f'toolchain: {len(pkgs)} packages, {len(need)} to download ({total / 1e6:.0f} MB)')
+    # Room for the downloads and for the unpacked tools beside the ones in use (msys64.new), asked before the first
+    # download: a disk that fills while a package unpacks otherwise ends the step with an error that names no cause.
+    # A package's installed size is in the lock; of a CLANG64 package only a few files are unpacked (_wanted), for
+    # which its download size stands in.
+    unpacked = sum(p['csize'] if p.get('env') else p.get('isize', 0) for p in pkgs)
+    full = net.space_problem(layout.toolchain, total + unpacked, 'the build tools')
+    if full:
+        raise ToolchainError(full)
     done_before = 0
     for p in need:
         dest = layout.pkgs / p['filename']
@@ -261,9 +269,11 @@ def install(layout, lock, progress=None, cancel=None, log=print, version='dev'):
             try:
                 net.download(mirror + p['filename'], dest, sha256=p['sha256'], size=p['csize'], cancel=cancel,
                              progress=(lambda d, t, base=done_before: progress and progress('download', base + d, total)),
-                             version=version)
+                             version=version, log=lambda line: log(f'toolchain: {line}'))
                 last_error = None
                 break
+            except net.NoSpace as e:   # another server has the same file for the same full disk
+                raise ToolchainError(str(e)) from e
             except net.DownloadError as e:
                 last_error = e
                 log(f'toolchain: {e}')

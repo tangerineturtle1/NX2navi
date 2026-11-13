@@ -60,7 +60,8 @@ def runtime_id(layout):
 
 
 def safe_extract(zip_path, dest):
-    """Unpack a zip into dest, refusing absolute names and names that climb out of it."""
+    """Unpack a zip into dest, refusing absolute names and names that climb out of it, and, before anything is
+    written, a zip whose files do not fit the disk (net.space_problem)."""
     dest = Path(dest)
     root = dest.resolve()
     with zipfile.ZipFile(zip_path) as z:
@@ -71,21 +72,25 @@ def safe_extract(zip_path, dest):
             target = (dest / name).resolve()
             if target != root and root not in target.parents:
                 raise UpdateError(f'{Path(zip_path).name}: unsafe path {info.filename}')
+        full = net.space_problem(dest, sum(info.file_size for info in z.infolist()),
+                                 f'the files of {Path(zip_path).name}')
+        if full:
+            raise UpdateError(full)
         z.extractall(dest)
 
 
-def _fetch(release, key, layout, progress, cancel, version):
+def _fetch(release, key, layout, progress, cancel, version, log=None):
     url, headers, size, sha = release.asset(key)
     entry = release.manifest[key]
     dest = layout.downloads / entry['name']
     net.download(url, dest, sha256=sha, size=size, headers=headers, progress=progress, cancel=cancel,
-                 version=version)
+                 version=version, log=log)
     return dest
 
 
-def stage_app(layout, release, progress=None, cancel=None, version='dev'):
+def stage_app(layout, release, progress=None, cancel=None, version='dev', log=None):
     """Download, check and unpack the release's app archive into app/<version>; returns that folder."""
-    zip_path = _fetch(release, 'app', layout, progress, cancel, version)
+    zip_path = _fetch(release, 'app', layout, progress, cancel, version, log)
     ver = versions.display(release.version)
     final = layout.apps / ver
     part = layout.apps / f'{ver}.part'
@@ -113,12 +118,12 @@ def runtime_needed(layout, release):
     return bool(rt) and not layout.dev and rt.get('id') != runtime_id(layout)
 
 
-def stage_runtime(layout, release, progress=None, cancel=None, version='dev', dest=None):
+def stage_runtime(layout, release, progress=None, cancel=None, version='dev', dest=None, log=None):
     """Unpack a new Python into dest (python.next, for the stub to swap in at the next start); False when the running
     one is current."""
     if not runtime_needed(layout, release):
         return False
-    zip_path = _fetch(release, 'runtime', layout, progress, cancel, version)
+    zip_path = _fetch(release, 'runtime', layout, progress, cancel, version, log)
     nxt = Path(dest) if dest else layout.root / 'python.next'
     shutil.rmtree(nxt, ignore_errors=True)
     part = nxt.with_name(nxt.name + '.part')
@@ -142,16 +147,16 @@ def prerelease(release):
         return True
 
 
-def stage(layout, release, progress=None, cancel=None, version='dev'):
+def stage(layout, release, progress=None, cancel=None, version='dev', log=None):
     """Download, check and unpack a release into app/<version>, with the Python it brings in python.staged there,
     without switching to it; staged.json, written last, marks it complete. Earlier staged releases it supersedes are
     removed. Returns the folder."""
     ver = versions.display(release.version)
-    folder = stage_app(layout, release, progress=progress, cancel=cancel, version=version)
+    folder = stage_app(layout, release, progress=progress, cancel=cancel, version=version, log=log)
     runtime = ''
     if runtime_needed(layout, release):
         stage_runtime(layout, release, progress=progress, cancel=cancel, version=version,
-                      dest=folder / STAGED_PYTHON)
+                      dest=folder / STAGED_PYTHON, log=log)
         runtime = release.manifest['runtime']['id']
     write_text(folder / STAGED, json.dumps({'version': ver, 'runtime': runtime, 'prerelease': prerelease(release),
                                             'notes': release.notes}))
@@ -257,7 +262,7 @@ def prune(layout):
         shutil.rmtree(d, ignore_errors=True)
     if layout.downloads.is_dir():
         for f in layout.downloads.iterdir():
-            if f.suffix in ('.part', '.zip'):
+            if f.suffix in ('.part', '.zip', net.PART_OF):
                 f.unlink(missing_ok=True)
 
 

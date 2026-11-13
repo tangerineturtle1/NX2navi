@@ -289,20 +289,64 @@ static void stripe_run(void *arg) {
         to_nv12(t);
     }
 }
+// The NSTRIPES - 1 helper threads are made once and kept. Made per call (two calls per picture, 30-60 pictures a
+// second) they were about 300 new threads a second for as long as a movie played, and every DLL in the process (the
+// GPU driver's, overlays and audio hooks) sets itself up for each new thread: a cost per thread, and with an AMD driver
+// on an RX 580 the process commit grew by about 300 MB a second during the title movie until the system ran out
+// (FATAL "movie: out of memory for a 1920x1080 frame" at 45.7 GB). One caller at a time (call_lock); a worker that
+// could not be started leaves its stripe to the caller.
+static struct {
+    PlatMutex call_lock;     // one run_stripes at a time (several decoders may exist)
+    PlatMutex lock;          // the fields below
+    PlatCond go, done;
+    Stripe job[NSTRIPES];
+    uint64_t gen;            // bumped per batch
+    int pending;             // helper stripes of the batch not finished
+    int nworkers;            // started helpers (stripes 1..nworkers); -1 not tried yet
+} SP = {PLAT_MUTEX_INIT, PLAT_MUTEX_INIT, PLAT_COND_INIT, PLAT_COND_INIT, {{0}}, 0, 0, -1};
+
+static void stripe_worker(void *arg) {
+    int i = (int)(intptr_t)arg;
+    uint64_t seen = 0;
+    plat_mutex_lock(&SP.lock);
+    for (;;) {
+        while (SP.gen == seen) plat_cond_wait(&SP.go, &SP.lock);
+        seen = SP.gen;
+        Stripe t = SP.job[i];
+        plat_mutex_unlock(&SP.lock);
+        stripe_run(&t);
+        plat_mutex_lock(&SP.lock);
+        if (!--SP.pending) plat_cond_broadcast(&SP.done);
+    }
+}
+
 static void run_stripes(Stripe base) {
-    Stripe st[NSTRIPES];
-    PlatThread *th[NSTRIPES] = {0};
+    plat_mutex_lock(&SP.call_lock);
+    if (SP.nworkers < 0) {
+        SP.nworkers = 0;
+        for (int i = 1; i < NSTRIPES; i++, SP.nworkers++)
+            if (!plat_thread_spawn(stripe_worker, (void *)(intptr_t)i, "movie convert", 0)) break;
+        if (SP.nworkers < NSTRIPES - 1) rt_log("movie: %d of %d convert threads started", SP.nworkers, NSTRIPES - 1);
+    }
     int rows = ((base.h + NSTRIPES - 1) / NSTRIPES + 1) & ~1;   // even: chroma rows split at the same places
+    Stripe st[NSTRIPES];
     for (int i = 0; i < NSTRIPES; i++) {
         st[i] = base;
         st[i].y0 = i * rows < base.h ? i * rows : base.h;
         st[i].y1 = (i + 1) * rows < base.h ? (i + 1) * rows : base.h;
-        if (i) th[i] = plat_thread_new(stripe_run, &st[i], "movie convert");
-        if (i && !th[i]) stripe_run(&st[i]);
     }
+    plat_mutex_lock(&SP.lock);
+    memcpy(SP.job, st, sizeof st);
+    SP.pending = SP.nworkers;
+    SP.gen++;
+    plat_cond_broadcast(&SP.go);
+    plat_mutex_unlock(&SP.lock);
     stripe_run(&st[0]);
-    for (int i = 1; i < NSTRIPES; i++)
-        if (th[i]) plat_thread_join(th[i]);
+    for (int i = SP.nworkers + 1; i < NSTRIPES; i++) stripe_run(&st[i]);   // helpers that could not start
+    plat_mutex_lock(&SP.lock);
+    while (SP.pending) plat_cond_wait(&SP.done, &SP.lock);
+    plat_mutex_unlock(&SP.lock);
+    plat_mutex_unlock(&SP.call_lock);
 }
 
 // Out of memory for a decoded frame: the frame is dropped (the game shows the previous one a little longer) and

@@ -53,8 +53,7 @@ static void put(Out *o, const char *fmt, ...) {
     if (k > 0) o->at = o->at + (size_t)k < o->n ? o->at + (size_t)k : o->n - 1;
 }
 
-// The co-op room's secret and the offer number made from it, the relay's address and the player's name stay out of a
-// text that ends up in bug reports: only whether they are set.
+// The private settings (cfg_private.h) stay out of a text that ends up in bug reports: only whether they are set.
 static int private_setting(const char *key) { return cfg_private_key(key); }   // cfg_private.h: one list for all
 
 static void put_setting(const char *key, const char *value, int from_env, void *ctx) {

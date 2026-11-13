@@ -21,7 +21,7 @@ if __name__ == '__main__' and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = 'launcher'   # noqa: A001 — lets the relative imports below work when run as a script
 
-from . import build, gamefiles, jobs, versions  # noqa: E402
+from . import build, gamefiles, jobs, locks, versions  # noqa: E402
 from .context import Context  # noqa: E402
 from .paths import Layout  # noqa: E402
 
@@ -31,12 +31,13 @@ def follow(job):
     seen = {}
     job.start()
     while job.result is None:
-        for s in job.steps:
-            key = (s.state, s.value if s.state != jobs.RUNNING else int(s.fraction * 20))
-            if seen.get(s.id) != key:
-                seen[s.id] = key
-                print(f'{s.label}: {s.value}' + (f' ({s.detail})' if s.detail and s.state == jobs.RUNNING else ''),
-                      flush=True)
+        with job.locked():   # each step as one change of the worker left it
+            steps = [(s.id, s.label, s.state, s.value, s.fraction, s.detail) for s in job.steps]
+        for sid, label, state, value, fraction, detail in steps:
+            key = (state, value if state != jobs.RUNNING else int(fraction * 20))
+            if seen.get(sid) != key:
+                seen[sid] = key
+                print(f'{label}: {value}' + (f' ({detail})' if detail and state == jobs.RUNNING else ''), flush=True)
         time.sleep(0.2)
     for s in job.steps:
         if seen.get(s.id, (None,))[0] != s.state:
@@ -65,6 +66,24 @@ def main(argv=None):
     p.add_argument('old')
     a = ap.parse_args(argv)
     ctx = Context(Layout(root=a.root) if a.root else None, echo=False)
+    if a.cmd == 'check':   # reads the feed and changes nothing: it runs beside an open launcher
+        return run(a, ctx, None)
+    # Every other command changes the launcher's folder or the game's, as the window's jobs do: it holds the folder's
+    # lock (launcher/locks.py) from before it writes the settings until it ends, and is refused while the window or
+    # another command holds it
+    try:
+        held = locks.FileLock(ctx.layout.instance_lock, f'"{a.cmd}" from the command line', where=ctx.layout.root)
+    except locks.Busy as e:
+        print(f'error: {e}. Close it, or wait until it is done, and try again.', file=sys.stderr, flush=True)
+        return 1
+    try:
+        return run(a, ctx, held)
+    finally:
+        held.release()
+
+
+def run(a, ctx, held):
+    """One command. held: the launcher folder's lock, which `update` lets go of before the new version takes over."""
     s = ctx.settings
 
     if a.cmd == 'check':
@@ -93,6 +112,7 @@ def main(argv=None):
         new = ctx.layout.apps / versions.display(check.release.version)
         cli = new / 'launcher' / 'cli.py'
         print(f'finishing in {versions.display(check.release.version)}', flush=True)
+        held.release()   # the new version's command takes the lock itself
         return subprocess.call([ctx.layout.python_for_builds(), str(cli), '--root', str(ctx.layout.root),
                                 'continue-update', ctx.version])
 

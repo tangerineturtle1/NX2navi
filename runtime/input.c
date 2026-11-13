@@ -3,8 +3,9 @@
 // bindings are the tables in input_map.c (nx2navi.ini overrides them). The keyboard and the mouse come from the window
 // system's back end (input_wsys.h: input_win.c with Win32, input_sdl.c with SDL), which also owns the cursor capture.
 // Keys and their map: docs/controls.md.
-// The gamepad also rumbles (input_rumble) and, when it has a gyro and an accelerometer, feeds the six-axis sensor from a
-// thread of its own (input_motion_start). Every SDL call on the gamepad is made under `lock`.
+// The gamepad also rumbles (input_rumble; a Switch controller's linear actuators can take the game's own values instead,
+// "HD rumble" below) and, when it has a gyro and an accelerometer, feeds the six-axis sensor from a thread of its own
+// (input_motion_start). Every SDL call on the gamepad is made under `lock`.
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "input.h"
+#include "input_hd_pair.h"
 #include "input_map.h"
 #include "input_wsys.h"
 #ifdef _WIN32
@@ -498,6 +500,244 @@ static int sdl_enter(void) {
 
 static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 
+// ---- HD rumble: the game's vibration values as they are, for a controller with linear actuators
+// A Switch Pro Controller and a Joy-Con play a frequency and an amplitude per band, which is what the game sends
+// (ov_input.c VibrationValue); SDL_RumbleGamepad drives them at two fixed frequencies. With NX2NAVI_RUMBLE_HD=1 (live,
+// off by default) the primary gamepad, when it is one of these, gets the game's values in the controller's own rumble
+// report (rumble_hd.c) and no dual-motor call any more (input_rumble):
+// - HD_SDL, a Pro Controller or a single Joy-Con: SDL_SendGamepadEffect takes the report for these controllers and
+//   writes it with SDL's own report number, over USB and over Bluetooth. With the setting on, hd_probe tries the call
+//   with the neutral value when the gamepad becomes the primary, so the log says at once whether it is taken. With the
+//   setting off nothing is written: the controller is known by its ids, and the first report after the setting is
+//   turned on is the trial (hd_wrote; a refusal sends the gamepad back to its motors).
+// - HD_PAIR, a left and a right Joy-Con that SDL presents as one gamepad: SDL refuses the call for that gamepad, so the
+//   reports go to the two HID devices directly (input_hd_pair.c).
+// Every other gamepad keeps the motors' path, the Switch 2 controllers too (other product ids, another protocol).
+// The game's thread only posts its newest values (input_rumble_hd). A thread of its own writes the reports (hd_main):
+// every HD_TICK_NS while there is something to write it asks rumble_hd_due, which spaces the reports, keeps only the
+// newest value, repeats a held one, and turns values the game stopped renewing into the neutral one, so a paused or
+// frozen game does not leave the controller vibrating. The thread sleeps once the neutral value is out. The neutral
+// value is also written when another gamepad becomes the primary (hd_pad_leave), when the setting is turned off
+// (hd_tick) and before the process ends (input_rumble_hd_stop).
+enum { HD_NONE, HD_SDL, HD_PAIR };
+enum { VID_NINTENDO = 0x057E, PID_JOYCON_LEFT = 0x2006, PID_JOYCON_RIGHT = 0x2007, PID_SWITCH_PRO = 0x2009,
+       PID_JOYCON_GRIP = 0x200E };
+#define HD_TICK_NS 5000000ull
+static int pad_hd;                    // under lock: how the primary takes rumble reports (HD_*)
+static volatile int32_t hd_shown;     // any thread: 0 the primary takes none, 1 it takes them, 2 for its single actuator
+static int sdl_rumbling;              // under lock: the primary's motors were last set to more than 0 (input_rumble)
+static PlatMutex hd_lock = PLAT_MUTEX_INIT;   // guards the fields below; taken after `lock`, never before it
+static PlatCond hd_go = PLAT_COND_INIT;
+static RumbleHd hd;                   // what the primary is to get and what it got
+static int hd_kick;                   // work for the thread: a post, or a pair that left
+static int hd_pair_left;              // the pair stopped being the primary: its two devices are to be closed
+static int hd_ended;                  // input_rumble_hd_stop ran: nothing is written any more
+static int hd_first_logged;           // under lock: the primary's first report was logged (hd_wrote)
+static volatile int32_t hd_thread;    // 0 not started, 1 running, -1 it could not be started (set under hd_lock)
+
+// NX2NAVI_RUMBLE_HD is on and rumble is not off altogether (NX2NAVI_RUMBLE=0); live (cfg_version). Any thread.
+static int hd_setting(void) {
+    static volatile int32_t on = -1;
+    static volatile uint32_t seen;
+    unsigned ver = cfg_version();
+    if (__atomic_load_n(&on, __ATOMIC_RELAXED) < 0 || ver != __atomic_load_n(&seen, __ATOMIC_RELAXED)) {
+        const char *all = cfg_get("NX2NAVI_RUMBLE");
+        __atomic_store_n(&on, cfg_bool("NX2NAVI_RUMBLE_HD") && !(all && !strcmp(all, "0")), __ATOMIC_RELAXED);
+        __atomic_store_n(&seen, ver, __ATOMIC_RELAXED);
+    }
+    return __atomic_load_n(&on, __ATOMIC_RELAXED);
+}
+
+// The time between two reports: NX2NAVI_RUMBLE_HD_MS, 5 to 50 ms, RUMBLE_HD_GAP_NS when unset; live. The HD thread only.
+static uint64_t hd_gap_ns(void) {
+    static uint64_t gap = RUMBLE_HD_GAP_NS;
+    static unsigned seen = ~0u;
+    unsigned ver = cfg_version();
+    if (ver == seen) return gap;
+    seen = ver;
+    const char *e = cfg_get("NX2NAVI_RUMBLE_HD_MS");
+    long ms = e && *e ? strtol(e, NULL, 10) : 0;
+    uint64_t set = ms ? (uint64_t)(ms < 5 ? 5 : ms > 50 ? 50 : ms) * 1000000u : RUMBLE_HD_GAP_NS;
+    if (set != gap) rt_log("input: HD rumble: a report at most every %llu ms", (unsigned long long)(set / 1000000u));
+    return gap = set;
+}
+
+// Under lock and sdl_lock: how gamepad p takes rumble reports (HD_*), with *one set for a single actuator and the
+// words for the log in how. The controllers are known by Nintendo's vendor id, their product ids and the kind SDL
+// reads from the controller itself: a pad of another make that only looks like one to SDL stays on its motors.
+static int hd_probe(SDL_Gamepad *p, int *one, char *how, size_t cap) {
+    *one = 0;
+    uint16_t vid = SDL_GetGamepadVendor(p), pid = SDL_GetGamepadProduct(p);
+    SDL_GamepadType t = SDL_GetRealGamepadType(p);
+    int pro = vid == VID_NINTENDO && pid == PID_SWITCH_PRO && t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO;
+    int single = vid == VID_NINTENDO && (pid == PID_JOYCON_LEFT || pid == PID_JOYCON_RIGHT || pid == PID_JOYCON_GRIP) &&
+                 (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT);
+    if (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR) {
+        if (hd_pair_find()) {
+            snprintf(how, cap, "a Joy-Con pair, written to its two HID devices");
+            return HD_PAIR;
+        }
+        snprintf(how, cap, "a Joy-Con pair whose two Joy-Con are not both listed as HID devices");
+        return HD_NONE;
+    }
+    if (!pro && !single) {
+        snprintf(how, cap, "%04x:%04x is not a Switch Pro Controller or Joy-Con", vid, pid);
+        return HD_NONE;
+    }
+    const char *what = single ? "a single Joy-Con, one actuator" : "a Pro Controller";
+    *one = single;
+    if (!hd_setting()) {   // off: nothing is written to the controller
+        snprintf(how, cap, "%s, through SDL, whose driver is asked once rumble_hd is 1", what);
+        return HD_SDL;
+    }
+    uint8_t r[RUMBLE_HD_REPORT];
+    rumble_hd_report(rumble_hd_neutral, 0, r, sizeof r);
+    if (!SDL_SendGamepadEffect(p, r, sizeof r)) {
+        snprintf(how, cap, "%s, but its gamepad driver takes no rumble data: %s", what, SDL_GetError());
+        return HD_NONE;
+    }
+    snprintf(how, cap, "%s, through SDL", what);
+    return HD_SDL;
+}
+
+// Under lock, and under sdl_lock when connected is set: the primary stops being the primary (another gamepad takes
+// over, or it went away). A controller the HD path left vibrating gets the neutral value, and what was written to it
+// does not count for the next primary.
+static void hd_pad_leave(int connected) {
+    if (!pad) return;
+    plat_mutex_lock(&hd_lock);
+    int buzzing = rumble_hd_buzzing(&hd);
+    rumble_hd_forget(&hd);
+    if (pad_hd == HD_PAIR) {   // the HD thread closes the two devices, after a neutral report to each
+        hd_pair_left = 1, hd_kick = 1;
+        plat_cond_signal(&hd_go);
+    }
+    plat_mutex_unlock(&hd_lock);
+    if (pad_hd == HD_SDL && buzzing && connected) {
+        uint8_t r[RUMBLE_HD_REPORT];
+        rumble_hd_report(rumble_hd_neutral, 0, r, sizeof r);
+        SDL_SendGamepadEffect(pad, r, sizeof r);
+    }
+    pad_hd = HD_NONE, sdl_rumbling = 0, hd_first_logged = 0;
+    __atomic_store_n(&hd_shown, 0, __ATOMIC_RELAXED);
+}
+
+// Under lock: the report with data d was written at `now` (ok), or the controller or its driver did not take it: the
+// gamepad then goes back to its motors until it becomes the primary again. The primary's first report is logged with
+// its bytes, so a log shows that the path is in use and what the controller was sent.
+static void hd_wrote(int ok, const uint8_t d[RUMBLE_HD_DATA], uint64_t now, const char *err) {
+    plat_mutex_lock(&hd_lock);
+    if (ok) rumble_hd_sent(&hd, d, now);
+    else rumble_hd_forget(&hd);
+    plat_mutex_unlock(&hd_lock);
+    if (ok) {
+        if (!hd_first_logged)
+            rt_log("input: HD rumble: first report written (left %02x %02x %02x %02x, right %02x %02x %02x %02x)", d[0], d[1],
+                   d[2], d[3], d[4], d[5], d[6], d[7]);
+        hd_first_logged = 1;
+        return;
+    }
+    rt_log("input: HD rumble: a report for the gamepad was not taken (%s); it rumbles through its motors from here on", err);
+    pad_hd = HD_NONE;
+    __atomic_store_n(&hd_shown, 0, __ATOMIC_RELAXED);
+}
+
+// One round of the HD rumble thread: writes the report that is due, if one is. 1 when nothing is left to write until
+// the game posts again.
+static int hd_tick(void) {
+    uint8_t d[RUMBLE_HD_DATA];
+    uint64_t now = plat_now_ns(), gap = hd_gap_ns();
+    plat_mutex_lock(&lock);
+    int kind = pad ? pad_hd : HD_NONE, on = kind != HD_NONE && hd_setting();
+    plat_mutex_lock(&hd_lock);
+    int close_pair = hd_pair_left;
+    hd_pair_left = 0;
+    int due = !hd_ended && kind != HD_NONE && rumble_hd_due(&hd, on, now, gap, d);
+    int idle = hd_ended || kind == HD_NONE || (!due && rumble_hd_idle(&hd, on, now));
+    plat_mutex_unlock(&hd_lock);
+    if (due && kind == HD_SDL && plat_mutex_trylock(&sdl_lock)) {   // a round later while SDL updates
+        if (SDL_GamepadConnected(pad)) {   // a gamepad that went away is let go by the next scan (scan_pads)
+            uint8_t r[RUMBLE_HD_REPORT];
+            rumble_hd_report(d, 0, r, sizeof r);   // SDL puts its own number in
+            int ok = SDL_SendGamepadEffect(pad, r, sizeof r);
+            hd_wrote(ok, d, now, ok ? "" : SDL_GetError());
+        }
+        sdl_leave();
+    }
+    plat_mutex_unlock(&lock);
+    if (close_pair) hd_pair_close(1, 0);
+    if (due && kind == HD_PAIR) {
+        // waits for the two writes, so not under lock; after input_rumble_hd_stop it writes nothing (hd_pair_end)
+        int ok = hd_pair_write(d);
+        plat_mutex_lock(&lock);
+        // unless the pair left or the stop came meanwhile (hd_ended is written under lock as well)
+        if (pad && pad_hd == HD_PAIR && !hd_ended) hd_wrote(ok, d, now, ok ? "" : SDL_GetError());
+        plat_mutex_unlock(&lock);
+    }
+    return idle;
+}
+
+static void hd_main(void *arg) {
+    (void)arg;
+    for (int idle = 1;;) {
+        plat_mutex_lock(&hd_lock);
+        while (idle && !hd_kick) plat_cond_wait(&hd_go, &hd_lock);
+        hd_kick = 0;
+        plat_mutex_unlock(&hd_lock);
+        if (!idle) plat_wait_ns(HD_TICK_NS);
+        idle = hd_tick();
+    }
+}
+
+int input_rumble_hd_available(void) { return __atomic_load_n(&hd_shown, __ATOMIC_RELAXED) != 0; }
+
+int input_rumble_hd_on(void) {
+    return __atomic_load_n(&hd_shown, __ATOMIC_RELAXED) && __atomic_load_n(&hd_thread, __ATOMIC_RELAXED) >= 0 && hd_setting();
+}
+
+void input_rumble_hd(const RumbleHdValue v[2], const int live[2], float strength) {
+    int32_t shown = __atomic_load_n(&hd_shown, __ATOMIC_RELAXED);
+    if (!shown) return;
+    uint8_t d[RUMBLE_HD_DATA];
+    rumble_hd_data(v, live, strength, shown == 2, d);
+    plat_mutex_lock(&hd_lock);
+    rumble_hd_post(&hd, d, plat_now_ns());
+    if (!hd_thread) {
+        int ok = plat_thread_spawn(hd_main, NULL, "rumble", 0);
+        __atomic_store_n(&hd_thread, ok ? 1 : -1, __ATOMIC_RELAXED);
+        if (!ok) rt_log("input: HD rumble: its thread could not be started; the gamepad rumbles through its motors");
+    }
+    hd_kick = 1;
+    plat_cond_signal(&hd_go);
+    plat_mutex_unlock(&hd_lock);
+}
+
+void input_rumble_hd_stop(void) {
+    int got = 0, wait = 0;
+    // The locks are tried for a while and not waited for: a thread of the game may hold one for good by now.
+    for (int i = 0; i < 50 && !(got = plat_mutex_trylock(&lock)); i++) plat_wait_ns(1000000);
+    if (!got) return;
+    plat_mutex_lock(&hd_lock);
+    hd_ended = 1;
+    int buzzing = rumble_hd_buzzing(&hd);
+    rumble_hd_forget(&hd);
+    plat_mutex_unlock(&hd_lock);
+    int pair = pad && pad_hd == HD_PAIR;
+    if (pad && pad_hd == HD_SDL && buzzing) {
+        got = 0;
+        for (int i = 0; i < 50 && !(got = plat_mutex_trylock(&sdl_lock)); i++) plat_wait_ns(1000000);
+        if (got) {
+            uint8_t r[RUMBLE_HD_REPORT];
+            rumble_hd_report(rumble_hd_neutral, 0, r, sizeof r);
+            wait = SDL_GamepadConnected(pad) && SDL_SendGamepadEffect(pad, r, sizeof r);
+            sdl_leave();
+        }
+    }
+    plat_mutex_unlock(&lock);
+    if (pair) hd_pair_end(100);
+    if (wait) plat_wait_ns(30000000);   // SDL writes the report on a thread of its own: time for it before the process ends
+}
+
 // Every connected gamepad is kept open; `pad` is the one the game reads (and the one that rumbles and feeds motion):
 // the first one found, then whichever one the player presses (pad_follow). Taking only the first gamepad SDL lists
 // left the game deaf when that one was a device nobody holds: a virtual pad of Steam Input or DS4Windows, a wheel, a
@@ -510,6 +750,7 @@ static int pad_pressed_logged;       // the primary's first press was logged (on
 
 // Under lock: makes p the gamepad the game reads, with its labels, rumble and layout; logs it.
 static void pad_primary(SDL_Gamepad *p, const char *why) {
+    hd_pad_leave(1);
     pad = p;
     sensor_pad = 0, sensor_ok = 0, pad_pressed_logged = 0;
     pad_rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
@@ -531,6 +772,56 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
     rt_log("input: gamepad \"%s\" %s (%s, %s, east button %s)", SDL_GetGamepadName(pad), why,
            pad_rumble ? "rumble" : "no rumble", motion ? "gyro and accelerometer" : "no motion sensors",
            pad_east_a ? "labelled A" : "not labelled A");
+    char how[200];
+    int one;
+    pad_hd = hd_probe(pad, &one, how, sizeof how);
+    __atomic_store_n(&hd_shown, pad_hd == HD_NONE ? 0 : 1 + one, __ATOMIC_RELAXED);
+    rt_log("input: HD rumble %s for this gamepad: %s (rumble_hd = %s)", pad_hd == HD_NONE ? "not available" : "available",
+           how, cfg_value("NX2NAVI_RUMBLE_HD"));
+}
+
+// Joysticks SDL has no gamepad mapping for are not gamepads to it, and this file opens gamepads only. Known ones get a
+// mapping built from their own GUID (so it matches whatever bus, version and name checksum SDL put in it); any other is
+// logged once with its name, ids and GUID.
+// - A Switch that presents its Joy-Con over USB from its boot menu's tools:
+//   "Nyx Joy-Con", VID 0x11EC, PID 0xA7E1, a plain HID joystick: X, Y (left stick), Z, Rz (right stick) from 0 to 255
+//   with up at 0, a hat for the D-pad, and buttons 1-12 B, A, Y, X (south, east, west, north), L, R, ZL, ZR, Minus,
+//   Plus, left and right stick clicks. Capture and Home are not sent.
+static const struct { uint16_t vid, pid; const char *name, *map; } known_joysticks[] = {
+    {0x11EC, 0xA7E1, "Nyx Joy-Con (USB HID)",
+     "a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,back:b8,start:b9,leftstick:b10,"
+     "rightstick:b11,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,rightx:a2,righty:a3"},
+};
+
+static void map_joysticks(void) {
+    static SDL_JoystickID seen[32];
+    static int nseen;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    for (int i = 0; ids && i < n; i++) {
+        int done = 0;
+        for (int k = 0; k < nseen && !done; k++) done = seen[k] == ids[i];
+        if (done || SDL_IsGamepad(ids[i])) continue;
+        if (nseen < (int)(sizeof seen / sizeof *seen)) seen[nseen++] = ids[i];
+        uint16_t vid = SDL_GetJoystickVendorForID(ids[i]), pid = SDL_GetJoystickProductForID(ids[i]);
+        char guid[64];
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof guid);
+        const char *jname = SDL_GetJoystickNameForID(ids[i]);
+        int mapped = 0;
+        for (size_t k = 0; k < sizeof known_joysticks / sizeof *known_joysticks; k++) {
+            if (known_joysticks[k].vid != vid || known_joysticks[k].pid != pid) continue;
+            char m[512];
+            snprintf(m, sizeof m, "%s,%s,%s", guid, known_joysticks[k].name, known_joysticks[k].map);
+            int r = SDL_AddGamepadMapping(m);
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) mapped as a gamepad (%s)%s%s", jname ? jname : "?", vid, pid,
+                   guid, known_joysticks[k].name, r < 0 ? ": mapping refused, " : "", r < 0 ? SDL_GetError() : "");
+            mapped = 1;
+        }
+        if (!mapped)
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) has no gamepad mapping in SDL: not used (an SDL mapping "
+                   "in the SDL_GAMECONTROLLERCONFIG environment variable adds one)", jname ? jname : "?", vid, pid, guid);
+    }
+    SDL_free(ids);
 }
 
 // Under lock: closes the gamepads that went away and opens the ones that came; the primary falls back to the first
@@ -540,10 +831,12 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
 // its place, the menu opens: the player sees it, and it takes the keyboard and mouse until it is closed.
 static void scan_pads(void) {
     int had = pad != NULL;
+    map_joysticks();
     for (int i = 0; i < npads;) {
         if (SDL_GamepadConnected(pads[i])) { i++; continue; }
         rt_log("input: gamepad \"%s\" disconnected", SDL_GetGamepadName(pads[i]) ? SDL_GetGamepadName(pads[i]) : "?");
         if (pads[i] == pad) {
+            hd_pad_leave(0);
             pad = NULL, sensor_pad = 0, sensor_ok = 0;
             plat_xchg32(&pad_layout_shown, -1);
             for (int k = 0; k < 4; k++) plat_xchg32(&pad_labels[k], PAD_LABEL_NONE);
@@ -1138,8 +1431,17 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
     plat_mutex_lock(&lock);
     if (state == 1 && pad && pad_rumble && plat_mutex_trylock(&sdl_lock)) {   // one skipped while SDL updates
-        ok = SDL_RumbleGamepad(pad, low, high, ms);
-        if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
+        if (pad_hd != HD_NONE && input_rumble_hd_on()) {
+            // HD rumble has this gamepad (hd_tick): its motors are stopped once and get nothing more, so the reports
+            // with the game's values are the only rumble it is sent
+            if (sdl_rumbling) SDL_RumbleGamepad(pad, 0, 0, 0);
+            sdl_rumbling = 0;
+            ok = 1;
+        } else {
+            ok = SDL_RumbleGamepad(pad, low, high, ms);
+            sdl_rumbling = low || high;
+            if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
+        }
         sdl_leave();
     }
 #ifdef _WIN32

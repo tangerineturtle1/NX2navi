@@ -98,10 +98,19 @@ static void VKAPI_PTR on_allocate(VmaAllocator a, uint32_t type, VkDeviceMemory 
     plat_event_set(&H.ev);
 }
 
+// NX2NAVI_TEX_COMPACT: every device memory VMA gives back to the driver is reported to the texture compaction, which
+// counts the blocks its pass emptied (vk_texture.c vk_texture_block_freed). Any thread; the callback takes no lock.
+static void VKAPI_PTR on_free(VmaAllocator a, uint32_t type, VkDeviceMemory m, VkDeviceSize size, void *user) {
+    (void)a, (void)type, (void)size, (void)user;
+    vk_texture_block_freed((uint64_t)(uintptr_t)m);
+}
+
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) {
     static const VmaDeviceMemoryCallbacks cb = {.pfnAllocate = on_allocate};
+    static const VmaDeviceMemoryCallbacks cb_free = {.pfnAllocate = on_allocate, .pfnFree = on_free};
     const char *v = cfg_get("NX2NAVI_VRAM_HEADROOM");   // empty is unset: the key has no settings row for cfg_bool
     H.on = !v || !*v || cfg_bool("NX2NAVI_VRAM_HEADROOM");
+    if (vk_texture_compact_on()) return &cb_free;   // on_allocate does nothing for the headroom while H.on is 0
     return H.on ? &cb : NULL;
 }
 

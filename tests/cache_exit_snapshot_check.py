@@ -39,6 +39,9 @@ static volatile int32_t cache_saving_at_exit;
 static volatile LONG active, snapshots;
 static HANDLE old_in, release_old, new_in, file_in, release_file;
 static int block_file, fail_file, writes, save_result;
+static uint64_t mock_cap;   // cache_cap: 0 no limit
+static int prep_mode;
+static uint64_t cache_cap(void) { return mock_cap; }
 static struct {
     VkPipelineCache cache, play;
     int device, fold, feedback;
@@ -143,7 +146,18 @@ int main(void) {
     assert(plat_mutex_trylock(&cache_rw));
     assert(cache_save_one(0, 0, 1) == 0 && writes == before && !cache_saving_at_exit);
     plat_mutex_unlock(&cache_rw);
-    puts("cache save at exit: builds held back and waited for, autosave unchanged, timeout, failures and merges passed");
+
+    // A cache past the limit is not written (the next start would drop the file), holds no build back and lets the
+    // next save run; a preparation writes it anyway.
+    P.saved[0] = 0; mock_cap = 2; before = writes;
+    assert(cache_save_one(0, 100, 1) == 1 && writes == before && !cache_saving_at_exit && P.saved[0] == 0);
+    assert(cache_save_one(0, 0, 0) == 1 && writes == before);
+    cache_build_enter(); plat_mutex_unlock_shared(&cache_rw);
+    prep_mode = 1;
+    assert(cache_save_one(0, 100, 1) == 1 && writes == before + 1);
+    prep_mode = 0; mock_cap = 0;
+    puts("cache save at exit: builds held back and waited for, autosave unchanged, timeout, failures, merges and the "
+         "size limit passed");
     return 0;
 }
 '''

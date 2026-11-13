@@ -1143,6 +1143,22 @@ void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, u
     vkCmdEndRendering(cb);
 }
 
+// The swapchain is made without HDR (gfx_present.c create_swapchain): the encode's picture and the menu's image at the
+// picture's size (28 and 14 MiB at 2560x1440, 63 and 32 MiB at 2160 lines) were kept for the process once HDR had been
+// on. They go now, after a wait for the presents that may still read them; HDR switched on again makes them anew.
+void vk_hdr_images_release(void) {
+    VkCtx *c = vk_ctx();
+    if (!c || (!H.out.img && !H.menu.img)) return;
+    vk_queue_lock();
+    vkDeviceWaitIdle(c->device);
+    vk_queue_unlock();
+    for (int i = 0; i < SLOTS; i++)
+        if (H.src_view[i]) vkDestroyImageView(c->device, H.src_view[i], NULL), H.src_view[i] = VK_NULL_HANDLE;
+    img_free(c, &H.out);
+    img_free(c, &H.menu);
+    rt_log("vk_hdr: HDR is off: the encode's images are freed");
+}
+
 void vk_hdr_release(void) {
     VkCtx *c = vk_ctx();
     for (int i = 0; i < SLOTS; i++)
