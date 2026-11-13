@@ -1,7 +1,7 @@
 // ASTC textures on the GPU: the NX2NAVI_ASTC knob, a compute decoder that turns raw blocks into the RGBA8 image the CPU
 // decoder (tex_astc.c) would have written, and the native ASTC formats where the device samples them itself.
 //
-// NX2NAVI_ASTC_BC = 1 (gpu mode only; unset: by the video memory and RAM, create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
+// NX2NAVI_ASTC_BC = 1 (gpu mode only; unset or auto: by the video memory and RAM, create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
 // texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
 // NX2NAVI_ASTC_BC1 = 1 (default; with BC3 on): a texture whose every ASTC block decodes opaque (vk_texture.c "ASTC as
@@ -307,7 +307,7 @@ static int create_pipeline(VkCtx *c) {
 }
 
 // NX2NAVI_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
-// Unset: on when the largest device-local heap is under 20 GiB. There RGBA8 ASTC, four times the size of BC3, fills
+// Unset or auto (the menu's Texture compression row writes auto): on when the largest device-local heap is under 20 GiB. There RGBA8 ASTC, four times the size of BC3, fills
 // video memory (a GTX 1650 4 GiB went from 10-23 to 3-12 ms of GPU time a frame, issue #87). Ocarina in Kokiri Forest
 // holds 15.9 GiB of VRAM with RGBA8 and 8.2 GiB with BC3, at the same GPU time and no difference to see in the frame,
 // so 8-16 GiB cards take BC3 too; BC3 loses some precision (normal maps), so 24 and 32 GiB cards keep RGBA8 when the
@@ -317,6 +317,9 @@ static int create_pipeline(VkCtx *c) {
 // So RGBA8 needs 48 GiB of RAM as well.
 #define BC_KEEP_RGBA8_VRAM (20ull << 30)
 #define BC_KEEP_RGBA8_RAM_MB (48.0f * 1024 - 1024)   // a 48 GiB PC reports a little under 48 GiB
+static int bc_auto = -1;   // what unset or auto picks on this PC (vk_astc_bc_auto); -1 before create_bc_pipeline ran
+
+int vk_astc_bc_auto(void) { return bc_auto; }
 
 // The encoder's pipeline: BC3 blocks, or with bc1 BC1 blocks (bc3_encode.comp's specialization constant BC1).
 static VkResult bc_pipeline(VkCtx *c, int bc1, VkPipeline *out) {
@@ -347,10 +350,12 @@ static int create_bc_pipeline(VkCtx *c) {
             vram = c->mem_props.memoryHeaps[h].size;
     float ram_used, ram_mb, proc;
     plat_mem_info(&ram_used, &ram_mb, &proc);
-    int on = e && *e ? *e != '0' : vram < BC_KEEP_RGBA8_VRAM || (ram_mb > 0 && ram_mb < BC_KEEP_RGBA8_RAM_MB);
-    if (!(e && *e))
-        rt_log("vk: NX2NAVI_ASTC_BC unset: BC3 %s (largest device-local heap %llu MiB, RAM %.0f MiB)", on ? "on" : "off",
-               (unsigned long long)(vram >> 20), ram_mb);
+    bc_auto = vram < BC_KEEP_RGBA8_VRAM || (ram_mb > 0 && ram_mb < BC_KEEP_RGBA8_RAM_MB);
+    int set = e && *e && strcmp(e, "auto");
+    int on = set ? *e != '0' : bc_auto;
+    if (!set)
+        rt_log("vk: NX2NAVI_ASTC_BC %s: BC3 %s (largest device-local heap %llu MiB, RAM %.0f MiB)", e && *e ? "auto" : "unset",
+               on ? "on" : "off", (unsigned long long)(vram >> 20), ram_mb);
     if (!on) return 0;
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);

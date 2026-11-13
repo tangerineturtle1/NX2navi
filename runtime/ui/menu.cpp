@@ -83,6 +83,7 @@ int vk_fg4_failed(void);                // ... it failed in this run, FSR 3.1's 
 int vk_fg4_active(void);                // ... its swapchain is in place
 const char *vk_fg4_name(void);          // ... the version the library runs here ("3.1.6", "4.0.2")
 int vk_texture_detail_auto(void);       // vk_texture.c: the texture detail auto picks on this card, 0 full to 2 low
+int vk_astc_bc_auto(void);              // vk_astc.c: whether automatic texture compression is on here, -1 not known
 int vk_mesh_shader_native(void);        // vk_device.c: the GPU has mesh shaders (the mesh emulation does nothing)
 double frame_step_limit_hz(void);
 int frame_limit_adjustable(void);
@@ -755,6 +756,19 @@ static void row_texture_detail(void) {
     opt_choice_list("NX2NAVI_TEXTURE_DETAIL", UI_MENU_TEX_DETAIL, vals, names, 4, UI_MENU_TEX_DETAIL_DESC);
 }
 
+// Texture compression (vk_astc.c create_bc_pipeline): the game's ASTC textures, decoded on the GPU, stored as BC3 (BC1
+// where no texel is see-through) instead of RGBA8, a quarter of the video memory or less. Read when the decoder starts,
+// so the row notes the restart. The automatic entry names what it picks on this PC.
+static void row_astc_bc(void) {
+    static const char *const vals[] = {"auto", "0", "1"};
+    static char picked[96];   // the row keeps the pointer for the frame
+    int a = vk_astc_bc_auto();
+    if (a < 0) snprintf(picked, sizeof picked, "%s", menu_text(UI_MENU_AUTO));
+    else snprintf(picked, sizeof picked, menu_text(UI_MENU_TEX_DETAIL_AUTO), menu_text(a ? UI_MENU_ON : UI_MENU_OFF));
+    const char *names[] = {picked, menu_text(UI_MENU_OFF), menu_text(UI_MENU_ON)};
+    opt_choice_list("NX2NAVI_ASTC_BC", UI_MENU_ASTC_BC, vals, names, 3, UI_MENU_ASTC_BC_DESC);
+}
+
 static void row_shadow_scale(void) {
     static const char *const vals[] = {"1", "2", "3", "4"};
     static const char *const names[] = {"960 (1x)", "1920 (2x)", "2880 (3x)", "3840 (4x)"};
@@ -1288,6 +1302,7 @@ static void tab_screen(float scale) {
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
     row_texture_detail();
+    row_astc_bc();
     opt_end();
 }
 

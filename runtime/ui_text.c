@@ -530,7 +530,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MEMORY_VERIFY] = "Verify",
     [UI_MENU_TEX_ALIAS] = "Texture aliasing", [UI_MENU_TEX_ALIAS_DESC] = "A new texture created over a live texture's memory starts with that content instead of empty.",
     [UI_MENU_TEX_VRAM_PRESSURE] = "Texture memory limit", [UI_MENU_TEX_VRAM_PRESSURE_DESC] = "Percent of video memory above which textures the game released are dropped (they come back from storage when used again). 0 keeps them.",
-    [UI_MENU_ASTC_BC] = "Compress ASTC to BC3", [UI_MENU_ASTC_BC_DESC] = "With the GPU decoder: re-encodes decoded ASTC textures to BC3, a quarter of the video memory. Textures look slightly blockier. Auto: on for GPUs with 4 GB of video memory or less.",
+    [UI_MENU_ASTC_BC] = "Texture compression", [UI_MENU_ASTC_BC_DESC] = "Keeps the game's textures compressed (BC3, or BC1 where nothing is see-through) instead of fully decoded: a quarter of the video memory or less, with slightly less detail. Turn it on when the video memory fills up and the frame rate drops. Automatic: on with less than 20 GB of video memory or less than 48 GB of RAM.",
     [UI_MENU_LOD_GUARD] = "LOD guard", [UI_MENU_LOD_GUARD_DESC] = "Prevents objects flashing in the wrong place or a flat far field for a frame, by waiting for the game to finish rewriting level-of-detail data before the GPU reads it.",
     [UI_MENU_FIX_C0] = "Constant buffer fix",
     [UI_MENU_FIX_C0_DESC] = "Fills the driver-reserved constant bank c0 (storage sizes, dispatch size, point size, base instance) instead of reading zeros.",
@@ -1087,7 +1087,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MEMORY_VERIFY] = "Проверка",
     [UI_MENU_TEX_ALIAS] = "Наследование содержимого текстур", [UI_MENU_TEX_ALIAS_DESC] = "Новая текстура поверх памяти живой текстуры получает её содержимое, а не пустую.",
     [UI_MENU_TEX_VRAM_PRESSURE] = "Предел памяти текстур", [UI_MENU_TEX_VRAM_PRESSURE_DESC] = "Процент видеопамяти, выше которого освобождённые игрой текстуры удаляются (при повторном использовании загружаются снова). 0 — не удалять.",
-    [UI_MENU_ASTC_BC] = "Сжатие ASTC в BC3", [UI_MENU_ASTC_BC_DESC] = "С декодером на GPU: декодированные текстуры ASTC пересжимаются в BC3 и занимают вчетверо меньше видеопамяти. Текстуры чуть более блочные. Авто: включено на видеокартах с 4 ГБ видеопамяти и меньше.",
+    [UI_MENU_ASTC_BC] = "Сжатие текстур", [UI_MENU_ASTC_BC_DESC] = "Хранит текстуры игры сжатыми (BC3, или BC1, где нет прозрачности), а не полностью распакованными: вчетверо меньше видеопамяти или ещё меньше, с чуть меньшей детализацией. Включите, если видеопамять заполняется и частота кадров падает. Авто: включено при видеопамяти меньше 20 ГБ или ОЗУ меньше 48 ГБ.",
     [UI_MENU_LOD_GUARD] = "Защита LOD", [UI_MENU_LOD_GUARD_DESC] = "Не даёт объектам мелькать не на своём месте, а дальнему плану — на кадр становиться плоским: ждёт, пока игра допишет данные уровней детализации, и только потом их читает GPU.",
     [UI_MENU_FIX_C0] = "Исправление константного буфера",
     [UI_MENU_FIX_C0_DESC] = "Заполняет зарезервированный драйвером банк констант c0 (размеры хранилищ, размер запуска, размер точки, базовый экземпляр) вместо чтения нулей.",
@@ -1487,7 +1487,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_MEMORY_VERIFY] = "Verificar",
     [UI_MENU_TEX_ALIAS] = "Aliasing de texturas", [UI_MENU_TEX_ALIAS_DESC] = "Uma textura nova criada sobre a memória de uma textura viva começa com esse conteúdo em vez de vazia.",
     [UI_MENU_TEX_VRAM_PRESSURE] = "Limite de memória de texturas", [UI_MENU_TEX_VRAM_PRESSURE_DESC] = "Porcentagem da memória de vídeo acima da qual as texturas liberadas pelo jogo são descartadas (voltam do armazenamento quando usadas de novo). 0 mantém todas.",
-    [UI_MENU_ASTC_BC] = "Comprimir ASTC em BC3", [UI_MENU_ASTC_BC_DESC] = "Com o decodificador da GPU: recodifica as texturas ASTC decodificadas em BC3, que ocupa um quarto da memória de vídeo. As texturas ficam um pouco mais quadriculadas. Automático: ligado em GPUs com 4 GB de memória de vídeo ou menos.",
+    [UI_MENU_ASTC_BC] = "Compressão de texturas", [UI_MENU_ASTC_BC_DESC] = "Guarda as texturas do jogo comprimidas (BC3, ou BC1 onde nada é transparente) em vez de totalmente decodificadas: um quarto da memória de vídeo ou menos, com um pouco menos de detalhe. Ligue quando a memória de vídeo enche e a taxa de quadros cai. Automático: ligado com menos de 20 GB de memória de vídeo ou menos de 48 GB de RAM.",
     [UI_MENU_LOD_GUARD] = "Proteção de LOD", [UI_MENU_LOD_GUARD_DESC] = "Evita que objetos pisquem no lugar errado ou que o plano distante fique achatado por um quadro, esperando o jogo terminar de reescrever os dados de nível de detalhe antes que a GPU os leia.",
     [UI_MENU_FIX_C0] = "Correção do buffer de constantes",
     [UI_MENU_FIX_C0_DESC] = "Preenche o banco de constantes c0 reservado ao driver (tamanhos de armazenamento, tamanho do dispatch, tamanho do ponto, instância base) em vez de ler zeros.",
@@ -2138,10 +2138,10 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_TEX_VRAM_PRESSURE] = "纹理显存上限",
     [UI_MENU_TEX_VRAM_PRESSURE_DESC] = "显存占用超过这个百分比后，游戏已释放的纹理会被丢弃，"
                                        "再次用到时从存储重新加载。0 表示不丢弃。",
-    [UI_MENU_ASTC_BC] = "ASTC 压缩为 BC3",
-    [UI_MENU_ASTC_BC_DESC] = "配合 GPU 解码器使用：把解码后的 ASTC 纹理重新编码为 BC3，"
-                             "显存占用只有四分之一。纹理会出现轻微色块。"
-                             "自动：显存 4 GB 及以下的显卡上开启。",
+    [UI_MENU_ASTC_BC] = "纹理压缩",
+    [UI_MENU_ASTC_BC_DESC] = "以压缩格式保存游戏纹理（BC3，没有透明像素的纹理用 BC1），而不是完全解码："
+                             "显存占用为四分之一或更少，细节略有损失。显存占满、帧率下降时请开启。"
+                             "自动：显存小于 20 GB 或内存小于 48 GB 时开启。",
     [UI_MENU_LOD_GUARD] = "LOD 保护",
     [UI_MENU_LOD_GUARD_DESC] = "等待游戏改写完细节层次数据后再让 GPU 读取，"
                                "避免物体错位闪现，或远景有一帧变平。",

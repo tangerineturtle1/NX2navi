@@ -251,9 +251,10 @@
 # astc = auto
 # With GPU ASTC decoding, 1 requests BC3 compression. Slight blocking is possible. 0 keeps RGBA8, which uses about
 # four times as much memory for these textures and can exhaust memory while loading.
-# Leave this setting commented for automatic selection. The renderer requests BC3 when the largest device-local GPU
-# heap is under 20 GiB or the system reports less than 47 GiB of RAM (allowing for a nominal 48 GiB PC). If the RAM
-# size is unknown, only the GPU heap decides. Look for "NX2NAVI_ASTC_BC unset" in the game log to see the decision.
+# Leave this setting commented, or set it to auto, for automatic selection (the menu's Graphics tab, Texture
+# compression, writes auto, 0 or 1). The renderer requests BC3 when the largest device-local GPU heap is under 20 GiB or
+# the system reports less than 47 GiB of RAM (allowing for a nominal 48 GiB PC). If the RAM size is unknown, only the
+# GPU heap decides. Look for "NX2NAVI_ASTC_BC unset" or "NX2NAVI_ASTC_BC auto" in the game log to see the decision.
 # astc_bc = 1
 # With BC3 on: a texture none of whose texels is see-through is BC1, half the size of BC3 with the same texels (each
 # upload checks the blocks as it copies them). 0: every ASTC texture BC3.
