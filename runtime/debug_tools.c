@@ -39,6 +39,7 @@
 #include <string.h>
 #include <zstd.h>
 
+#include "bugcap.h"
 #include "cfg.h"
 #include "cpu.h"
 #include "debug_tools.h"
@@ -74,6 +75,15 @@ static uint64_t player(void) {
 int dbg_player_pos(float xyz[3]) {
     uint64_t a = dbg_supported() ? player() : 0;
     return a && rd(a + 0x31c, xyz, 12) && isfinite(xyz[0]) && isfinite(xyz[1]) && isfinite(xyz[2]);
+}
+
+// The actor's rotation beside its position: nine floats, a 3x3 matrix by rows (bugcap.c writes them as they are).
+int dbg_player_rot(float m[9]) {
+    uint64_t a = dbg_supported() ? player() : 0;
+    if (!a || !rd(a + 0x328, m, 36)) return 0;
+    for (int i = 0; i < 9; i++)
+        if (!isfinite(m[i])) return 0;
+    return 1;
 }
 
 static float speed_factor = 1.0f;
@@ -182,16 +192,24 @@ static int flags_list(void) {
     return 1;
 }
 
+// Under flags_lock: the menu's thread, the game's thread (test_script, warp_tick) and a bug capture's writer
+// (bugcap.c) all ask, and the list is made by whichever asks first.
+static PlatMutex flags_lock = PLAT_MUTEX_INIT;
 int dbg_flags_refresh(void) {
-    if (!dbg_supported() || !flags_list()) return 0;
+    if (!dbg_supported()) return 0;
+    plat_mutex_lock(&flags_lock);
+    if (!flags_list()) {
+        plat_mutex_unlock(&flags_lock);
+        return 0;
+    }
     uint64_t m = gmd(), entries = m ? rd_ptr(m + 0x18) : 0;
     uint32_t count = 0;
-    if (!entries || !rd(m + 0x10, &count, 4) || !count || count > 200000) return flag_n;
-    uint8_t *raw = malloc((size_t)count * 0x18);
+    uint8_t *raw = entries && rd(m + 0x10, &count, 4) && count && count <= 200000 ? malloc((size_t)count * 0x18) : NULL;
     if (raw && rd(entries, raw, (size_t)count * 0x18))
         for (int i = 0; i < flag_n; i++)
             if (flag_pairs[i].index < count) flag_value[i] = raw[(size_t)flag_pairs[i].index * 0x18 + 0x16] & 1;
     free(raw);
+    plat_mutex_unlock(&flags_lock);
     return flag_n;
 }
 
@@ -458,6 +476,23 @@ static const char *place_after(const char *area, const char *pos) {
     return first;
 }
 
+// The start position of area nearest to xyz among those the game's file gives coordinates for (a bug capture names
+// it, and a replay of the capture arrives there, bugcap.c). 0 while the list is not read or the area has none.
+int dbg_place_nearest(const char *area, const float xyz[3], char name[64], float *dist) {
+    int n = dbg_places(), best = -1;
+    float best_d = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(places[i].area, area) || !places[i].has_xyz) continue;
+        float dx = places[i].xyz[0] - xyz[0], dy = places[i].xyz[1] - xyz[1], dz = places[i].xyz[2] - xyz[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (best < 0 || d < best_d) best = i, best_d = d;
+    }
+    if (best < 0) return 0;
+    snprintf(name, 64, "%s", places[best].pos);
+    if (dist) *dist = best_d;
+    return 1;
+}
+
 static int place_listed(const char *area, const char *pos) {
     int n = dbg_places();
     for (int i = 0; i < n; i++)
@@ -494,9 +529,32 @@ static int text_get(const char *name, char out[64]) {
     return 1;
 }
 
-// A text written into the entry's own buffers (game thread). 0: the game has no such text.
+// Every 64-character text of the game data with its name's hash (a bug capture lists them, bugcap.c): the area, the
+// reserved next area and start position among them. Returns how many it visited.
+int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx) {
+    uint64_t m = dbg_supported() ? gmd() : 0, sec = m + (uint64_t)GD_TEXT64 * 0x60;
+    uint64_t table = m ? rd_ptr(sec + 0x20) : 0, entries = m ? rd_ptr(sec + 0x18) : 0;
+    uint32_t count = 0, size = 0;
+    if (!table || !entries || !rd(sec + 0x10, &count, 4) || !rd(sec + 0x2c, &size, 4) || !size || size > 100000) return 0;
+    int n = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        Pair pr;
+        char text[64];
+        if (!rd(table + (uint64_t)i * 8, &pr, 8) || !pr.hash || pr.index >= count) continue;
+        uint64_t tp = rd_ptr(entries + (uint64_t)pr.index * 0x108 + 0x68);
+        if (!tp || !rd(tp, text, 63)) continue;
+        text[63] = 0;
+        cb(pr.hash, text, ctx);
+        n++;
+    }
+    return n;
+}
+uint32_t dbg_name_hash(const char *name) { return hash_of(name); }
+
+// The area the game is in: its text Sequence_CurrentBanc. 0 while the game has none.
 int dbg_area(char out[64]) { return dbg_supported() && text_get("Sequence_CurrentBanc", out) && out[0]; }
 
+// A text written into the entry's own buffers (game thread). 0: the game has no such text.
 static int text_set(const char *name, const char *value) {
     uint64_t e = gmd_entry(GD_TEXT64, 0x108, hash_of(name)), text = e ? rd_ptr(e + 0x68) : 0, other = e ? rd_ptr(e + 0x18) : 0;
     int32_t room = 0;
@@ -777,6 +835,13 @@ static struct {
 } fc = {.sticks = 1, .speed = 8.0f, .reach = 5.0};
 static PlatMutex ground_lock = PLAT_MUTEX_INIT;
 
+// The game's own camera as its update chose it, before the free camera stands in: kept per scene camera (0 the one
+// that follows Link, 1 the one events direct) while a bug capture watches (dbg_camera_watch) or the free camera is on,
+// which is when the patch site calls dbg_freecam_host at all.
+static struct { double pos[3], at[3]; float up[3]; uint64_t n; } cam_seen[2];
+static PlatMutex cam_lock = PLAT_MUTEX_INIT;
+static volatile int32_t cam_watch;   // how many watch it: a bug capture, and Link's walk to a captured place
+
 int dbg_freecam_flying(void) { return fc.on && fc.sticks && !fc.capture && fc.avoid; }
 void dbg_freecam_avoid_set(int on) {
     if ((on != 0) != fc.avoid) rt_log("debug: free camera ground avoidance %s", on ? "on" : "off");
@@ -845,18 +910,31 @@ static void set_s(Cpu *c, int r, float v) {
 // The update runs for each of the game's cameras, every frame: the one that follows Link and the one its events
 // direct are the scene's, and the free camera stands in for both; the camera of the interface's 3D models and the
 // one the sound follows stay the game's. A camera's state (x19) has its actor at +0x10, the actor its name at +0x20.
+// 1 the camera that follows Link, 2 the events' camera, 0 another.
 static int scene_camera(uint64_t state) {
     char name[16] = "";
     uint64_t actor = rd_ptr(state + 0x10), np = actor ? rd_ptr(actor + 0x20) : 0;
     if (!np || !rd(np, name, 13)) return 0;
-    return !memcmp(name, "PlayerCamera", 13) || !memcmp(name, "EventCamera", 12);
+    return !memcmp(name, "PlayerCamera", 13) ? 1 : !memcmp(name, "EventCamera", 12) ? 2 : 0;
 }
 
 // The patch site's host function, on the patch page at +0xf70. patches.c registers it: that file is compiled with
 // the game version's patches.h, which has the page's address.
 void dbg_freecam_host(Cpu *c) {
     fc.updates++;
-    if (fc.on && scene_camera(c->x[19])) {
+    int scene = scene_camera(c->x[19]);
+    if (scene) {   // what the game chose, for a bug capture (dbg_camera_seen)
+        static const int up_reg[3] = {7, 16, 6};
+        plat_mutex_lock(&cam_lock);
+        for (int i = 0; i < 3; i++) cam_seen[scene - 1].pos[i] = reg_d(c, i), cam_seen[scene - 1].at[i] = reg_d(c, 3 + i);
+        for (int i = 0; i < 3; i++) {
+            uint32_t b = (uint32_t)c->v[up_reg[i]];
+            memcpy(&cam_seen[scene - 1].up[i], &b, 4);
+        }
+        cam_seen[scene - 1].n++;
+        plat_mutex_unlock(&cam_lock);
+    }
+    if (fc.on && scene) {
         if (fc.capture) {   // start where the game's camera is, looking where it looks
             double d[3] = {reg_d(c, 3) - reg_d(c, 0), reg_d(c, 4) - reg_d(c, 1), reg_d(c, 5) - reg_d(c, 2)};
             double len = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
@@ -878,6 +956,35 @@ void dbg_freecam_host(Cpu *c) {
 
 int dbg_freecam_available(void) { return dbg_supported() && rt_patch_set("freecam") >= 0; }
 
+// The patch site calls dbg_freecam_host while the free camera is on or a bug capture watches the game's camera.
+static void cam_patch_sync(void) { rt_patch_switch(rt_patch_set("freecam"), fc.on || cam_watch); }
+
+void dbg_camera_watch(int on) {
+    if (!dbg_freecam_available()) return;
+    if (__atomic_add_fetch(&cam_watch, on ? 1 : -1, __ATOMIC_ACQ_REL) < 0) __atomic_store_n(&cam_watch, 0, __ATOMIC_RELEASE);
+    cam_patch_sync();
+}
+
+uint64_t dbg_camera_seen(int which, double pos[3], double at[3], float up[3]) {
+    if (which < 0 || which > 1) return 0;
+    plat_mutex_lock(&cam_lock);
+    memcpy(pos, cam_seen[which].pos, sizeof cam_seen[which].pos);
+    memcpy(at, cam_seen[which].at, sizeof cam_seen[which].at);
+    memcpy(up, cam_seen[which].up, sizeof cam_seen[which].up);
+    uint64_t n = cam_seen[which].n;
+    plat_mutex_unlock(&cam_lock);
+    return n;
+}
+
+// The game's thread: the free camera, which must be on, at a place and direction given outright (a replay of a bug
+// capture, bugcap.c), instead of where the game's camera is.
+void dbg_freecam_place(const double pos[3], float yaw, float pitch) {
+    memcpy(fc.pos, pos, sizeof fc.pos);
+    fc.yaw = yaw, fc.pitch = pitch > 1.5f ? 1.5f : pitch < -1.5f ? -1.5f : pitch;
+    fc.reach = 5.0;
+    fc.capture = 0;
+}
+
 void dbg_freecam_set(int on, int sticks, float speed) {
     if (!dbg_freecam_available()) return;
     fc.sticks = sticks != 0;
@@ -885,7 +992,7 @@ void dbg_freecam_set(int on, int sticks, float speed) {
     if (on && !fc.on) fc.capture = 1;
     if ((on != 0) != fc.on) rt_log("debug: free camera %s", on ? "on" : "off");   // what a tester changed, for the log
     fc.on = on != 0;
-    rt_patch_switch(rt_patch_set("freecam"), on != 0);
+    cam_patch_sync();
 }
 
 void dbg_freecam_reset(void) { fc.capture = 1; }   // back to the game's view, and free from there
@@ -896,6 +1003,7 @@ int dbg_freecam(int *sticks, float *speed, double pos[3]) {
     if (pos) memcpy(pos, fc.pos, sizeof fc.pos);
     return fc.on;
 }
+void dbg_freecam_angles(float *yaw, float *pitch) { *yaw = fc.yaw, *pitch = fc.pitch; }
 
 // Whether s holds the len characters at part, in any case.
 static int contains_nocase(const char *s, const char *part, size_t len) {
@@ -912,12 +1020,20 @@ static int contains_nocase(const char *s, const char *part, size_t len) {
 // he moves towards the next point (the game's camera follows behind him, so a stick to the side turns him), with an
 // integral that takes out the camera's own angle; a point counts as reached within ROUTE_NEAR metres. When he gains
 // less than a metre on it in 2.5 seconds he is stuck (a wall, a fence, a steep slope): he sidesteps for two seconds,
-// three times to one side and then to the other, and after ROUTE_STUCK such tries the route ends.
+// three times to one side and then to the other, and after ROUTE_STUCK such tries the route ends. A route asked for
+// with a smaller distance (dbg_route_to, a replay of a bug capture) walks the last three metres, so that Link stops on
+// the point instead of running rings round it, and is steered by the game's own camera (dbg_camera_seen): the stick
+// moves Link along the camera's view and across it, so the stick's angle is the angle between the view and the way to
+// the point, with nothing to estimate. In a room that matters: the estimate starts with a run straight ahead, which
+// in Link's house put him on the furniture beside the door, three metres from the point, for good.
 #define ROUTE_MAX 16
 #define ROUTE_NEAR 4.0
 #define ROUTE_STUCK 10
 static struct {
-    volatile int on;
+    volatile int on, gave_up;
+    int by_camera;            // steered by the game's camera, which is watched meanwhile (dbg_route_to)
+    uint64_t cam_n, cam_ns;   // the camera updates seen at the last look, and when their number last grew
+    float within;             // metres: a point counts as reached within them
     int n, at, have_last, have_heading, side, stuck;
     float pt[ROUTE_MAX][2];   // x, z in metres
     char name[ROUTE_MAX][48];
@@ -926,9 +1042,18 @@ static struct {
     uint64_t prev_ns, prog_ns, side_until;
 } route;
 
-static void route_start(void) {
+static void route_end(void) {
+    route.on = 0;
+    if (route.by_camera) dbg_camera_watch(0);
+    route.by_camera = 0;
+}
+
+static void route_start(float within) {
+    route.within = within, route.gave_up = 0;
     route.at = 0, route.have_last = route.have_heading = 0, route.stuck = 0, route.side = 1, route.integ = 0;
     route.best = 1e9f, route.prog_ns = plat_now_ns(), route.side_until = 0, route.prev_ns = 0;
+    if (route.by_camera) dbg_camera_watch(0);   // of a walk that this route replaces
+    route.by_camera = 0;
     route.on = route.n > 0;
     if (route.on) rt_log("debug: route of %d points, first %s at %.1f %.1f", route.n, route.name[0], route.pt[0][0], route.pt[0][1]);
 }
@@ -943,10 +1068,10 @@ static void route_pad(int32_t *lx, int32_t *ly) {
     route.prev_ns = now;
     if (dt > 0.1) dt = 0.1;
     double dx = route.pt[route.at][0] - p[0], dz = route.pt[route.at][1] - p[2], d = sqrt(dx * dx + dz * dz);
-    if (d < ROUTE_NEAR) {
+    if (d < route.within) {
         rt_log("debug: route: reached %s (%d of %d) at %.1f %.1f %.1f", route.name[route.at], route.at + 1, route.n, p[0], p[1], p[2]);
         if (++route.at == route.n) {
-            route.on = 0;
+            route_end();
             rt_log("debug: route done");
             return;
         }
@@ -964,11 +1089,21 @@ static void route_pad(int32_t *lx, int32_t *ly) {
     route.integ += err * dt * 0.4;
     route.integ = route.integ > 1.0 ? 1.0 : route.integ < -1.0 ? -1.0 : route.integ;
     double a = -(1.2 * err + route.integ);   // the stick's angle from straight ahead, right positive
+    if (route.by_camera) {
+        double cp[3], ct[3];
+        float up[3];
+        uint64_t seen = dbg_camera_seen(0, cp, ct, up);
+        if (seen != route.cam_n) route.cam_n = seen, route.cam_ns = now;
+        double fx = ct[0] - cp[0], fz = ct[2] - cp[2], fl = sqrt(fx * fx + fz * fz);
+        // the view, level: ahead (fx, fz), right (-fz, fx), as the free camera's frame below has them
+        if (route.cam_ns && now - route.cam_ns < 250000000ull && fl > 1e-6 && d > 1e-6)
+            a = atan2((-dx * fz + dz * fx) / fl, (dx * fx + dz * fz) / fl);
+    }
     a = a > 1.4 ? 1.4 : a < -1.4 ? -1.4 : a;
-    if (d < route.best - 1.0f) route.best = (float)d, route.prog_ns = now;
+    if (d < route.best - (route.within < ROUTE_NEAR ? 0.25f : 1.0f)) route.best = (float)d, route.prog_ns = now;
     else if (now - route.prog_ns > 2500000000ull && now >= route.side_until) {
         if (++route.stuck > ROUTE_STUCK) {
-            route.on = 0;
+            route_end(), route.gave_up = 1;
             rt_log("debug: route given up before %s: stuck %d times at %.1f %.1f %.1f", route.name[route.at], ROUTE_STUCK, p[0], p[1], p[2]);
             return;
         }
@@ -980,8 +1115,22 @@ static void route_pad(int32_t *lx, int32_t *ly) {
                route.name[route.at], route.side > 0 ? "right" : "left");
     }
     if (now < route.side_until) a = route.side * 1.5;
-    *lx = (int32_t)(sin(a) * 30000), *ly = (int32_t)(cos(a) * 30000);
+    double tilt = route.within < ROUTE_NEAR && d < 3.0 && now >= route.side_until ? (d / 3.0 < 0.4 ? 0.4 : d / 3.0) : 1.0;
+    *lx = (int32_t)(sin(a) * 30000 * tilt), *ly = (int32_t)(cos(a) * 30000 * tilt);
 }
+
+// The game's thread: Link runs to one point of the area, reached within near_m metres. dbg_route_state: 1 on his way,
+// 0 there (or no route), 2 given up (stuck).
+void dbg_route_to(float x, float z, float near_m) {
+    route.n = 1;
+    route.pt[0][0] = x, route.pt[0][1] = z;
+    snprintf(route.name[0], sizeof route.name[0], "the captured place");
+    route_start(near_m > 0.3f && near_m < ROUTE_NEAR ? near_m : (float)ROUTE_NEAR);
+    route.by_camera = 1, route.cam_n = 0, route.cam_ns = 0;
+    dbg_camera_watch(1);
+}
+int dbg_route_state(void) { return route.on ? 1 : route.gave_up ? 2 : 0; }
+void dbg_route_stop(void) { route_end(); }
 
 // The game's thread, with the pad's state before the game gets it: while the free camera has the sticks, the left one
 // moves it where it looks and sideways, the right one turns it, ZR and ZL raise and lower it, R makes it four times as
@@ -989,6 +1138,7 @@ static void route_pad(int32_t *lx, int32_t *ly) {
 // Nothing stops it: it goes through walls, objects and the ground, below which the picture shows the void under the
 // map. Ground avoidance (the menu's switch, off unless asked for) keeps it a metre above ground-like surfaces instead.
 void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
+    bugcap_replay_pad(buttons);   // a replay of a bug capture presses A until the save is loaded
     route_pad(lx, ly);
     if (!fc.on || !fc.sticks || fc.capture) {
         fc.last_ns = 0;
@@ -1085,7 +1235,7 @@ static void test_script(uint64_t tick) {
                 snprintf(route.name[route.n], sizeof route.name[0], "point %d", route.n + 1);
                 route.n++, q += used;
             }
-            route_start();
+            route_start((float)ROUTE_NEAR);
         } else if (!strncmp(colon + 1, "routeto ", 8)) {
             // routeto <part of a start position's name>[/<another part>] ...: the area's own start positions, in order
             char area[64] = "", item[128];
@@ -1113,7 +1263,7 @@ static void test_script(uint64_t tick) {
                 snprintf(route.name[route.n], sizeof route.name[0], "%s", places[found].pos);
                 route.n++;
             }
-            route_start();
+            route_start((float)ROUTE_NEAR);
         } else if (!strncmp(colon + 1, "warp ", 5)) {
             char area[64] = "", pos[64] = "";
             if (sscanf(colon + 6, "%63[^ ;] %63[^ ;]", area, pos) >= 1) dbg_warp(area, pos);
@@ -1169,6 +1319,7 @@ void dbg_tick(Cpu *c) {
     if (!dbg_supported() || (!tick && !player())) return;
     tick++;
     test_script(tick);
+    bugcap_replay_tick(tick);   // a replay of a bug capture: the teleport, the walk and the camera (bugcap.c)
     warp_tick(c, tick);
     static Req todo[Q_MAX];
     int n;

@@ -42,6 +42,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_oq_hold.h"
 
 enum { W_FORMAT, W_REGION, W_BUFFER, W_OVERLAP, W_COPY, W_CLEAR, W_QUERY, W_COUNT };
 
@@ -133,15 +134,22 @@ static void event_cb(void *arg) {
 }
 
 // NVNcounterData = {counter, timestamp}; timestamps are Tegra 19.2 MHz ticks (the base of GetSystemTick).
-static void write_counter(uint64_t addr, uint64_t counter) {
-    uint64_t rec[2] = {counter, (uint64_t)((unsigned __int128)kern_now_ns() * 12 / 625)};
-    memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
+// keep: the 4-byte quarters of the record the write leaves as they are (bit n: bytes 4n to 4n + 3), 0 none.
+// ahead_ns: the timestamp is that much past now (a tail timestamp the GPU has not reached yet, counter_cb), else 0.
+static void write_counter(uint64_t addr, uint64_t counter, unsigned keep, uint64_t ahead_ns) {
+    uint64_t rec[2] = {counter, (uint64_t)((unsigned __int128)(kern_now_ns() + ahead_ns) * 12 / 625)};
+    if (!keep) {
+        memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
+        return;
+    }
+    for (unsigned q = 0; q < 4; q++)
+        if (!(keep >> q & 1)) memcpy((uint8_t *)(uintptr_t)addr + 4 * q, (const uint8_t *)rec + 4 * q, 4);
 }
 
 // Reports other than samples passed (timestamps; the statistics counters are not modelled) write a counter of 0. The
 // counter word matters: Ocarina writes {1, 0} into a record from the CPU, reports TIMESTAMP_TOP into it and gates
 // clears on it differing from a zero record (mode 1), clears that must not run.
-static void pending_written(uint64_t addr, uint64_t seq);   // below, with the pending table
+static void report_write(uint64_t addr, uint64_t seq, uint64_t counter, uint64_t ahead_ns);   // below, with the pending table
 
 // tail: the submission's value for a timestamp reported in its tail (vk_exec.c "the early tail"), else 0
 typedef struct { uint64_t addr, seq, tail; } CounterWrite;
@@ -150,12 +158,7 @@ static void counter_cb(void *arg) {
     CounterWrite *w = arg;
     if (vk_sync_effect_late()) __atomic_fetch_add(&late_counters, 1, __ATOMIC_RELAXED);
     // A timestamp of the tail, written while the GPU still runs the tail: the time the tail is expected to end at
-    uint64_t ahead = w->tail ? vk_sync_tail_pending_ns(w->tail) : 0;
-    if (ahead) {
-        uint64_t rec[2] = {0, (uint64_t)((unsigned __int128)(kern_now_ns() + ahead) * 12 / 625)};
-        memcpy((void *)(uintptr_t)w->addr, rec, sizeof rec);
-    } else write_counter(w->addr, 0);
-    pending_written(w->addr, w->seq);
+    report_write(w->addr, w->seq, 0, w->tail ? vk_sync_tail_pending_ns(w->tail) : 0);
     free(w);
 }
 
@@ -177,7 +180,10 @@ static void counter_cb(void *arg) {
 // condition records from the CPU between frames, so within a frame a timestamp report decides the record's value even
 // after it reached memory: Ocarina's CPU, running a frame ahead, had re-armed a record with 1 by the time a later depth
 // clear of the frame read it, the clear ran after the depth copy and the frame showed only sky (white flashes).
-typedef struct { uint64_t addr, seq, frame; volatile uint64_t written; int unknown, type; } Pending;
+// clr_seq, clr_mask: the quarters of the record a small buffer clear filled after the report clr_seq, the newest
+// replayed before the clear ("small buffer clears over counter records" below). Written by the replay thread under
+// clr_lock; the report writes read them under it.
+typedef struct { uint64_t addr, seq, frame; volatile uint64_t written; int unknown, type; uint64_t clr_seq; uint8_t clr_mask; } Pending;
 static Pending pending[PENDING];
 static uint64_t report_seq;
 static uint64_t cond_frame;
@@ -223,10 +229,133 @@ static Pending *pending_slot(uint64_t addr, int insert) {
     }
     Pending *e = free_ ? free_ : victim;
     if (!e) return NULL;   // every probed entry still has a report in flight
-    e->seq = 0, e->frame = 0, e->unknown = 0, e->type = -1;
+    e->seq = 0, e->frame = 0, e->unknown = 0, e->type = -1, e->clr_seq = 0, e->clr_mask = 0;
     __atomic_store_n(&e->written, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&e->addr, addr, __ATOMIC_RELEASE);
     return e;
+}
+
+// ---- small buffer clears over counter records (NX2NAVI_CLEAR_SMALL_CPU, default 1; 0: the GPU's fill alone)
+//
+// A ClearBuffer or ReportValue is a fill the GPU makes where it stands in the stream (clear_buf): guest memory has the
+// bytes once the GPU got there, through the imported pool, a mirror's twin or the mirror's write-back. A counter
+// report reaches guest memory another way, as a CPU write after its submission's fence (report_write), and a render
+// condition reads the record when it is replayed (counter_word). For a record that gets both, the two ways do not
+// keep the order of the stream:
+// - a report followed by a clear ends as the report: its write comes after the fence, the fill ran before it. When
+//   the clear is in a later submission the completion thread races the GPU for the last word;
+// - a condition replayed after the clear reads what memory held before the GPU ran the fill, or the 0 of a report
+//   that the clear has since overwritten.
+// So a fill of at most CLEAR_SMALL bytes is also applied here, at its place in the replay, to the records it covers
+// that the pending table holds, which are the records a counter report went into: the covered bytes get the value in
+// guest memory at once, the entry notes which quarters of the record were filled and after which report, reports up
+// to that one leave those quarters alone when their write comes, and a condition takes them from memory. A report
+// replayed after the clear writes the whole record as before. The GPU's fill is recorded all the same; it writes the
+// value a second time and is what a shader or a mirror sees.
+// Only those records, not every small fill: the write here is ahead of the GPU, and the GPU reads guest memory too,
+// at once in an imported pool and through the next upload of the page the write watch then lists in a mirrored one.
+// A draw count or an atomic counter a shader adds to, reset by such a fill, would read the reset before the passes
+// that still count on the old value have run. Nothing on the GPU reads a counter record (conditions are decided on
+// the CPU), a report's own write already lands on the same page, and whatever this write puts a value over, the GPU's
+// fill puts the same value over later.
+// The counts (vk_exec_clear_stats) are kept whatever the setting is: the small fills into CPU-visible memory, how
+// many covered such a record, and the reports that went into bytes one of the last CLR_RING fills had covered.
+#define CLEAR_SMALL 256
+#define CLR_RING 8
+static PlatMutex clr_lock = PLAT_MUTEX_INIT;   // a report's write against a clear's note and write
+static volatile int32_t clr_any;               // an entry holds a note: the report writes take clr_lock from here on
+static int clr_cpu = -1;                       // the setting
+// A flag per 4 KiB page a counter report went into, by a hash of the page (a page that shares another's flag only
+// costs a clear its table lookups). Replay thread.
+static uint8_t rep_pages[1u << 16];
+static struct {
+    uint64_t n, bytes, hit, recs, after, frame0;   // since the last line: fills, their bytes, fills over a record, such
+                                                   // records, reports into filled bytes; the frame of the last line
+    volatile uint64_t kept;                        // report writes that left filled quarters alone
+    uint64_t addr;                                 // the last fill
+    uint32_t size, value;
+    struct { uint64_t lo, hi; } ring[CLR_RING];    // the last fills, and the range that holds them all
+    uint64_t lo, hi;
+    int next;
+} CS;
+
+static uint8_t *rep_page(uint64_t addr) { return &rep_pages[(uint32_t)(((addr >> 12) * 0x9E3779B97F4A7C15ull) >> 48)]; }
+
+// Replay thread, at a report into the record at addr.
+static void clear_note_report(uint64_t addr) {
+    *rep_page(addr) = 1, *rep_page(addr + sizeof(NVNcounterData) - 1) = 1;
+    if (addr >= CS.hi || addr + sizeof(NVNcounterData) <= CS.lo) return;
+    for (int i = 0; i < CLR_RING; i++)
+        if (addr < CS.ring[i].hi && addr + sizeof(NVNcounterData) > CS.ring[i].lo) { CS.after++; return; }
+}
+
+// Replay thread: the fill of [a, a + n) with value, 4-byte aligned, backed and CPU-visible, at its place in the stream.
+static void clear_small(uint64_t a, uint64_t n, uint32_t value) {
+    if (clr_cpu < 0) {
+        clr_cpu = cfg_bool("NX2NAVI_CLEAR_SMALL_CPU");
+        rt_log("vk: buffer clears of at most %d bytes %s (NX2NAVI_CLEAR_SMALL_CPU)", CLEAR_SMALL,
+               clr_cpu ? "are also applied at their place in the replay to the counter records they cover"
+                       : "are the GPU's fill alone, also over counter records");
+    }
+    CS.n++, CS.bytes += n, CS.addr = a, CS.size = (uint32_t)n, CS.value = value;
+    CS.ring[CS.next].lo = a, CS.ring[CS.next].hi = a + n, CS.next = (CS.next + 1) % CLR_RING;
+    CS.lo = UINT64_MAX, CS.hi = 0;
+    for (int i = 0; i < CLR_RING; i++) {
+        if (CS.ring[i].lo == CS.ring[i].hi) continue;
+        if (CS.ring[i].lo < CS.lo) CS.lo = CS.ring[i].lo;
+        if (CS.ring[i].hi > CS.hi) CS.hi = CS.ring[i].hi;
+    }
+    if (!*rep_page(a) && !*rep_page(a + n - 1)) return;   // no report ever went into these pages
+    int hit = 0;
+    for (uint64_t k = a - 12; k < a + n; k += 4) {   // every record address whose 16 bytes reach into the fill
+        Pending *e = pending_slot(k, 0);
+        if (!e) continue;
+        unsigned m = 0;
+        for (unsigned q = 0; q < 4; q++)
+            if (k + 4 * q >= a && k + 4 * q < a + n) m |= 1u << q;
+        hit = 1, CS.recs++;
+        if (!clr_cpu) continue;
+        __atomic_store_n(&clr_any, 1, __ATOMIC_RELEASE);
+        plat_mutex_lock(&clr_lock);
+        // the quarters filled since the newest report: an earlier fill's stay when no report came in between
+        e->clr_mask = (uint8_t)(e->clr_seq < e->seq ? m : e->clr_mask | m);
+        e->clr_seq = report_seq;   // every report replayed so far
+        for (unsigned q = 0; q < 4; q++)
+            if (m >> q & 1) memcpy((void *)(uintptr_t)(k + 4 * q), &value, 4);
+        plat_mutex_unlock(&clr_lock);
+    }
+    CS.hit += (uint64_t)hit;
+}
+
+// The quarters of e's record that a small clear filled after its newest report: memory holds them.
+static unsigned clear_quarters(const Pending *e) { return e->clr_seq >= e->seq ? e->clr_mask : 0; }
+
+// Completion thread, or the thread whose wait runs the results: report seq to addr goes into guest memory, but for
+// the quarters a small clear replayed after it has filled.
+static void report_write(uint64_t addr, uint64_t seq, uint64_t counter, uint64_t ahead_ns) {
+    int lk = __atomic_load_n(&clr_any, __ATOMIC_ACQUIRE);
+    unsigned keep = 0;
+    if (lk) {
+        plat_mutex_lock(&clr_lock);
+        const Pending *e = pending_slot(addr, 0);
+        if (e && seq <= e->clr_seq) keep = e->clr_mask;
+        if (keep) __atomic_fetch_add(&CS.kept, 1, __ATOMIC_RELAXED);
+    }
+    write_counter(addr, counter, keep, ahead_ns);
+    if (lk) plat_mutex_unlock(&clr_lock);
+    pending_written(addr, seq);
+}
+
+// The counts since the last call as a clause for a periodic log line (vk_usnap.c summary). Replay thread.
+void vk_exec_clear_stats(char *out, size_t n) {
+    uint64_t kept = __atomic_exchange_n(&CS.kept, 0, __ATOMIC_RELAXED);
+    snprintf(out, n, "buffer clears of at most %d bytes into CPU-visible memory: %llu in %llu frames, %llu bytes (the last "
+             "%u bytes of %#x at %#llx), %llu of them over a record a counter report went into before (%llu records), "
+             "%llu counter reports into bytes one of the last %d had cleared, %llu report writes left cleared bytes alone",
+             CLEAR_SMALL, (unsigned long long)CS.n, (unsigned long long)(cond_frame - CS.frame0),
+             (unsigned long long)CS.bytes, CS.size, CS.value, (unsigned long long)CS.addr, (unsigned long long)CS.hit,
+             (unsigned long long)CS.recs, (unsigned long long)CS.after, CLR_RING, (unsigned long long)kept);
+    CS.n = CS.bytes = CS.hit = CS.recs = CS.after = 0, CS.frame0 = cond_frame;
 }
 
 // ---- occlusion counts (samples passed)
@@ -428,6 +557,7 @@ void vk_exec_oq_draw(VkExec *ex) {
 void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 
 static void oq_batch_drop(void);   // the results kept by the completion thread (oq_take)
+static void oq_hold_drop(void);    // the counts remembered by the completion thread (oq_report_count)
 
 void vk_exec_xfer_shutdown(void) {
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
@@ -435,6 +565,7 @@ void vk_exec_xfer_shutdown(void) {
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
     oq_batch_drop();
+    oq_hold_drop();
 }
 
 // The completion thread reads the results in batches (NX2NAVI_OQ_BATCH, default 1; 0: every segment by itself, as
@@ -502,6 +633,35 @@ static uint64_t oq_take(VkDevice dev, uint32_t q, int *avail) {
     return OQB.v[2 * k];
 }
 
+// NX2NAVI_OQ_HOLD (default 0): a report whose segment left draws uncounted (a full ring, vk_exec_oq_draw) writes the
+// larger of what was counted and the last complete count of its record (vk_oq_hold.h); off, what was counted, at least
+// 1. Such reports are counted either way and logged at the 1st, 10th, 100th... so a log shows how often the ring ran
+// full. Completion thread only, as oq_count.
+static OqHold oq_held;
+static int oq_hold_on = -1;
+static uint64_t oq_lossy;
+
+static void oq_hold_drop(void) { memset(&oq_held, 0, sizeof oq_held), oq_lossy = 0, oq_hold_on = -1; }
+
+static uint64_t oq_report_count(const OqSegment *s, uint64_t counted) {
+    if (oq_hold_on < 0) {
+        oq_hold_on = cfg_bool("NX2NAVI_OQ_HOLD");
+        if (oq_hold_on) rt_log("vk: samples-passed reports that miss draws repeat their record's last complete count (NX2NAVI_OQ_HOLD)");
+    }
+    if (!s->lost) {
+        if (oq_hold_on) oqh_note(&oq_held, s->addr, counted);
+        return counted;
+    }
+    uint64_t v = oq_hold_on ? oqh_lost(&oq_held, s->addr, counted) : counted;
+    uint64_t n = ++oq_lossy, p = 1;
+    while (p < n) p *= 10;
+    if (p == n)
+        rt_log("vk: %llu samples-passed reports so far missed draws the full occlusion query ring left uncounted (this "
+               "one: %llu counted, %llu reported%s)", (unsigned long long)n, (unsigned long long)counted,
+               (unsigned long long)v, oq_hold_on ? ", NX2NAVI_OQ_HOLD" : "");
+    return v;
+}
+
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
@@ -539,7 +699,7 @@ static void oq_cb(void *arg) {
         if (s->lost && !oq_count) oq_count = 1;
         if (s->addr) {
             if (vk_sync_effect_late()) __atomic_fetch_add(&late_counts, 1, __ATOMIC_RELAXED);
-            write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+            report_write(s->addr, s->seq, oq_report_count(s, oq_count), 0);
         }
     }
     free(s->q), free(s);
@@ -785,6 +945,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     if (!vk_mem_resolve(p->addr, sizeof(NVNcounterData), &m))
         rt_fatal("vk: counter report at %#llx is in no memory pool", (unsigned long long)p->addr);
     vk_mem_count(m.cls, VK_MUSE_GPU_WRITE, sizeof(NVNcounterData));
+    clear_note_report(p->addr);
     if (samples) oq_report(ex, p->addr);
     else {
         // a timestamp in the tail is the one result a tail may hand the CPU: its time is written ahead (counter_cb)
@@ -807,11 +968,21 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
 // 1: *v read, 0: not readable, 2: a samples-passed report not in memory yet (unknown)
 static int counter_word(uint64_t addr, uint64_t *v) {
     const Pending *e = pending_slot(addr, 0);   // the last report to addr decides
-    if (e && !e->unknown && e->frame == cond_frame) return *v = 0, 1;   // a timestamp/statistics report of this frame
-    if (e && __atomic_load_n(&e->written, __ATOMIC_ACQUIRE) < e->seq) return *v = 0, e->unknown ? 2 : 1;
+    // but for the halves of the word a small clear filled after it (clear_small): memory holds those
+    unsigned filled = e ? clear_quarters(e) & 3 : 0;
+    int zero = 0;   // the report decides the halves that were not filled: 0
+    if (e && filled != 3) {
+        if (!e->unknown && e->frame == cond_frame) zero = 1;   // a timestamp/statistics report of this frame
+        else if (__atomic_load_n(&e->written, __ATOMIC_ACQUIRE) < e->seq) {
+            if (e->unknown) return *v = 0, 2;
+            zero = 1;
+        }
+    }
+    if (zero && !filled) return *v = 0, 1;
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
+    if (zero) *v &= filled == 1 ? 0xffffffffull : 0xffffffff00000000ull;
     vk_mem_count(m.cls, VK_MUSE_CPU_READ, sizeof *v);
     return 1;
 }
@@ -823,13 +994,14 @@ static int last_type(uint64_t addr) {
 }
 
 // NX2NAVI_LOG_RCOND=ab (diagnosis): the words a condition compares and where each came from: "f" a report replayed
-// this frame (0), "p" a pending report (0 or unknown), "m" memory, with the newest report's type and frame.
+// this frame (0), "p" a pending report (0 or unknown), "m" memory, "c" memory after a small clear that came after the
+// report (clear_small), with the newest report's type and frame.
 void vk_exec_cond_why(const p_render_cond *c, char *buf, size_t cap) {
     int o = snprintf(buf, cap, "%#llx mode %d:", (unsigned long long)c->addr, c->mode);
     for (int k = 0; k < 2 && o < (int)cap; k++) {
         uint64_t a = c->addr + 16 * (uint64_t)k;
         const Pending *e = pending_slot(a, 0);
-        const char *src = !e ? "m" : !e->unknown && e->frame == cond_frame ? "f"
+        const char *src = !e ? "m" : (clear_quarters(e) & 3) == 3 ? "c" : !e->unknown && e->frame == cond_frame ? "f"
                         : __atomic_load_n(&e->written, __ATOMIC_ACQUIRE) < e->seq ? "p" : "m";
         o += snprintf(buf + o, cap - (size_t)o, " %llu %s(type %d, frame %lld of %llu)",
                       (unsigned long long)*(const uint64_t *)(uintptr_t)a, src, e ? e->type : -1,
@@ -1061,7 +1233,8 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
 
 // ---- buffer fills (ClearBuffer, and ReportValue as a 4-byte one): vkCmdFillBuffer in GPU order after a full
 // barrier, so the value lands after earlier work, as NVN's semaphore release does; CPU-visible ranges go to
-// vk_guest_written at the fence, as copies do. Works in CPU-invisible pools.
+// vk_guest_written at the fence, as copies do. Works in CPU-invisible pools. A small fill of CPU-visible memory is
+// also applied to the counter records it covers, here in the replay (clear_small).
 
 static void clear_buf(VkExec *ex, const p_clear_buf *p) {
     if ((p->addr | p->size) & 3) {
@@ -1071,6 +1244,9 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
     }
     uint64_t dst = p->addr, left = p->size;
     vk_gpu_gap_note(VK_GAP_CLEAR_BUF, p->size);
+    VkMemSpan whole;
+    if (p->size && p->size <= CLEAR_SMALL && !nvn_gpu_only(p->addr) && vk_mem_resolve(p->addr, p->size, &whole))
+        clear_small(p->addr, p->size, p->value);
     int started = 0;
     while (left) {
         VkMemSpan d;

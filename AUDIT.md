@@ -301,12 +301,12 @@ platform's seven levels; "normal" when nothing sets one.
 |---|---|---|---|---|
 | "pipe worker" | `vk_pipeline.c` `pipe_worker` (~3533) | `workers_start` (~3623), first use | `plat_cpu_usable()/4` clamped 2..`MAX_WORKERS` (4). Below normal for prebuild jobs, normal otherwise | Never |
 | "pipe lib worker" | `vk_pipeline.c` `lib_worker` (~3500) | `workers_start` (~3638), with GPL and `NX2NAVI_PIPE_WAIT` not `draw` | Pipe-worker count or 2 | Never |
-| "pipe prewarm" | `vk_pipeline.c` `warm_builder` (~4015) | `prewarm_run` (~4186) on the prewarm thread | min(cpus, 64) | Joined; ends at `PREWARM_PIPE_MS` (20 s) unless `NX2NAVI_PREWARM_FULL=1` |
+| "pipe prewarm" | `vk_pipeline.c` `warm_builder` (~4015) | `prewarm_run` (~4186) on the prewarm thread | min(cpus, 64) | Joined; ends at `PREWARM_PIPE_MS` (20 s) unless `NX2NAVI_PREWARM_FULL=1` or the whole warm after a driver change (`bf_decide`) |
 | "pipe list" | `warm_builder` (~5942) | `seed_pipelines`, preparation modes only | min(cpus, 64) | Joined |
 | "big compute" | `vk_pipeline.c` `bg_main` (~5140) | `bg_start` (~5252) by the last `lb_worker`; `NX2NAVI_LIB_PREBUILD_BIG_BG` (default 1) | 1, below normal; raised to normal when a dispatch waits for it | Joined in `lb_stop` |
-| "lib prebuild" | `vk_pipeline.c` `lb_worker` (~5418) | `lb_start` (~5707) from the boot prewarm; `NX2NAVI_LIB_PREBUILD` | `NX2NAVI_LIB_PREBUILD_THREADS` or 2 (max 16). Idle priority, normal around `P.lock` and shader loads | When the list is done |
+| "lib prebuild" | `vk_pipeline.c` `lb_worker` (~5418) | `lb_start` (~5707) from the boot prewarm; `NX2NAVI_LIB_PREBUILD` | `NX2NAVI_LIB_PREBUILD_THREADS` or 2 (max 16). Idle priority, normal around `P.lock` and shader loads. In the whole warm after a driver change (`bf_wait`): one per core (max 16) at normal priority while the start waits | When the list is done |
 | "lib warm check" | `vk_pipeline.c` `lw_main` (~5572) | `lw_start` (~5649); `NX2NAVI_LIB_WARM` (default 1) | 1, below normal | Joined in `lw_stop` |
-| "lib warm" | `vk_pipeline.c` `lw_worker` (~5532) | `lw_main` when the driver cache is cold | cpus/4 clamped 2..6, idle | Joined in `lw_stop` |
+| "lib warm" | `vk_pipeline.c` `lw_worker` (~5532) | `lw_main` when the driver cache is cold | cpus/4 clamped 2..6, idle. In the whole warm after a driver change (`bf_wait`): one per core (max 32) at normal priority while the start waits | Joined in `lw_stop` |
 | "lib warm" | `vk_pipeline.c` `lb_warm_worker` (~5733) | `lb_warm_prepared` (~5794), preparation modes only | min(cpus, 64) | Joined |
 | "pipe autosave" | `vk_pipeline.c` `autosave_main` (~6390) | `vk_pipeline_autosave` (~6402) from the present thread, once | 1, detached, below normal, 500 ms loop | Never; not stopped by `vk_pipeline_shutdown` (lead L-15) |
 
@@ -1075,7 +1075,7 @@ back.
 | 68 | Lazy write-back command buffer and fence | `lz_init_lock` | One | Never freed explicitly |
 | 69 | Upload batches (command buffers and fences: inflight and spare) | `cmd_lock` | Grow only | Reused; shutdown |
 | 70 | Staging cache | `cmd_lock` | `STG_CACHE` 24 buffers, `STG_CACHE_BYTES` 192 MiB | At batch retire |
-| 71 | Staging VMA pool | — | `STG_BLOCK` 64 MiB blocks, `STG_MIN_BLOCKS` 2; requests ≤ 32 MiB | — |
+| 71 | Staging VMA pool | — | `STG_BLOCK` 64 MiB blocks; `STG_MIN_BLOCKS` 4 kept on a discrete GPU (256 MiB of host memory), `STG_MIN_BLOCKS_UMA` 2 on an integrated one; requests ≤ 32 MiB; an open batch is submitted at `STG_FLUSH` 64 MiB of staging | — |
 | 72 | Staging arena | `cmd_lock` | `ARENA_CHUNK` 8 MiB, ≤ 2 MiB per request, `ARENA_KEEP` 8; `NX2NAVI_STG_ARENA` | At fence; shutdown |
 | 73 | Deferred destruction list `dead[]` (images, views, buffers, host frees) | `cmd_lock` | None found | `vk_mem_collect` on the completion thread once the stamped value is reached |
 | 74 | Headroom spare (half a VMA block per device-local type; block `NX2NAVI_VMA_BLOCK_MB` 64, 16..256) | "vk headroom" | 85 % of VMA's budget; `NX2NAVI_VRAM_HEADROOM=0` off | Replaced, dropped when there is no room or commit is low, at stop |
@@ -1150,7 +1150,7 @@ back.
 | 115 | Pipeline layouts, set layouts, update templates | `P.lock` | None found | Shutdown |
 | 116 | Stage libraries `libs[1024]` chained; failed builds cached as null | `P.lock` | None found | Shutdown (`libs_destroy`) |
 | 117 | Library and pipeline job queues | `P.lock` | None found | When built; dropped at shutdown |
-| 118 | `VkPipelineCache` in memory and `pipeline-cache.bin` | `cache_rw`, `save_lock` | File > `NX2NAVI_PIPELINE_CACHE_MAX_MB` (512) starts empty; in memory: the driver's, none found | Saved by "pipe autosave" at most every 20 s and at exit (waits ≤ 5 s) |
+| 118 | `VkPipelineCache` in memory and `pipeline-cache.bin` | `cache_rw`, `save_lock` | Each file > `NX2NAVI_PIPELINE_CACHE_MAX_MB` (RAM / 32, 1024 to 4096 MB) starts empty, and no cache past it is written; in memory: the driver's, none found | Saved by "pipe autosave" at most every 20 s and at exit (waits ≤ 5 s) |
 | 119 | Pipeline binaries `pipeline-binaries.bin` | `PB.lock` | `NX2NAVI_PIPE_BINARIES_MAX_MB` 1024; `NX2NAVI_PIPE_BINARIES` default 0 | — |
 | 120 | `pipeline-keys.bin` and its `seen` set | `K.io` | None found (append-only) | Never |
 | 121 | `compute-used.bin` | `cu_io` | `NX2NAVI_COMPUTE_KEEP` 512 | — |

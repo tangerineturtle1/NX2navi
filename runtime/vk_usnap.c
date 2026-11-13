@@ -38,7 +38,7 @@ typedef struct Arena {
     VkBuffer buf;
     VmaAllocation alloc;
     uint8_t *map;
-    uint8_t *cpu;    // with DLSS (vk_dlaa_available), the same bytes in host memory for the CPU's reads (vk_usnap_bytes):
+    uint8_t *cpu;    // with DLSS (vk_dlaa_available) or frame generation alone (vk_dlaa_fg_only), the same bytes in host memory for the CPU's reads (vk_usnap_bytes):
                      // map is often device memory through the BAR, written fast but read back at about a microsecond a
                      // cache line. Without DLSS nothing reads them back, and the bytes go into map in one copy.
     uint64_t size;
@@ -259,11 +259,13 @@ static int wr_hits(uint64_t lo, uint64_t hi) {   // wr_prune ran: disjoint, sort
 static void summary(void) {
     if (U.subs + U.off_subs < 3600) return;
     double s = U.subs ? (double)U.subs : 1.0;
+    char clears[512];   // among the GPU writes: the small buffer clears and the counter records they covered
+    vk_exec_clear_stats(clears, sizeof clears);
     rt_log("vk_usnap: %llu submissions with a snapshot, %llu without; per submission %.0f ranges, %.1f KiB copied in "
            "%.3f ms, %.0f uniform bindings from the copy, %.1f dropped by GPU writes, %.1f left out (GPU writes in "
-           "flight), %.1f refused (not an imported pool)",
+           "flight), %.1f refused (not an imported pool); %s",
            (unsigned long long)U.subs, (unsigned long long)U.off_subs, U.regions / s, U.bytes / s / 1024.0,
-           U.copy_ns / s / 1e6, U.hits / s, U.drops / s, U.inflight / s, U.refused / s);
+           U.copy_ns / s / 1e6, U.hits / s, U.drops / s, U.inflight / s, U.refused / s, clears);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
@@ -288,7 +290,7 @@ static void copy_down(void *arg, int lo, int hi) {
 // Hyrule Field, half a millisecond of the submitting thread's time on one thread.
 static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total, int par) {
     uint8_t *dst = a->map;
-    if (vk_dlaa_available()) {
+    if (vk_dlaa_available() || vk_dlaa_fg_only()) {   // the motion pass reads the camera (vk_dlaa.c mv_pass)
         if (!a->cpu && !(a->cpu = malloc(a->size))) rt_fatal("vk_usnap: out of memory");
         dst = a->cpu;
     }

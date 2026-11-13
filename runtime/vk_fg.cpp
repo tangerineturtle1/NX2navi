@@ -4,9 +4,9 @@
 // queue and pacing threads, so the screen shows twice the game's frame rate.
 //
 // The generated frame is built from the presented picture and the scene's depth and camera motion vectors, which
-// vk_dlaa.c makes for DLSS and FSR 3.1 upscaling: frame generation needs one of those on (DLAA or Native AA included).
-// The HUD is interpolated with the picture (it hardly moves); the menu is not, since generation pauses while it is
-// open. The device creates two more queues of the graphics family for it (vk_device.c, vk_fg_queue_count).
+// vk_dlaa.c makes for DLSS and FSR 3.1 upscaling, and without an upscaler for frame generation alone (vk_dlaa.c
+// fg_only_frame: the same pass at the scene's size, no jitter). The HUD is kept out through the picture without it
+// (vk_dlaa.c hudless); the menu is not generated, since generation pauses while it is open. The device creates two more queues of the graphics family for it (vk_device.c, vk_fg_queue_count).
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -50,6 +50,7 @@ struct {
     FgrRing cuts;   // each frame id's camera cut, for the generation callback (vk_fg_reset.h)
     uint64_t cut_frames = 0;   // frames handed to the callback as cuts
     int prepared = 0;          // the last frame was prepared (generation on with its inputs)
+    uint64_t vram = 0;         // the frame generation context's video memory as the library reported it, 0 not told
 } F;
 
 VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
@@ -86,8 +87,8 @@ void fail(const char *what, unsigned r) {
 }  // namespace
 
 // Follows the setting: gfx_present.c's window_settings_live remakes the swapchain when this stops matching vk_fg_active.
-// It needs DLSS's or FSR 3.1's motion vectors, so it also needs one of them on, and the FSR 3.1 library: a build
-// without it keeps the plain swapchain whatever the setting says, with one line in the log. Not on a device made through
+// With or without an upscaler (vk_dlaa.c makes the motion vectors either way, fg_only_frame), and with the FSR 3.1
+// library: a build without it keeps the plain swapchain whatever the setting says, with one line in the log. Not on a device made through
 // Streamline's proxies (NVIDIA's frame generation set at the start, vk_dlssg_dpa): AMD's swapchain there crashed in
 // NVIDIA's driver when the menu switched from NVIDIA's frame generation to AMD's. That switch waits for a restart,
 // as the menu says (menu.cpp row_framegen). Not after a failure (fail): the present code then takes AMD's swapchain
@@ -97,13 +98,14 @@ void fail(const char *what, unsigned r) {
 // setting asks for it while FSR 4 is the upscaler (use4). The swapchain in place is wanted only while its library is
 // still the one to use: a change of that setting or of the upscaler between FSR 3.1 and FSR 4, or a failure of the SDK
 // 2.4 path, takes it down as switching frame generation off does, and the next present makes it with the other library.
+// FSR 4 is the upscaler only while one is set (dlaa): without an upscaler the FSR 3.1 library's runs.
 static int use4(void) {   // NX2NAVI_FSR4_FG (default 0, live): 1 takes the SDK 2.4's frame generation with FSR 4
-    return cfg_bool("NX2NAVI_FSR4_FG") && vk_ffx_fsr4() && !vk_fg4_failed() && vk_fg4_available();
+    return cfg_bool("NX2NAVI_FSR4_FG") && cfg_bool("NX2NAVI_DLAA") && vk_ffx_fsr4() && !vk_fg4_failed() &&
+           vk_fg4_available();
 }
 
 extern "C" int vk_fg_wanted(void) {
-    if (strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") || !cfg_bool("NX2NAVI_DLAA") || !vk_dlaa_wanted() || vk_dlssg_dpa())
-        return 0;
+    if (strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") || vk_dlssg_dpa()) return 0;
     int four = use4();
     if (vk_fg4_active()) return four;
     if (F.sc) return !F.failed && !four;
@@ -229,8 +231,8 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     float jx = 0, jy = 0;
     int reset = 0;
     int have = vk_dlaa_fg_inputs(&depth, &mv, &jx, &jy, &reset);
-    // The context's largest render size covers the depth and motion vectors it is given. They have the scene's size,
-    // which DLAA and the widescreen pictures make larger than the window, and a context made for the window's size alone
+    // The context's largest render size covers the depth and motion vectors it is given. They have the scene's size
+    // (with an upscaler or without), which DLAA and the widescreen pictures make larger than the window, and a context made for the window's size alone
     // wrote past its own resources: a crash in amd_fidelityfx_vk.dll, device faults, striped frames. The scene is never
     // larger than the picture (widescreen.c wide_picture), so the context is made for that once; remaking it while the
     // swapchain still generated from the old one hung the present. A frame with a larger depth anyway is not generated.
@@ -264,6 +266,11 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
         ffxReturnCode_t r = vk_ffx_create(&F.fg, &d.header);
         if (r != FFX_API_RETURN_OK) return F.fg = nullptr, fail("the frame generation context", r);
         F.fg_ext = ext, F.fg_fmt = fmt, F.fg_max = max_render;
+        FfxApiEffectMemoryUsage mem = {};   // for the memory report (vk_fg_vram); 0 when the provider does not say
+        ffxQueryDescFrameGenerationGetGPUMemoryUsage mq = {};
+        mq.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
+        mq.gpuMemoryUsageFrameGeneration = &mem;
+        F.vram = vk_ffx_query(&F.fg, &mq.header) == FFX_API_RETURN_OK ? mem.totalUsageInBytes : 0;
         rt_log("fg: frame generation context for %ux%u%s, render size up to %ux%u", ext.width, ext.height,
                hdr_format(fmt) ? " (HDR)" : "", max_render.width, max_render.height);
     }
@@ -282,7 +289,7 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     else if (!hudless) F.no_hudless++;
     else if (!on) F.paused++;
     F.frame++;
-    // A cut: DLSS started a new history (vk_dlaa_fg_inputs), or the frame before was not prepared (generation off for
+    // A cut: DLSS started a new history, or without an upscaler the same cases did (vk_dlaa_fg_inputs), or the frame before was not prepared (generation off for
     // the menu, no inputs), so the frame between the two would be made from a stale depth and motion
     fgr_note(&F.cuts, F.frame, reset || !F.prepared);
     if ((reset || !F.prepared) && on) F.cut_frames++;
@@ -342,9 +349,18 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
 }
 
 extern "C" void vk_fg_release(void) {
+    // the HUD-less picture is made for frame generation alone: a frame generator that runs again asks for it again
+    // (vk_fg_frame); left set, it was made and copied every frame after frame generation went off, and kept
+    vk_dlaa_hudless_wanted = 0;
     vk_fg4_release();
     if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
     F.prepared = 0;
+}
+
+// The frame generation contexts' video memory, FSR 3.1's and FSR 4's (vk_fg4_vram), for the memory report
+// (vk_ffx.cpp vk_ffx_vram). The swapchain's own images are counted with the swapchain (gfx_present.c).
+extern "C" uint64_t vk_fg_vram(void) {
+    return (__atomic_load_n(&F.fg, __ATOMIC_RELAXED) ? __atomic_load_n(&F.vram, __ATOMIC_RELAXED) : 0) + vk_fg4_vram();
 }

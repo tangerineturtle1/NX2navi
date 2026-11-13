@@ -483,6 +483,76 @@ static int test_remade(uint8_t *guest) {
     return 0;
 }
 
+// A pool in the device address table gets its VRAM mirror while a guest submission is recorded, as on a draw's first
+// use of it as a buffer (vk_memory.c mirror_create). The table takes the mirror up by a store the GPU runs after the
+// mirror's first copy (vk_gpa.c vk_gpa_flip_cmd), so nothing is changed when the mirror is made; read from the table's
+// own memory once the submission is done, the pool's page reads the mirror and writes guest memory as well, and the
+// mirror holds the pool's bytes.
+static void mirror_use_record(VkCommandBuffer cb, void *arg) {
+    vk_texture_new_submit();
+    vk_mem_mirror_begin();
+    vk_mem_use(arg);
+    vk_mem_mirror_end(cb, vk_sync_issued() + 1);
+}
+
+static int test_table_mirror(uint8_t *guest) {
+    VkCtx *c = vk_ctx();
+    if (vk_mem_shadow_storage() || !vk_gpa_wanted()) {
+        printf("probe-vkmem: a new mirror in the device address table: skipped (%s)\n",
+               vk_mem_shadow_storage() ? "shadow storage, no mirrors" : "no device address table");
+        return 0;
+    }
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = guest + 0xD00000, .size = 0x10000,
+                   .game_mem = guest + 0xD00000};
+    volatile uint32_t *w = (volatile uint32_t *)(pool.mem + 0x3000);
+    uint64_t a = (uintptr_t)w, f0 = 0, t0 = 0, f1 = 0, t1 = 0, fm = 0, tm = 0;
+    *w = 0x600DF00Du;
+    GCHECK(vk_gpa_on() && vk_pool_init(&pool), "a CPU-visible pool in the device address table");
+    VkBuffer sb;
+    VmaAllocation sa;
+    volatile uint32_t *s = vk_staging(0x1000, &sb, &sa);
+    VkMemSpan sp;
+    int bad = 1;
+#define TM_CHECK(cond, ...) do { if (!(cond)) { printf("probe-vkmem: FAIL table mirror: "); printf(__VA_ARGS__); printf("\n"); goto done; } } while (0)
+    TM_CHECK(vk_mem_lookup(a, 4, &sp) && sp.buffer && sp.pool, "the pool has no buffer");
+    VkBuffer imported = sp.buffer;
+    TM_CHECK(vk_gpa_probe(a, &f0, &t0) && f0 == t0 && f0 == vk_gpa_device_address(imported) + sp.offset,
+             "before a mirror the table gives %#llx / %#llx for the pool's page, expected its imported buffer twice",
+             (unsigned long long)f0, (unsigned long long)t0);
+    uint64_t fence = vk_sync_submit_own(mirror_use_record, &sp);
+    // read while the submission may still be in flight: the table as the CPU left it when the mirror was made
+    int mid = vk_gpa_probe(a, &fm, &tm);
+    TM_CHECK(vk_sync_fence_wait(fence, 5000000000ull), "fence timed out");
+    if (sp.buffer == imported) {
+        printf("probe-vkmem: a new mirror in the device address table: skipped (the pool got no mirror)\n");
+        bad = 0;
+        goto done;
+    }
+    TM_CHECK(vk_gpa_probe(a, &f1, &t1), "the pool's page left the table");
+    if (vk_mem_gpa_late())   // else the table changes when the mirror is made, as up to 0.9.2
+        TM_CHECK(mid && (fm == f0 || fm == f1) && tm == f0, "while the submission ran the table gave %#llx / %#llx: neither "
+                 "the state before the store (%#llx twice) nor after it", (unsigned long long)fm, (unsigned long long)tm,
+                 (unsigned long long)f0);
+    TM_CHECK(f1 == vk_gpa_device_address(sp.buffer) + sp.offset, "after the submission the page reads %#llx, expected the "
+             "mirror's %#llx", (unsigned long long)f1, (unsigned long long)(vk_gpa_device_address(sp.buffer) + sp.offset));
+    TM_CHECK(t1 == f0, "after the submission the page's twin is %#llx, expected the imported buffer's %#llx",
+             (unsigned long long)t1, (unsigned long long)f0);
+    copy_wait(sp.buffer, sp.offset, sb, 0, 4);
+    vmaInvalidateAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
+    TM_CHECK(s[0] == 0x600DF00Du, "the mirror holds %#010x, expected the pool's 0x600df00d", s[0]);
+    g_gpu_checks += 4;
+    printf("probe-vkmem: a pool that gets its mirror in a recorded submission: the device address table names the mirror "
+           "after it, with guest memory as the twin (%s)\n",
+           vk_mem_gpa_late() ? "by a store in queue order, after the mirror's first copy" : "changed at once, NX2NAVI_GPA_LATE=0");
+    bad = 0;
+done:
+    vk_sync_finish();
+    vmaDestroyBuffer(c->vma, sb, sa);
+    vk_pool_fini(&pool);
+#undef TM_CHECK
+    return bad;
+}
+
 // test_table_sync, test_table_store: a guest submission of one part that records nothing. bound: its record binds the
 // device address table, as the replay of a draw whose shader reads through the table does (vk_exec_draw.c ssbo_info),
 // so its prologue brings every shadow of the table up to date (vk_memory.c vk_mem_shadow_sync).
@@ -1366,7 +1436,7 @@ static int test_gpu(void) {
     vk_mem_stats(&st);
     GCHECK(!st.imported_pools && !st.physical_pools && !st.virtual_pools, "pools left after fini");
     g_gpu_checks += 2;
-    return test_table_sync(h) || test_table_store(h) || test_remade(h);
+    return test_table_sync(h) || test_table_store(h) || test_remade(h) || test_table_mirror(h);
 }
 
 int probe_vkmem(void) {

@@ -66,7 +66,14 @@
 // 36,000 shaders: flushing these files too held its translation at half speed on an NVMe drive.
 //
 // Reflection: every shader that enters the cache has its .res.json parsed into GfxShaderRes arrays and its SPIR-V
-// scanned for interface Locations and the workgroup size (gfx.h accessors at the end of the file).
+// scanned for interface Locations, the workgroup size and its Binding decorations (gfx.h accessors at the end of the
+// file).
+//
+// SPIR-V at rest (NX2NAVI_SHADER_COMPRESS, default 1; section "SPIR-V at rest"): the memory cache keeps every shader
+// for the life of the process, but its SPIR-V is read only while modules are made of it. A background thread keeps the
+// SPIR-V of a shader nobody read for NX2NAVI_SHADER_COMPRESS_IDLE_S seconds (fewer while the system memory is tight,
+// mem_budget.h) as a zstd frame alone, and a reader that pins it (gfx_shader_spirv_pin) gets it decoded back
+// (runtime/spv_store.h).
 //
 // The c2 handle ranges of handle_slot are the translator's handle layout.
 // The code layout the translator sees (graphics: code[0x30..], compute: code[0..]; c1 = code[c1..length]
@@ -79,8 +86,11 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "mem_budget.h"
 #include "platform/platform.h"
+#include "prof.h"
 #include "prp_file.h"
+#include "spv_store.h"
 
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
@@ -114,9 +124,12 @@ struct GfxShader {
     struct GfxShader *next;
     uint8_t key[32];
     uint8_t iid[32];                                       // input id (see the keys at the top)
-    uint32_t *spirv;
-    uint64_t words;
-    char *reflection;                                      // the service's .res.json text, parsed into the fields below
+    // The SPIR-V: plain while the shader is built (spv.plain, spv.words), then pinned by readers and compressed when
+    // idle (section "SPIR-V at rest"). spv_lock guards what spv_store.h says.
+    SpvStore spv;
+    uint32_t *bind;                                        // its OpDecorate Binding values in module order (spirv_seal)
+    uint32_t nbind;
+    char *reflection;                                    // the service's .res.json text, parsed into the fields below
     uint64_t reflection_size;
     // Reflection (reflect(), once per shader before it enters the cache)
     int stage;                                             // GFX_STAGE_*
@@ -126,6 +139,11 @@ struct GfxShader {
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
     uint32_t mvprev_banks;                                 // .res.json "mvprev_banks" (patch 0015), 0 none
+    // VS: the matrix palette (reflect_palette): the bytes of one matrix (0: none), the uniform bank or storage buffer
+    // index it is read from, and the input Locations whose integers pick the matrices
+    uint8_t pal_stride, pal_storage;
+    int16_t pal_slot;
+    uint32_t pal_joints;
     uint32_t omap;                                         // FS: .res.json "frag_out_map", the colour components it writes
                                                            // (4 bits per target, the SPH omap); 0 unknown (older translations)
     uint8_t carried;                                       // 1 + the previous identity (C.prev) that translated it; 0 the
@@ -134,6 +152,7 @@ struct GfxShader {
 };
 
 static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
+static PlatMutex spv_lock = PLAT_MUTEX_INIT;                    // every shader's SpvStore (spv_store.h)
 static GfxShader *buckets[BUCKETS];
 static UseEnt *use_buckets[BUCKETS];                       // under cache_lock
 static volatile int64_t n_requests, n_hits, n_failures, n_keys, n_xlated;   // n_keys: memory cache entries
@@ -689,7 +708,8 @@ static GfxShader *mem_find(const uint8_t key[32]) {
 
 static void shader_free(GfxShader *s) {
     for (int k = 0; k < GFX_RES_KINDS; k++) free(s->res[k]);
-    free(s->spirv), free(s->reflection), free(s);
+    spv_store_free(&s->spv);
+    free(s->bind), free(s->reflection), free(s);
 }
 
 static void reflect(GfxShader *s);
@@ -702,6 +722,8 @@ static void carry_served(const GfxShader *s) {
            "none yet; each keeps its translation for this session, and a background pass translates them again for the "
            "next start", id[0], id[1], id[2], id[3]);
 }
+
+static void zpass_kick(void);
 
 // Inserts s, or frees it and returns the entry another thread inserted first.
 static GfxShader *mem_insert(GfxShader *s) {
@@ -721,6 +743,7 @@ static GfxShader *mem_insert(GfxShader *s) {
     plat_mutex_unlock(&cache_lock);
     if (added && s->carried) carry_served(s);
     else if (added) ids_note();
+    if (added) zpass_kick();
     return s;
 }
 
@@ -761,6 +784,31 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
 static void reflect_spirv(GfxShader *s);
 static void reflect_stage(GfxShader *s);
 
+// The last step of making a shader, once its in-memory SPIR-V is final (after reflect and the HDR swap): the module's
+// Binding decorations are listed (gfx_shader_bindings, which vk_pipeline.c module_binding_missing and vk_exec_draw.c
+// mfb_binding_base read in place of the SPIR-V: the first runs on the drawing thread at every pipeline miss, and must
+// not decode a compressed module there), and the store gets its first use stamp, so that a shader just loaded is not
+// compressed before its first pipelines are made.
+static void spirv_seal(GfxShader *s) {
+    const uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words;
+    uint32_t cap = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 71 && len >= 4 && w[i + 2] == 33) {   // OpDecorate Binding
+            if (s->nbind == cap) {
+                uint32_t *b = realloc(s->bind, (cap = cap ? cap * 2 : 16) * sizeof *b);
+                if (!b) rt_fatal("gfx_shader: out of memory");
+                s->bind = b;
+            }
+            s->bind[s->nbind++] = w[i + 3];
+        }
+        i += len;
+    }
+    s->spv.used_ms = plat_now_ms();
+}
+
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
 // malformed. iid: the input id, NULL when the caller sets it. full 0: only the stage and the interface Locations are
 // reflected and the SPIR-V is left as the translator wrote it (the carry pass checks a translation it does not keep).
@@ -794,8 +842,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
     GfxShader *s = calloc(1, sizeof *s);
     memcpy(s->key, key, 32);
     if (iid) memcpy(s->iid, iid, 32);
-    s->spirv = (uint32_t *)spv;
-    s->words = spv_size / 4;
+    spv_store_fill(&s->spv, (uint32_t *)spv, spv_size / 4, 0);
     s->reflection = (char *)res;
     s->reflection_size = res_size;
     if (!full) {
@@ -803,7 +850,8 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         return s;
     }
     reflect(s);
-    if (s->stage == GFX_STAGE_FS) vk_hdr_shader_swap(&s->spirv, &s->words);   // the in-memory copy; the cache keeps its own
+    if (s->stage == GFX_STAGE_FS) vk_hdr_shader_swap(&s->spv.plain, &s->spv.words);   // the in-memory copy; the cache keeps its own
+    spirv_seal(s);
     return s;
 }
 
@@ -815,14 +863,16 @@ const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const cha
     if (!s) return NULL;
     size_t rn = strlen(res_json);
     uint8_t *buf = malloc(words * 4 + rn);
-    s->spirv = malloc(words * 4), s->reflection = malloc(rn + 1);
-    if (!buf || !s->spirv || !s->reflection) rt_fatal("gfx_shader: out of memory");
+    spv_store_fill(&s->spv, malloc(words * 4), words, 0);
+    s->reflection = malloc(rn + 1);
+    if (!buf || !s->spv.plain || !s->reflection) rt_fatal("gfx_shader: out of memory");
     memcpy(buf, spirv, words * 4), memcpy(buf + words * 4, res_json, rn);
     rt_sha256(buf, words * 4 + rn, s->key);
     free(buf);
-    memcpy(s->spirv, spirv, words * 4), memcpy(s->reflection, res_json, rn + 1);
-    s->words = words, s->reflection_size = rn;
+    memcpy(s->spv.plain, spirv, words * 4), memcpy(s->reflection, res_json, rn + 1);
+    s->reflection_size = rn;
     reflect(s);
+    spirv_seal(s);
     return s;
 }
 
@@ -960,8 +1010,8 @@ enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FL
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (translated modules stay
 // far below).
 static void reflect_spirv(GfxShader *s) {
-    const uint32_t *w = s->spirv;
-    uint64_t n = s->words;
+    const uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words;
     s->local[0] = s->local[1] = s->local[2] = 1;
     if (n < 5) return;
     uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
@@ -1035,8 +1085,8 @@ static void patch_txd_transpose(GfxShader *s) {
         const char *e = cfg_get("NX2NAVI_TXD_TRANSPOSE");
         on = e && *e ? *e != '0' : rt_nvn_api_version[0] < 200;
     }
-    uint32_t *w = s->spirv;
-    uint64_t n = s->words;
+    uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words;
     if (!on || n < 5) return;
     uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
     uint64_t *cc = calloc(bound, sizeof *cc);   // word index of a 2-constituent OpCompositeConstruct defining the id
@@ -1073,8 +1123,8 @@ static void patch_txd_transpose(GfxShader *s) {
         i += len;
     }
     o[3] = next;
-    free(s->spirv);
-    s->spirv = o, s->words = k;
+    free(s->spv.plain);
+    s->spv.plain = o, s->spv.words = k;
     if (plat_inc32(&n_logged) <= 4) rt_log("gfx_shader: %d gradient samples now read their derivatives per coordinate", found);
 out:
     free(cc);
@@ -1100,8 +1150,8 @@ static void reflect_exact(GfxShader *s) {
            X_IN_BOUNDS_ACCESS_CHAIN = 66, X_COMPOSITE_EXTRACT = 81, X_COPY_OBJECT = 83, X_SAMPLED_IMAGE = 86, X_FETCH = 95,
            X_IMAGE = 100, X_QUERY_SIZE_LOD = 103, X_QUERY_SIZE = 104, X_QUERY_LEVELS = 106, X_DEC_BINDING = 33 };
     static volatile int32_t n_pool_logged;
-    const uint32_t *w = s->spirv;
-    uint64_t n = s->words, fn = 0;
+    const uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words, fn = 0;
     if (!s->nres[GFX_RES_TEX] || n < 5) return;
     int any = 0;   // nine shaders in ten have no such read: they cost this walk over the instruction headers
     for (uint64_t i = 5; i < n && !any;) {
@@ -1198,8 +1248,8 @@ static void patch_vec_index(GfxShader *s) {
         if (on) rt_log("gfx_shader: uniform vector components at computed indices are read whole and selected "
                        "(NX2NAVI_VEC_INDEX_FIX=0 turns it off)");
     }
-    uint32_t *w = s->spirv;
-    uint64_t n = s->words;
+    uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words;
     if (!on || n < 5) return;
     uint32_t bound = w[3];
     if (bound > (1u << 22)) return;
@@ -1345,13 +1395,136 @@ static void patch_vec_index(GfxShader *s) {
         i += len;
     }
     o[3] = next;
-    free(s->spirv);
-    s->spirv = o, s->words = k;
+    free(s->spv.plain);
+    s->spv.plain = o, s->spv.words = k;
     if (plat_inc32(&n_logged) <= 4)
         rt_log("gfx_shader: %d uniform vector component reads at computed indices now select the component", found);
 #undef VX_OP
 out:
     free(def), free(ptr_v), free(target), free(acv);
+}
+
+// The matrix palette of a skinned vertex shader, for the motion vectors of skinned characters (vk_skin_motion.inc).
+// The game's skinning reads a joint index from an integer vertex input, multiplies it by the size of one bone matrix
+// (48 bytes, three rows of four floats; 64 for a 4x4) and reads the matrix at that byte offset of a uniform block. The
+// translation keeps that shape, so the rule is:
+//   joint value   a value loaded from an Input variable of an integer type that has a Location, and what bit casts,
+//                 integer conversions, component extracts and stores to and loads from local variables make of it;
+//   matrix offset a joint value multiplied by the constant 48 or 64 (or shifted left by 6), and what integer adds,
+//                 subtracts, shifts right and bit masks make of it (the translator turns the byte offset into a vec4
+//                 index and a component), again through local variables;
+//   palette       the uniform or storage block one of whose access chains takes a matrix offset as an index.
+// Local variables are followed whatever the order of their stores and loads. A shader whose matrix offsets reach two
+// different blocks has no palette (none does). Counted over the 1,460 vertex shaders of the 6,152 pipelines a played
+// folder recorded (game 1.1.1): 254 are drawn with an unsigned integer attribute in their vertex layout, and the rule
+// finds a palette in 253 of them (the last reads its integer attribute as a float and indexes nothing with it) and in
+// none of the other 1,206. Every palette is a uniform block of 48-byte matrices, at c6 (180 shaders) or at c7 (73), so
+// the bank cannot be told from the list of banks a shader reads. 208 of the 253 layouts also carry weights (a
+// normalised attribute beside the indices); the other 45 bind each vertex to one joint and carry none.
+static void reflect_palette(GfxShader *s) {
+    enum { P_COMPOSITE_EXTRACT = 81, P_COPY_OBJECT = 83, P_LOAD = 61, P_STORE = 62, P_ACCESS_CHAIN = 65,
+           P_IN_BOUNDS_ACCESS_CHAIN = 66, P_UCONVERT = 113, P_SCONVERT = 114, P_BITCAST = 124, P_IADD = 128,
+           P_ISUB = 130, P_IMUL = 132, P_SHR = 194, P_SAR = 195, P_SHL = 196, P_OR = 197, P_AND = 199,
+           P_FUNCTION = 54, P_DEC_BINDING = 33, P_SC_UNIFORM = 2, P_SC_STORAGE = 12 };
+    const uint32_t *w = s->spv.plain;
+    uint64_t n = s->spv.words, fn = 0;
+    s->pal_stride = 0, s->pal_slot = -1;
+    if (s->stage != GFX_STAGE_VS || n < 5) return;
+    int any = 0;   // most vertex shaders read no integer input and stop here
+    for (int l = 0; l < 32 && !any; l++) any = (s->in_mask >> l & 1) && s->in[l].type != GFX_TYPE_FLOAT;
+    if (!any) return;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    // per id: an integer type; a pointer type's target; an integer constant 6, 48 or 64, as its value + 1; a
+    // variable's Location + 1 and Binding + 1; a block variable; the Location + 1 a joint value came from; the matrix
+    // size of a matrix offset
+    uint8_t *isint = calloc(bound, 1), *con = calloc(bound, 1), *loc = calloc(bound, 1), *block = calloc(bound, 1);
+    uint8_t *joint = calloc(bound, 1), *scaled = calloc(bound, 1);
+    uint32_t *pointee = calloc(bound, sizeof *pointee), *bind = calloc(bound, sizeof *bind);
+    uint32_t found = 0, found_bind = 0, found_joints = 0;
+    int two = 0;
+    if (!isint || !con || !loc || !block || !joint || !scaled || !pointee || !bind) goto out;
+    #define PID(x) ((x) < bound)
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i;
+        if (op == P_FUNCTION) {
+            fn = i;
+            break;
+        }
+        if (op == OP_DECORATE && len >= 4 && PID(a[1])) {
+            if (a[2] == DEC_LOCATION && a[3] < 32) loc[a[1]] = (uint8_t)(a[3] + 1);
+            else if (a[2] == P_DEC_BINDING) bind[a[1]] = a[3] + 1;
+        } else if (op == OP_TYPE_INT && len >= 4 && PID(a[1])) {
+            isint[a[1]] = 1;
+        } else if (op == OP_TYPE_VECTOR && len >= 4 && PID(a[1]) && PID(a[2])) {
+            isint[a[1]] = isint[a[2]];
+        } else if (op == OP_TYPE_POINTER && len >= 4 && PID(a[1])) {
+            pointee[a[1]] = a[3];
+        } else if (op == OP_CONSTANT && len == 4 && PID(a[1]) && PID(a[2]) && isint[a[1]] &&
+                   (a[3] == 6 || a[3] == 48 || a[3] == 64)) {
+            con[a[2]] = (uint8_t)(a[3] + 1);
+        } else if (op == OP_VARIABLE && len >= 4 && PID(a[1]) && PID(a[2])) {
+            uint32_t t = pointee[a[1]];
+            if (a[3] == SC_INPUT && loc[a[2]] && PID(t) && isint[t]) joint[a[2]] = loc[a[2]];
+            else if ((a[3] == P_SC_UNIFORM || a[3] == P_SC_STORAGE) && bind[a[2]] > 1) block[a[2]] = 1;   // Binding 0: the support buffer
+        }
+        i += len;
+    }
+    if (!fn) goto out;
+    #define PJOINT(to, from) do { if (!joint[to] && joint[from]) joint[to] = joint[from], changed = 1; } while (0)
+    #define PSCALED(to, from) \
+        do { if (!scaled[to] && scaled[from]) scaled[to] = scaled[from], joint[to] = joint[from], changed = 1; } while (0)
+    for (int pass = 0, changed = 1; pass < 4 && changed; pass++) {   // again while a pass learned something: a load may
+        changed = 0;                                                 // stand before the store it reads (a loop)
+        for (uint64_t i = fn; i < n;) {
+            uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+            if (!len || i + len > n) goto out;
+            const uint32_t *a = w + i;
+            if ((op == P_ACCESS_CHAIN || op == P_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && PID(a[2]) && PID(a[3])) {
+                PJOINT(a[2], a[3]);
+                for (uint32_t k = 4; block[a[3]] && k < len; k++) {
+                    if (!PID(a[k]) || !scaled[a[k]]) continue;
+                    if (found && found_bind != bind[a[3]]) two = 1;
+                    found = scaled[a[k]], found_bind = bind[a[3]];
+                    if (joint[a[k]]) found_joints |= 1u << (joint[a[k]] - 1);
+                }
+            } else if ((op == P_LOAD || op == P_BITCAST || op == P_UCONVERT || op == P_SCONVERT || op == P_COPY_OBJECT ||
+                        op == P_COMPOSITE_EXTRACT) && len >= 4 && PID(a[2]) && PID(a[3])) {
+                PJOINT(a[2], a[3]);
+                PSCALED(a[2], a[3]);
+            } else if (op == P_STORE && len >= 3 && PID(a[1]) && PID(a[2]) && !block[a[1]]) {
+                PJOINT(a[1], a[2]);
+                PSCALED(a[1], a[2]);
+            } else if (op == P_IMUL && len >= 5 && PID(a[2]) && PID(a[3]) && PID(a[4])) {
+                for (int k = 0; k < 2; k++) {
+                    uint32_t x = a[3 + k], c = a[4 - k];
+                    if (!scaled[a[2]] && joint[x] && !scaled[x] && (con[c] == 49 || con[c] == 65))
+                        scaled[a[2]] = (uint8_t)(con[c] - 1), joint[a[2]] = joint[x], changed = 1;
+                }
+            } else if (op == P_SHL && len >= 5 && PID(a[2]) && PID(a[3]) && PID(a[4])) {
+                if (!scaled[a[2]] && joint[a[3]] && !scaled[a[3]] && con[a[4]] == 7)
+                    scaled[a[2]] = 64, joint[a[2]] = joint[a[3]], changed = 1;
+            } else if ((op == P_IADD || op == P_ISUB || op == P_SHR || op == P_SAR || op == P_AND || op == P_OR) &&
+                       len >= 5 && PID(a[2]) && PID(a[3]) && PID(a[4])) {
+                PSCALED(a[2], a[3]);
+                PSCALED(a[2], a[4]);
+            }
+            i += len;
+        }
+    }
+    #undef PJOINT
+    #undef PSCALED
+    #undef PID
+    if (!found || two || !found_joints) goto out;
+    for (int kind = GFX_RES_UBO; kind <= GFX_RES_SSBO; kind++)
+        for (int i = 0; i < s->nres[kind]; i++)
+            if ((uint32_t)s->res[kind][i].binding + 1 == found_bind && s->res[kind][i].slot >= 0) {
+                s->pal_stride = (uint8_t)found, s->pal_storage = kind == GFX_RES_SSBO;
+                s->pal_slot = s->res[kind][i].slot, s->pal_joints = found_joints;
+            }
+out:
+    free(isint), free(con), free(loc), free(block), free(joint), free(scaled), free(pointee), free(bind);
 }
 
 static void reflect_stage(GfxShader *s) {
@@ -1375,6 +1548,7 @@ static void reflect(GfxShader *s) {
     }
     reflect_spirv(s);
     reflect_exact(s);
+    reflect_palette(s);
     patch_txd_transpose(s);
     patch_vec_index(s);
 }
@@ -1435,6 +1609,7 @@ static void use_path(const uint8_t h[32], char *p) {
 typedef struct UseFile { struct UseFile *next; uint8_t name[32]; UseMask m; } UseFile;
 static UseFile *use_files[USE_FILE_BUCKETS];
 static volatile int32_t use_files_ready;
+static volatile int64_t use_files_n;   // entries use_preload made (gfx_shader_ram)
 
 static UseFile **use_file_slot(const uint8_t name[32]) {
     UseFile **e = &use_files[(name[0] | name[1] << 8) % USE_FILE_BUCKETS];
@@ -1505,6 +1680,7 @@ static void use_preload(void *arg) {
     UsePreload st = {0};
     plat_file_list(cache_dir, ".use", use_preload_file, &st);
     n += st.n, bad += st.bad;
+    __atomic_store_n(&use_files_n, (int64_t)n, __ATOMIC_RELAXED);
     plat_xchg32(&use_files_ready, 1);
     rt_log("gfx_shader: %d use masks read in %.0f ms on a background thread (%d unreadable)", n,
            (plat_now_ns() - t0) / 1e6, bad);
@@ -1670,13 +1846,15 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control, uint8_t *options_hash) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
-    o += sprintf(o, "\",\"stage\":\"%s\",\"debug\":false,\"code\":\"", stage);
+    o += sprintf(o, "\",\"code\":\"");
     json_esc(&o, code_path);
-    o += sprintf(o, "\",\"c1\":\"");
+    o += sprintf(o, "\",");
+    const char *options = o;
+    o += sprintf(o, "\"stage\":\"%s\",\"debug\":false,\"c1\":\"", stage);
     for (uint32_t i = 0; i < c1_len; i++) o += sprintf(o, "%02x", c1[i]);
     o += sprintf(o, "\"");
     if (a) {
@@ -1755,6 +1933,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             if (end >= 8 * (ntex + nimg)) o += sprintf(o, ",\"nvn2_table\":[%d,%d,%d]", end - 8 * (ntex + nimg), ntex, nimg);
         }
     }
+    if (options_hash) rt_sha256(options, (size_t)(o - options), options_hash);
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
     o += sprintf(o, "\"}");
@@ -1847,6 +2026,138 @@ static int carry_has_iid(const uint8_t iid[32]) {
     return 0;
 }
 
+// ---- SPIR-V at rest (NX2NAVI_SHADER_COMPRESS, default 1)
+// The memory cache keeps every shader for the life of the process: 7115 shaders and 777 MiB of the C runtime heap in
+// a session of 2026-11-13, nearly all of it SPIR-V (a .res.json averages 1.8 KB). The SPIR-V is read where modules
+// are made of it: the pipeline workers and the boot's builds (vk_pipeline.c create_graphics, lib_create, emu_get), a
+// compute pipeline the drawing thread creates at a dispatch (vk_pipeline.c compute_create), a mesh shader's outputs at
+// its first pipeline key (mesh_outs), the mesh fallback's workers (vk_exec_draw.c mfb_module), an emulated mesh draw's
+// primitive (mesh_emu_draw_prim), the shader preparation (gfx_shader_guess.c) and the diagnostics (vk_dump.c,
+// gfx_shader_probe.c). What the drawing thread compares at every pipeline miss or draw comes from values kept apart:
+// the module's FNV-1a (gfx_shader_spirv_fnv: vk_dlaa.c, vk_crumbs.c, the water corrections, NX2NAVI_SKIP_SHADERS) and
+// its Binding decorations (gfx_shader_bindings: vk_pipeline.c module_binding_missing), so those decode nothing.
+// Every reader pins the SPIR-V (gfx_shader_spirv_pin, gfx_shader_spirv_unpin; spv_store.h has the lock rules). One
+// background thread (zpass_main) walks the cache every ZPASS_PERIOD_MS and compresses the SPIR-V of each shader no
+// reader pinned for NX2NAVI_SHADER_COMPRESS_IDLE_S seconds (zstd level ZPASS_LEVEL, checked by decoding it before the
+// plain copy goes), then frees the plain copy. The frame stays with the shader, so a shader read again keeps its
+// decoded copy until it is idle once more, and then only loses that copy. The thread takes spv_lock for a few loads
+// and stores per shader at normal priority, so that no reader waits for the scheduler to run a lowered thread inside
+// the lock, and encodes at the lowest priority with no lock held.
+// Measured on the shader cache of a test install (44,151 modules, 3,835 MiB, mean 91 KB, largest 4.8 MB): level 1
+// keeps 26.2% of the bytes (3.8 times smaller), encodes at 630 MB/s and decodes at 1.4 GB/s, 60 us for a mean module
+// and about 3.4 ms for the largest compute shader; level 3 kept 26.5% and level 6 25.1% at a third of the speed, and a
+// trained dictionary saved 1% more. The memory report shows the SPIR-V held, what it would be uncompressed, the
+// shaders held compressed and the decodes, those on the drawing threads apart (gfx_shader_ram).
+#define ZPASS_PERIOD_MS 2000
+#define ZPASS_LEVEL 1
+
+static struct {
+    PlatOnce once;
+    PlatMutex pass;                        // held over a pass; gfx_shader_drop_memory takes it before it frees entries
+    volatile int32_t state;                // 0 no shader yet, 1 compressing, -1 off (NX2NAVI_SHADER_COMPRESS=0)
+    uint32_t idle_s;                       // NX2NAVI_SHADER_COMPRESS_IDLE_S
+    volatile int64_t frames, frame_fail;   // frames made, frames the encoder or its check refused
+    volatile int64_t dec, dec_ns;          // decodes in pins (gfx_shader_spirv_pin, gfx_shader_spirv_fnv)
+    volatile int64_t dec_draw, dec_draw_ns, dec_draw_max_ns;   // those on the drawing threads (prof.h)
+} Z = {PLAT_ONCE_INIT, PLAT_MUTEX_INIT};
+
+static void zpass_count_decode(uint64_t ns) {
+    if (!ns) return;
+    plat_inc64(&Z.dec), plat_add64(&Z.dec_ns, (int64_t)ns);
+    uint32_t tid = plat_thread_id();
+    if (tid != prof_render_tid && tid != prof_replay_tid) return;
+    plat_inc64(&Z.dec_draw), plat_add64(&Z.dec_draw_ns, (int64_t)ns);
+    int64_t m = __atomic_load_n(&Z.dec_draw_max_ns, __ATOMIC_RELAXED);
+    while ((int64_t)ns > m && !__atomic_compare_exchange_n(&Z.dec_draw_max_ns, &m, (int64_t)ns, 0, __ATOMIC_RELAXED,
+                                                           __ATOMIC_RELAXED)) {}
+}
+
+// The bytes of a shader's plain SPIR-V and of its frame, as the memory report counts them (no lock: spv_store.h
+// writes both pointers and the frame's size atomically).
+static void spv_held(const GfxShader *g, uint64_t *plain, uint64_t *z) {
+    *plain = __atomic_load_n(&g->spv.plain, __ATOMIC_RELAXED) ? g->spv.words * 4 : 0;
+    *z = __atomic_load_n(&g->spv.zsize, __ATOMIC_RELAXED);
+}
+
+// How long a shader goes unpinned before its SPIR-V is compressed: NX2NAVI_SHADER_COMPRESS_IDLE_S, at most 5 s while
+// the system memory is tight and 1 s while it is critical (mem_budget.h). Every level compresses losslessly; a shorter
+// wait only means that a shader read again soon after is decoded once more.
+static uint64_t zpass_idle_ms(void) {
+    uint64_t ms = (uint64_t)Z.idle_s * 1000;
+    int level = mem_budget_level(MEM_RAM);
+    uint64_t cap = level == MEM_CRITICAL ? 1000 : level == MEM_TIGHT ? 5000 : ms;
+    return ms < cap ? ms : cap;
+}
+
+static void zpass_main(void *arg) {
+    (void)arg;
+    SpvPacker pk = {0};
+    int logged = 0;
+    for (;;) {
+        plat_sleep_ms(ZPASS_PERIOD_MS);
+        uint64_t idle_ms = zpass_idle_ms(), t0 = plat_now_ns(), raw = 0, packed = 0, freed = 0;
+        uint32_t made = 0, dropped = 0;
+        plat_mutex_lock(&Z.pass);
+        for (int i = 0; i < BUCKETS; i++) {
+            // Entries are inserted at a bucket's head and never unlinked while Z.pass is held: the chain read from the
+            // head stays valid without the lock, and an entry inserted meanwhile waits for the next pass.
+            plat_mutex_lock_shared(&cache_lock);
+            GfxShader *g = buckets[i];
+            plat_mutex_unlock_shared(&cache_lock);
+            for (; g; g = g->next) {
+                uint64_t now = plat_now_ms();
+                int step = spv_pack_begin(&g->spv, &spv_lock, now, idle_ms);
+                if (step == SPV_PACK_NONE) continue;
+                void *z = NULL;
+                uint32_t zn = 0;
+                if (step == SPV_PACK_ENCODE) {
+                    plat_thread_priority(PLAT_PRIO_LOWEST);
+                    z = spv_pack_encode(&g->spv, &pk, ZPASS_LEVEL, &zn);
+                    plat_thread_priority(PLAT_PRIO_NORMAL);
+                    if (z) {
+                        plat_inc64(&Z.frames), made++, raw += g->spv.words * 4, packed += zn;
+                    } else if (plat_inc64(&Z.frame_fail) <= 4) {
+                        rt_log("gfx_shader: SPIR-V at rest: a shader's SPIR-V (%llu words) was not compressed (the encoder "
+                               "failed or its frame did not decode to the same words); it stays as it is",
+                               (unsigned long long)g->spv.words);
+                    }
+                }
+                uint64_t f = spv_pack_end(&g->spv, &spv_lock, step, z, zn, now, idle_ms);
+                freed += f, dropped += f != 0;
+            }
+        }
+        plat_mutex_unlock(&Z.pass);
+        if (made && !logged) {
+            logged = 1;
+            rt_log("gfx_shader: SPIR-V at rest: the first pass compressed %u shaders unused for %u s, %.1f MiB to %.1f MiB "
+                   "(%.1f%%), and freed %.1f MiB of plain SPIR-V in %u shaders, in %.0f ms (NX2NAVI_SHADER_COMPRESS=0 keeps "
+                   "it plain)", made, (unsigned)(idle_ms / 1000), raw / 1048576.0, packed / 1048576.0,
+                   raw ? 100.0 * (double)packed / (double)raw : 0.0, freed / 1048576.0, dropped,
+                   (double)(plat_now_ns() - t0) / 1e6);
+        }
+    }
+}
+
+static void zpass_start(void *arg) {
+    (void)arg;
+    if (!cfg_bool("NX2NAVI_SHADER_COMPRESS")) {
+        __atomic_store_n(&Z.state, -1, __ATOMIC_RELEASE);
+        rt_log("gfx_shader: SPIR-V at rest: off (NX2NAVI_SHADER_COMPRESS=0): every shader keeps its SPIR-V plain");
+        return;
+    }
+    int idle = cfg_int("NX2NAVI_SHADER_COMPRESS_IDLE_S");
+    Z.idle_s = idle < 1 ? 1 : (uint32_t)idle;
+    if (!plat_thread_spawn(zpass_main, NULL, "shader compress", 0)) {
+        __atomic_store_n(&Z.state, -1, __ATOMIC_RELEASE);
+        rt_log("gfx_shader: SPIR-V at rest: cannot start its thread; every shader keeps its SPIR-V plain");
+        return;
+    }
+    __atomic_store_n(&Z.state, 1, __ATOMIC_RELEASE);
+}
+
+// The first shader that enters the memory cache starts the background thread.
+static void zpass_kick(void) { plat_once(&Z.once, zpass_start, NULL); }
+
 // ---- public
 
 // Raw line exchange for the probe: one line to the service, its reply in `reply`. Starts the service if needed.
@@ -1864,8 +2175,10 @@ uint64_t gfx_shader_failures(void) { return (uint64_t)n_failures; }
 uint64_t gfx_shader_requests(void) { return (uint64_t)n_requests; }   // lines sent to the service
 uint64_t gfx_shader_cache_hits(void) { return (uint64_t)n_hits; }     // gets answered from memory or disk
 
-// Drops the memory cache (the probe uses it to prove the disk cache). Pointers handed out before are invalid.
+// Drops the memory cache (the probe uses it to prove the disk cache). Pointers handed out before are invalid. A pass of
+// the SPIR-V thread ends first: it walks the entries without cache_lock (zpass_main).
 void gfx_shader_drop_memory(void) {
+    plat_mutex_lock(&Z.pass);
     plat_mutex_lock(&cache_lock);
     for (int i = 0; i < BUCKETS; i++) {
         for (GfxShader *s = buckets[i], *n; s; s = n) {
@@ -1884,6 +2197,7 @@ void gfx_shader_drop_memory(void) {
         use_files[i] = NULL;
     }
     plat_mutex_unlock(&cache_lock);
+    plat_mutex_unlock(&Z.pass);
 }
 
 static const GfxShader *fail(const char *why, const char *hex) {
@@ -2087,8 +2401,90 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
 
 // ---- translation
 
+typedef struct PreparedJobs PreparedJobs;
+static _Thread_local PreparedJobs *preparing;
+
+// Only preparation workers share translator results. Logical shader and input IDs continue to include the full
+// guest program. The child sees the bytes of the code file and the serialized options in build_request.
+typedef struct PreparedJob {
+    struct PreparedJob *next;
+    uint8_t digest[32];
+    PlatCond done;
+    int busy, ready;
+    char cache_key[65], reflection_key[65];
+} PreparedJob;
+
+struct PreparedJobs {
+    PlatMutex lock;
+    PreparedJob *buckets[BUCKETS];
+    volatile int64_t reused;
+};
+
+// One worker owns a cold request. A failed owner leaves it available for the next worker to retry.
+static PreparedJob *prepared_enter(const uint8_t options_hash[32], const uint8_t *bytes, size_t n, PreparedJob **owner) {
+    uint8_t parts[3][32], digest[32];
+    memcpy(parts[0], xlate_id, 32);
+    rt_sha256(bytes, n, parts[1]);
+    memcpy(parts[2], options_hash, 32);
+    rt_sha256(parts, sizeof parts, digest);
+    uint32_t slot;
+    memcpy(&slot, digest, sizeof slot);
+    PreparedJob **bucket = &preparing->buckets[slot % BUCKETS];
+    plat_mutex_lock(&preparing->lock);
+    PreparedJob *j = *bucket;
+    while (j && memcmp(j->digest, digest, 32)) j = j->next;
+    if (!j && (j = calloc(1, sizeof *j))) {
+        memcpy(j->digest, digest, 32);
+        plat_cond_init(&j->done);
+        j->next = *bucket;
+        *bucket = j;
+    }
+    if (j) {
+        while (j->busy) plat_cond_wait(&j->done, &preparing->lock);
+        if (!j->ready) {
+            j->busy = 1;
+            *owner = j;
+        }
+    }
+    plat_mutex_unlock(&preparing->lock);
+    return *owner ? NULL : j;
+}
+
+static void prepared_finish(PreparedJob *owner, const GfxShader *s, const uint8_t request_key[32]) {
+    plat_mutex_lock(&preparing->lock);
+    if (s) {
+        key_hex(s->key, owner->cache_key);
+        key_hex(request_key, owner->reflection_key);
+        owner->ready = 1;
+    }
+    owner->busy = 0;
+    plat_cond_broadcast(&owner->done);
+    plat_mutex_unlock(&preparing->lock);
+}
+
+// Copy the unmodified disk SPIR-V. disk_load_from applies the per-install HDR substitution in memory.
+// The translator embeds its job key in reflection, so each logical job gets the key it would have emitted.
+static GfxShader *prepared_copy(const PreparedJob *j, const Req *r, const char *hex, const char *spv, const char *res) {
+    char path[PATH_CAP + 80];
+    uint64_t ns = 0, nr = 0;
+    snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, j->cache_key);
+    uint8_t *reflection = read_file(path, &nr);
+    if (!reflection) return NULL;
+    const char *end = (char *)reflection + nr;
+    const char *id = json_key((char *)reflection, end, "key");
+    if (!id || end - id < 66 || *id != '"' || id[65] != '"' || memcmp(id + 1, j->reflection_key, 64))
+        return free(reflection), NULL;
+    memcpy((char *)id + 1, hex, 64);
+    snprintf(path, sizeof path, "%s/%s.spv", cache_dir, j->cache_key);
+    uint8_t *raw = read_file(path, &ns);
+    int ok = raw && plat_file_write_cached(spv, raw, (size_t)ns) && plat_file_write_cached(res, reflection, (size_t)nr);
+    free(raw);
+    free(reflection);
+    return ok ? disk_load_from(r->key, r->iid, 0, 1) : NULL;
+}
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                      const GfxShaderAnswers *a) {
+                                      const GfxShaderAnswers *a, PreparedJob **owner, int *published) {
     const uint8_t *key = r->key;
     GfxShader *s;
     UseMask m;
@@ -2106,39 +2502,47 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);
     snprintf(res_path, PATH_CAP + 80, "%s/%s.res.json", cache_dir, hex);
-    if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
-    size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+    size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
-    if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
-    int ok = svc_request(req, reply, sizeof reply);
+    if (!req) return fail("out of memory", hex);
     // NX2NAVI_XLATE_KEEP=1: a last-frame variant's job stays as <key>.job (one request line) with its code, to run the
     // translator on by hand (nx2navi_xlate --serve < <key>.job); 2 keeps every job translated in this run (delete a
     // key's .res.json and .spv from the cache to have it translated, and kept, again)
-    static int keep = -1;
-    if (keep < 0) {
-        const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
-        keep = k && *k ? atoi(k) : 0;
-    }
-    // A failed translation keeps its job and code too (rare; what a translator fix is tested on).
-    int failed = ok && strncmp(reply, "ok ", 3);
-    int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
-    if (kept) {
-        char job_path[PATH_CAP + 80];
-        snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
-        write_file(job_path, req, strlen(req));
-    }
-    free(req);
-    if (!kept) plat_file_delete(code_path);
-    if (!ok) return fail("translator unavailable", hex);
-    if (strncmp(reply, "ok ", 3)) {
-        plat_file_delete(spv_path), plat_file_delete(res_path);
-        if (r->sm86) plat_inc64(&n_sm86);
-        return fail(reply, hex);
+    const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
+    int keep = k && *k ? atoi(k) : 0;
+    uint8_t options[32];
+    int share = preparing && !keep;
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control, share ? options : NULL);
+    size_t code_len = (size_t)(r->length - skip);
+    PreparedJob *prior = share ? prepared_enter(options, code + skip, code_len, owner) : NULL;
+    s = prior ? prepared_copy(prior, r, hex, spv_path, res_path) : NULL;
+    int reused = s != NULL;
+    if (s) {
+        free(req);
+    } else {
+        if (!write_file(code_path, code + skip, code_len)) return free(req), fail("cannot write the code file", hex);
+        int ok = svc_request(req, reply, sizeof reply);
+        // Keep a failed translation's job and code for diagnosis.
+        int failed = ok && strncmp(reply, "ok ", 3);
+        int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
+        if (kept) {
+            char job_path[PATH_CAP + 80];
+            snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
+            write_file(job_path, req, strlen(req));
+        }
+        free(req);
+        if (!kept) plat_file_delete(code_path);
+        if (!ok) return fail("translator unavailable", hex);
+        if (failed) {
+            plat_file_delete(spv_path), plat_file_delete(res_path);
+            if (r->sm86) plat_inc64(&n_sm86);
+            return fail(reply, hex);
+        }
+        if (!(s = disk_load_from(key, r->iid, 0, 1))) return fail("translator output missing or malformed", hex);
     }
     // Not flushed (see "Durability" at the top): the translator wrote them whole, and disk_load checks both.
     if (cache_flush()) plat_file_flush(spv_path), plat_file_flush(res_path);
-    if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
+    *published = 1;
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
         build_key(r->code_hash, a, &m, mk, miid);
@@ -2151,6 +2555,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         if (moved) {
             use_store(r->code_hash, &m);
         } else {                                           // keep the mask for this run only
+            *published = 0;
             plat_file_delete(spv_path), plat_file_delete(res_path), rt_log("gfx_shader: cannot rename %s", hex);
             plat_mutex_lock(&cache_lock);
             use_put(r->code_hash, 1, &m);
@@ -2159,7 +2564,8 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         memcpy(s->key, mk, 32), memcpy(s->iid, miid, 32);
     }
     in_store(s->iid, stage, control, code, r, a);
-    plat_inc64(&n_xlated);
+    if (reused) plat_inc64(&preparing->reused);
+    else plat_inc64(&n_xlated);
     s->fresh = 1;
     return mem_insert(s);
 }
@@ -2171,7 +2577,10 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
     int away = kern_core_away();
     const uint8_t *id = r->final ? r->key : r->code_hash;
     flight_enter(id);
-    const GfxShader *s = translate_one(r, stage, control, code, a);
+    PreparedJob *owner = NULL;
+    int published = 0;
+    const GfxShader *s = translate_one(r, stage, control, code, a, &owner, &published);
+    if (owner) prepared_finish(owner, published ? s : NULL, r->key);
     flight_leave(id);
     kern_core_back(&away);
     return s;
@@ -2604,9 +3013,35 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
            (double)plat_now_ms() - t0);
     free(w.other);
 }
-const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
-    if (words) *words = s->words;
-    return s->spirv;
+// Section "SPIR-V at rest": the plain SPIR-V, decoded first when the shader holds it compressed; valid until the
+// matching unpin. A frame that does not decode (the packer checked it when it made it) or a decode buffer that cannot
+// be had ends the process, as every other allocation of this file does.
+const uint32_t *gfx_shader_spirv_pin(const GfxShader *cs, uint64_t *words) {
+    GfxShader *s = (GfxShader *)cs;
+    uint64_t ns;
+    const uint32_t *w = spv_pin(&s->spv, &spv_lock, &ns);
+    if (!w) rt_fatal("gfx_shader: a shader's compressed SPIR-V (%llu words) cannot be decoded", (unsigned long long)s->spv.words);
+    zpass_count_decode(ns);
+    if (words) *words = s->spv.words;
+    return w;
+}
+
+void gfx_shader_spirv_unpin(const GfxShader *s) { spv_unpin(&((GfxShader *)s)->spv, &spv_lock, plat_now_ms()); }
+
+uint64_t gfx_shader_words(const GfxShader *s) { return s->spv.words; }
+
+// Worked out once per shader, by the first caller or by the SPIR-V thread before it compresses the module, so that a
+// caller on the drawing thread finds it ready for any compressed shader.
+uint64_t gfx_shader_spirv_fnv(const GfxShader *s) {
+    uint64_t ns;
+    uint64_t h = spv_fnv(&((GfxShader *)s)->spv, &spv_lock, plat_now_ms(), &ns);
+    zpass_count_decode(ns);
+    return h;
+}
+
+uint32_t gfx_shader_bindings(const GfxShader *s, const uint32_t **b) {
+    *b = s->bind;
+    return s->nbind;
 }
 
 const char *gfx_shader_res_json(const GfxShader *s) { return s->reflection; }
@@ -2626,7 +3061,7 @@ int gfx_shader_write_code(const GfxShader *s, const char *path) {
     char *req = st ? malloc(cap) : NULL, job[PATH_CAP + 80], hex[65];
     if (ok && req) {
         key_hex(s->key, hex);
-        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control);
+        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control, NULL);
         snprintf(job, sizeof job, "%s.job", path);
         write_file(job, req, strlen(req));
     }
@@ -2653,6 +3088,12 @@ uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]) {
 }
 
 uint32_t gfx_shader_mvprev_banks(const GfxShader *s) { return s->mvprev_banks; }
+
+int gfx_shader_palette(const GfxShader *s, int *slot, int *storage, uint32_t *joints) {
+    if (!s->pal_stride) return 0;
+    *slot = s->pal_slot, *storage = s->pal_storage, *joints = s->pal_joints;
+    return s->pal_stride;
+}
 
 uint32_t gfx_shader_omap(const GfxShader *s) { return s->omap; }
 
@@ -2906,6 +3347,7 @@ typedef struct {
     PrgList progs;
     const uint8_t *ans;
     size_t n_ans;
+    PreparedJobs jobs;
     uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
     volatile int64_t next, done, missing, failed, refined;
 } Prep;
@@ -2919,9 +3361,10 @@ static void prg_collect(const uint8_t *rec, void *ctx) {
 
 static void prep_worker(void *arg) {
     Prep *p = arg;
+    preparing = &p->jobs;
     for (;;) {
         size_t i = (size_t)plat_inc64(&p->next) - 1;
-        if (i >= p->n_ans) return;
+        if (i >= p->n_ans) break;
         const uint8_t *r = p->ans + i * ANS_REC;
         uint8_t key_rec[12 + 32];
         memcpy(key_rec + 12, r + 4, 32);
@@ -2943,6 +3386,7 @@ static void prep_worker(void *arg) {
         else if (p->iid) memcpy(p->iid[i], s->iid, 32);
         plat_inc64(&p->done);
     }
+    preparing = NULL;
 }
 
 // Translates every record of ans_path whose program is in prg_path on `threads` threads with up to `procs` translators.
@@ -2966,6 +3410,7 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
     plat_inc32(&C.suspended);   // a preparation translates everything under the current translator, carrying nothing
+    plat_mutex_init(&p.jobs.lock);
     uint64_t xl0 = (uint64_t)n_xlated;
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
     svc_set_limit(procs);
@@ -2992,6 +3437,15 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
            "cached; %lld default variants with refined answers; %.0f ms", p.n_ans, what, p.progs.n,
            (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed, (long long)p.missing, (long long)p.refined,
            (double)plat_now_ms() - t0);
+    rt_log("gfx_shader: prepare: %lld equivalent translator requests reused", (long long)p.jobs.reused);
+    for (int b = 0; b < BUCKETS; b++) {
+        PreparedJob *j = p.jobs.buckets[b];
+        while (j) {
+            PreparedJob *next = j->next;
+            free(j);
+            j = next;
+        }
+    }
     free(p.progs.idx), free(pb);
     if (ans_out) *ans_out = ab;
     else free(ab);
@@ -3259,7 +3713,7 @@ static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwh
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), snprintf(why, nwhy, "out of memory"), -1;
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control);
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control, NULL);
     int ok = carry_exchange(req, reply, sizeof reply), refused = ok && strncmp(reply, "ok ", 3);
     if (refused) {   // as translate_one: the job and its code stay, for a translator fix to be tested on
         char job_path[PATH_CAP + 80];
@@ -3553,14 +4007,54 @@ void gfx_shader_carry_start(void) {
     if (!plat_thread_spawn(carry_main, NULL, "shader carry", 0)) rt_log("gfx_shader: carry: cannot start the background pass");
 }
 
-// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the shader memory cache's entries with their SPIR-V and reflection bytes
-// (kept for the life of the process), the remembered failures, the translation and load queues, and the translator
-// processes. cache_lock is held shared: lookups go on, a translator's insert waits for the walk.
+// The memory report's figure for the shader caches in process memory (vk_memory.c system_log), at report time: the
+// memory cache's translated shaders (entries with their SPIR-V, reflection text and resource lists, kept for the life of
+// the process), the use masks (those read at the start, use_preload, and those found since), the cache pack's index,
+// and the records of programs and answers met in play (their sets and what waits to be appended). The walk holds
+// cache_lock shared, as gfx_shader_sizes does: a translator's insert waits for it. The SPIR-V is counted as it is
+// held (section "SPIR-V at rest": a plain copy, a compressed frame or both), read without spv_lock: a store the SPIR-V
+// thread changes meanwhile is counted as it was or as it is.
+void gfx_shader_ram(GfxShaderRam *r) {
+    memset(r, 0, sizeof *r);
+    plat_mutex_lock_shared(&cache_lock);
+    for (int i = 0; i < BUCKETS; i++) {
+        for (const GfxShader *g = buckets[i]; g; g = g->next) {
+            uint64_t plain, z;
+            spv_held(g, &plain, &z);
+            r->shaders++;
+            r->cache += sizeof *g + plain + z + (uint64_t)g->nbind * sizeof *g->bind + g->reflection_size + 1;
+            for (int k = 0; k < GFX_RES_KINDS; k++) r->cache += (uint64_t)g->nres[k] * sizeof *g->res[k];
+            r->spv_held += plain + z, r->spv_full += g->spv.words * 4, r->spv_packed += !plain && z;
+        }
+        for (const UseEnt *u = use_buckets[i]; u; u = u->next) r->use += sizeof *u;
+    }
+    plat_mutex_unlock_shared(&cache_lock);
+    r->compress = __atomic_load_n(&Z.state, __ATOMIC_ACQUIRE);
+    r->decodes = (uint64_t)__atomic_load_n(&Z.dec, __ATOMIC_RELAXED);
+    r->decode_ns = (uint64_t)__atomic_load_n(&Z.dec_ns, __ATOMIC_RELAXED);
+    r->draw_decodes = (uint64_t)__atomic_load_n(&Z.dec_draw, __ATOMIC_RELAXED);
+    r->draw_decode_ns = (uint64_t)__atomic_load_n(&Z.dec_draw_ns, __ATOMIC_RELAXED);
+    r->draw_decode_max_ns = (uint64_t)__atomic_load_n(&Z.dec_draw_max_ns, __ATOMIC_RELAXED);
+    r->use += (uint64_t)__atomic_load_n(&use_files_n, __ATOMIC_RELAXED) * sizeof(UseFile) + sizeof use_files;
+    r->pack = (uint64_t)pack_n * sizeof(PackEnt);
+    plat_mutex_lock(&RC.lock);
+    r->records = ((uint64_t)RC.pairs.cap + RC.progs.cap) * sizeof(uint64_t) + RC.ans.cap + RC.prg.cap;
+    plat_mutex_unlock(&RC.lock);
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the shader memory cache's entries with their SPIR-V as held (plain and
+// compressed, gfx_shader_ram) and reflection bytes (kept for the life of the process), the remembered failures, the
+// translation and load queues, and the translator processes. cache_lock is held shared: lookups go on, a translator's
+// insert waits for the walk.
 void gfx_shader_sizes(PerfSizes *s) {
     uint64_t n = 0, spv = 0, refl = 0, failed = 0, xq = 0, lq = 0, procs = 0, busy = 0;
     plat_mutex_lock_shared(&cache_lock);
     for (int i = 0; i < BUCKETS; i++)
-        for (const GfxShader *g = buckets[i]; g; g = g->next) n++, spv += g->words * 4, refl += g->reflection_size;
+        for (const GfxShader *g = buckets[i]; g; g = g->next) {
+            uint64_t plain, z;
+            spv_held(g, &plain, &z);
+            n++, spv += plain + z, refl += g->reflection_size;
+        }
     plat_mutex_unlock_shared(&cache_lock);
     plat_mutex_lock(&failed_lock);
     for (int i = 0; i < FAILED_N; i++) failed += failed_used[i] != 0;

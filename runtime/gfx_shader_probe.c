@@ -171,8 +171,10 @@ int probe_shader(void) {
         first[i] = translate(&entries[i], &err);
         FAIL_IF(!first[i], "shader %s did not translate", entries[i].key);
         uint64_t words;
-        const uint32_t *w = gfx_shader_spirv(first[i], &words);
-        FAIL_IF(words < 5 || w[0] != 0x07230203, "shader %s: bad SPIR-V magic", entries[i].key);
+        const uint32_t *w = gfx_shader_spirv_pin(first[i], &words);
+        uint32_t magic = w[0];
+        gfx_shader_spirv_unpin(first[i]);
+        FAIL_IF(words < 5 || magic != 0x07230203, "shader %s: bad SPIR-V magic", entries[i].key);
     }
     FAIL_IF(gfx_shader_requests() - req0 != WANT, "pass 1 sent %llu requests, expected %d",
             (unsigned long long)(gfx_shader_requests() - req0), WANT);
@@ -187,8 +189,10 @@ int probe_shader(void) {
         second[i] = translate(&entries[i], &err);
         FAIL_IF(!second[i], "shader %s missing from the disk cache", entries[i].key);
         uint64_t words;
-        const uint32_t *w = gfx_shader_spirv(second[i], &words);
-        FAIL_IF(words < 5 || w[0] != 0x07230203, "shader %s: bad SPIR-V magic from disk", entries[i].key);
+        const uint32_t *w = gfx_shader_spirv_pin(second[i], &words);
+        uint32_t magic = w[0];
+        gfx_shader_spirv_unpin(second[i]);
+        FAIL_IF(words < 5 || magic != 0x07230203, "shader %s: bad SPIR-V magic from disk", entries[i].key);
     }
     int hits = (int)(gfx_shader_cache_hits() - hits0);
     FAIL_IF(gfx_shader_requests() != req0, "pass 2 contacted the service");

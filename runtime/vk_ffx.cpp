@@ -128,6 +128,7 @@ struct Up {
     uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
     bool drs = false;                          // made for dynamic resolution (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)
     uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
+    uint64_t vram = 0;                         // its video memory as the library reported it at its creation, 0 not told
 } U[4];
 uint64_t up_tick;
 // A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
@@ -244,6 +245,12 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
+    // its video memory, for the memory report (vk_ffx_vram); a provider that does not know the query leaves it 0
+    FfxApiEffectMemoryUsage mem = {};
+    ffxQueryDescUpscaleGetGPUMemoryUsage mq = {};
+    mq.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+    mq.gpuMemoryUsageUpscaler = &mem;
+    if (A.query(&slot->ctx, &mq.header) == FFX_API_RETURN_OK) slot->vram = mem.totalUsageInBytes;
     rt_log("ffx: FSR 3.1 upscaling to %ux%u from render sizes up to %ux%u (%s)", ow, oh, mw, mh,
            v.versionName ? v.versionName : "provider unknown");
     return slot;
@@ -431,9 +438,39 @@ extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDes
     return A.ok ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
+// The upscaler is off (vk_dlaa.c retire_idle; the device is idle): FSR 3.1's and FSR 4's upscale contexts go, made again
+// at the next upscale. Frame generation's contexts are not these.
+extern "C" int vk_ffx_holds(void) {
+    for (Up &u : U)
+        if (u.ctx) return 1;
+    return vk_ffx4_holds();
+}
+extern "C" void vk_ffx_release_idle(void) {
+    vk_ffx4_release();
+    if (!A.ok) return;
+    for (Up &u : U)
+        if (u.ctx) destroy_up(&u, "the upscaler is off");
+}
+
 extern "C" void vk_ffx_release(void) {
     vk_ffx4_release();
     if (!A.ok) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u.ctx = nullptr;
+}
+
+// The memory report's FSR figures (vk_memory.c outside_log): the video memory of the upscaling contexts that exist,
+// FSR 3.1's here and FSR 4's (vk_ffx4_vram), as the library reported each at its creation, with their count; and
+// frame generation's (vk_fg_vram). The library allocates it itself, outside VMA. Read without a lock: a context made or
+// destroyed meanwhile shows in the next report.
+extern "C" uint64_t vk_ffx_vram(int *contexts, uint64_t *fg) {
+    uint64_t bytes = 0;
+    int n = 0;
+    for (Up &u : U)
+        if (__atomic_load_n(&u.ctx, __ATOMIC_RELAXED)) n++, bytes += __atomic_load_n(&u.vram, __ATOMIC_RELAXED);
+    int n4 = 0;
+    bytes += vk_ffx4_vram(&n4);
+    *contexts = n + n4;
+    *fg = vk_fg_vram();
+    return bytes;
 }

@@ -1358,6 +1358,12 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 static uint32_t map_gen;
 uint32_t mem_map_gen(void) { return __atomic_load_n(&map_gen, __ATOMIC_ACQUIRE); }
 
+// The application pool is the title's own plus res_heap_extra_bytes (mem_init), and the game asks for a heap of
+// nearly all of it: past HEAP_CAP the request below is refused, so this is the most that may be added.
+uint64_t mem_heap_extra_max_kib(void) {
+    return HEAP_CAP > DEFAULT_POOL ? ((HEAP_CAP - DEFAULT_POOL) & ~0x1fffffull) >> 10 : 0;
+}
+
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: the commit or decommit, the wait for the lock included
@@ -1871,6 +1877,12 @@ void mem_guest_census(uint64_t frame) {
         rt_log("mem: lazy heap at frame %llu: %.0f of %.0f MiB committed, by %llu faults and the rest by kernel "
                "accesses and pointer checks", (unsigned long long)frame, heap_lazy_bytes / 1048576.0,
                __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE) / 1048576.0, (unsigned long long)heap_lazy_faults);
+}
+
+void mem_guest_usage(uint64_t *heap, uint64_t *heap_committed, uint64_t *phys_maps) {
+    *heap = __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
+    *heap_committed = heap_lazy ? __atomic_load_n(&heap_lazy_bytes, __ATOMIC_RELAXED) : *heap;
+    *phys_maps = __atomic_load_n(&alias_bytes, __ATOMIC_RELAXED);
 }
 
 // NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the guest heap and physical maps, the kernel region's bump and commit, the

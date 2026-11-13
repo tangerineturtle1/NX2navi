@@ -8,17 +8,30 @@
 #pragma clang diagnostic pop
 // Every VMA allocation goes by the device-local heaps' live budgets (vk_vma_budget.c): a heap within the reserve of its
 // budget takes nothing new while another heap can.
+// Each allocation is also counted under its owner, by the source file that made it, until it is freed through the
+// wrappers below (vk_vma_owner_bytes, for the memory report: vk_memory.c owner_log).
 VkResult vk_vma_create_image(VmaAllocator vma, const VkImageCreateInfo *ici, const VmaAllocationCreateInfo *ai, VkImage *img,
-                             VmaAllocation *a, VmaAllocationInfo *info);
+                             VmaAllocation *a, VmaAllocationInfo *info, const char *file);
 VkResult vk_vma_create_buffer(VmaAllocator vma, const VkBufferCreateInfo *bci, const VmaAllocationCreateInfo *ai,
-                              VkBuffer *buf, VmaAllocation *a, VmaAllocationInfo *info);
+                              VkBuffer *buf, VmaAllocation *a, VmaAllocationInfo *info, const char *file);
 VkResult vk_vma_allocate_memory(VmaAllocator vma, const VkMemoryRequirements *req, const VmaAllocationCreateInfo *ai,
-                                VmaAllocation *a, VmaAllocationInfo *info);
+                                VmaAllocation *a, VmaAllocationInfo *info, const char *file);
+void vk_vma_destroy_image(VmaAllocator vma, VkImage img, VmaAllocation a);
+void vk_vma_destroy_buffer(VmaAllocator vma, VkBuffer buf, VmaAllocation a);
+void vk_vma_free_memory(VmaAllocator vma, VmaAllocation a);
 uint64_t vk_vma_moved(void);   // allocations placed outside a full heap so far
+// The owners of VMA allocations (vk_vma_budget.c owner_of says which files make each one's).
+enum { VK_OWN_TEXTURES, VK_OWN_POOLS, VK_OWN_UPSCALER, VK_OWN_REPLAY, VK_OWN_USNAP, VK_OWN_GPA, VK_OWN_ASTC,
+       VK_OWN_PRESENT, VK_OWN_HEADROOM, VK_OWN_OTHER, VK_OWN_N };
+// The bytes of an owner's live allocations on the device-local heaps (local 1) or on the others (local 0). No lock.
+uint64_t vk_vma_owner_bytes(int owner, int local);
 #ifndef VK_VMA_BUDGET_IMPL
-#define vmaCreateImage vk_vma_create_image
-#define vmaCreateBuffer vk_vma_create_buffer
-#define vmaAllocateMemory vk_vma_allocate_memory
+#define vmaCreateImage(v, ici, ai, img, a, info) vk_vma_create_image(v, ici, ai, img, a, info, __FILE__)
+#define vmaCreateBuffer(v, bci, ai, buf, a, info) vk_vma_create_buffer(v, bci, ai, buf, a, info, __FILE__)
+#define vmaAllocateMemory(v, req, ai, a, info) vk_vma_allocate_memory(v, req, ai, a, info, __FILE__)
+#define vmaDestroyImage vk_vma_destroy_image
+#define vmaDestroyBuffer vk_vma_destroy_buffer
+#define vmaFreeMemory vk_vma_free_memory
 #endif
 #include "nvn_obj.h"   // pool_t, tex_t, view_t, samp_par, NVNcopyRegion (memory and textures block)
 #include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block)
@@ -54,6 +67,10 @@ typedef struct VkCtx {
         has_mesh_shader, has_vrs,           // VK_EXT_mesh_shader with taskShader and meshShader (NVN2 task/mesh stages)
         has_maximal_reconvergence,          // VK_KHR_shader_maximal_reconvergence (vk_pipeline.c spirv_reconverge)
         has_pipeline_binary,                // VK_KHR_pipeline_binary with VK_KHR_maintenance5 (vk_pipeline.c pipe_create)
+        has_low_latency2,                   // VK_NV_low_latency2 with VK_KHR_present_id, which it needs (vk_lowlat.c)
+        has_present_id,                     // ... and the presentId feature: presents may carry a frame's number
+        has_anti_lag,                       // VK_AMD_anti_lag with its antiLag feature (vk_lowlat.c)
+        lists_low_latency,                  // the driver lists one of the two, left out: the run started with the mode off
         has_mesh_queries;                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
     int mesh_fallback;                      // task and mesh programs run as compute passes and are drawn from buffers
                                             // (mesh_fallback: auto without has_mesh_shader; vk_exec_draw.c "mesh fallback")
@@ -148,12 +165,14 @@ typedef struct {
     const GfxShader *first[2], *last[2];// vertex and fragment shader of the first and last draw; a dispatch: first[0]
     uint32_t gp;                        // NX2NAVI_GPU_PASSES: the timestamp pair of this mark plus one; 0 none
     uint32_t layer;                     // NX2NAVI_GPU_PASSES: the first layer of the depth target (a shadow cascade)
+    uint32_t gap;                       // bits of VK_GAP_*: what the replay recorded between the mark before and this one
 } VkPassMark;
 void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAVI_GPU_PASSES, GPU time per pass and dispatch
 // NX2NAVI_GPU_PASSES also times what a part of a submission spends outside its passes and dispatches (vk_crumbs.c, "the
 // gap ledger"). vk_gpu_passes_part: vk_sync.c, at the start (end 0) and the end (end 1) of each part's command buffer.
 // vk_gpu_gap_note: the replay is about to record commands of this kind outside a pass or dispatch; units is their size
-// (bytes for buffers, texels for images, 0 unknown). Both do nothing outside the timed frames. Replay thread only.
+// (bytes for buffers, texels for images, 0 unknown). Outside the timed frames the first does nothing and the second
+// only notes the kind for the next pass mark (VkPassMark.gap, a lost device's report). Replay thread only.
 enum {
     VK_GAP_COPY_B2B, VK_GAP_COPY_B2T, VK_GAP_COPY_T2B, VK_GAP_COPY_T2T, VK_GAP_CLEAR_BUF, VK_GAP_CLEAR_TEX,
     VK_GAP_CLEAR_TARGET, VK_GAP_UPSCALER, VK_GAP_WB_MERGE, VK_GAP_WB_COPY, VK_GAP_TWIN, VK_GAP_POOL_MARKS,
@@ -184,6 +203,12 @@ const VkPassMark *vk_pass_mark_record(uint32_t id);   // the ring record of mark
 // the extension they came from), then each with its ring record. vk_pass_marks_report logs it; the probe checks it.
 void vk_pass_marks_format(const char *source, uint32_t started, uint32_t finished, char *o, size_t size);
 void vk_pass_marks_report(void);    // vk_device.c device_fault_report: the AMD words and the NVIDIA checkpoints, formatted
+// Draw marks (vk_crumbs.c, NX2NAVI_DRAW_CRUMBS=1 with VK_AMD_buffer_marker; off by default): a mark where the shaders
+// or the pipeline state change inside pass m, before the draw with index draw in that pass, so a lost device's report
+// names the shaders of the draws the GPU had not finished. From any thread that records draws (the replay and its
+// workers): the mark takes its number atomically. Nothing while vk_draw_marks_on is 0.
+extern int vk_draw_marks_on;
+void vk_draw_mark(VkCommandBuffer cb, const VkPassMark *m, const GfxShader *vs, const GfxShader *fs, uint32_t draw);
 
 // ---- window and present (gfx_present.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled
@@ -231,7 +256,8 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
 // Luminance statistics of an HDR10 shot inside rect {x, y, w, h}: the darkest pixel, the 0.1st, 1st, 50th and 99th
 // percentiles and the brightest pixel in nits, and the share of pixels under 0.01 nits (vk_hdr.c).
 void vk_hdr_luminance_stats(const uint8_t *in, int stride, const int rect[4], int a2r, float out[7]);
-void vk_hdr_release(void);   // before the device goes away
+void vk_hdr_release(void);
+void vk_hdr_images_release(void);   // the swapchain has no HDR: the encode's images go (waits for the device)   // before the device goes away
 // The support buffer's HDR settings, a vec4 at 1440 (vk_exec_draw.c support_fill; read by the game's tonemap with
 // shaders/hdr_tonemap.frag spliced in, vk_hdr.c tonemap_splice).
 void vk_hdr_support(float out[4]);
@@ -239,6 +265,11 @@ void vk_hdr_support(float out[4]);
 int vk_contact_strength(void);   // percent, 0 = off
 void vk_contact_release(void);   // before the device goes away
 void vk_present_flip(void);
+// The swapchain's images, their size and their pixels' bytes, for the memory report (vk_memory.c outside_log).
+void vk_present_swapchain_mem(uint32_t *n, uint32_t *w, uint32_t *h, uint64_t *bytes);
+// FSR's video memory for the memory report (vk_ffx.cpp): the upscaling contexts', FSR 3.1's and FSR 4's, with their
+// count, and frame generation's in *fg; as the library reported each at its creation, 0 where it did not say.
+uint64_t vk_ffx_vram(int *contexts, uint64_t *fg);
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
 // rebuild do. Recursive. Taking it first hands the replay's held submissions to the queue (vk_sync_flush_held); the
 // raw forms leave them held, for vk_sync.c itself.
@@ -253,6 +284,22 @@ void vk_sync_flush_held(void);    // queue lock held: the held submissions go to
 // NX2NAVI_ASPECT); the rest is black.
 void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);
 void vk_present_capture(int on);
+// The next presented frame, as the window gets it with the overlay on it, for a bug capture (bugcap.c): its pixels
+// are copied (px, malloc'd, as the swapchain holds them) and cb gets them on the presenting thread right after that
+// present; cb owns g and frees it with vk_present_grab_free. vk_present_grab_rgba: the pixels as RGBA bytes, an HDR10
+// picture converted to sRGB, into out (w * h * 4). One request at a time: 0 while one waits.
+typedef struct {
+    uint8_t *px;
+    int w, h;                 // the swapchain image
+    int bgra, hdr, a2r;       // its bytes' order; an HDR10 swapchain, and whether it is A2R10G10B10
+    int image_w, image_h;     // the game image this present showed
+    int scaler;               // how it was scaled to the window: 0 not, 1 bilinear, 2 FSR 1, 3 bilinear + sharpening
+    float pic[4];             // where the picture sits in the swapchain image, in fractions: x, y, w, h
+} VkGrab;
+int vk_present_grab(void (*cb)(VkGrab *g, void *ctx), void *ctx);
+void vk_present_grab_cancel(void);   // the request is dropped: once this returns, cb has run or never will
+void vk_present_grab_rgba(const VkGrab *g, uint8_t *out);
+void vk_present_grab_free(VkGrab *g);
 int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt);
 
 // The window system's part of device creation (gfx_window_win.c with Win32, gfx_window_sdl.c with SDL): the instance
@@ -370,6 +417,7 @@ void vk_mvprev_frame(void);   // each present, beside vk_dlaa_frame
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
 int vk_mem_mirror_pending(void);
+int vk_mem_gpa_late(void);   // --probe-vkmem: NX2NAVI_GPA_LATE, the table takes a new mirror up in queue order
 void vk_mem_mirror_prologue(VkCommandBuffer cb);
 // Staged mirror uploads (vk_memory.c): the GPU of the submission being recorded reads guest memory itself (noted by
 // vk_mem_note_live); vk_mem_take_live returns that and starts the next submission's note.
@@ -424,6 +472,14 @@ int vk_mem_flush_add_probe(void);        // --probe-vkexec: the flush range list
 uint64_t vk_mem_mirror_uploaded(void);   // --probe-vkexec: bytes copied into mirrors since the last summary line
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
+// Guest memory as dma-bufs (vk_memory.c "dma-buf imports"): pick_device tells whether the device has
+// VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf (before vk_mem_class_log); create_device enables them
+// when the pools are imported that way.
+void vk_mem_dmabuf_caps(int exts);
+int vk_mem_dmabuf_on(void);
+// After vkCreateDevice, before vk_mem_lazy_decide: a page of guest memory imported as the pools will be; any refusal
+// turns the dma-buf imports off for the run (shadow storage then). bda: buffers get device addresses.
+void vk_mem_dmabuf_probe(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int bda);
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
@@ -432,6 +488,8 @@ void vk_mem_lost_report(void);                    // a line with the video memor
 float vk_mem_device_used_mb(void);                // device-local memory this process holds (the driver's budget
                                                   // figure), MB; -1 without VK_EXT_memory_budget. Any thread.
 void vk_mem_stage_log(const char *stage);         // one line after a boot stage: device memory, process commit
+void vk_mem_exit_log(void);                       // at the process's end: the memory report's growth ranking of the
+                                                  // session (vk_memory.c growth_take), once it reached play
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
@@ -650,7 +708,14 @@ int vk_sampler_slot_count_locked(void);
 // Bindless pools (vk_exec_draw.c, "texture and sampler pools"): set 2 of every pipeline layout. Shaders that index
 // the texture or sampler pool with handles from memory have their pool arrays moved there (vk_pipeline.c
 // spirv_pool_rebind); VK_POOL_KINDS image bindings, one per view kind, then the sampler pool.
-#define VK_POOL_TEX 32768                           // as the translator's Accessor.TexturePoolLength
+// VK_POOL_TEX covers the game's whole texture pool: Ocarina makes one of 33068 descriptors (nvnTexturePoolInitialize),
+// and with 32768 the translator's clamp sent every handle from 32768 up to slot 32767, so the textures the game
+// numbered there (some ground after an area load) were drawn with whatever slot 32767 held, often an empty image:
+// see-through ground until the area was loaded again. 16 kinds x 40960 = 655,360 sampled images in set 2, under
+// NVIDIA's 1,048,576 update-after-bind limit with room for the bound slots; vk_exec_draw.c pool_layout_make logs the
+// device's limits and says which one a failed layout passed. vk_texture_register logs a slot past the pool.
+#define VK_POOL_TEX 40960                           // as the translator's Accessor.TexturePoolLength
+#define VK_POOL_TEX_CARRIED 32768                   // the length before: carried translations still declare it
 #define VK_POOL_SAMP 4096                           // Accessor.SamplerPoolLength
 #define VK_POOL_KINDS 16                            // kind = depth * 8 + dim * 2 + arrayed, dim 1D 2D 3D CUBE
 extern volatile uint32_t vk_pool_kinds_used;        // bit k: a pipeline was made with a kind-k pool array
@@ -672,10 +737,16 @@ uint64_t vk_pool_takes(void);
 void vk_texture_pool_ctx(int on);
 VkDescriptorSetLayout vk_pool_set_layout(void);     // the pools' layout (made on first use)
 VkDescriptorSetLayout vk_empty_set_layout(void);    // set 1 of layouts without one
-// The upscaler stand-in (vk_tonemap.c): src (sampled) scaled to dw x dh and tonemapped into its own RGBA16F image, which
-// it returns for the caller to blit into the target; VK_NULL_HANDLE when it cannot. The caller binds its own compute
-// pipeline again afterwards.
-VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh);
+// The upscaler stand-in (vk_tonemap.c): src (sampled, sw x sh) scaled to dw x dh and tonemapped into its own RGBA16F
+// image, which it returns for the caller to blit into the target; VK_NULL_HANDLE when it cannot. edge: 1 lets it scale
+// with the edge-adaptive filter (NX2NAVI_STANDIN_FILTER), 0 keeps the linear one (another upscaler's picture replaces
+// this one). The caller binds its own compute pipeline again afterwards.
+VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t sw, uint32_t sh, uint32_t dw,
+                          uint32_t dh, int edge);
+// A source image of the stand-in goes (vk_exec_draw.c fallback_scratch, or a game image's destroy through
+// vk_exec_image_gone): its views go through the deferred destruction, before another image can take its handle. Any
+// thread.
+void vk_tonemap_forget(VkImage src);
 // What vk_texture_by_id(id) returns can change only when this does: the slot is registered again, or a texture entry at
 // its storage address is created, dropped, released or taken back into use. Unlocked; read it before the lookup it
 // guards (a lookup may create an entry). 0 when the slot was never registered: nothing is kept under 0.
@@ -749,10 +820,43 @@ void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those imag
 void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   // vk_pool_fini: drop the images there
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 // Entries now, live and released (TextureFinalize, kept until sweep_released), with the bytes of their own memory
-// (images not bound into pool memory).
-typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
+// (images not bound into pool memory). Of the live bytes: those whose content only the GPU made (render targets and
+// what the GPU drew or copied into), and the idle ones no lookup reached lately (vk_texture.c idle, what the VRAM
+// pressure may evict); of the released bytes: those released too lately for any bound to drop them (stale_after).
+typedef struct {
+    uint64_t live, released, own_live, own_released, bytes_live, bytes_released;
+    uint64_t bytes_live_gpu, bytes_live_idle, bytes_released_young;
+} VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
+// The texture cache's host memory for the memory report (vk_memory.c system_log), in bytes: its entries and tables, and
+// the CPU's decode and write-back temporaries in use now and at most at once since the last call (which resets that).
+typedef struct { uint64_t entries, bytes, tmp, tmp_peak; } VkTexHost;
+void vk_texture_host(VkTexHost *h);
 void vk_texture_census_log(uint64_t frame);         // vk_memory.c vram_log: the live entries' memory by kind and format
+void vk_texture_reuse_log(uint64_t frame);          // vk_memory.c owner_log: released textures taken back, made again
+// The holes in VMA's blocks that hold textures (vk_texture.c "compaction", vk_tex_compact.h), for vk_memory.c holes_log.
+// A VkBlockRow is an allocation of another kind that the caller knows to lie in one of VMA's blocks (a VRAM mirror):
+// the block's device memory handle and size, the allocation's size and memory type.
+typedef struct { uint64_t mem, block_size, bytes; uint32_t type; } VkBlockRow;
+// Of the device-local memory type whose blocks hold the most texture memory (type): the blocks that hold a texture,
+// their sizes and the textures and rows in them; the textures that could move to another block or be dropped (marks 0:
+// the texture pool's marks do not tell which textures are sampled, and none counts as movable); the blocks at most half
+// full by what is listed, and those of them that hold nothing but such textures, which are what a compaction could
+// give back to the driver.
+typedef struct {
+    uint32_t type, marks, blocks, sparse, emptiable;
+    uint64_t block_bytes, tex_bytes, other_bytes, move_bytes, drop_bytes;
+    uint64_t sparse_bytes, sparse_listed, emptiable_bytes, emptiable_move, emptiable_drop;
+} VkTexHoles;
+void vk_texture_holes(const VkBlockRow *other, int nother, VkTexHoles *h);
+// Texture compaction (NX2NAVI_TEX_COMPACT; vk_texture.c "the pass"): idle textures move out of sparsely used blocks
+// so that the blocks go back to the driver. vk_mem_census asks at each present whether the holes are due a look
+// and, when they are, hands over the VRAM mirrors' rows for the plan; the allocator's free callback reports each
+// device memory it gives back (vk_headroom.c on_free; any thread).
+int vk_texture_compact_on(void);
+int vk_texture_compact_due(void);
+void vk_texture_compact_plan(const VkBlockRow *other, int nother);
+void vk_texture_block_freed(uint64_t mem);
 void vk_texture_want_room(uint64_t bytes);          // a VRAM mirror that did not fit: idle textures make that much room
 int vk_texture_commit_low(void);                    // the system's commit was low at the last check (vk_texture.c)
 // vk_mem_vram's device-local use less the free space inside VMA's blocks (vk_memory.c), for the evictions
@@ -789,6 +893,9 @@ int vk_sync_effect_late(void);
 uint64_t vk_sync_cb_value(void);            // the value whose side effect the calling thread is running; 0: not in one
 void vk_sync_cb_stats(char *out, size_t n);
 void vk_exec_late_stats(uint64_t *events, uint64_t *counters, uint64_t *counts);   // vk_exec_xfer.c: such callbacks since the last call
+// vk_exec_xfer.c clear_small: the small buffer clears since the last call and the counter records they covered, as a
+// clause for a periodic log line. Replay thread.
+void vk_exec_clear_stats(char *out, size_t n);
 VkCommandBuffer vk_sync_split_exec(void);   // vk_sync_split for the part before a submission's write-backs
 int vk_mem_mirror_wb_pending(void);         // vk_memory.c: vk_mem_mirror_end has write-backs to record
 uint64_t vk_sync_fence_done(void);         // highest done value
@@ -934,6 +1041,9 @@ double vk_pipeline_building_ms(const VkPipeState *s);
 // The stage libraries of a draw the replay has not reached yet, queued to the workers when no pipeline is known for its
 // state (vk_pipeline.c "stage libraries ahead of their draws"). Returns the libraries queued.
 int vk_pipeline_hint(const VkPipeState *s);
+// 1 when mesh pipelines are linked from stage libraries like vertex pipelines (NX2NAVI_GPL_MESH; vk_pipeline.c
+// mesh_lib_init says where not): a new one is then usable after a link, not only after its whole build.
+int vk_pipeline_mesh_libs(void);
 // rt_boot calls it unless --shot is given; NX2NAVI_PIPE_SYNC=1 makes it a no-op. Of the probes only --probe-prewarm
 // calls it.
 void vk_pipeline_async_enable(void);
@@ -945,10 +1055,15 @@ void vk_pipeline_prewarm(void);
 // Ends the boot prebuild's crash marker (vk_pipeline.c, "boot prebuild crash marker"): boot_wait calls it when it lets
 // the game start while the prewarm goes on, so a crash in play is not taken for one in the boot's builds.
 void vk_pipeline_prewarm_marker_clear(void);
+// boot_wait calls it when it lets the game start while the prewarm goes on: the builders of the whole warm after a
+// driver change (vk_pipeline.c bf_decide) go on as in play, at idle priority and in the background's numbers.
+void vk_pipeline_prewarm_detach(void);
 typedef struct {
-    int phase;                            // 0 starting (device, key file), 1 shaders, 2 pipelines, 3 done
+    // 0 starting (device, key file), 1 shaders, 2 pipelines, 5 done. Only in the whole warm after a driver change
+    // (vk_pipeline.c bf_decide): 3 compute pipelines, 4 the prepared variants built into the driver's cache.
+    int phase;
     int64_t sh_done, sh_total, sh_translated;   // gfx_shader_prewarm_progress
-    int64_t pipe_done, pipe_total;        // pipelines built or failed of those queued
+    int64_t pipe_done, pipe_total;        // pipelines built or failed of those queued; phases 3 and 4: their counts
 } VkPrewarmProgress;
 void vk_pipeline_prewarm_progress(VkPrewarmProgress *p);   // any thread, while vk_pipeline_prewarm runs or after
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
@@ -1015,7 +1130,25 @@ PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void);
 int vk_pipeline_set_indep(int on);
 typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layouts, async_built, pending_skips; } VkPipeStats;
 void vk_pipeline_stats(VkPipeStats *s);
-void vk_pipeline_save(void);               // writes the VkPipelineCache to pipeline-cache.bin next to nx2navi.exe
+// The memory report's pipeline figures (vk_memory.c outside_log, system_log), at report time. Counts of what holds
+// device memory outside VMA: graphics pipelines by kind (gfx_none: entries building or failed), of those with a pipeline
+// the ones no draw looked up for idle_min minutes and the ones none did in this run; built stage libraries by kind
+// (vertex input, pre-rasterization, fragment shader, fragment output); compute pipelines likewise; pipeline layouts.
+// Host bytes: the pipeline, library and layout tables, the key file's set and records, the shared list's records (only
+// until the boot's prebuild is done with them), the pipeline binaries' index. cache: the data the driver holds for
+// pipeline-cache.bin [0] and the play cache [1], as last asked (cache_asked) or else as loaded at the boot.
+typedef struct {
+    uint64_t gfx, gfx_whole, gfx_fast, gfx_opt, gfx_none, gfx_idle, gfx_never;
+    uint64_t lib[4], lib_none;
+    uint64_t comp, comp_none, comp_idle, comp_never;
+    uint64_t layouts;
+    uint64_t ram_pipes, ram_keys, ram_seed, ram_binaries;
+    uint64_t cache[2];
+    int cache_asked;
+    uint32_t idle_min;
+} VkPipeMem;
+void vk_pipeline_mem(VkPipeMem *m, uint32_t idle_min);
+void vk_pipeline_save(void);              // writes the VkPipelineCache to pipeline-cache.bin next to nx2navi.exe
 void vk_pipeline_save_exit(void);          // vk_pipeline_save as the process ends: new builds wait while it waits for
                                            // the running ones
 void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since
@@ -1033,5 +1166,9 @@ void vk_pipeline_foreign_counts(VkForeignPipes *o);
 
 #include "vk_rec.h"   // last: its macros route the vkCmd* calls of every file that includes vk.h
 
-// Select the main scene view for selective animated motion.
-int vk_fg_pose_prepare(uint64_t cam, VkImage depth);
+// Select the main scene view for selective animated motion, and decide which of the frame's other skinned draws
+// continue a draw of last frame (vk_skin_motion.inc skin_resolve). ex: the submission that records the motion vectors,
+// which are made for the camera block cam and tested against the depth image depth of w x h. 1: the frame has motion
+// draws to record.
+struct VkExec;
+int vk_fg_pose_prepare(struct VkExec *ex, uint64_t cam, VkImage depth, uint32_t w, uint32_t h);

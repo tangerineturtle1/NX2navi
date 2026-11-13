@@ -4,7 +4,8 @@
 # matched against, +116 the ratio that replaces it and +120 the tolerance of the match, as floats; +144 the bit
 # patterns of the UI's full-screen orthographic projection (m00 = 2 / 3840, m11 = 2 / 2160), +160..+175 and +208..+223
 # the four screen vtables that keep it, +176 the UI's horizontal squeeze (16:9 over the picture's ratio) in four lanes, +192 the
-# movie's margin on each side as a share of the width.
+# movie's margin on each side as a share of the width, +224 what the viewport of the save's picture gets added to its x
+# and +228 to its width, as 32-bit integers.
 #
 # The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF (MIT; see THIRD_PARTY_NOTICES.md). Each is
 # written without branches or flags, as the generator's patch sites need. The set names differ from the other patch
@@ -21,6 +22,7 @@ set zstd        NX2NAVI_ZSTD_NATIVE       1
 set osolver     NX2NAVI_PHYSICS_STEPS     1
 set opickup     NX2NAVI_PICKUP_COUNT      1
 set freecam     NX2NAVI_PATCH_FREECAM     0
+set omovie      NX2NAVI_MOVIE_PTS         1
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
 # nominal frame through main+0x3b4e300 (+0x10 frames per update, +0x14 the inverse, +0x18 seconds, +0x1c the rate),
@@ -46,6 +48,37 @@ site ostep main 3b4eaf8 1e201820 bd410120   # fdiv s0, s1, s0 -> ldr s0, [x9, #2
 # with the fraction kept for the next frame, so the day keeps the game's pace at any frame rate. x30 is the function's
 # own saved one, and the call at main+0x3cdfc8 sets it again.
 site ostep main 3cdfc0 1e380008 952b4be8   # fcvtzs w8, s0 -> bl page+0xf60
+# The water's ripples: the water renderer (main+0x472e0, reached from main+0x47160 for a water object whose flags at
+# +8 have bit 3, which that entry clears) runs its ripple simulation trunc(step) * substeps times, the step being the
+# time manager's (its +0, or one of its group steps at +0x20 + 0x30 * n) and the substeps +0x4c of the water's
+# parameters (object +0x1e8, then +0x150, or the parent those name), and skips the simulation when the product is
+# under 1 (main+0x47618). With the step above under one frame that was every frame above 60 fps: the rings Link and
+# everything else make in water stood still. The cut calls the page's +0xf50 instead (runtime/frame_rate.c
+# frame_rate_water_host): the step goes into a remainder kept for the water object (x21, the function's x0) and w9
+# gets the whole steps in it, so the rings spread at the game's pace at any frame rate, and a step of exactly one
+# frame gives what the game computes. Every path to the cut has the step in s0 (the one that asks the parameters'
+# parent keeps it across its call), and x30 is the function's own saved one.
+site ostep main 475f8 1e380009 95396656   # fcvtzs w9, s0 -> bl page+0xf50
+
+# Physics solver steps, at least a 60 fps frame's (physics_steps = 2, runtime/frame_rate.c frame_step_init switches
+# this set on and osolver off): the step setup below with the count of osolver, ceil(frames per update * count - 0.25),
+# raised to the count itself, the steps of one 60 Hz frame. Above 60 fps the rounded-up count still gives fewer
+# solver steps an update (2 at 120 to 160 fps, 1 at 240) while their number a second stays near 240; with this set
+# every update gets the 60 Hz frame's 4, each covering a quarter of the update's time, so a run at 240 fps solves 960
+# steps a second, 576 at 144. Link stood on the Deku Tree's floating platform (B1, Obj_Deku_MoveFloor_A_01, drifting
+# under GroundControlActor_WaveLoop) is carried by it fully at 60 fps, about a tenth at 160 and not at all at 240,
+# which follows the steps an update and not those a second; whether this mends the carry needs a run. At 60 and 30
+# fps the count is the game's (4 and 8). The first two sites are osolver's; at the third the cut becomes fmax s0, s0,
+# s1 (s1 the count, made a float by the scvtf before the fmadd) and the round up, so w1 = max(ceil(s0), count). s0
+# and s1 are not read before the call's callee (the world's main+0x3a24c20) and the code after it write them, and
+# none of the words reads or writes the flags.
+set osolverfull NX2NAVI_PHYSICS_STEPS_FULL 0
+site osolverfull main 38aebe4 bd440d02 1e2a1002            # ldr s2, [x8, #0x40c] (0.001) -> fmov s2, #0.25
+site osolverfull main 38aebf0 1f010800 1f218800            # fmadd s0, s0, s1, s2 -> fnmsub s0, s0, s1, s2
+site osolverfull main 38aebf4 1e380001 1e214800 1e280001   # fcvtzs w1, s0 -> fmax s0, s0, s1; fcvtps w1, s0
+site osolverfull main 38afd10 bd440d02 1e2a1002            # the same three in the second copy
+site osolverfull main 38afd1c 1f010800 1f218800
+site osolverfull main 38afd20 1e380001 1e214800 1e280001
 
 # Physics solver steps: the physics system's step setup (main+0x38aeb80, and the same code in main+0x38afc10) gives the
 # rigid body world its solver step count for the frame, trunc(frames per update * count + 0.001) with the count at
@@ -65,6 +98,92 @@ site osolver main 38aebf4 1e380001 1e280001   # fcvtzs w1, s0 -> fcvtps w1, s0 (
 site osolver main 38afd10 bd440d02 1e2a1002   # the same three words in the second copy
 site osolver main 38afd1c 1f010800 1f218800
 site osolver main 38afd20 1e380001 1e280001
+
+# Floors that carry a character: the character controller's update (main+0x3890a80, run from the physics step's jobs)
+# calls each of the controller's update modules (vtable +0x50). Three of them make the character follow what it stands
+# on: CharacterUpdateFollowSurface (vtable main+0x4c35730, update main+0x13d490), CharacterUpdateFollowSurfaceExtension
+# (main+0x4b9c008, main+0x139dc0) and CharacterUpdateDynamicFollowSurface (main+0x4c357b0, main+0x389aa40). Each finds
+# the supporting body by its ID (the word at [[controller +8] +0x28] +0x2c, looked up in the physics system's body
+# table), takes the body's velocity at the character (main+0x139c20: the linear part from the body's last and previous
+# transforms times the inverse of the step, main+0x138940, plus the angular part) and adds it to the character's move.
+# Before it adds it, each compares the physics system's inverse step ([[main+0x4e87ff0] +0xc0] +0x28, one over the
+# frame's seconds times the time scale, main+0x3b69870) with 100.0 and, above it, keeps a tenth of the velocity
+# (main+0x13dad4, main+0x13a39c, main+0x389af24; the 0.1 at main+0x3e40fb4). At the game's 60 and 30 fps the inverse
+# step is 60 or 30, so that happens only in a slow motion under 0.6 of the game's speed; above 100 fps it happened every
+# update. Link on the Deku Tree's floating platform (B1, Obj_Deku_MoveFloor_A_01) was carried at about a tenth of its
+# speed at 117 and 160 fps, and the platform drifted from under him (at 240 fps not at all, which the tenth alone does
+# not explain). The set compares with the page's +260 instead (runtime/frame_rate.c floor_carry_store, written with
+# +256): 100 / frames per update under one frame per update, else 100. The inverse step times frames per update is 60
+# over the time scale at any frame rate, so above 60 fps the cut comes where it came at 60 fps, and at 60 fps and below
+# (100 there, and until the first present) the words give what the game computes. At each site mov w8, #100.0 and
+# fmov s1, w8 become adrp x8, page and ldr s1, [x8, #260]; the fcmp
+# s0, s1 and b.gt after them are the game's. x8 is written again before any read on every path from the sites; s1 is
+# written again before any read, or reaches only calls that take no float argument (getters such as main+0xacd430 and
+# those behind vtable +0x68 and +0x210, nn::os::LockMutex and UnlockMutex, GetTlsValue, memset) and returns whose
+# caller (main+0x3890a80) reads no float result. No word reads or writes the flags.
+set ofollow NX2NAVI_FLOOR_CARRY 1
+site ofollow main 13d704 52a85908 @page:x8   # CharacterUpdateFollowSurface: mov w8, #0x42c80000 (100.0) -> adrp x8, page
+site ofollow main 13d708 1e270101 bd410501   # fmov s1, w8 -> ldr s1, [x8, #260]
+site ofollow main 13a064 52a85908 @page:x8   # the same two in CharacterUpdateFollowSurfaceExtension
+site ofollow main 13a068 1e270101 bd410501
+site ofollow main 389ac20 52a85908 @page:x8  # and in CharacterUpdateDynamicFollowSurface
+site ofollow main 389ac24 1e270101 bd410501
+
+# Fixed steps of the height-field surfaces: the physics' two water managers, phive::InteractiveWaterMgr (its update
+# main+0x3875f20, the vtable slot at main+0x4c32f90) and phive::ResponsiveWaterMgr (main+0x3882660, the slot at
+# main+0x4c33a88; the names are those of their postUpdateWorld profiler scopes, and their bodies are named
+# InteractiveWater_* and ResponsiveWater_* WaterBody, IceBody and SandBody), and the game's interactive floor
+# simulation built on the same base (main+0x632cb0, the slot at main+0x4c338e0; its object is made at main+0x990040 by
+# the code that sets up the InteractiveFloorBody, main+0x98fb70; the Deku Tree's ground webs are such a floor, the
+# "SimulationCarpet" of DgnObj_Spiderweb_Ground's InteractiveFloorControllerExtensionParam, 24 x 24 points) simulate
+# their surfaces in fixed steps of 1/60 s. Each update takes the frame's seconds (s0, kept in s8), divides them by 1/60
+# (main+0x3876014, main+0x38827f8, main+0x632cfc) and cuts the quotient to a whole number of steps, n = trunc(seconds *
+# 60) (fcvtzs into w8, w8 and w22); it keeps n, and min(max(n, 0), 3) as the count of steps it queues, each with a step
+# of 1/60 s (main+0x38764d8, main+0x3882cb0, main+0x632d40), and skips the whole simulation while n is under 1
+# (main+0x3876230, main+0x38829e8, main+0x632f20). Nothing keeps the fraction: at 60 fps every update runs one step, at
+# 30 two, and every update shorter than 1/60 s none, so above 60 fps those surfaces stood still whatever pushed into
+# them, a web under Link among them. After the division each site calls the page's +0xf20
+# (runtime/frame_rate.c frame_rate_sim_host): s0 becomes the whole steps in the quotient plus a remainder kept for the
+# object (x19, the function's x0 at all three), as a float, and the game's own cut and clamp follow. So the surfaces
+# run 60 steps a second at any frame rate, and an update of exactly 1/60 s gives what the game computes. The host
+# writes only s0's low lane, which the division wrote; x30 is the function's own, saved by its prologue
+# (main+0x3875f2c, main+0x388266c, main+0x632cbc) and read only by its return after the epilogue reloads it; nothing
+# reads or writes the flags.
+set owater NX2NAVI_WATER_STEPS 1
+site owater main 3876014 1e201900 1e201900 9458abc3   # fdiv s0, s8, s0 -> fdiv s0, s8, s0; bl page+0xf20 (InteractiveWaterMgr)
+site owater main 38827f8 1e201900 1e201900 945879ca   # the same at ResponsiveWaterMgr's
+site owater main 632cfc 1e201900 1e201900 9521b889    # the same at the interactive floors'
+
+# The sound manager's job (main+0x415300, its task's phase in w2: 0 hands the time manager's step, [[main+0x4c7e890]]
+# +0x10, to the sound system; 1 runs the sound objects' updates; 2 the system's own update, main+0x3798410; any other
+# returns through main+0x4155fc). Above 60 fps the set ostep makes that step a fraction of one, and fed fractions the
+# game has been reported to hold sounds after an area unloads until no voice is free, then go silent
+# (runtime/frame_rate.c, "the sound manager's job at whole steps"). The set
+# runs the job at 60 Hz then: after the prologue (add x29, sp, #0x20) the page's +0xf10 decides from the phase and the
+# step whether the job runs this frame, and puts phase 3 in w2 when it does not, so cbnz w2 and the phase tests send it
+# to its own epilogue; after phase 0's load of the step (ldr s0, [x8, #0x10]) the page's +0xf00 makes a fraction one
+# whole step. At a step of one or more the job runs every frame with the game's step. x30 was saved by the prologue
+# (stp x29, x30, [sp, #0x20]) and is reloaded by every way out; no word reads or writes the flags.
+set osound NX2NAVI_SOUND_STEPS 1
+site osound main 41531c 910083fd 910083fd 952a2efd   # add x29, sp, #0x20 -> add x29, sp, #0x20; bl page+0xf10
+site osound main 415334 bd401100 bd401100 952a2ef3   # ldr s0, [x8, #0x10] -> ldr s0, [x8, #0x10]; bl page+0xf00
+
+# Movie-synchronised event timelines: the movie layer advances its counter at +760 on each draw of a ready
+# picture. main+0x3b3ec10 reads that counter for the event dispatcher, so rendering a picture twice also
+# advances voices and overlays twice. Both ready paths reach these sites only after main+0x3b5ce80 checks
+# the player and its video surface. Use the timestamp of the surface's current picture: main+0x3b61ea0 reads
+# it from the selected non-EOS VideoFrame when switching the image buffers, before marking the surface ready.
+# x8 = layer->controller->player->surface->timestamp in ns. Clamp negative timestamps to zero and convert to
+# the nearest 60 Hz timeline tick (WebM timestamps can be rounded to milliseconds). The original add of one
+# counts the first picture as frame one. x9 is scratch on both paths, and the replacement preserves flags.
+# At the movie cap (runtime/frame_rate.c movie_cap_hz, 60 fps) the two counts are the same while the decoder keeps up.
+# They differ when no new picture is ready for a redraw: the old count went on, so cues kept pace with the soundtrack,
+# which plays on its own; this count waits with the picture and goes on with it, a step of 2 or more when the decoder
+# drops a picture. main+0x3b3ec10 hands the counter out as a float frame (scvtf) through a virtual call, and its
+# readers were not traced, so whether they compare frames as ranges or exact values is not known: if exactly, a cue
+# on a dropped picture's tick would be missed. NX2NAVI_MOVIE_PTS=0 (movie_pts in nx2navi.ini) gives the old count.
+site omovie main 3b5c7c4 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d2800789 9b097d08 528ca009 72a3b9a9 8b090108 d37ff929 9ac90908
+site omovie main 3b5c908 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d2800789 9b097d08 528ca009 72a3b9a9 8b090108 d37ff929 9ac90908
 
 # Pick-up window count: the window that shows a pick-up above the character (its update is main+0xa67e50) moves the
 # number it shows (+0x360) to the new total (+0x35c) by trunc(frames per update * max(1, difference / 50)) a frame, and
@@ -152,6 +271,22 @@ site wide_hud main 774368 ad401041 ad401041 @page:x16 fd404a10 6e040431 6e0c2491
 # at x29 - 40: min x +8, max x +16); it moves in by the page's margin on each side, the middle 16:9 of the picture.
 site wide_movie main 3b5c758 a941a269 d100a3b0 bd400a10 bd401211 1e303a32 @page:x17 bd40c233 1e330a52 1e322a10 1e323a31 bd000a10 bd001211 a941a269   # movie layer viewport: ldp x9, x8, [x19, #0x18]
 
+# The save's picture: the viewport helper (main+0x2846e0) makes whole pixels of a viewport object on its target and
+# hands x, y, width and height in w1..w4 to nvnCommandBufferSetScissor (main+0x284804) and then to
+# nvnCommandBufferSetViewport (main+0x284828), before it leaves through SetDepthRange; the two procedures' addresses
+# are the globals behind main+0x4c8da90 and main+0x4c8e7d8, which main+0x12a1738 onwards fills by name. The picture a
+# save file shows is drawn through it into a target of 543x306 (not a constant of main: the size comes with the game's
+# data, so the site knows the viewport by its numbers), and the whole picture went in: wider than 16:9, it came out
+# squeezed. Where the helper loads SetViewport's address, a viewport of exactly 0, 0, 543, 306 gets the page's +224
+# added to its x and +228 to its width (runtime/widescreen.c wide_init: wider by the picture's ratio over 16:9 and
+# centred on the target). The scissor was set before and stays the target's, so the save shows the middle 16:9 of the
+# picture, the part a 16:9 picture holds. Without branches or flags: the differences from those four numbers are or-ed
+# together, clz >> 5 of that is 1 only when there is none, and madd adds the page's two numbers times it. x9..x12 and
+# x16 are free: the call takes x0..x4, and the helper reads none of them after it. The set is on only for a picture
+# wider than 16:9.
+set wide_save NX2NAVI_PATCH_WIDE_SAVE 0
+site wide_save main 284824 f9400108 f9400108 @page:x16 295c2e0a 51087c69 5104c88c 2a0c0129 2a010129 2a020129 5ac01129 53057d29 1b0a0521 1b0b0d23   # ldr x8, [x8]; ldp w10, w11, [x16, #224]; sub w9, w3, #543; sub w12, w4, #306; orr w9, w9, w12; orr w9, w9, w1; orr w9, w9, w2; clz w9, w9; lsr w9, w9, #5; madd w1, w9, w10, w1; madd w3, w9, w11, w3
+
 # The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c): the
 # three calls of ZSTD_decompressMultiFrame (main+0xeb380: dctx, dst, capacity, src, size, dict, dict size, ddict) go to
 # the host function on the patch page (+0xff0). main+0xe910c is the file loader's call for a file that fits one read
@@ -172,3 +307,59 @@ site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
 # on the patch page (+0xf70), which puts the free camera's vectors into those registers and does the instruction's
 # own work.
 site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70
+
+# Occlusion queries off, an experiment (patch_occlusion_off = 1; off by default). main+0x11ac790 copies the values of a
+# parameter object (x20) into a list of options (x21): an option is found by the CRC-32 of its name (vtable +0x38) and
+# keeps its value at +0x18. Two of the parameters are CreateZPrePassOcclusionQuery (the byte main+0xf5acc0 returns:
+# +0x596 of the object, or its parent's while +0x606 is clear) and CreateSamplesPassedQuery (main+0xf5bf70: +0x58e and
+# +0x607), named so where main+0x35727d0 lists the parameters; their options are create_z_pre_pass_occlusion_query
+# (0x2b8ea8de) and create_samples_passed_query (0xd1eaac2b). The function reads each byte at three places: where it
+# first writes the option (its mode 0), and where an update (mode 1) compares the byte with the option and where it
+# then stores it. All six read 0 instead, so neither option is ever set: the game is left without its occlusion
+# queries, and so without their reports and the conditional renders that depend on them, and draws what it would have
+# tested. What that costs and saves in play has not been measured, hence the default. Left as they are: the function's
+# mode 2, which only answers whether one option differs from its parameter (the compare every option shares,
+# main+0x11c8be0) and so answers yes for these two wherever the parameter is set, and the listing at main+0x35727d0.
+set occlusion_off NX2NAVI_PATCH_OCCLUSION_OFF 0
+site occlusion_off main 11ace68 39400008 2a1f03e8   # ldrb w8, [x0] -> mov w8, wzr: the z-pre-pass query's first write
+site occlusion_off main 11b828c 39400008 2a1f03e8   # its update's compare
+site occlusion_off main 11b82a4 39400008 2a1f03e8   # its update's store
+site occlusion_off main 11acec8 39400008 2a1f03e8   # the samples-passed query's first write
+site occlusion_off main 11b82dc 39400008 2a1f03e8   # its update's compare
+site occlusion_off main 11b82f4 39400008 2a1f03e8   # its update's store
+
+# Sprint button (runtime/sprint.c). Link sprints while his input flags (the 64-bit word at *(Link +0x50)) have bit 4,
+# the dash input. Link's movement update (main+0x4aaa80) loads that word at
+# main+0x4ae798 into x10 and tests bit 4 twice from it: at main+0x4ae7a0 to start the sprint (Link +0x2c bit 20, when
+# his state is Walk) and at main+0x4afa90 to keep it. The update of the camera and stance that follows
+# (main+0xc025d0) loads the flags' low byte at main+0xc07f3c into w8 and tests the same bit at main+0xc07f40. Each site
+# keeps its load and calls the page's host function after it (+0xf40, +0xf30; +0xf50 up to +0xff0 are taken, see
+# runtime/patches.c, mouse_direct.c and ov_zstd.c), which ORs bit 4 into x10 or w8 while
+# the sprint button's sprint is on for Link (sprint_link, sprint_stance); x19 is Link at both. x30 is the function's
+# own saved one at both sites: both functions call others before and after, and restore x30 from their frames.
+set sprint NX2NAVI_SPRINT_BUTTON_PATCH 1
+site sprint main 4ae798 f940014a f940014a 9527c9ea   # ldr x10, [x10] -> ldr x10, [x10]; bl page+0xf40
+site sprint main c07f3c 39400108 39400108 950a63fd   # ldrb w8, [x8] -> ldrb w8, [x8]; bl page+0xf30
+
+# Text speed (runtime/text_speed.c). The message window (its update main+0x774b00) shows its text through a typewriter
+# object at window +0x2b0 (its step main+0xafe140): each frame the step adds speed (+0x4c) times the frame's step (s0)
+# to a reveal position (+0x60) and shows every character whose extent that position passed. The message's tags (group 1,
+# main+0xafdff0) hold the script: type 0 waits a number of frames (+0x58, the reveal stops until it has run out), type 1
+# sets the speed to the base (+0x50) times its value, type 2 shows the rest at once, type 3 starts a timer (+0x5c) after
+# which the window turns the page by itself. A press of the decide button while the text types (window +0x348) shows the
+# page at once, ignoring the waits (typewriter +0x72 = 2), unless the window marked the message unskippable (+0x34a):
+# a message with a type 3 tag, and some window types (main+0x76eb40), are, so text timed against a cutscene, a voice or
+# a sound is never hurried. Both sites keep to that rule.
+# Instant: where the update tests the decide press for that (main+0x774b74, tbz w20), the page's byte +0x20c is ORed in,
+# so the game's own skip runs on the first frame of every page it lets the player skip; the test of +0x34a after it is
+# the game's. The same site stores the typewriter (x8, loaded at main+0x774b48) at page +0x200 while the message may be
+# skipped, 0 otherwise: x10 = [x19 +0x34a] - 1 is all ones for 0 and 0 for 1. x9 and x10 are written before they are
+# read again on every path from the site, and no word writes the flags.
+# Fast: where the step loads the speed (main+0xafe1d8), s1 becomes s1 + s1 * eq * (page +0x208), eq being 1 when the
+# typewriter (x19) is the one at page +0x200 (clz of the difference is 64 only for equal values) and +0x208 the
+# factor less one, so only a skippable message window types faster; its waits keep their length. x22, x27, s2 and s8
+# are written by the next words of the step before anything reads them (d8 is saved by its prologue), and no word
+# writes the flags. The set runs only while text_speed is not normal.
+set text_speed NX2NAVI_TEXT_SPEED_PATCH 1
+site text_speed main 774b74 36000074 @page:x9 394d2a6a d100054a 8a0a010a f901012a 39483129 2a140129 36000069   # tbz w20, #0, #0x774b80 -> adrp x9, page; ldrb w10, [x19, #0x34a]; sub x10, x10, #1; and x10, x8, x10; str x10, [x9, #0x200]; ldrb w9, [x9, #0x20c]; orr w9, w9, w20; tbz w9, #0, #0x774b80
+site text_speed main afe1d8 bd404e61 bd404e61 @page:x22 f94102db cb13037b dac0137b d346ff7b 9e220362 bd420ac8 1e280842 1f020421   # ldr s1, [x19, #0x4c]; adrp x22, page; ldr x27, [x22, #0x200]; sub x27, x27, x19; clz x27, x27; lsr x27, x27, #6; scvtf s2, x27; ldr s8, [x22, #0x208]; fmul s2, s2, s8; fmadd s1, s1, s2, s1

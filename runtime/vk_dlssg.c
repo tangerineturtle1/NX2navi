@@ -1,6 +1,7 @@
 // DLSS Frame Generation (NX2NAVI_FRAMEGEN = dlss; applies after a restart) through nx2navi_dlssg.dll
-// (runtime/dlssg/nx2_sl.cpp), which drives NVIDIA Streamline. Like AMD's frame generation (vk_fg.cpp) it needs DLSS or
-// FSR 3.1 upscaling on, whose depth, motion vectors and camera it hands over, and an RTX 40 or 50 GPU.
+// (runtime/dlssg/nx2_sl.cpp), which drives NVIDIA Streamline. Like AMD's frame generation (vk_fg.cpp) it takes the
+// depth, motion vectors and camera vk_dlaa.c makes for DLSS or FSR 3.1 upscaling, or without an upscaler for frame
+// generation alone (vk_dlaa.c fg_only_frame: the same pass at the scene's size, no jitter); it needs an RTX 40 or 50 GPU.
 //
 // The DLL and Streamline (sl.interposer.dll and its plugins, nvngx_dlssg.dll) sit next to the game. The instance and
 // device are created through Streamline's proxies (vk_device.c), so it can add the extensions, features and queues
@@ -73,14 +74,10 @@ static int reflex_mode(void) {
     return m;
 }
 
+// With any upscaler or none: vk_dlaa.c makes the inputs either way (vk_dlaa_frame says which, at the start and at each
+// change).
 int vk_dlssg_wanted(void) {
-    if (S.wanted < 0) {
-        S.wanted = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss");
-        if (S.wanted && !vk_dlaa_wanted()) {
-            rt_log("dlssg: frame generation needs DLSS or FSR 3.1 upscaling (any mode): off");
-            S.wanted = 0;
-        }
-    }
+    if (S.wanted < 0) S.wanted = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss");
     return S.wanted;
 }
 
@@ -312,7 +309,9 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         static int told;
         if (c.inverted && !told++) rt_log("dlssg: the scene's depth is inverted, which Streamline is not told");
         k.jitter[0] = jx, k.jitter[1] = jy;
-        k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
+        // render pixels: the scene's size, which is the output's or smaller (an upscaling mode, or the game's own scale
+        // without an upscaler); Streamline takes the depth and the vectors at their own size and the output at ext
+        k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;
         k.reset = reset;
     }
     // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off

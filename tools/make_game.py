@@ -49,6 +49,14 @@ sets the number), the largest files first. The lifted code is built for this
 PC's x86-64 level (cpu_level), with MSYS2 CLANG64's clang when it sits beside the UCRT64 folder and reports the same
 version (fast_clang: the same objects, about a fifth faster).
 
+Profile-guided build (docs/building.md, "Profile-guided build"). A kit with data/pgo-v111.profdata and its record
+(tools/pgo.py merge; in a source checkout build/pgo/) compiles the lifted code at -O2 with that execution profile, and
+the runtime with it too (pgo_profile); functions the profile never saw run are optimised for size. The profile is
+left out, and the build is the one a kit without a profile makes (the lifted code at -O1), when its record names
+another recomp/ than this kit's, when the compilers cannot read the file (one trial compile before the others start),
+or with NX2NAVI_PGO=off. --pgo gen (NX2NAVI_PGO=gen, which a launcher started with it passes on) builds an
+instrumented game instead: it adds its counts to <out>/pgo/*.profraw every minute and at exit, for tools/pgo.py merge.
+
     python tools/make_game.py --make-runtime-lib <kit>/lib --msys <ucrt64>   # the release's prebuilt runtime
 
 On Linux the same steps make <out>/ocarina with the clang, clang++ and lld on PATH and the system's libraries
@@ -520,9 +528,15 @@ EMITTED = re.compile(r'emitted (\d+)/(\d+) chunks')
 
 def lift_digest():
     """The lifter's code, the patch table and the bring-up fixes: what the lifted C depends on besides the ExeFS."""
-    h = hashlib.sha256(tree_digest(KIT / 'recomp', ('*.py', 'patches-v111.txt')).encode())
+    h = hashlib.sha256(recomp_digest().encode())
     h.update(repr(LIFT_FIXES).encode())
     return h.hexdigest()
+
+
+def recomp_digest(kit=None):
+    """The lifter's code and the patch table by content: what names the generator in the lift's key and in an
+    execution profile's record (pgo_record). kit: another checkout or kit folder than this one."""
+    return tree_digest((kit or KIT) / 'recomp', ('*.py', 'patches-v111.txt'))
 
 
 # The mods' code (tools/mod_files.py): the tools that make patch sets of it, the patch file each writes, the status
@@ -969,13 +983,18 @@ def compiler_id(clang, env):
 
 def object_key(cmd, src, dst, cache, salt, sysroot=False):
     """The cache key of compiling src into dst with cmd: the compiler's id (salt), the command's flags with the cache's
-    roots standing for their paths, and the source's sha256. --sysroot is left out: only fast_clang's compiler gets it,
-    and its objects are the UCRT64 compiler's byte for byte, so the object of either serves (sysroot=True keeps it: the
-    keys up to 0.6.0)."""
+    roots standing for their paths (the kit's execution profile too: its content is part of the salt, pgo_salt), and
+    the source's sha256. --sysroot is left out: only fast_clang's compiler gets it, and its objects are the UCRT64
+    compiler's byte for byte, so the object of either serves (sysroot=True keeps it: the keys up to 0.6.0)."""
     flags = [c for c in cmd[1:] if c not in (str(src), str(dst)) and (sysroot or not c.startswith('--sysroot='))]
+
+    def rooted(f, name, root):
+        # a path under a root, alone or as the value of -fprofile-use= (the kit's profile, pgo_use_flags)
+        head = PGO_USE if f.startswith(PGO_USE) else ''
+        path = os.path.normcase(f[len(head):])
+        return head + name + path[len(root):].replace(os.sep, '/') if path.startswith(root) else f
     for name, root in cache.roots.items():
-        flags = [name + os.path.normcase(f)[len(root):].replace(os.sep, '/') if os.path.normcase(f).startswith(root)
-                 else f for f in flags]
+        flags = [rooted(f, name, root) for f in flags]
     return sha256_bytes(json.dumps([salt, [os.path.basename(cmd[0])] + flags, cache.file_sha(src)]).encode())
 
 
@@ -1425,6 +1444,184 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
+# ---- the profile-guided build (docs/building.md, "Profile-guided build")
+#
+# An execution profile is the counts an instrumented game gathered in a play session, merged into one file
+# (tools/pgo.py merge). With it the compiler lays the code that ran out straight, inlines the calls that were hot and
+# optimises the functions that never ran for size. The file names the lifted functions by their address and the
+# runtime's by their name, each with a hash of its control flow: a function whose C differs from the one that was
+# trained gets no counts, and the compiler says nothing about it.
+PGO_NAME = 'pgo-v111.profdata'   # in the kit's data/ (a release) or build/pgo/ (a source checkout, tools/pgo.py)
+PGO_RAW = 'pgo'                  # in the game folder: where an instrumented game adds its counts, *.profraw
+PGO_TRAINING = 'training.json'   # beside the counts: what the instrumented game was built from (pgo_gen_record)
+PGO_USE = '-fprofile-use='
+# A static function's profile name carries its source's path by default; the file's base name alone keeps the names
+# equal between the folder the profile was trained in and this kit's (tools/build_game.py PGO_NAMES).
+PGO_NAMES = ['-mllvm', '-static-func-full-module-prefix=false']
+PGO_MODE = ''                    # --pgo; without it NX2NAVI_PGO decides (pgo_mode)
+
+
+def pgo_mode():
+    """'gen': build an instrumented game; 'off': build without the kit's profile; '': build with it when it fits.
+    From --pgo, else from NX2NAVI_PGO, which reaches a build the launcher starts through its environment."""
+    mode = (PGO_MODE or os.environ.get('NX2NAVI_PGO', '')).strip().lower()
+    return mode if mode in ('gen', 'off') else ''
+
+
+def pgo_file():
+    """The kit's execution profile, or None: data/ of a release, else build/pgo/ of a source checkout, where
+    tools/pgo.py merge writes it."""
+    for d in (KIT / 'data', KIT / 'build' / 'pgo'):
+        if (d / PGO_NAME).is_file():
+            return d / PGO_NAME
+    return None
+
+
+PGO_IDS = {}   # pgo_id's answers by path, size and modification time: the step keys ask several times a build
+
+
+def pgo_id(profile):
+    """sha256 over the profile and its record, 'unreadable' when the profile cannot be read: what stands for them in
+    the compile step's key and in the object keys, so a kit that brings another profile compiles again."""
+    try:
+        st = os.stat(profile)
+        at = (str(profile), st.st_size, st.st_mtime_ns)
+        if at not in PGO_IDS:
+            h = hashlib.sha256(sha256_file(profile).encode())
+            try:
+                h.update(profile.with_suffix('.json').read_bytes())
+            except OSError:
+                pass
+            PGO_IDS[at] = h.hexdigest()
+        return PGO_IDS[at]
+    except OSError:
+        return 'unreadable'
+
+
+def pgo_tag():
+    """The profile-guided build's part of the compile step's key (step_key): '' for a kit without a profile that
+    builds as before, so the key of every game built so far stays what it is."""
+    mode, profile = pgo_mode(), pgo_file()
+    if mode == 'gen':
+        return '|pgo gen'
+    if not profile:
+        return ''
+    return '|pgo off' if mode == 'off' else f'|pgo {pgo_id(profile)}'
+
+
+def pgo_record(profile):
+    """Why the record beside a profile (<name>.json, tools/pgo.py merge) does not let this kit use it, '' when it
+    does: recomp_digest there must be this kit's recomp/. Functions are matched by name and control-flow hash, so a
+    profile trained on the C of another generator loses the counts of every function that generator writes
+    differently, without a word from the compiler: an -O2 build with a profile of unknown worth. Such a kit builds
+    as one without a profile instead."""
+    rec = profile.with_suffix('.json')
+    try:
+        trained = json.loads(rec.read_text(encoding='utf-8'))['recomp_digest']
+    except OSError:
+        return f'its record {rec.name} is missing or cannot be read'
+    except (ValueError, KeyError, TypeError):
+        return f'its record {rec.name} does not name the recomp/ it was trained on'
+    return '' if trained == recomp_digest() else 'it was trained on another recomp/ than this kit\'s'
+
+
+def pgo_use_flags(profile):
+    """Every compile's flags for a build with the profile. The warnings about functions the profile lacks or knows
+    with other control flow are off like every other warning (-w)."""
+    return [PGO_USE + str(profile), *PGO_NAMES]
+
+
+def pgo_gen_flags(out):
+    """Every compile's flags for an instrumented build of the game folder out. The folder for the counts is baked in
+    as an absolute path: left relative, the game would resolve it against whatever folder it was started from.
+    NX2NAVI_PGO_GEN: the runtime adds the counts to the file every minute and when it ends the process
+    (runtime/platform/win32.c pgo_flush_thread, plat_exit)."""
+    return [f'-fprofile-generate={(Path(out) / PGO_RAW).as_posix()}', *PGO_NAMES, '-DNX2NAVI_PGO_GEN']
+
+
+def pgo_trial(profile, compilers, env, work):
+    """Why a compiler that will read the profile cannot, '' when each compiles a test file with it. compilers: each
+    one's argv up to its flags. The profile was written by the LLVM release of the training build and is read by the
+    clang of this PC's build tools: a compiler older than the file's format refuses it, as it does a file that is cut
+    short or is no profile, and it would refuse it again in every compile of the build."""
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        src, obj = work / 'trial.c', work / 'trial.o'
+        src.write_text('int nx2navi_pgo_trial(int x) { return x + 1; }\n', encoding='ascii')
+        for cc in compilers:
+            cmd = [*map(str, cc), '-c', '-std=gnu11', '-O2', '-w', *pgo_use_flags(profile), '-o', str(obj), str(src)]
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace')
+            except OSError as e:
+                return f'{cc[0]} does not start: {error_text(e)}'
+            if p.returncode:
+                return (p.stderr.strip().splitlines() or [f'exit code {p.returncode}'])[-1][-300:]
+        return ''
+    except OSError as e:
+        return error_text(e)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def pgo_profile(clang, env, work, fast=None, msys=None):
+    """(the kit's execution profile, '') when this build compiles with it, else (None, why not). It is left out, and
+    the build is the one a kit without a profile makes, when the kit has none, with NX2NAVI_PGO=off, off Windows
+    (the profile is trained on the Windows build), when its record names another recomp/ (pgo_record), and when a
+    compiler of this build cannot read it (pgo_trial; fast: fast_clang's compiler, which compiles the lifted code,
+    with msys as its sysroot). work: a folder of its own for the trial compile."""
+    profile = pgo_file()
+    if not profile:
+        return None, 'this kit has no execution profile'
+    if pgo_mode() == 'off':
+        return None, f'the execution profile {profile.name} is left out (NX2NAVI_PGO=off)'
+    if not WIN:
+        return None, f'the execution profile {profile.name} is for the Windows build'
+    why = pgo_record(profile)
+    if not why:
+        said = pgo_trial(profile, [[clang]] + ([[fast, f'--sysroot={msys}']] if fast else []), env, work)
+        why = said and f'the compiler cannot read it ({said})'
+    return (None, f'the execution profile {profile.name} is not used: {why}') if why else (profile, '')
+
+
+def pgo_salt(cid, profile):
+    """The compiler's id for the keys of objects compiled with the profile: the profile's content with it, as no
+    dependency file names the profile. Without a profile the id itself, so those keys stay what they were."""
+    return sha256_bytes(f'{cid}|pgo {pgo_id(profile)}'.encode()) if profile else cid
+
+
+def pgo_gen_check(clangxx, env, work, msys, ld):
+    """An instrumented build links the compiler's profile runtime, which MSYS2 packs apart from clang
+    (mingw-w64-ucrt-x86_64-compiler-rt) and the launcher's build tools do not hold: an empty program is linked with
+    it now (ld: the link's own linker flags), so that build tools without it stop the build here and not at the
+    link, after every compile."""
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        src = work / 'trial.c'
+        src.write_text('int main(void) { return 0; }\n', encoding='ascii')
+        p = subprocess.run([str(clangxx), *ld, '-fprofile-generate', '-o', str(work / ('trial.exe' if WIN else 'trial')),
+                            '-x', 'c', str(src)], capture_output=True, text=True, env=env, errors='replace')
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if p.returncode:
+        said = (p.stderr.strip().splitlines() or [f'exit code {p.returncode}'])[0][-300:]
+        fail('an instrumented build (NX2NAVI_PGO=gen) needs the compiler\'s profile runtime, and these build tools do '
+             f'not link it ({said}). ' +
+             (f'Unpack the MSYS2 package mingw-w64-ucrt-x86_64-compiler-rt of this clang\'s version into {msys.parent}'
+              if WIN else 'Install the compiler-rt package of this clang\'s version'))
+
+
+def pgo_gen_record(out, clang, env):
+    """<out>/pgo/training.json: the recomp/ and the compiler the instrumented game was built from. tools/pgo.py merge
+    takes the profile's record from it, so the record names the generator of the game that was played, whatever the
+    checkout holds when the counts are merged."""
+    raw = Path(out) / PGO_RAW
+    raw.mkdir(parents=True, exist_ok=True)
+    record = {'version': 'v111', 'recomp_digest': recomp_digest(), 'compiler': clang_version(clang, env),
+              'kit': kit_version()}
+    (raw / PGO_TRAINING).write_text(json.dumps(record, indent=1) + '\n', encoding='utf-8')
+
+
 def guest_opt_ini(out):
     """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe (the low-end GPU rows of the menu's Game tab write it there)
     when the environment does not set it: the next build of the game folder out takes it. Only while low_end_gpu = 1
@@ -1447,13 +1644,15 @@ def guest_opt_ini(out):
         os.environ['NX2NAVI_GUEST_OPT'] = found
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), pgo=()):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. first: include flags that go
     ahead of inc for the runtime's sources only (vulkan_headers); the lifted code includes none of those headers,
     and its command, which is part of its objects' keys, stays as it was. NX2NAVI_GUEST_OPT (an environment variable,
     or guest_opt in nx2navi.ini) 2 builds the lifted code at -O2; by default -O1: the game's own threads run it and
-    bound the frame on a slower CPU; the build takes several times longer."""
-    guest_opt = '-O2' if os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2' else '-O1'   # -O1 unless guest_opt = 2
+    bound the frame on a slower CPU; the build takes several times longer. pgo: the flags of a profile-guided build
+    for every compile (pgo_use_flags, pgo_gen_flags); with them the lifted code is built at -O2 too, the level the
+    profile's inlining and its layout of hot and cold code work at. Without them every command is what it was."""
+    guest_opt = '-O2' if pgo or os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2' else '-O1'   # -O1 unless guest_opt = 2
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
@@ -1466,14 +1665,16 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
         return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', guest_opt if guest else '-O2',
-                *march, '-fno-strict-aliasing', '-w', *declspec, *([] if guest else first), *inc, '-o', str(dst), str(src)]
+                *march, '-fno-strict-aliasing', '-w', *declspec, *pgo, *([] if guest else first), *inc, '-o', str(dst),
+                str(src)]
     return cmd_for
 
 
 def make_runtime_lib(dest, msys, jobs, obj=None):
     """--make-runtime-lib: compile every runtime source that does not include a per-install header into
     <dest>/libnx2navirt.a, with runtime-lib.json naming the runtime/ tree and the compiler it was built from. The
-    objects stay in obj (default <dest>/obj), which a release keeps out of what it ships."""
+    objects stay in obj (default <dest>/obj), which a release keeps out of what it ships. A kit with an execution
+    profile compiles the library with it, under pgo_profile's conditions; runtime-lib.json then names the profile."""
     dest = Path(dest).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     obj = Path(obj).resolve() if obj else dest / 'obj'
@@ -1484,11 +1685,17 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     srcs = [(p, obj / name) for p, name in runtime_sources() if not per_install(p, tainted)]
     inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
+    if pgo_mode() == 'gen':
+        fail('the prebuilt runtime is never an instrumented one: an instrumented build (NX2NAVI_PGO=gen) compiles '
+             'runtime/ itself')
+    profile, why = pgo_profile(clang, env, obj / 'pgo-trial')
+    say(f'  the runtime is compiled with the execution profile {profile.name}' if profile else f'  {why}')
     t0 = time.time()
-    compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc, first=vulkan_headers(clang, env)),
+    compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc, first=vulkan_headers(clang, env),
+                                                          pgo=pgo_use_flags(profile) if profile else ()),
                                         cache, jobs, env,
                                         lambda d, t: (d % 20 == 0 or d == t) and say(f'  {d} of {t}'),
-                                        salt=compiler_id(clang, env))
+                                        salt=pgo_salt(compiler_id(clang, env), profile))
     if bad:
         report_failures(bad)
         fail(f'{len(bad)} runtime files did not compile')
@@ -1502,7 +1709,7 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
         fail('the runtime library could not be archived')
     meta = {'runtime': runtime_digest(), 'compiler': clang_version(clang, env),
-            'objects': sorted(o.name for _, o in srcs)}
+            'objects': sorted(o.name for _, o in srcs), 'pgo': pgo_id(profile) if profile else ''}
     (dest / 'runtime-lib.json').write_text(json.dumps(meta, indent=1), encoding='utf-8')
     rsp.unlink(missing_ok=True)
     say(f'{lib}: {len(srcs)} runtime files ({compiled} compiled, {reused} kept), {lib.stat().st_size / 1e6:.1f} MB, '
@@ -1723,7 +1930,9 @@ def write_runtime_map(full, dst):
 def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
-    update: a rebuild after a kit update (lifted_level)."""
+    update: a rebuild after a kit update (lifted_level). The kit's execution profile, when this build can use it
+    (pgo_profile), goes into every compile; NX2NAVI_PGO=gen makes an instrumented game instead (pgo_gen_flags), its
+    runtime compiled here too, as the prebuilt one counts nothing."""
     lift, gen, obj = cache_dir / 'lift', cache_dir / 'gen', cache_dir / 'obj'
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
@@ -1733,7 +1942,12 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
-    prebuilt = prebuilt_runtime(clang, env)
+    gen_counts = pgo_mode() == 'gen'
+    # lld links several times faster than GNU ld
+    ld = ['-fuse-ld=lld'] if ((msys / 'bin' / 'ld.lld.exe').is_file() if WIN else shutil.which('ld.lld')) else []
+    if gen_counts:
+        pgo_gen_check(clangxx, env, cache_dir / 'pgo-trial', msys, ld)
+    prebuilt = None if gen_counts else prebuilt_runtime(clang, env)
     runtime = [(p, obj / name) for p, name in runtime_sources()]
     if prebuilt:
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
@@ -1761,7 +1975,17 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     vulkan = vulkan_headers(clang, env)
     if vulkan:
         say(f'  the Vulkan headers come from {vulkan[1]}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan)
+    profile = None
+    if gen_counts:
+        pgo = pgo_gen_flags(out)
+        say(f'  an instrumented build (NX2NAVI_PGO=gen): the lifted code at -O2 and a slower game, which adds its '
+            f'counts to {out / PGO_RAW} every minute and at exit')
+    else:
+        profile, why = pgo_profile(clang, env, cache_dir / 'pgo-trial', fast, msys)
+        pgo = pgo_use_flags(profile) if profile else []
+        say(f'  the lifted code (at -O2) and the runtime are built with the execution profile {profile.name}'
+            if profile else f'  {why}')
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan, pgo=pgo)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths; and
     # up to 0.7.1 the runtime's without the Vulkan headers' folder ahead of the system's (an object that compiled
@@ -1772,6 +1996,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     kits = earlier_kits()
 
     def alts(src, dst):
+        if pgo:   # no earlier version compiled with a profile or counted: nothing of theirs is the same compile
+            return [], kits
         keys = [object_key(plain(src, dst), src, dst, cache, cid_old, sysroot=True)]
         if vulkan:
             keys.append(object_key(no_vulkan(src, dst), src, dst, cache, cid))
@@ -1799,8 +2025,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         late = [(s, o) for s, o in runtime + srcs[-(2 if WIN else 1):] if per_install(s, tainted)]
         say(f'  {len(late)} files wait for the RomFS index: {", ".join(s.name for s, _ in late)}')
     early = [j for j in srcs if j not in late]
+    salt = pgo_salt(cid, profile)
     compiled, reused, bad = compile_all(early, cmd_for, cache, jobs, env, lambda d, t: progress(d, len(srcs)),
-                                        salt=cid, stop=romfs_job.failed if romfs_job else None, alts=alts)
+                                        salt=salt, stop=romfs_job.failed if romfs_job else None, alts=alts)
     if romfs_job:
         if romfs_job.thread.is_alive():
             say('  waiting for the RomFS image')
@@ -1808,7 +2035,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         if not bad:
             romfs_index(out, gen)
             c2, r2, bad = compile_all(late, cmd_for, cache, jobs, env,
-                                      lambda d, t: progress(len(early) + d, len(srcs)), salt=cid, alts=alts)
+                                      lambda d, t: progress(len(early) + d, len(srcs)), salt=salt, alts=alts)
             compiled, reused = compiled + c2, reused + r2
     say(f'  {compiled} compiled, {reused} unchanged since the last build')
     if bad:
@@ -1816,19 +2043,24 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         fail(f'{len(bad)} files did not compile')
     if cache.keep_only({o.name for _, o in srcs}):
         cache.save()
-    (obj / LIFTED_BUILD).write_text(json.dumps({'level': level}), encoding='utf-8')   # lifted_level reads it next update
+    # lifted_level reads the level at the next update; pgo says what the objects were compiled with: 'gen', the
+    # profile's id (pgo_id) or nothing
+    (obj / LIFTED_BUILD).write_text(json.dumps({'level': level, 'pgo': 'gen' if gen_counts else
+                                                pgo_id(profile) if profile else ''}), encoding='utf-8')
 
     objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=(msys / 'bin' / 'ld.lld.exe').is_file())]
                                    if WIN else [])
     exe = out / EXE_NAME
     rsp = cache_dir / 'link.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for o in objs), encoding='utf-8')
-    # lld links several times faster than GNU ld; the stack matches tools/build_game.py's build
+    # the stack matches tools/build_game.py's build
     # 16 MiB for the main thread with either linker (GNU ld takes the same flag): the default 2 MiB is too little
     if WIN:
-        ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
+        ld = ld + ['-Wl,--stack,16777216']
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
+        ld = ld + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
+    if gen_counts:   # the link takes in the profile runtime, which writes the counts
+        ld.append('-fprofile-generate')
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one.
     # -Xlinker passes the path as one argument; -Wl, would cut it at every comma of the game folder's path (issue #470)
     ld += ['-Xlinker', '--Map=' + (cache_dir / 'ocarina.map').as_posix()]
@@ -1878,6 +2110,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     beside = copy_dlls(exe, msys / 'bin', out) if WIN else []
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB' + (f'; beside it: {", ".join(beside)}' if beside else ''))
     (out / 'profile').mkdir(exist_ok=True)
+    if gen_counts:
+        pgo_gen_record(out, clang, env)
 
 
 # ---------------------------------------------------------------- main
@@ -2340,7 +2574,9 @@ def step_key(step, identity, out=None):
     processor (cpu_tag); shaders: the compile without the mods' code, the preparing script and the translator;
     prompts: the game files, the kit's button art, the version of the tools that draw it (PROMPT_TOOLS), the bind_
     lines of nx2navi.ini, and whether every folder it writes is still there; scan: the game files, the check's version
-    (SCAN_TOOL) and whether its report is still there."""
+    (SCAN_TOOL) and whether its report is still there. The compile's key also names the kit's execution profile or
+    an instrumented build (pgo_tag); the shaders' key does not, as neither changes what the shaders are prepared
+    from."""
     if step in ('exefs', 'romfs'):
         return f'{step}-1|{identity}'
     if step == 'scan':
@@ -2362,7 +2598,7 @@ def step_key(step, identity, out=None):
         return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}'
                 f'|{kit_version()}|cpu {cpu_tag()}')
     if step == 'compile':
-        return compile_of(lift)
+        return compile_of(lift) + pgo_tag()
     # shaders: the built game without the mods' code (UNAFFECTED) and the translator that prepared them, the one
     # xlate_source finds (the kit's bin/, or a source checkout's build/xlate/)
     return (f'shaders-1|{compile_of(base)}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
@@ -2391,7 +2627,7 @@ def main():
 
 
 def build_main():
-    global EVENTS
+    global EVENTS, PGO_MODE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--nup', help='the game as one .nup file')
     ap.add_argument('--exefs', help='the game\'s exefs folder (with --romfs, instead of --nup)')
@@ -2410,9 +2646,14 @@ def build_main():
     ap.add_argument('--events', action='store_true', help='machine-readable progress lines on stdout ("@@" + JSON)')
     ap.add_argument('--make-runtime-lib', metavar='DIR', help='build the prebuilt runtime library of a release into DIR')
     ap.add_argument('--obj', help='with --make-runtime-lib: the folder for its objects')
+    ap.add_argument('--pgo', choices=('gen', 'off'),
+                    help='gen: build an instrumented game, which adds its execution counts to <out>/pgo/*.profraw '
+                         '(for tools/pgo.py merge); off: build without the execution profile of the kit. Default: the '
+                         'environment variable NX2NAVI_PGO, else build with the profile of the kit when it fits')
     ap.add_argument('--until', choices=STEPS, help=argparse.SUPPRESS)   # tests: stop after this step
     a = ap.parse_args()
     EVENTS = a.events
+    PGO_MODE = a.pgo or ''
     jobs_why = '--jobs'
     if not a.jobs or a.jobs < 1:
         a.jobs, jobs_why = default_jobs()
@@ -2458,6 +2699,10 @@ def build_main():
             fail(f'the Python package {pip_name} is missing or does not load ({e}): '
                  f'pip install numpy lz4 zstandard zbic{extra}')
     cache.mkdir(parents=True, exist_ok=True)
+    if pgo_mode() == 'gen':
+        # The instrumented game also runs inside this build (the shaders step, the driver cache's warm-up): those
+        # runs count into the build cache, so that the game folder's counts are those of play alone
+        os.environ['LLVM_PROFILE_FILE'] = str(cache / 'pgo-build' / 'build_%m.profraw')
     reset = state.get('version') != STATE_VERSION or state.get('input') != src.identity
     if reset:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}

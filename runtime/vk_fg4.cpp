@@ -40,6 +40,7 @@ extern "C" uint64_t vk_fg4_presents(VkSwapchainKHR) { return 0; }
 extern "C" PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void) { return nullptr; }
 extern "C" void vk_fg4_frame(VkCommandBuffer, VkSwapchainKHR, VkFormat, VkExtent2D, VkImage, const int *) {}
 extern "C" void vk_fg4_release(void) {}
+extern "C" uint64_t vk_fg4_vram(void) { return 0; }
 #else
 #include <windows.h>
 #include <mutex>
@@ -89,6 +90,7 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg4_generating)
+    uint64_t vram = 0;   // the frame generation context's video memory as the library reported it
 } F;
 
 std::mutex g_lock;       // the probe: the menu asks from its thread, the present from its own
@@ -344,6 +346,7 @@ extern "C" void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt
         mq.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
         mq.gpuMemoryUsageFrameGeneration = &mem;
         vk_ffx4_api_query(&F.fg, &mq.header);
+        F.vram = mem.totalUsageInBytes;
         rt_log("fg4: AMD FSR frame generation %s for %ux%u%s, render size up to %ux%u, made in %.0f ms, %.0f MiB of video memory",
                provider(&F.fg), ext.width, ext.height, hdr_format(fmt) ? " (HDR)" : "", max_render.width, max_render.height,
                (double)(plat_now_ns() - t0) / 1e6, (double)mem.totalUsageInBytes / 1048576.0);
@@ -434,5 +437,10 @@ extern "C" void vk_fg4_release(void) {
         if (h && F.fn.pOutDestroySwapchainFFXAPI) F.fn.pOutDestroySwapchainFFXAPI(vk_ctx()->device, h, nullptr, nullptr);
     }
     F.fn = {};
+}
+
+// The frame generation context's video memory, for the memory report (vk_fg.cpp vk_fg_vram).
+extern "C" uint64_t vk_fg4_vram(void) {
+    return __atomic_load_n(&F.fg, __ATOMIC_RELAXED) ? __atomic_load_n(&F.vram, __ATOMIC_RELAXED) : 0;
 }
 #endif   // _WIN32

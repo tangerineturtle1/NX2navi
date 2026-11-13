@@ -236,9 +236,22 @@ NVN_API(nvnDeviceRegisterFastClearDepth) { ret_x(c, 0); }
 NVN_API(nvnDeviceGetImageHandle) { ret_x(c, (uint64_t)(int64_t)(int)arg_x(c, 1)); }
 // NVNtextureHandle nvnDeviceGetTextureHandle(const NVNdevice *d, int texture_id, int sampler_id):
 // texture id (20 bits) | sampler id << 20, the encoding the replay decodes (NVN_HANDLE_TEX / NVN_HANDLE_SAMP)
+// An id out of range (-1: the game had no texture to give, as when its render-target heap is full) gets texture
+// slot 0 and sampler slot 0: the first 256 slots of both pools are reserved (nvnDeviceGetInteger 0x11 and 0x12 above)
+// and no game registers into them, so slot 0 holds the stand-in. That holds for a draw that binds the handle, where
+// handle 0 is "no texture" (vk_exec_draw.c), and for a shader that takes the handle out of a uniform buffer and
+// indexes the pool arrays with it: slot 0 is inside their VK_POOL_TEX entries, which a slot past them is not.
+// Ending the game here turned one missing texture into a crash.
 NVN_API(nvnDeviceGetTextureHandle) {
     int tid = (int)arg_x(c, 1), sid = (int)arg_x(c, 2);
-    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) rt_fatal("nvn: texture handle ids out of range %d/%d", tid, sid);
+    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) {
+        static int said;
+        if (said < 8 && ++said)
+            rt_log("nvn: texture handle asked for with ids out of range (texture %d, sampler %d): the handle of the "
+                   "reserved slot 0 is given, which draws the stand-in", tid, sid);
+        if (tid < 0 || tid >= (1 << 20)) tid = 0;
+        if (sid < 0 || sid >= (1 << 12)) sid = 0;
+    }
     ret_x(c, (uint64_t)tid | (uint64_t)sid << 20);
 }
 // NVNtextureHandle nvnDeviceGetTexelFetchHandle(const NVNdevice *d, int texture_id)
@@ -290,10 +303,24 @@ NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags =
 // Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
 // loader threads, which held a virtual core through it while job workers waited (NX2NAVI_CORE_DIAG). The thread gives
 // the core up, as for any blocking host call.
+static void pool_finalize(pool_t *o);
+
 NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
+    // A pool object initialized again without Finalize: the back end's record of the old pool (its import, a VRAM
+    // mirror, a physical pool's device-local memory, its device address table record and its GPU address range) was
+    // left behind for good, since nothing names it any more. It is finalized first, as nvnTextureInitialize does
+    // for a texture; the back end lets the memory go once the GPU is past the submissions that may use it.
+    if (o->magic == NVN_POOL_MAGIC) {
+        static uint64_t again;
+        uint64_t n = __atomic_add_fetch(&again, 1, __ATOMIC_RELAXED);
+        if (n <= 4 || !(n & (n - 1)))
+            rt_log("nvn: MemoryPoolInitialize: pool %p (%#llx bytes) initialized again without Finalize, finalized first "
+                   "(%llu so far)", (void *)o->mem, (unsigned long long)o->size, (unsigned long long)n);
+        pool_finalize(o);
+    }
     memset(o, 0, sizeof *o);
     o->magic = NVN_POOL_MAGIC;
     o->flags = s->flags;
@@ -320,9 +347,7 @@ NVN_API(nvnMemoryPoolInitialize) {
     ret_x(c, ok);
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolFinalize) {
-    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
-    pool_t *o = arg_p(c, 0);
+static void pool_finalize(pool_t *o) {
     if (o->magic != NVN_POOL_MAGIC) return;
     motion_owner_forget_range((uint64_t)(uintptr_t)o->mem,o->size);
     if (pool_gpu_visible(o)) index_del(o);
@@ -331,6 +356,11 @@ NVN_API(nvnMemoryPoolFinalize) {
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
+}
+
+NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
+    pool_finalize(arg_p(c, 0));
 }
 static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
 

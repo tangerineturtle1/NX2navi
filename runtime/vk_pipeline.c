@@ -46,13 +46,17 @@
 #include "mesh_emu_spirv.h"
 #include "gfx.h"
 #include "host.h"
+#include "boot_warm.h"
+#include "mem_need.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "prp_file.h"
 #include "spirv_water.h"
+#include "stutter_map.h"
 #include "tex.h"
 #include "vk_build_gate.h"
 #include "vk_cache_file.h"
+#include "vk_exec.h"
 #include "vk_save_retry.h"
 #include "vk_warm_hint.h"
 
@@ -81,7 +85,12 @@ static struct {
     int indep;                         // stage-independent layouts (vk_caps.gpl): vertex set 0, fragment set 1
     int push_stage;                    // GFX_STAGE_* whose set is pushed with independent layouts
     int gpl;                           // draws whose pipeline is building get a fast-linked one (vk_caps.gpl)
-    struct { uint64_t links, fb_links, wlinks, flinks, dlinks, pr_added, lib_slow[4], ready_n[6], ready_nofast, ready_mesh, ready_recorded, ready_fresh, ready_logged, lib_logged, hints, hint_libs, requeued, link_fail, defer, lib_n[4], lib_fail, swaps, slow, pre_used[4]; double pr_added_ms, lib_slow_ms[4], ready_ms, ready_max, link_ms, link_max, lib_ms[4], lib_max[4], dlink_ms, dlink_max; } g;
+    int mesh_lib;                      // mesh pipelines are linked from stage libraries too (mesh_lib_init, mesh_libs)
+    struct { uint64_t links, fb_links, wlinks, flinks, dlinks, pr_added, lib_slow[4], ready_n[6], ready_nofast, ready_mesh, ready_recorded, ready_fresh, ready_logged, lib_logged, hints, hint_libs, requeued, link_fail, defer, lib_n[4], lib_fail, swaps, slow, pre_used[4]; double pr_added_ms, lib_slow_ms[4], ready_ms, ready_max, link_ms, link_max, lib_ms[4], lib_max[4], dlink_ms, dlink_max;
+             // mesh pipelines' share of the counts above: m_links fast links and their link time; of the ready_mesh
+             // pipelines a draw missed, m_ready_fast became usable through a fast link, m_ready_ms after the miss in
+             // all; m_lib_*: [0] their task and mesh libraries, [1] their fragment shader libraries (lib_build)
+             uint64_t m_links, m_ready_fast, m_lib_n[2]; double m_link_ms, m_link_max, m_ready_ms, m_ready_max, m_lib_ms[2], m_lib_max[2]; } g;
     int vs_outs_all;                   // NX2NAVI_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src, f_full_subgroups;
@@ -93,6 +102,8 @@ static struct {
     VkPipelineCache play;              // what this run compiles (pipeline-cache-play.bin); VK_NULL_HANDLE: all goes into cache
     uint64_t play_loaded;              // bytes of pipeline-cache-play.bin the driver took at boot
     uint64_t saved[2];                 // the data size of cache [0] and play [1] that their files hold; 0: not known
+    volatile uint64_t held[2];         // the data size of cache [0] and play [1] when last asked (cache_save_one,
+                                       // cache_sizes_ask); 0: not asked yet (the memory report takes the loaded size)
     int fold;                          // the play file's content was merged into cache: saving cache removes the play file
     volatile uint64_t play_made;       // pipelines this run compiled into play
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
@@ -146,15 +157,28 @@ typedef struct Pipe {
     int building;                      // a background job owns info.pipeline (under P.lock)
     struct Job *job;                   // that job while building
     const struct Layout *lay;          // graphics: the layout it was entered with
-    VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
+    VkPipeline fast;                   // GPL: the fast-linked pipeline, until the optimised one replaces it (fast_retire)
     uint8_t fast_tried;
     uint8_t link_queued;               // a waiting draw queued its fast link to the workers (LibJob p), not yet run
     uint8_t used;                      // compute: a dispatch of this run asked for it (vk_pipeline_compute)
     uint8_t pre;                       // compute: built and kept by the boot prebuild (lb_compute) or bg_main
+    uint8_t optimised;                 // graphics: its pipeline is the whole build that replaced a fast link (fast_retire)
+    uint32_t used_min;                 // pipe_minute when a draw or dispatch last looked it up; 0 none in this run
     uint64_t t_miss;                   // graphics: when a draw first missed it (ns), 0 once it is usable (ready_note)
     size_t key_size;
     uint8_t key[];
 } Pipe;
+
+// The memory report's clock for pipelines not used lately (vk_pipeline_mem): wall minutes, plus one so that 0 stays
+// "never". The autosave thread moves it every half second; a lookup stores it into its Pipe under P.lock, which the
+// lookup holds anyway, so the per-draw cost is one compare. A pipeline that only the replay's memo of the previous draw
+// served (vk_exec_draw.c, PM) keeps an older minute: at most the one pipeline each replay context remembers.
+static volatile uint32_t pipe_minute;
+static uint32_t minute_now(void) { return (uint32_t)(plat_now_ns() / 60000000000ull) + 1; }
+static inline void pipe_used(Pipe *p) {
+    uint32_t m = __atomic_load_n(&pipe_minute, __ATOMIC_RELAXED);
+    if (p->used_min != m) p->used_min = m;
+}
 
 static Layout *layouts[LAYOUT_BUCKETS];
 static Pipe *pipes[PIPE_BUCKETS];
@@ -746,8 +770,12 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
 // The data of the pipeline cache file at path for vkCreatePipelineCache (malloc'd, its size in *size), NULL when the
 // run starts without it, which the log says with the file's size. Cache data whose header names another device or
 // driver is dropped before Vulkan sees it.
-// NX2NAVI_PIPELINE_CACHE_MAX_MB (default 512; 0 no limit): a larger file starts the run empty, and the run's
-// saves replace it. The file only grows: entries of earlier translators and builds stay, and on NVIDIA
+// NX2NAVI_PIPELINE_CACHE_MAX_MB (cache_cap; 0 no limit): a larger file starts the run empty, and the run's
+// saves replace it. The limit bounds each of the two files, not their sum. It has to stay above what one run
+// builds: at 512, with the pipeline list of 0.9.1 (8,849 records), an RTX 2080 Ti's file held 551 MB and the play
+// file the run then wrote 541 MB, so both were dropped at every start, 7,247 of 8,531 pipelines were built again in
+// each (17 s of the boot) and 541 MB were written again in each session (cache_load says so when both files are
+// over). The file only grows: entries of earlier translators and builds stay, and on NVIDIA
 // (621.01) an entry another executable wrote is neither used nor written again, so a renamed or updated exe
 // compiles while the file keeps its size (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). The
 // whole file sits in process memory twice at the boot (this read and the driver's copy) and is copied out
@@ -755,12 +783,48 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
 // read, so a file that is dropped never takes its size in memory. Sizes are 64-bit all the way
 // (vk_cache_file.h cache_file_read): a file past 2 GB is read with the limit raised or off, and refused by
 // its real size otherwise.
+// The limit is kept on the write side too (cache_load's fold, cache_save_one): a run never writes a file the next start
+// would refuse. Before, only the read checked it, all or nothing, and nothing kept the files under it: on an RTX 5080
+// (0.9.2, 2026-11-12) pipeline-cache-play.bin reached 524.9 MB in one session of about 15 minutes, the next start
+// dropped it whole ("starting empty") and the session after compiled its pipelines again (boot hits 13-18 %, about
+// 5,000 pipelines left to background builds at 250-273 ms each). pipeline-cache.bin itself grows 14-28 MB at each
+// fold (323 -> 448 -> 461 -> 489 MB in four starts) and so crosses 512 MB in a few sessions (0.8.0: a 766 MB file
+// dropped at a start). With the limit at 2048 MB the same files were read and folded: boot hits 84 %, nothing left to
+// background builds, the boot 17 s instead of 24.
+// cache_cap: NX2NAVI_PIPELINE_CACHE_MAX_MB when set (0: no limit); unset, the machine's RAM / 32 between 1024 and
+// 4096 MB (16 and 32 GB: 1024; 64 GB: 2048; 128 GB and more: 4096). Never below 1024: a full cache of the pipeline
+// list is about 550 MB on an NVIDIA card, and a limit under what the files reach compiles everything past it again at
+// every start, for good (RAM / 32 alone gave 509 MB on a 16 GB machine). The RAM and not the commit headroom at the
+// boot, so the same file is not read on one start and refused on the next. Read once, at the start; every caller
+// computes the same value, so the unlocked cache of it is harmless.
+static uint64_t cache_cap(void) {
+    static uint64_t cap = UINT64_MAX;
+    if (cap != UINT64_MAX) return cap;
+    const char *set = cfg_get("NX2NAVI_PIPELINE_CACHE_MAX_MB");
+    float used = 0, total = 0, proc = 0;
+    uint64_t mb;
+    if (set && *set) mb = strtoull(set, NULL, 10);
+    else {
+        plat_mem_info(&used, &total, &proc);
+        mb = total > 0 ? (uint64_t)total / 32 : 512;
+        mb = mb < 1024 ? 1024 : mb > 4096 ? 4096 : mb;
+    }
+    if (set && *set)
+        rt_log("vk_pipeline: pipeline cache files up to %llu MB%s (NX2NAVI_PIPELINE_CACHE_MAX_MB)",
+               (unsigned long long)mb, mb ? "" : ": no limit");
+    else
+        rt_log("vk_pipeline: pipeline cache files up to %llu MB (from %.0f GB of RAM; NX2NAVI_PIPELINE_CACHE_MAX_MB "
+               "sets it)", (unsigned long long)mb, total / 1024.0);
+    return cap = mb << 20;
+}
+
 static int cache_over_cap;   // the last file cache_data_read was asked for is over the limit
+static int cache_foreign;    // pipeline-cache.bin was written by another device or driver (a driver update)
 static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
     *size = 0;
     cache_over_cap = 0;
     if (!path[0]) return NULL;
-    uint64_t cap = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_MAX_MB"), NULL, 10) << 20, len = 0;
+    uint64_t cap = cache_cap(), len = 0;
     int why = CACHE_FILE_NONE;
     void *data = cache_file_read(path, sizeof(VkPipelineCacheHeaderVersionOne), cap, &len, &why);
     if (!data) {
@@ -768,6 +832,7 @@ static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
             cache_over_cap = 1,
             rt_log("vk_pipeline: %s holds %.0f MB, over NX2NAVI_PIPELINE_CACHE_MAX_MB %llu: starting empty; it is "
                    "replaced when the play file is next folded in, at the next start that finds one", path, len / 1048576.0, (unsigned long long)(cap >> 20));
+        // (A file over the limit comes from before the limit was kept on the write side, or from a lower limit.)
         else if (why != CACHE_FILE_NONE)
             rt_log("vk_pipeline: %s (%llu bytes, %.1f MB) is not read: %s; starting empty", path,
                    (unsigned long long)len, len / 1048576.0, cache_file_why(why));
@@ -779,6 +844,7 @@ static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
         h.deviceID != c->props.deviceID || memcmp(h.pipelineCacheUUID, c->props.pipelineCacheUUID, VK_UUID_SIZE)) {
         rt_log("vk_pipeline: %s (%.1f MB) was written by another device or driver; starting empty", path,
                len / 1048576.0);
+        if (path == P.cache_path) cache_foreign = 1;
         free(data);
         return NULL;
     }
@@ -830,10 +896,50 @@ static void cache_load(VkCtx *c) {
     int want = cfg_bool("NX2NAVI_PIPELINE_CACHE_PLAY") && !prep_mode, on = want && P.cache_control;
     size_t psize = 0, pkept = 0;
     void *pdata = cache_data_read(c, P.play_path, &psize);
+    if (base_over && cache_over_cap)   // what one run builds is over the limit: nothing will ever replace either file
+        rt_log("vk_pipeline: both pipeline cache files are over NX2NAVI_PIPELINE_CACHE_MAX_MB, so what one run builds does "
+               "not fit it: this start builds every pipeline again, and so will each one after it until the limit is "
+               "raised above the play file's size (pipeline_cache_max_mb in nx2navi.ini; 0 = no limit)");
     VkPipelineCache play = psize || on ? cache_make(c, pdata, psize, &pkept) : VK_NULL_HANDLE;
     free(pdata);
     uint64_t fold_at = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_PLAY_MB"), NULL, 10) << 20;
     int fold = play && psize && (!on || psize >= fold_at || base_over);
+    if (fold && on && !base_over && cache_cap()) {
+        // Only a fold whose result fits: pipeline-cache.bin past the limit would be dropped whole at the next start
+        // (cache_data_read). The merge into P.cache is the one the kept play cache gets below anyway, so it is done
+        // here once and its size asked; a play file mostly holds what the other already has (461.2 + 524.9 MB folded
+        // to 489.0 MB, 2026-11-12), so the size of the two files says little.
+        // The fold is written at the first autosave, after the boot's prewarm and background builds have added to
+        // P.cache: it is taken only with room for a play file's worth of growth (fold_at) under the limit, so that
+        // save is not refused (cache_save keeps the play file meanwhile).
+        VkResult r = vkMergePipelineCaches(c->device, P.cache, 1, &play);
+        size_t merged = 0;
+        if (r == VK_SUCCESS && vkGetPipelineCacheData(c->device, P.cache, &merged, NULL) == VK_SUCCESS &&
+            merged + fold_at > cache_cap()) {
+            rt_log("vk_pipeline: %s: %.1f MB read, the driver holds %.1f MB of it; folding it in would make %s %.1f MB, "
+                   "with less than %llu MB of room left under the limit of %llu MB: both files stay as they are, and "
+                   "this run's pipelines go into the play file as long as it stays under the limit", P.play_path,
+                   psize / 1048576.0, pkept / 1048576.0, P.cache_path, merged / 1048576.0,
+                   (unsigned long long)(fold_at >> 20), (unsigned long long)(cache_cap() >> 20));
+            fold = 0, psize = 0;   // merged already: the branch for a kept play file below is skipped
+        } else if (r != VK_SUCCESS) {
+            rt_log("vk_pipeline: %s did not merge into the cache of %s (%d); it is left as it is and not used in this run",
+                   P.play_path, P.cache_path, (int)r);
+            vkDestroyPipelineCache(c->device, play, NULL);
+            play = VK_NULL_HANDLE, fold = 0, on = 0, psize = 0;
+        } else {
+            rt_log("vk_pipeline: folding %s in makes %s %.1f MB (the limit is %llu MB)", P.play_path, P.cache_path,
+                   merged / 1048576.0, (unsigned long long)(cache_cap() >> 20));
+            vkDestroyPipelineCache(c->device, play, NULL);
+            play = VK_NULL_HANDLE;
+            P.fold = 1, P.saved[0] = 0;
+            rt_log("vk_pipeline: %s: %.1f MB read, the driver holds %.1f MB of it; merged into the cache of %s, which is "
+                   "written once now (it reached the size at which it is folded in, before play)", P.play_path,
+                   psize / 1048576.0, pkept / 1048576.0, P.cache_path);
+            play = cache_make(c, NULL, 0, &pkept), psize = 0;
+            fold = 0;   // done
+        }
+    }
     if (fold) {
         // Into P.cache now; the file is written by the first save, which then removes the play file. A run that ends
         // before that save finds both files as they were and merges again.
@@ -906,6 +1012,45 @@ static void keys_open(void);
 static void cu_open(void);
 static void prebuild_start(void);
 
+// ---- stage libraries for mesh pipelines (NX2NAVI_GPL_MESH, default 1; 0: each mesh pipeline is built whole, as before)
+// A mesh pipeline (task and mesh stages: the game's foliage, grass and terrain) used to be left out of the stage
+// libraries: each new one was a whole build, 0.2 to 1.1 s the first time foliage of a kind appeared, and its draws
+// waited or were left out of the picture until it was done. With the setting on such a pipeline is made like a vertex
+// pipeline ("graphics pipeline library" below): linked at its first use from libraries, with the whole build behind.
+//  - Its pre-rasterization library holds the task and mesh stages with the viewport and rasterization state, keyed by
+//    both shaders (PrKey.vs, PrKey.ts). A mesh pipeline has no vertex input state, so it is linked from three
+//    libraries and none of them is a vertex input library (gpl_link).
+//  - Its layout is a stage-independent pair like a vertex pipeline's (mesh_pair_layout): set 0 holds the mesh stage's
+//    bindings and the task stage's after them, set 1 the fragment stage's. Without libraries all three share set 0.
+//  - Its fragment shader library is the one a vertex pipeline with the same fragment shader uses, unless the key says
+//    otherwise (FsKey): the inputs no mesh output feeds are filled in the module (fill, points), and on a device
+//    with a per-draw shading rate the rate is dynamic state of every mesh pipeline, which the pre-rasterization and
+//    the fragment shader state both hold, so both libraries list it (vrs). The fragment output library is shared.
+//  - The pre-rasterization library lists the dynamic states a whole mesh pipeline lists (mesh_dyn): not the vertex
+//    input, its strides, the topology or primitive restart, which a pipeline with a mesh stage may not list. So does
+//    a fragment shader library that is a mesh pipeline's alone (vrs). A library shared with vertex pipelines still
+//    lists those four: they belong to the vertex input state, which no library of a mesh pipeline holds, and what a
+//    library lists as dynamic counts only for the state the library itself holds.
+// Off, with the reason in the start's log line: without the graphics pipeline library, on a device that draws no mesh
+// pipeline (no mesh shaders, or the mesh fallback), and where mesh pipelines alone are built without the driver's
+// optimiser (noopt_flag_for): a fragment library shared with vertex pipelines would be an optimised one.
+static VkPipelineCreateFlags noopt_flag_for(int mesh);
+
+static void mesh_lib_init(const VkCtx *c) {
+    const char *why = !c->has_mesh_shader ? "this GPU has no mesh shaders"
+                    : c->mesh_fallback ? "mesh draws go through the mesh fallback (mesh_fallback = 1)"
+                    : !vk_caps.gpl ? "the graphics pipeline library is off"
+                    : !cfg_bool("NX2NAVI_GPL_MESH") ? "NX2NAVI_GPL_MESH=0"
+                    : noopt_flag_for(1) != noopt_flag_for(0) ? "they alone are built without the driver's optimiser "
+                                                               "(NX2NAVI_VK_NOOPT), which a shared library would not be"
+                    : NULL;
+    P.mesh_lib = !why;
+    if (why) rt_log("vk_pipeline: mesh pipelines are built whole, without stage libraries: %s", why);
+    else rt_log("vk_pipeline: mesh pipelines are linked from stage libraries like vertex pipelines: the task and mesh "
+                "stages in one pre-rasterization library, a fast link at the first draw, the whole build behind it "
+                "(NX2NAVI_GPL_MESH=0 builds each whole, as before)");
+}
+
 static int ensure_init(void) {
     if (P.ready) return 1;
     if (!vk_init()) return 0;
@@ -916,6 +1061,7 @@ static int ensure_init(void) {
     }
     VkCtx *c = vk_ctx();
     P.device = c->device;
+    __atomic_store_n(&pipe_minute, minute_now(), __ATOMIC_RELAXED);
     VkPhysicalDevicePushDescriptorPropertiesKHR pd = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pd};
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
@@ -930,6 +1076,7 @@ static int ensure_init(void) {
     P.vs_outs_all = vo && !strcmp(vo, "all");
     if (P.indep) rt_log("vk_pipeline: stage-independent layouts: vertex set 0, fragment set 1, %s set pushed; vertex outputs: %s",
                         P.push_stage == GFX_STAGE_VS ? "vertex" : "fragment", P.vs_outs_all ? "all 32 locations" : "union of paired fragment inputs");
+    mesh_lib_init(c);
     // vk_device.c enables every feature the GPU reports in this chain, so the query tells what is enabled.
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT e3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceProvokingVertexFeaturesEXT pvf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
@@ -2152,7 +2299,12 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
         } else if (op == OP_TYPE_ARRAY_ && len >= 4 && w[i + 1] < bound && w[i + 2] < bound && w[i + 3] < bound) {
             int32_t k = kind[w[i + 2]];
             uint32_t want = k == 100 ? VK_POOL_SAMP : VK_POOL_TEX;
-            kind[w[i + 1]] = k >= 0 && cval[w[i + 3]] == want ? k + 1000 : -1;   // + 1000: a pool array
+            // A translation carried over from a translator whose pool was VK_POOL_TEX_CARRIED long (gfx_shader.c,
+            // carry) is a pool array too: left in its own set, its textures were never bound and the scene drew
+            // with empty images until the background pass translated it again. It indexes the first
+            // VK_POOL_TEX_CARRIED entries of the larger binding, which Vulkan allows.
+            int pool = k >= 0 && (cval[w[i + 3]] == want || (k != 100 && cval[w[i + 3]] == VK_POOL_TEX_CARRIED));
+            kind[w[i + 1]] = pool ? k + 1000 : -1;   // + 1000: a pool array
         } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && w[i + 1] < bound && w[i + 3] < bound) {
             kind[w[i + 1]] = kind[w[i + 3]] >= 1000 ? kind[w[i + 3]] : -1;
         } else if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 1] < bound && w[i + 2] < bound) {
@@ -2652,6 +2804,16 @@ static VkShaderStageFlags stage_bit(int stage) {
 
 static int is_mesh(const VkPipeState *s) { return s->vs && gfx_shader_stage(s->vs) == GFX_STAGE_MS; }
 
+// 1 when a mesh pipeline entered now is linked from stage libraries (comment at mesh_lib_init): it then gets a
+// stage-independent layout (pipe_miss), which is how the rest of the file tells (no_libs).
+static int mesh_libs(void) { return P.mesh_lib && P.indep; }
+
+int vk_pipeline_mesh_libs(void) { return ensure_init() && mesh_libs(); }
+
+// 1 for a mesh pipeline of layout l that has no stage libraries and so no fast link: every build of it is its whole
+// build. A vertex pipeline is never one (gpl_link itself refuses the shared layout the probe can give it).
+static int no_libs(const VkPipeState *s, const Layout *l) { return is_mesh(s) && !(l && l->set1); }
+
 // Where a shader's translation came from (gfx_shader_origin), for the log.
 static const char *origin_name(const GfxShader *s) {
     static const char *const name[3] = {"from the shader cache", "a previous translator's", "translated in this session"};
@@ -2717,24 +2879,22 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
 }
 
 // The first binding a module's resource variables use that the binding list b[0..n) lacks (module bindings >= 1 moved
-// by off), or -1. A reflection that misses a resource would otherwise hand the driver an invalid layout.
+// by off), or -1. A reflection that misses a resource would otherwise hand the driver an invalid layout. The module's
+// Binding decorations come from the list the shader keeps (gfx_shader_bindings), not from its SPIR-V: this runs on the
+// drawing thread at every pipeline miss (pipe_miss), where a compressed module would be decoded.
 static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayoutBinding *b, uint32_t n, uint32_t off) {
-    uint64_t words = 0;
-    const uint32_t *w = gfx_shader_spirv(s, &words);
+    const uint32_t *bind;
+    uint32_t nb = gfx_shader_bindings(s, &bind);
     const GfxShaderRes *tr;
     int nt = gfx_shader_resources(s, GFX_RES_TEX, &tr);
-    for (uint64_t i = 5; w && i < words;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > words) break;
+    for (uint32_t i = 0; i < nb; i++) {
         int pooled = 0;   // a pool array: set 2, not in this layout (spirv_pool_rebind)
-        for (int t = 0; t < nt && op == SPV_OP_DECORATE && len >= 4; t++)
-            if (tr[t].pool && tr[t].binding == (w[i + 3] & 0xffff)) pooled = 1;   // GfxShaderRes.binding is 16 bits
-        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && !pooled) {
-            uint32_t want = w[i + 3] + (w[i + 3] >= 1 ? off : 0), j = 0;
-            while (j < n && b[j].binding != want) j++;
-            if (j == n) return (int)w[i + 3];
-        }
-        i += len;
+        for (int t = 0; t < nt; t++)
+            if (tr[t].pool && tr[t].binding == (bind[i] & 0xffff)) pooled = 1;   // GfxShaderRes.binding is 16 bits
+        if (pooled) continue;
+        uint32_t want = bind[i] + (bind[i] >= 1 ? off : 0), j = 0;
+        while (j < n && b[j].binding != want) j++;
+        if (j == n) return (int)bind[i];
     }
     return -1;
 }
@@ -2947,15 +3107,17 @@ static const MeshEmuEnt *emu_get(const GfxShader *ms, const GfxShader *ts, VkPip
     const char *why = NULL;
     uint64_t n = 0;
     size_t cn = 0;
-    const uint32_t *w = gfx_shader_spirv(ms, &n);
+    const uint32_t *w = gfx_shader_spirv_pin(ms, &n);
     uint32_t *c = w ? mesh_emu_compute(w, (size_t)n, &e->mi, &cn, &why) : NULL;
+    gfx_shader_spirv_unpin(ms);
     if (c && (e->mesh = emu_compute(c, cn, layout))) e->ok = 1;
     else if (!why) why = "the mesh stage's compute pipeline was not created";
     free(c);
     if (e->ok && e->mi.payload_words && !ts) e->ok = 0, why = "a mesh stage that reads a task payload without a task stage";
     if (e->ok && ts) {
-        w = gfx_shader_spirv(ts, &n);
+        w = gfx_shader_spirv_pin(ts, &n);
         c = w ? mesh_emu_compute(w, (size_t)n, &e->ti, &cn, &why) : NULL;
+        gfx_shader_spirv_unpin(ts);
         uint32_t *r = c && toff ? spirv_rebind(c, cn, toff) : NULL;   // the task stage's bindings follow the fragment stage's
         if (c && (e->task = emu_compute(r ? r : c, cn, layout))) {
             if (e->ti.payload_words != e->mi.payload_words) e->ok = 0, why = "task and mesh payload sizes differ";
@@ -3093,6 +3255,56 @@ static uint32_t vs_outs(const GfxShader *vs, const GfxShader *fs, GfxShaderIo io
     return mask;
 }
 
+// What a mesh module writes (spirv_mesh_outputs), kept per mesh shader: the library keys of a mesh pipeline need it
+// at every lookup (lib_keys), and reading it walks the module's declarations with two tables of its id bound.
+#define MESH_OUTS_CAP 1024
+static struct {
+    PlatMutex lock;
+    const GfxShader *ms[MESH_OUTS_CAP];
+    uint32_t mask[MESH_OUTS_CAP];
+    uint8_t points[MESH_OUTS_CAP];
+    uint32_t n;
+} MSO = {.lock = PLAT_MUTEX_INIT};
+
+static uint32_t mesh_outs(const GfxShader *ms, int *points) {
+    uint32_t j = (uint32_t)(((uintptr_t)ms >> 4) * 0x9e3779b1u) & (MESH_OUTS_CAP - 1), mask;
+    plat_mutex_lock(&MSO.lock);
+    while (MSO.ms[j] && MSO.ms[j] != ms) j = (j + 1) & (MESH_OUTS_CAP - 1);
+    if (MSO.ms[j]) {
+        mask = MSO.mask[j], *points = MSO.points[j];
+        plat_mutex_unlock(&MSO.lock);
+        return mask;
+    }
+    plat_mutex_unlock(&MSO.lock);
+    uint64_t n = 0;
+    const uint32_t *w = gfx_shader_spirv_pin(ms, &n);   // once per mesh shader: decoded here if it is compressed
+    *points = 0;
+    mask = w ? spirv_mesh_outputs(w, n, points) : ~0u;   // as create_graphics takes a module it cannot read
+    gfx_shader_spirv_unpin(ms);
+    plat_mutex_lock(&MSO.lock);
+    for (j = (uint32_t)(((uintptr_t)ms >> 4) * 0x9e3779b1u) & (MESH_OUTS_CAP - 1); MSO.ms[j] && MSO.ms[j] != ms;)
+        j = (j + 1) & (MESH_OUTS_CAP - 1);
+    if (!MSO.ms[j] && MSO.n + 1 < MESH_OUTS_CAP * 3 / 4)   // a full table: read again next time
+        MSO.ms[j] = ms, MSO.mask[j] = mask, MSO.points[j] = (uint8_t)*points, MSO.n++;
+    plat_mutex_unlock(&MSO.lock);
+    return mask;
+}
+
+// The inputs of fragment shader fs that mesh shader ms does not write, which the fragment module of their pipeline
+// gets filled in (spirv_fs_fill_inputs; create_graphics works the same mask out for a whole build), and in *points
+// whether they are filled as a point sprite's. 0 and no points when nothing is filled.
+static uint32_t mesh_fill(const GfxShader *ms, const GfxShader *fs, int *points) {
+    GfxShaderIo fin[32];
+    *points = 0;
+    if (!fs) return 0;
+    int pts = 0;
+    uint32_t need = gfx_shader_inputs(fs, fin), have = mesh_outs(ms, &pts), missing = 0;
+    for (int i = 0; i < 32; i++)
+        if (need >> i & 1 && !fin[i].packed && !(have >> i & 1)) missing |= 1u << i;
+    if (missing) *points = pts;
+    return missing;
+}
+
 // ---- pipeline cache table
 
 static Pipe *pipe_find(const void *key, size_t size, uint64_t h) {
@@ -3162,14 +3374,27 @@ static int is_src1(unsigned f) { return f >= NVN_BLEND_FUNC_SRC1_COLOR && f <= N
 // which NX2navi never sets (0 of 876 pipelines in the field and fight saves).
 // NX2NAVI_VK_NOOPT=1: pipelines built without the driver's optimiser, for a driver whose shader compiler crashes on
 // one (the test switch for such a report); slower shaders, the same picture. mesh: only pipelines with task and mesh
-// stages, the foliage's, whose optimiser is the suspect in device losses some minutes into a forest on AMD GPUs.
+// stages, the terrain's and the foliage's. 0: none.
+// Unset: mesh on AMD's Windows driver for RDNA 1 and 2 (vk_caps.amd_sc), 0 elsewhere. That driver loses the device
+// ("No fault detected", a timeout) minutes into play on RX 6600 to RX 6950 XT cards in every version from 0.6.0 to
+// 0.9.2, with the pipeline library on or off and the lazy write-back on or off. Where the reports' pass marks name a
+// pass the GPU was in, twelve logs of five reporters, it is a pass whose first draw is a mesh pipeline (mesh shader
+// ba4302f1 with fragment shader f64a96dd in nine, the one-draw pass of 1bbdb17e with 6cc3a476 in three); the five
+// logs of 0.9.1 and 0.9.2 stop between the compute dispatch before such a pass and the pass. No reporter ran with
+// the optimiser off, so that it is the cause is not shown: it is the one suspect the marks leave, it costs shader
+// speed in those pipelines and not the picture, and NX2NAVI_VK_NOOPT=0 gives the optimised ones back. The flag is
+// part of what the driver's cache keys a pipeline by, so those pipelines are built once more after the change.
 static VkPipelineCreateFlags noopt_flag_for(int mesh) {
     static int on = -1;
     if (on < 0) {
-        const char *v = cfg_value("NX2NAVI_VK_NOOPT");
-        on = !strcmp(v, "mesh") ? 2 : strcmp(v, "0") != 0;
-        if (on) rt_log("vk_pipeline: %s built without the driver's optimiser (NX2NAVI_VK_NOOPT)",
-                       on == 2 ? "pipelines with task and mesh stages" : "pipelines");
+        const char *v = cfg_get("NX2NAVI_VK_NOOPT");
+        int by_driver = !v || !*v;
+        on = by_driver ? (vk_caps.amd_sc ? 2 : 0) : !strcmp(v, "mesh") ? 2 : strcmp(v, "0") != 0;
+        if (on) rt_log("vk_pipeline: %s built without the driver's optimiser (%s)",
+                       on == 2 ? "pipelines with task and mesh stages" : "pipelines",
+                       by_driver ? "the default on AMD's driver for RDNA 1 and 2, where the device is lost in passes "
+                                   "that start with such a pipeline; NX2NAVI_VK_NOOPT=0 builds them optimised"
+                                 : "NX2NAVI_VK_NOOPT");
     }
     return on == 1 || (on == 2 && mesh) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
 }
@@ -3359,23 +3584,24 @@ enum { WATER_VERTEX, WATER_FRAGMENT, WATER_ABSORPTION };
 static struct { uint64_t key; uint32_t *code; uint64_t words; int state; } water_mods[8];
 static PlatMutex water_lock = PLAT_MUTEX_INIT;
 
-// The edited module that stands for the module of hash `key`, or NULL. w: the translation it is made from at the
-// first call (NULL: only look); a fragment translation is first put into its set 1 form, which must be the module
-// `key` names, as it is the form the pipeline builds.
-static const uint32_t *water_module(uint64_t key, int kind, const WaterProfile *p, const uint32_t *w, uint64_t n,
-                                    uint64_t *words) {
+// The edited module that stands for the module of hash `key`, or NULL. src: the translation it is made from at the
+// first call (NULL: only look), whose SPIR-V is pinned for the edit only; a fragment translation is first put into its
+// set 1 form, which must be the module `key` names, as it is the form the pipeline builds.
+static const uint32_t *water_module(uint64_t key, int kind, const WaterProfile *p, const GfxShader *src, uint64_t *words) {
     const uint32_t *code = NULL;
     plat_mutex_lock(&water_lock);
     int i = 0;
     while (i < 8 && water_mods[i].state && water_mods[i].key != key) i++;
-    if (i < 8 && !water_mods[i].state && w) {
-        uint64_t wn = 0;
+    if (i < 8 && !water_mods[i].state && src) {
+        uint64_t wn = 0, n = 0;
+        const uint32_t *w = gfx_shader_spirv_pin(src, &n);
         uint32_t *c = NULL, *set1 = kind == WATER_VERTEX ? NULL : spirv_set(w, n, 1);
         if (kind == WATER_VERTEX) c = spirv_water_vertex(w, n, &wn);
         else if (set1 && fnv(FNV0, set1, (size_t)n * 4) == key)
             c = kind == WATER_FRAGMENT ? spirv_water_fragment(set1, n, &wn)
                                        : spirv_water_absorption(set1, n, p->mat_pointer, p->mat_distance, &wn);
         free(set1);
+        gfx_shader_spirv_unpin(src);
         water_mods[i].key = key, water_mods[i].code = c, water_mods[i].words = wn, water_mods[i].state = c ? 1 : -1;
         static const char *const names[] = {"vertex stage of the coordinate pair", "fragment stage of the coordinate pair",
                                             "absorption material"};
@@ -3390,23 +3616,21 @@ static const uint32_t *water_module(uint64_t key, int kind, const WaterProfile *
 }
 
 // The water mode of a pipeline's shaders: 1 a coordinate pair whose two edited modules exist, 2 the absorption
-// material whose edited module exists, else 0.
+// material whose edited module exists, else 0. The drawing thread asks it for every pipeline it links (lib_keys): the
+// modules' hashes are the ones the shaders keep (gfx_shader_spirv_fnv), and the SPIR-V is read only to make an edited
+// module, once per profile.
 static int water_projective_pair(const VkPipeState *s) {
     static int on = -1;
     if (on < 0) on = cfg_bool("NX2NAVI_WATER_PROJECTIVE");
     if (!on || !P.indep || !s->fs) return 0;
-    uint64_t vn = 0, fn = 0, wn;
-    const uint32_t *f = gfx_shader_spirv(s->fs, &fn);
-    if (!f) return 0;
-    uint64_t fh = fnv(FNV0, f, (size_t)fn * 4);
+    uint64_t wn, fh = gfx_shader_spirv_fnv(s->fs);
     for (size_t i = 0; i < sizeof water_profiles / sizeof *water_profiles; i++) {
         const WaterProfile *p = &water_profiles[i];
         // The absorption correction is independent of the coordinate pair.
-        if (fh == p->mat) return water_module(p->mat_set1, WATER_ABSORPTION, p, f, fn, &wn) ? 2 : 0;
+        if (fh == p->mat) return water_module(p->mat_set1, WATER_ABSORPTION, p, s->fs, &wn) ? 2 : 0;
         if (fh != p->fs) continue;
-        const uint32_t *v = s->vs ? gfx_shader_spirv(s->vs, &vn) : NULL;
-        if (!v || fnv(FNV0, v, (size_t)vn * 4) != p->vs) return 0;
-        return water_module(p->vs, WATER_VERTEX, p, v, vn, &wn) && water_module(p->fs_set1, WATER_FRAGMENT, p, f, fn, &wn);
+        if (!s->vs || gfx_shader_spirv_fnv(s->vs) != p->vs) return 0;
+        return water_module(p->vs, WATER_VERTEX, p, s->vs, &wn) && water_module(p->fs_set1, WATER_FRAGMENT, p, s->fs, &wn);
     }
     return 0;
 }
@@ -3415,7 +3639,7 @@ static int water_projective_pair(const VkPipeState *s) {
 // (in its set 1 form), else the module itself.
 static VkShaderModule water_pair_module(const uint32_t *w, uint64_t n, int early, int mode) {
     uint64_t words = 0;
-    const uint32_t *code = mode ? water_module(fnv(FNV0, w, (size_t)n * 4), 0, NULL, NULL, 0, &words) : NULL;
+    const uint32_t *code = mode ? water_module(fnv(FNV0, w, (size_t)n * 4), 0, NULL, NULL, &words) : NULL;
     if (mode == 1 && !code) LOG_ONCE("vk_pipeline: water: a coordinate pair's fragment module is not in its known form; built as it is");
     return code ? make_module(code, words, early) : make_module(w, n, early);
 }
@@ -3424,7 +3648,7 @@ static VkShaderModule water_pair_module(const uint32_t *w, uint64_t n, int early
 // outputs the vertex shader's union adds (spirv_add_outputs), which differ from one install to the next and are added
 // to the edited module as to any other. NULL in every other case. The module stays the table's.
 static const uint32_t *water_pair_vertex(const uint32_t *v, uint64_t n, int mode, uint64_t *words) {
-    return mode == 1 && v ? water_module(fnv(FNV0, v, (size_t)n * 4), 0, NULL, NULL, 0, words) : NULL;
+    return mode == 1 && v ? water_module(fnv(FNV0, v, (size_t)n * 4), 0, NULL, NULL, words) : NULL;
 }
 
 // water_projective_pair for a pipeline of key k. A coordinate pair blended with dual-source factors keeps its original
@@ -3457,10 +3681,34 @@ void vk_pipeline_line_width(VkCommandBuffer cb, const VkPipeState *s, float widt
     vkCmdSetLineWidth(cb, w);
 }
 
+// What a mesh pipeline's task stage bindings are moved by in layout l: past the mesh stage's in a stage-independent
+// layout, where the two share set 0 (mesh_pair_layout), and past the fragment stage's in the shared set (pipe_miss).
+static uint32_t task_off(const VkPipeState *s, const Layout *l, uint32_t fs_off) {
+    return l->set1 ? binding_span(s->vs) - 1 : fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
+}
+
+// The dynamic states of a mesh pipeline into out (room for P.n_dyn + 1): P.dyn without the vertex input, its strides,
+// the topology and primitive restart, which a pipeline with a mesh stage must not list, and with the fragment
+// shading rate where the device sets one per draw (vk_exec_draw.c mesh_shading_rate). Returns their number.
+static uint32_t mesh_dyn(VkDynamicState *out) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < P.n_dyn; i++)
+        if (P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE &&
+            P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)
+            out[n++] = P.dyn[i];
+    if (vk_ctx()->has_vrs) out[n++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
+    return n;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
-    const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
+    // The stages' translations, pinned until the pipeline is made (gfx.h gfx_shader_spirv_pin): vcode and fcode become
+    // patched copies on the way, vplain and fplain stay the translations.
+    uint64_t vw0 = 0, fw0 = 0;
+    const uint32_t *vplain = gfx_shader_spirv_pin(s->vs, &vw0), *fplain = s->fs ? gfx_shader_spirv_pin(s->fs, &fw0) : NULL;
+    const uint32_t *vcode = vplain;
+    vw = vw0;
     uint32_t *vpatched = NULL, *fpatched = NULL;
     int mesh = is_mesh(s), emu = mesh && l->emu;
     // the water pair's vertex edit is for a translated vertex stage: an emulated mesh draw's generated one has none
@@ -3471,7 +3719,11 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     if (emu) {   // NX2NAVI_MESH_EMULATION: the task and mesh stages as compute pipelines, a generated vertex shader here
         uint32_t toff = fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
         const MeshEmuEnt *me = emu_get(s->vs, s->ts, l->layout, toff, 1);
-        if (!me || !me->ok) return VK_NULL_HANDLE;
+        if (!me || !me->ok) {
+            gfx_shader_spirv_unpin(s->vs);
+            if (s->fs) gfx_shader_spirv_unpin(s->fs);
+            return VK_NULL_HANDLE;
+        }
         GfxShaderIo fin[32];
         uint8_t ty[32], cp[32];
         uint32_t need = s->fs ? gfx_shader_inputs(s->fs, fin) : 0;
@@ -3480,21 +3732,24 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             cp[i] = need >> i & 1 && !fin[i].packed && fin[i].comps ? (uint8_t)fin[i].comps : 4;
         }
         size_t vn = 0;
-        uint64_t fsw = 0;
-        const uint32_t *fcode0 = s->fs ? gfx_shader_spirv(s->fs, &fsw) : NULL;
-        vpatched = mesh_emu_vs(&me->mi, need, ty, cp, fcode0, (size_t)fsw, &vn);
-        if (!vpatched) return VK_NULL_HANDLE;
+        vpatched = mesh_emu_vs(&me->mi, need, ty, cp, fplain, (size_t)fw0, &vn);
+        if (!vpatched) {
+            gfx_shader_spirv_unpin(s->vs);
+            if (s->fs) gfx_shader_spirv_unpin(s->fs);
+            return VK_NULL_HANDLE;
+        }
         vcode = vpatched, vw = vn;
         mesh = 0;   // a vertex pipeline from here on
     }
     VkShaderModule tm = VK_NULL_HANDLE;
-    if (mesh && s->ts) {   // the task stage's bindings follow the fragment stage's (pipe_miss)
+    if (mesh && s->ts) {   // the task stage's bindings follow another stage's in its set (task_off)
         uint64_t tw;
-        const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
-        uint32_t toff = fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
+        const uint32_t *tcode = gfx_shader_spirv_pin(s->ts, &tw);
+        uint32_t toff = task_off(s, l, fs_off);
         uint32_t *t = tcode && toff ? spirv_rebind(tcode, tw, toff) : NULL;
         tm = make_module(t ? t : tcode, tw, 0);
         free(t);
+        gfx_shader_spirv_unpin(s->ts);
     }
     if (l->set1 && !mesh) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
@@ -3525,7 +3780,8 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
             else vcode = vpatched, vw = n2;
         }
-        const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
+        const uint32_t *fcode = fplain;
+        fw = fw0;
         if (missing && mesh && fcode) {   // inputs no mesh output feeds read as Maxwell gives them (spirv_fs_fill_inputs)
             uint64_t n2 = 0;
             uint32_t *f = spirv_fs_fill_inputs(fcode, fw, missing, points, &n2);
@@ -3563,10 +3819,8 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         n_stages++;
     }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
-    uint64_t sw;
-    const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    if (!emu) pin_subgroup32(&stages[0], &rqv, scode, sw);
-    if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
+    if (!emu) pin_subgroup32(&stages[0], &rqv, vplain, vw0);   // vcode may be a patched copy that is freed by now
+    if (s->fs) pin_subgroup32(&stages[1], &rqf, fplain, fw0);
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -3621,15 +3875,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         mdyn[P.n_dyn] = VK_DYNAMIC_STATE_LINE_WIDTH;
         dy.dynamicStateCount = P.n_dyn + 1, dy.pDynamicStates = mdyn;
     }
-    if (mesh) {   // a mesh pipeline must not list vertex input, topology or primitive restart as dynamic
-        uint32_t n = 0;
-        for (uint32_t i = 0; i < P.n_dyn; i++)
-            if (P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE &&
-                P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)
-                mdyn[n++] = P.dyn[i];
-        if (vk_ctx()->has_vrs) mdyn[n++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;   // vk_exec_draw.c mesh_shading_rate
-        dy.dynamicStateCount = n, dy.pDynamicStates = mdyn;
-    }
+    if (mesh) dy.dynamicStateCount = mesh_dyn(mdyn), dy.pDynamicStates = mdyn;
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->n_color,
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
@@ -3683,6 +3929,8 @@ out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
     if (fm) vkDestroyShaderModule(P.device, fm, NULL);
     if (tm) vkDestroyShaderModule(P.device, tm, NULL);
+    gfx_shader_spirv_unpin(s->vs);
+    if (s->fs) gfx_shader_spirv_unpin(s->fs);
     return pipe;
 }
 
@@ -3694,7 +3942,10 @@ out:
 // pre-rasterization library uses {set 0, null} and the fragment shader library {null, set 1}. The fast link runs on the
 // thread of the draw that needs it (no link-time optimisation); the optimised pipeline is the job pipe_miss queued
 // (a monolithic build with the same modules), which replaces the fast one in the Pipe when done. Libraries and fast
-// pipelines live until vk_pipeline_shutdown.
+// pipelines live until vk_pipeline_shutdown. No library is made to be optimised at its link: the optimised pipeline is
+// that whole build, so the links take what the libraries hold as it is.
+// A mesh pipeline is linked from three of them, its pre-rasterization library holding the task and mesh stages
+// (comment at mesh_lib_init).
 // Background build signalling, both with P.lock: work_cv wakes the pipeline workers, done_cv wakes threads waiting for a
 // pipeline or a stage library to be published.
 static PlatCond work_cv = PLAT_COND_INIT, done_cv = PLAT_COND_INIT;
@@ -3710,8 +3961,12 @@ static Lib *libs[LIB_BUCKETS];
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
 typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, water_projective;
                  uint8_t lines;   // key_lines: the library lists the line width as dynamic state
+                 const GfxShader *ts;   // a mesh pipeline's library (vs is its mesh stage): its task stage, or NULL
                  GfxShaderIo fin[32]; } PrKey;
-typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, water_projective; const GfxShader *fs; } FsKey;
+// fill, points, vrs: zero for a vertex pipeline. A mesh pipeline's: the inputs filled in the module and whether as a
+// point sprite's (mesh_fill), and 1 when the library lists the fragment shading rate as dynamic state (mesh_dyn).
+typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, water_projective; const GfxShader *fs;
+                 uint32_t fill; uint8_t points, vrs, pad[2]; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, fbl, pad[2]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;   // fbl: GKey.fbl, the feedback loop flags of the library (gpl_feedback)
 
@@ -3740,13 +3995,23 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
                                        .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | noopt_flag(), .pDynamicState = &dy};
     VkDynamicState ldyn[sizeof P.dyn / sizeof P.dyn[0] + 1];
-    if (kind == LIB_PR && ((const PrKey *)key)->lines) {   // the rasterization state is this library's: as create_graphics
+    int mesh = is_mesh(s);   // the libraries of a mesh pipeline (comment at mesh_lib_init)
+    if (kind == LIB_PR && mesh) {   // what a whole mesh pipeline lists: as create_graphics
+        dy.dynamicStateCount = mesh_dyn(ldyn), dy.pDynamicStates = ldyn;
+        pi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | noopt_flag_for(1);
+    } else if (kind == LIB_PR && ((const PrKey *)key)->lines) {   // the rasterization state is this library's: as create_graphics
         memcpy(ldyn, P.dyn, P.n_dyn * sizeof *ldyn);
         ldyn[P.n_dyn] = VK_DYNAMIC_STATE_LINE_WIDTH;
         dy.dynamicStateCount = P.n_dyn + 1, dy.pDynamicStates = ldyn;
+    } else if (kind == LIB_FS && ((const FsKey *)key)->vrs) {
+        // The shading rate is part of the pre-rasterization and of the fragment shader state: a mesh pipeline's
+        // libraries of both kinds list it as dynamic state, as a state dynamic in one library has to be in every
+        // other library that holds it. Such a library is a mesh pipeline's alone, so it takes that pipeline's list.
+        dy.dynamicStateCount = mesh_dyn(ldyn), dy.pDynamicStates = ldyn;
     }
-    VkShaderModule m = VK_NULL_HANDLE;
+    VkShaderModule m = VK_NULL_HANDLE, tm = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
+    VkPipelineShaderStageCreateInfo mst[2];   // a mesh pipeline's pre-rasterization stages: mesh, then task
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
@@ -3773,6 +4038,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     uint32_t *patched = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
+    const GfxShader *pinned[2] = {NULL, NULL};   // the shaders whose SPIR-V is pinned until out (gfx_shader_spirv_pin)
     if (kind == LIB_VI) {
         if (!P.dyn_vi) {
             VtxInput v;
@@ -3785,10 +4051,31 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             vi.vertexBindingDescriptionCount = v.n_bind, vi.pVertexBindingDescriptions = vb;
         }
         pi.pVertexInputState = &vi, pi.pInputAssemblyState = &ia;
+    } else if (kind == LIB_PR && mesh) {
+        // The task and mesh stages as create_graphics builds them: the mesh module as translated, the task module with
+        // its bindings moved past the mesh stage's (task_off in a stage-independent layout); the mesh stage alone
+        // takes the subgroup pin there, so here too. No vertex outputs are added: what a fragment shader reads and
+        // the mesh stage does not write is filled in the fragment module (FsKey.fill).
+        uint64_t vw, tw = 0;
+        const uint32_t *vcode = gfx_shader_spirv_pin(pinned[0] = s->vs, &vw);
+        if (!vcode || !(m = make_module(vcode, vw, 0))) goto out;
+        mst[0] = st, mst[0].stage = VK_SHADER_STAGE_MESH_BIT_EXT, mst[0].module = m;
+        pin_subgroup32(&mst[0], &rq, vcode, vw);
+        pi.stageCount = 1;
+        if (s->ts) {
+            const uint32_t *tcode = gfx_shader_spirv_pin(pinned[1] = s->ts, &tw);
+            uint32_t toff = binding_span(s->vs) - 1;
+            patched = tcode && toff ? spirv_rebind(tcode, tw, toff) : NULL;
+            if (!tcode || !(tm = make_module(patched ? patched : tcode, tw, 0))) goto out;
+            mst[1] = st, mst[1].stage = VK_SHADER_STAGE_TASK_BIT_EXT, mst[1].module = tm;
+            pi.stageCount = 2;
+        }
+        pi.pStages = mst, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
+        pi.layout = lay;
     } else if (kind == LIB_PR) {
         const PrKey *pk = key;
         uint64_t vw, sw, n2 = 0;
-        const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw), *scode = vcode;
+        const uint32_t *vcode = gfx_shader_spirv_pin(pinned[0] = s->vs, &vw), *scode = vcode;
         sw = vw;
         uint64_t wn = 0;
         const uint32_t *vwater = water_pair_vertex(vcode, vw, pk->water_projective, &wn);
@@ -3802,17 +4089,22 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         pi.layout = lay;
     } else if (kind == LIB_FS) {
         if (s->fs) {
+            const FsKey *fk = key;
             uint64_t fw, sw, n2 = 0;
-            const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw), *scode = fcode;
+            const uint32_t *fcode = gfx_shader_spirv_pin(pinned[0] = s->fs, &fw), *scode = fcode;
             sw = fw;
-            uint32_t *d = NULL;
+            uint32_t *d = NULL, *filled = NULL;
+            if (fk->fill && fcode) {   // a mesh pipeline's: before the other rewrites, as create_graphics
+                if ((filled = spirv_fs_fill_inputs(fcode, fw, fk->fill, fk->points, &n2))) fcode = filled, fw = n2;
+                else LOG_ONCE("vk_pipeline: cannot fill fragment inputs the mesh stage lacks (mask %#x)", fk->fill);
+            }
             if (k->dsb && fcode) {
                 if ((d = spirv_dual_source(fcode, fw, &n2))) fcode = d, fw = n2;
                 else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
-            free(d);
-            if (!patched || !(m = water_pair_module(patched, fw, !k->a2c, ((const FsKey *)key)->water_projective))) goto out;
+            free(d), free(filled);
+            if (!patched || !(m = water_pair_module(patched, fw, !k->a2c, fk->water_projective))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -3845,13 +4137,17 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     pi.pNext = fb_chain(&fci, &fb, pi.pNext);
     static const char *const kind_name[4] = {"a vertex input library", "a pre-rasterization library",
                                              "a fragment shader library", "a fragment output library"};
-    crash_note(kind_name[kind], s->vs, s->fs, NULL);
+    crash_note(kind == LIB_PR && mesh ? "a pre-rasterization library of task and mesh stages" : kind_name[kind], s->vs,
+               s->fs, mesh ? s->ts : NULL);
     if (pipe_create(1, &pi, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_crash_context(NULL);
     if (pipe && (kind == LIB_PR || kind == LIB_FS)) fb_note(FB_LIBRARY, &fb);   // the shader libraries: the others compile nothing
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
+    if (tm) vkDestroyShaderModule(P.device, tm, NULL);
     free(patched);
+    for (int i = 0; i < 2; i++)
+        if (pinned[i]) gfx_shader_spirv_unpin(pinned[i]);
     return pipe;
 }
 
@@ -3923,6 +4219,12 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
         plat_mutex_lock(&P.lock);
         P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
         if (ms > P.g.lib_max[kind]) P.g.lib_max[kind] = ms;
+        int mesh = is_mesh(s) && (kind == LIB_PR || kind == LIB_FS);   // a mesh pipeline's shader library
+        if (mesh) {
+            int i = kind == LIB_FS;
+            P.g.m_lib_n[i]++, P.g.m_lib_ms[i] += ms;
+            if (ms > P.g.m_lib_max[i]) P.g.m_lib_max[i] = ms;
+        }
         int added = kind == LIB_PR && ((const PrKey *)(const void *)b->key)->missing;
         if (added) P.g.pr_added++, P.g.pr_added_ms += ms;
         if (ms >= 25) P.g.lib_slow[kind]++, P.g.lib_slow_ms[kind] += ms;
@@ -3932,7 +4234,9 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
             const uint8_t *id = sh ? gfx_shader_input_id(sh) : NULL;
             P.g.lib_logged++;
             rt_log("vk_pipeline: gpl: a %s library took %.0f ms: shader %02x%02x%02x%02x, %s%s",
-                   kind == LIB_PR ? "pre-rasterization" : "fragment shader", ms, id ? id[0] : 0, id ? id[1] : 0,
+                   kind == LIB_FS ? (mesh ? "fragment shader (of a mesh pipeline)" : "fragment shader")
+                                  : mesh ? "pre-rasterization (task and mesh stages)" : "pre-rasterization",
+                   ms, id ? id[0] : 0, id ? id[1] : 0,
                    id ? id[2] : 0, id ? id[3] : 0, origin_name(sh),
                    added ? "; outputs were added for its fragment shader, a module the preparation did not build"
                    : sh && gfx_shader_origin(sh) == 2 ? "; nothing was prepared from a shader first translated now"
@@ -4005,8 +4309,13 @@ static void libs_destroy(void) {
     }
 }
 
-// The four library keys of pipeline s (key k).
+// The four library keys of pipeline s (key k). A mesh pipeline (one with stage libraries: no_libs is 0) has no use
+// for the first, and what tells its two shader libraries from a vertex pipeline's is here: the pre-rasterization
+// key names the mesh stage and the task stage and adds no outputs (a mesh shader is in no vertex output union), the
+// fragment key carries what is filled in the module and the dynamic shading rate (FsKey). Neither takes a water
+// correction, as create_graphics gives a mesh pipeline none.
 static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, FsKey *fk, FoKey *ok) {
+    int mesh = is_mesh(s);
     memset(v, 0, sizeof *v);
     v->kind = LIB_VI, v->topo_class = k->topo_class;
     memcpy(v->attr_fmt, k->attr_fmt, sizeof v->attr_fmt), memcpy(v->attr_off, k->attr_off, sizeof v->attr_off);
@@ -4015,12 +4324,18 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     GfxShaderIo fin[32];
     pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
     pk->lines = (uint8_t)key_lines(k);
-    pk->missing = vs_union_missing(s, fin);
+    if (mesh) pk->ts = s->ts;
+    else pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
     memset(fk, 0, sizeof *fk);
     fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
-    pk->water_projective = fk->water_projective = (uint8_t)water_mode(s, k);
+    if (mesh) {
+        int points = 0;
+        fk->fill = mesh_fill(s->vs, s->fs, &points);
+        fk->points = (uint8_t)points, fk->vrs = vk_ctx()->has_vrs != 0;
+    }
+    pk->water_projective = fk->water_projective = mesh ? 0 : (uint8_t)water_mode(s, k);
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
     ok->blend_en = k->blend_en, ok->fbl = k->fbl, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
@@ -4048,11 +4363,17 @@ static int gpl_feedback(void) {
 // build 0 (drawing thread): links only when the shader libraries exist (vertex input and fragment output libraries,
 // which hold no shader, are built here); *final 0 = not yet, a worker builds them. build 1 (worker): builds the
 // missing libraries and links with P.lock released. VK_NULL_HANDLE with *final 1 when GPL cannot express the pipeline
-// (shared layout; a feedback loop with NX2NAVI_GPL_FEEDBACK=0) or a build failed.
+// (shared layout, which is also a mesh pipeline's without stage libraries; a feedback loop with
+// NX2NAVI_GPL_FEEDBACK=0) or a build failed.
+// A mesh pipeline is linked from three libraries: the pre-rasterization one with its task and mesh stages, the
+// fragment shader one and the fragment output one. It has no vertex input state, and a complete pipeline needs that
+// state only where its pre-rasterization state holds a vertex shader. The link names no state of its own and no
+// dynamic state: what is dynamic is what the libraries were made with.
 static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int build, int *final) {
     Layout *l = (Layout *)lc;
     *final = 1;
     if (!l->set1 || (k->fbl && !gpl_feedback())) return VK_NULL_HANDLE;
+    int mesh = is_mesh(s);
     uint64_t t0 = qpc();
     ViKey vk_;
     PrKey pk;
@@ -4067,31 +4388,36 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         if (!build) *final = 0, P.g.defer++;
         return VK_NULL_HANDLE;
     }
-    lib[0] = lib_get(LIB_VI, s, k, l, &vk_, sizeof vk_, 1, &miss);
+    lib[0] = mesh ? VK_NULL_HANDLE : lib_get(LIB_VI, s, k, l, &vk_, sizeof vk_, 1, &miss);
     lib[3] = lib_get(LIB_FO, s, k, l, &ok, sizeof ok, 1, &miss);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (lib[0] && lib[1] && lib[2] && lib[3]) {
-        VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
-                                             .pLibraries = lib};
+    double link_ms = 0;
+    if ((mesh || lib[0]) && lib[1] && lib[2] && lib[3]) {
+        VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                                             .libraryCount = mesh ? 3 : 4, .pLibraries = mesh ? lib + 1 : lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
                                            .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         char what[160];   // the parts that differ between links: a link that crashes the driver names its case
         snprintf(what, sizeof what,
-                 "a library link (fragment shader %s, %u colour targets, depth format %u, stencil format %u, %u samples, "
-                 "vertex outputs added %#x)", s->fs ? "yes" : "none", k->n_color, k->depth, k->stencil, k->samples,
-                 pk.missing);
-        crash_note(what, s->vs, s->fs, NULL);
+                 "a library link (%sfragment shader %s, %u colour targets, depth format %u, stencil format %u, %u samples, "
+                 "vertex outputs added %#x)", mesh ? "task and mesh stages, " : "", s->fs ? "yes" : "none", k->n_color,
+                 k->depth, k->stencil, k->samples, pk.missing);
+        crash_note(what, s->vs, s->fs, mesh ? s->ts : NULL);
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
         plat_crash_context(NULL);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
         if (build) plat_mutex_lock(&P.lock);
-        P.g.link_ms += ms;
+        P.g.link_ms += ms, link_ms = ms;
         if (ms > P.g.link_max) P.g.link_max = ms;
     }
     if (pipe) P.g.links++, P.g.fb_links += k->fbl != 0;
     else if (!P.g.link_fail++) rt_log("vk_pipeline: gpl: fast link failed; such draws wait or skip as without GPL");
+    if (pipe && mesh) {
+        P.g.m_links++, P.g.m_link_ms += link_ms;
+        if (link_ms > P.g.m_link_max) P.g.m_link_max = link_ms;
+    }
     double total = ms_since(t0);
     if (!build && total > 5.0 && P.g.slow++ < 16)
         rt_log("vk_pipeline: gpl: fast link on the drawing thread took %.1f ms", total);
@@ -4173,6 +4499,7 @@ static struct {
     uint32_t pend_n, pend_cap;
     uint8_t *file;                     // the file as read at boot, until the prewarm is done with it
     size_t file_n;                     // records in it
+    size_t own_n;                      // of them, the first ones: this install's own (keys_open); the shared list's follow
     PlatMutex io;                        // one writer
     // prebuild progress (under P.lock)
     int loading;                       // the prewarm still queues records
@@ -4276,6 +4603,7 @@ static void keys_open_seed(void);
 static void keys_open_own(void);
 static void keys_open(void) {
     keys_open_own();
+    K.own_n = K.file_n;
     if (K.path[0]) keys_open_seed();
 }
 
@@ -4388,10 +4716,12 @@ static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 // Caller holds P.lock.
 // p, which a draw missed, has its first usable pipeline: how long that took is how long its draws were skipped or
 // waited. fast 0: it had no fast link and this is the optimised build. Caller holds P.lock.
-// The summary (save_with) counts what a slow one can be: a mesh pipeline (no stage libraries, so its whole build), one
-// the key file names whose prebuild had not come to it, one with a shader translated in this session (nothing of it
-// was prepared, so its libraries compile cold). The first READY_LOGS that took READY_SLOW_MS or longer get a line
-// each with those facts, so a log says which pipelines left their draws out of the picture and for which reason.
+// The summary (save_with) counts what a slow one can be: a mesh pipeline (its task and mesh library is the largest
+// to compile, and without stage libraries, no_libs, this is its whole build), one the key file names whose prebuild
+// had not come to it, one with a shader translated in this session (nothing of it was prepared, so its libraries
+// compile cold). The first READY_LOGS that took READY_SLOW_MS or longer get a line each with those facts, so a log
+// says which pipelines left their draws out of the picture and for which reason. The mesh pipelines are also counted
+// by themselves: how many became usable through a fast link, and after how long.
 #define READY_SLOW_MS 50.0
 #define READY_LOGS 48
 static void ready_note(Pipe *p, int fast) {
@@ -4408,6 +4738,12 @@ static void ready_note(Pipe *p, int fast) {
     int fresh = gfx_shader_origin(j->s.vs) == 2 || (j->s.fs && gfx_shader_origin(j->s.fs) == 2) ||
                 (j->s.ts && gfx_shader_origin(j->s.ts) == 2);
     P.g.ready_mesh += (uint64_t)mesh, P.g.ready_recorded += j->prebuild, P.g.ready_fresh += (uint64_t)fresh;
+    stutter_ready(mesh, gfx_shader_input_id(j->s.vs), j->s.fs ? gfx_shader_input_id(j->s.fs) : NULL, ms, j->prebuild,
+                  fresh, fast);
+    if (mesh) {
+        P.g.m_ready_fast += fast != 0, P.g.m_ready_ms += ms;
+        if (ms > P.g.m_ready_max) P.g.m_ready_max = ms;
+    }
     if (ms < READY_SLOW_MS || P.g.ready_logged >= READY_LOGS) return;
     P.g.ready_logged++;
     const uint8_t *vi = gfx_shader_input_id(j->s.vs), *fi = j->s.fs ? gfx_shader_input_id(j->s.fs) : NULL;
@@ -4417,8 +4753,8 @@ static void ready_note(Pipe *p, int fast) {
            "%02x%02x%02x%02x (%s), fragment shader %s (%s)%s%s",
            ms, mesh ? "mesh" : "vertex",
            fast ? "fast-linked, so the time went to its stage libraries (the lines \"a ... library took\" name the slow ones)"
-                : mesh ? "which has no stage libraries: this is its whole build"
-                       : "which got no fast link: this is its whole build",
+                : no_libs(&j->s, p->lay) ? "which has no stage libraries: this is its whole build"
+                                         : "which got no fast link: this is its whole build",
            j->prebuild ? "pipeline-keys.bin names it and its prebuild had not come to it" : "not in pipeline-keys.bin before",
            mesh ? "mesh" : "vertex", vi[0], vi[1], vi[2], vi[3], origin_name(j->s.vs), fid, origin_name(j->s.fs),
            j->k.fbl ? "; feedback loop" : "", P.g.ready_logged == READY_LOGS ? " (the last such line of this run)" : "");
@@ -4465,7 +4801,7 @@ static void u_run(LibJob *lj) {
 // worker linked every new pipeline of a burst, one after another at 5 to 10 ms each. On a first visit to Kokiri
 // Forest (RTX 5090, libraries in the driver's cache) 180 of the 444 pipelines draws missed took over 50 ms to become
 // usable, the longest 1.3 s, and their draws were missing from every frame until then; with the library workers
-// linking, 23 did, 19 of them mesh pipelines, which have no fast link.
+// linking, 23 did, 19 of them mesh pipelines, which had no fast link then (they have one with mesh_libs).
 static int fast_workers(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("NX2NAVI_PIPE_FAST_WORKERS");
@@ -4478,7 +4814,7 @@ static Job *fast_take(void) {
     if (!P.gpl || !fast_workers()) return NULL;
     for (Job *j = A.head, *prev = NULL; j; prev = j, j = j->next) {
         Pipe *p = j->p;
-        if (p->info.pipeline || p->fast_tried || p->link_queued || !p->lay || is_mesh(&j->s)) continue;
+        if (p->info.pipeline || p->fast_tried || p->link_queued || !p->lay || no_libs(&j->s, p->lay)) continue;
         if (prev) prev->next = j->next;
         else A.head = j->next;
         if (A.tail == j) A.tail = prev;
@@ -4655,6 +4991,116 @@ int vk_pipeline_probe_buildgate(void) {
     return fails ? 1 : 0;
 }
 
+// ---- fast-linked pipelines the optimised build replaces
+// With the graphics pipeline library a draw first gets a pipeline linked from stage libraries (p->fast), and the
+// optimised build of the same state replaces it in p->info.pipeline when it is done. The fast link was kept until the
+// process ended, so every pipeline a run drew held its fast link's driver memory as well: one play session of 13,800
+// frames made 1,108 fast links and replaced 907 of them, while the video memory outside the allocator, where the
+// driver keeps compiled pipelines, grew by 491 MiB (RTX 5090), and a 68,400-frame session grew it from 1,672 to
+// 2,485 MiB. A replaced fast link is destroyed now, once the GPU is past every submission that may have recorded it.
+// The draws read p->info.pipeline when they record (vk_exec_draw.c, the pipeline memo reads it again each time) and
+// keep no handle past the submission they record, so after the store below a draw can only have the old handle in
+// the submission being recorded, or in an earlier one: vk_sync_issued() + 1 at most. The destroy waits for one more
+// submission than that, for a recording thread that runs a submission behind (vk_rec.c). It runs on the completion
+// thread (vk_completion_add), which holds no lock of ours while it calls it; a lost device or the end of the process
+// leaves it to the driver, as everything else.
+static uint64_t fast_retired;   // P.lock: fast links destroyed so far
+
+static void fast_destroy_cb(void *arg) {
+    vkDestroyPipeline(P.device, (VkPipeline)(uintptr_t)arg, NULL);
+}
+
+// P.lock held, p->info.pipeline just replaced by the optimised pipeline: the fast link goes once the GPU is done with it.
+static void fast_retire(Pipe *p) {
+    VkPipeline old = p->fast;
+    if (!old || old == p->info.pipeline) return;
+    p->fast = VK_NULL_HANDLE;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   // the new handle is visible before the submission count is read
+    uint64_t rf = vk_exec_recording_fence(), at = vk_sync_issued() + 2;
+    if (rf + 1 > at) at = rf + 1;
+    vk_completion_add(at, fast_destroy_cb, (void *)(uintptr_t)old);
+    fast_retired++;
+}
+
+// ---- pipelines no draw has used, given back while video memory is short
+// The boot builds the recorded pipelines ahead of play (the prewarm and the shipped pipeline list), and the driver keeps
+// each one's compiled code in video memory until it is destroyed. In a 4K session with DLSS and frame generation the
+// device-local memory outside the allocator was 4.2 GB with 6,300 graphics pipelines alive, 3,589 of them not drawn
+// once in that run. On a card short of video memory those are the cheapest thing to give back: no draw has recorded
+// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget (vk_mem_vram,
+// which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH graphics pipelines that
+// no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them with their entries once
+// the GPU is past the submission being recorded and one more (as fast_retire). A draw that needs one later misses it as
+// it would a pipeline never built (pipe_miss): its stage libraries link it, or the look-ahead queued them
+// (vk_pipeline_hint), and its optimised build comes from the pipeline cache, which still holds it.
+// Only entries no lookup reached go (used_min 0; pipe_minute is set before the first lookup, ensure_init), so no draw's
+// memo (vk_exec_draw.c, the PM context) nor any caller holds their VkPipeInfo. Not taken: mesh pipelines (without
+// stage libraries their build is long), entries building or with a link queued, failed ones, and compute pipelines.
+// The next pass logs the device-local use then and now, so a log says what a batch gave back.
+// NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0.
+#define RELEASE_EVERY_MS 5000
+#define RELEASE_BATCH 256
+static uint64_t rel_total, rel_batches;
+static uint64_t rel_used0;   // device-local use (MiB) when the last batch went; 0 none to report
+
+static void released_destroy_cb(void *arg) {   // the completion thread: the entry is out of the table since its batch
+    Pipe *p = arg;
+    if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
+    free(p->bindings);
+    free(p);
+}
+
+// Caller holds P.lock.
+static int releasable(const Pipe *p) {
+    if (p->used_min || !p->info.pipeline || p->building || p->job || p->link_queued || p->fast || p->t_miss || !p->lay)
+        return 0;
+    if (p->info.bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS || p->key_size != sizeof(GKey)) return 0;
+    const GKey *k = (const GKey *)p->key;
+    return k->vs && gfx_shader_stage(k->vs) != GFX_STAGE_MS;
+}
+
+static void pressure_release(uint64_t now) {
+    static int on = -1, pct;
+    static uint64_t last;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_PIPE_RELEASE");
+        pct = cfg_int("NX2NAVI_TEX_VRAM_PRESSURE");
+        if (pct <= 0 || pct > 100) pct = 80;
+        if (!on) rt_log("vk_pipeline: every pipeline stays for the run, also while video memory is short (NX2NAVI_PIPE_RELEASE=0)");
+    }
+    if (!on || now - last < RELEASE_EVERY_MS) return;
+    last = now;
+    uint64_t used = 0, budget = 0;
+    int exact = 0;
+    if (!vk_mem_vram(&used, &budget, &exact) || !budget) return;
+    if (rel_used0) {
+        rt_log("vk_pipeline: device-local memory in use %llu MiB when the last batch of unused pipelines went, %llu MiB "
+               "now", (unsigned long long)rel_used0, (unsigned long long)(used >> 20));
+        rel_used0 = 0;
+    }
+    if (used * 100 < budget * (uint64_t)pct) return;
+    Pipe *gone[RELEASE_BATCH];
+    int n = 0;
+    plat_mutex_lock(&P.lock);
+    for (int b = 0; b < PIPE_BUCKETS && n < RELEASE_BATCH; b++)
+        for (Pipe **pp = &pipes[b]; *pp && n < RELEASE_BATCH;) {
+            Pipe *p = *pp;
+            if (releasable(p)) *pp = p->next, gone[n++] = p;
+            else pp = &p->next;
+        }
+    uint64_t at = vk_sync_issued() + 2;
+    plat_mutex_unlock(&P.lock);
+    if (!n) return;
+    for (int i = 0; i < n; i++) vk_completion_add(at, released_destroy_cb, gone[i]);
+    rel_total += (uint64_t)n, rel_batches++;
+    rel_used0 = used >> 20;
+    if (rel_batches <= 16 || !(rel_batches & (rel_batches - 1)))
+        rt_log("vk_pipeline: video memory in use %llu of %llu MiB (over %d%%): %d graphics pipelines no draw used in this "
+               "run given back, %llu in %llu batches so far; a draw that needs one builds it again from the pipeline "
+               "cache (NX2NAVI_PIPE_RELEASE)", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), pct, n,
+               (unsigned long long)rel_total, (unsigned long long)rel_batches);
+}
+
 // The whole build of job j, which the caller took off its queue, and the job's end: its pipeline is entered, the
 // threads waiting for it are woken and j is freed. lowrun: 1 on a pool worker that took j from the low queue. Caller
 // holds P.lock, which is released for the build.
@@ -4662,9 +5108,9 @@ static void job_build(Job *j, int lowrun) {
     plat_mutex_unlock(&P.lock);
     VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
     plat_mutex_lock(&P.lock);
-    if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+    if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
     ready_note(j->p, 0);
-    if (pipe && j->p->fast) P.g.swaps++;
+    if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
     j->p->building = 0;
     j->p->job = NULL;
     if (pipe) {
@@ -4741,7 +5187,7 @@ static void pipe_worker(void *arg) {
         // Step 1 for a job a draw waits for: its stage libraries and the fast link. Step 2, the optimised build, goes to
         // the head of the low queue, so a burst of new pipelines gets every fast link before any optimised build.
         if (P.gpl && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay &&
-            !is_mesh(&j->s)) {
+            !no_libs(&j->s, j->p->lay)) {
             int final;
             VkPipeline f = gpl_link(&j->s, &j->k, j->p->lay, 1, &final);   // releases P.lock while building
             j->p->fast_tried = 1;
@@ -4847,16 +5293,16 @@ static void promote(Pipe *p) {
     }
 }
 
-// A draw waits up to wait_ms for the pipeline of job j, which has no fast link (a mesh pipeline, a pipeline without
-// stage libraries, or one whose link failed) and so needs its whole build. While the job is still queued the wait
-// buys nothing: the draw queue is first in, first out, and the jobs before it are the fast links and builds of other
-// draws' misses, so on a burst of new pipelines the one a draw stood waiting for started last and the draw was
-// skipped at the end of its wait all the same.
+// A draw waits up to wait_ms for the pipeline of job j, which has no fast link (a pipeline without stage libraries,
+// as a mesh pipeline is with NX2NAVI_GPL_MESH=0, or one whose link failed) and so needs its whole build. While the
+// job is still queued the wait buys nothing: the draw queue is first in, first out, and the jobs before it are the
+// fast links and builds of other draws' misses, so on a burst of new pipelines the one a draw stood waiting for
+// started last and the draw was skipped at the end of its wait all the same.
 // - The job goes to the head of the draw queue and a worker is woken, so the next free worker takes it.
 // - A wait longer than TAKE_WAIT_MS is not one of a frame's budgets (vk_exec_draw.c frame_wait is at most 500 ms): the
 //   caller wants this pipeline whatever it takes (a one-shot draw with NX2NAVI_ONESHOT_BUDGET=0). With no worker idle
 //   the job is then built here at once (job_build), as a library no worker took is (lib_wait). A wait inside a
-//   budget is never turned into a build on this thread: a compile takes 0.2 to 1.1 s for a mesh pipeline, and the
+//   budget is never turned into a build on this thread: a whole mesh pipeline takes 0.2 to 1.1 s to compile, and the
 //   budget exists so that the replay thread is not held that long.
 // Caller holds P.lock; it is released while the job is built here.
 #define TAKE_WAIT_MS 500u
@@ -4887,6 +5333,21 @@ static void job_wanted(Job *j, uint32_t wait_ms) {
     plat_cond_signal(&work_cv);
 }
 
+// The stage-independent layout of a mesh pipeline that has stage libraries (mesh_libs): the mesh stage's bindings and
+// the task stage's after them in set 0, which the pre-rasterization library of the two is made with, and the fragment
+// stage's in set 1, which is the set of that fragment shader in a vertex pipeline too, so the fragment shader library
+// can be the same one. NULL with *why set. On success *B holds both lists, set 0 first (layout_pair). Caller holds
+// P.lock.
+static Layout *mesh_pair_layout(const VkPipeState *s, Bindings *B, const char **why) {
+    Bindings F = {0};
+    Layout *l = NULL;
+    if (!add_stage(B, s->vs, 0) || (s->ts && !add_stage(B, s->ts, binding_span(s->vs) - 1)) ||
+        (s->fs && !add_stage(&F, s->fs, 0))) *why = "too many bindings";
+    else if (!(l = layout_pair(B, &F))) *why = "descriptor layout creation failed";
+    B->pool |= F.pool;
+    return l;
+}
+
 // Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
 // entered too. *queued: 1 when a job owns it. Caller holds P.lock.
 static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
@@ -4897,15 +5358,20 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     uint32_t span = binding_span(s->vs);
     int mesh = is_mesh(s);
     if (mesh) {
-        // Mesh draws (VK_EXT_mesh_shader): one set holding the mesh stage's bindings, the fragment stage's after them and
-        // the task stage's after those (create_graphics renumbers both modules); no libraries (the GPL fast link is for
-        // vertex pipelines). They go to the workers like the others: built here, each new one stopped the frame for its
-        // whole compile (0.26-0.51 s in Kokiri Forest), and they are recorded for the boot prewarm (keys_note).
+        // Mesh draws (VK_EXT_mesh_shader). With stage libraries (mesh_libs) the layout is a stage-independent pair
+        // like a vertex pipeline's (mesh_pair_layout). Without them, and for an emulated mesh pipeline, one set holds
+        // the mesh stage's bindings, the fragment stage's after them and the task stage's after those (create_graphics
+        // renumbers both modules), and the pipeline has no fast link. They go to the workers like the others: built
+        // here, each new one stopped the frame for its whole compile (0.26-0.51 s in Kokiri Forest), and they are
+        // recorded for the boot prewarm (keys_note).
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
         int emu = !vk_ctx()->has_mesh_shader && mesh_emu_on();
         if (!vk_ctx()->has_mesh_shader && !emu) why = "the GPU has no mesh shaders (mesh_emulation = 1 emulates them)";
         else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
-        else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
+        else if (!emu && mesh_libs()) {
+            l = mesh_pair_layout(s, &B, &why);
+            span = 1;   // the fragment module keeps its bindings, in set 1
+        } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
                  (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
         else if (!(l = emu ? layout_get_emu(&B) : layout_get(&B))) why = "descriptor layout creation failed";
     } else if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
@@ -5061,7 +5527,8 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
 // and links on its thread in microseconds instead of waiting for them or being skipped while they build. Nothing else
 // is entered, no pipeline, no optimised build and no key record: a state the scan guessed wrong costs two libraries
 // at most. The feedback loop bits, the topology and the targets do not matter here, as no shader library depends on
-// them. Returns the libraries queued.
+// them. A mesh draw is named too where mesh pipelines have stage libraries (mesh_libs): its task and mesh library is
+// the one that takes longest to make. Returns the libraries queued.
 static int hint_on(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("NX2NAVI_PIPE_AHEAD");
@@ -5069,8 +5536,11 @@ static int hint_on(void) {
 }
 
 int vk_pipeline_hint(const VkPipeState *s) {
-    if (!A.on || !U.on || !hint_on() || !s->vs || !ensure_init() || !P.gpl || !P.indep || is_mesh(s)) return 0;
-    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) return 0;
+    if (!A.on || !U.on || !hint_on() || !s->vs || !ensure_init() || !P.gpl || !P.indep) return 0;
+    int mesh = is_mesh(s);
+    if (mesh ? !mesh_libs() || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS) : gfx_shader_stage(s->vs) != GFX_STAGE_VS)
+        return 0;
+    if (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) return 0;
     GKey k;
     gkey_fill(s, &k);
     if (k.topo_class == 3) return 0;
@@ -5079,7 +5549,9 @@ int vk_pipeline_hint(const VkPipeState *s) {
     plat_mutex_lock(&P.lock);
     if (!pipe_find(&k, sizeof k, h)) {
         Bindings B = {0}, F = {0};
-        Layout *l = add_stage(&B, s->vs, 0) && (!s->fs || add_stage(&F, s->fs, 0)) ? layout_pair(&B, &F) : NULL;
+        const char *why = NULL;
+        Layout *l = mesh ? mesh_pair_layout(s, &B, &why)
+                  : add_stage(&B, s->vs, 0) && (!s->fs || add_stage(&F, s->fs, 0)) ? layout_pair(&B, &F) : NULL;
         Lib *b[2];
         uint64_t q0 = U.queued, w0 = U.waits;
         if (l && l->set1 && workers_start() && lib_queue(s, &k, l, b)) queued = (int)(U.queued - q0);
@@ -5105,6 +5577,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     } else {
         p = pipe_miss(s, &k, h, async, &queued);
     }
+    if (p) pipe_used(p);
     // A draw that would wait (wait_ms) gets its missing shader libraries built at once, the vertex and fragment ones in
     // parallel on idle workers (lib_wait; about 0.12 ms per library from the driver's disk cache, 5-180 ms cold), and
     // links them here: its own job may queue behind optimised builds of earlier pipelines. The job then only does the
@@ -5120,13 +5593,13 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                       : "builds its libraries itself (NX2NAVI_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay && !is_mesh(s) &&
-        wait_ms && draw_build && U.on && link_queue(p, s, &k, (Layout *)p->lay)) {
+    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay &&
+        !no_libs(s, p->lay) && wait_ms && draw_build && U.on && link_queue(p, s, &k, (Layout *)p->lay)) {
         // the libraries and the link on the library workers; this thread waits below without building
         p->fast_tried = 1;
         job_lower(p->job);
     } else if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay &&
-               !is_mesh(s)) {
+               !no_libs(s, p->lay)) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
@@ -5231,9 +5704,9 @@ static void warm_builder(void *arg) {
         plat_mutex_unlock(&P.lock);
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
-        if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+        if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
         ready_note(j->p, 0);
-        if (pipe && j->p->fast) P.g.swaps++;
+        if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
         j->p->building = 0;
         j->p->job = NULL;
         if (pipe) {
@@ -5259,7 +5732,7 @@ static int pm_skipped(void);
 static void pm_set(void);
 
 // vk_pipeline_prewarm_progress's numbers: the phase, and the pipelines finished (built or failed) of those queued, copied
-// while prewarm_run waits for its builders.
+// while prewarm_run waits for its builders; in phases 3 and 4 (bf_wait) the compute pipelines and the prepared variants.
 static int32_t pw_phase;
 static int64_t pw_pipe_done, pw_pipe_total;
 
@@ -5272,19 +5745,201 @@ void vk_pipeline_prewarm_progress(VkPrewarmProgress *p) {
 
 static void prewarm_run(void);
 
+// The whole warm on the boot screen after a driver change (comment at bf_decide).
+static struct {
+    int on;                  // this start waits for all of it
+    int lw;                  // lb_start left the library warm's start to bf_wait
+    volatile int32_t game;   // the wait is over: the warm ended, or the boot let the game start beside it
+    double t_end;            // now_ms() at which the whole warm's time on the boot screen is up; 0 no limit
+    char owed[PLAT_PATH_MAX * 2 + 48];   // boot-warm-owed.txt
+} BF;
+
+// 1 while the start waits for the builders of the whole warm: they run at normal priority on every core then, and as
+// in play (idle priority, the background's thread counts) from the moment the game starts.
+static int bf_waiting(void) {
+    return BF.on && !__atomic_load_n(&BF.game, __ATOMIC_ACQUIRE);
+}
+
+void vk_pipeline_prewarm_detach(void) {
+    __atomic_store_n(&BF.game, 1, __ATOMIC_RELEASE);
+}
+
+static void bf_decide(void);
+static void bf_wait(void);
+
 // The boot's share of the pipeline prebuild with the graphics pipeline library. The boot builds the recorded
 // pipelines in record order, so those met first in play (the title screen, the first places) come first, for at most
 // this long after the shaders are ready; the rest stay queued for the pool workers, which build them below normal
 // priority while the game runs. A draw that meets one of them before it is built gets a pipeline linked from stage
 // libraries at once (gpl_link), as for any new pipeline in play. After a driver update, when every pipeline is built
-// from nothing, the boot thus waits this long instead of for all of them (15 minutes and more with a long play
-// history). Without the library a draw would have to wait for a whole build, so the boot waits for all; so it does
-// with NX2NAVI_PREWARM_FULL=1.
+// from nothing, the boot waits for all of them and for the rest of the warm (bf_decide). Without the library a draw
+// would have to wait for a whole build, so the boot waits for all; so it does with NX2NAVI_PREWARM_FULL=1.
 #define PREWARM_PIPE_MS 20000.0
 
 void vk_pipeline_prewarm(void) {
     prewarm_run();
-    __atomic_store_n(&pw_phase, 3, __ATOMIC_RELEASE);
+    __atomic_store_n(&pw_phase, 5, __ATOMIC_RELEASE);
+}
+
+// ---- mesh pipelines' stage libraries ahead of their draws
+// The shader preparation and the boot build the stage libraries of single shaders (lb_library): one vertex or one
+// fragment shader is all such a library holds. A mesh pipeline's pre-rasterization library holds its mesh stage and
+// its task stage together, and its fragment shader library depends on what that mesh stage leaves unwritten (FsKey),
+// so these are taken from the pipeline records, which name all three shaders: every recorded mesh pipeline the boot
+// queues (prewarm_run) and every listed one the preparation builds (seed_pipelines) notes its two shader libraries
+// here, each key once. They are built once and destroyed, as the single shaders' libraries are, which leaves them in
+// the pipeline caches and the driver's own: a mesh pipeline of the same stages that a draw meets later (other
+// targets, another blend state or sample count, or a recorded one the boot has not come to) then finds its libraries
+// there and is linked in milliseconds, where it was compiled whole before.
+//  - preparation (mesh_pre_run, from seed_pipelines): on every core, before the pipeline cache is saved, so that
+//    file holds them too; they are as many as the list has mesh stage pairs, not the tens of thousands of single
+//    shaders' libraries that are kept out of it.
+//  - boot (mesh_pre_start, from lb_start): one thread beside the game at idle priority, behind the memory gate
+//    (gate_wait); NX2NAVI_LIB_PREBUILD=0 leaves it out with the rest of that prebuild.
+typedef struct {
+    VkPipeState s;
+    GKey k;
+    int kind;                          // LIB_PR or LIB_FS
+    uint64_t h;                        // key_hash of the key
+    uint32_t size;
+    union { PrKey pr; FsKey fs; } key;
+} MeshPre;
+static struct {
+    MeshPre *e;
+    uint32_t n, cap, n_pr;             // n_pr: the pre-rasterization libraries among them
+    volatile int64_t next;
+    volatile int32_t stop;
+    int boot;                          // the builder runs beside the game: idle priority, the memory gate
+    PlatThread *th;                    // the boot's builder
+    PlatMutex stat;
+    uint64_t built, have, fail;        // have: a draw had made the library by the time its turn came
+    double ms, max, t0;
+} MP = {.stat = PLAT_MUTEX_INIT};
+
+// Notes the two shader libraries of mesh pipeline s (key k), a pipeline with stage libraries (mesh_libs), for
+// mesh_pre_worker. Caller holds P.lock; no builder runs yet.
+static void mesh_pre_note(const VkPipeState *s, const GKey *k) {
+    ViKey v;
+    PrKey pk;
+    FsKey fk;
+    FoKey ok;
+    lib_keys(s, k, &v, &pk, &fk, &ok);
+    const void *key[2] = {&pk, &fk};
+    const uint32_t size[2] = {sizeof pk, sizeof fk};
+    for (int i = 0; i < 2; i++) {
+        int kind = i ? LIB_FS : LIB_PR;
+        uint64_t h = key_hash(key[i], size[i]);
+        uint32_t j = 0;
+        while (j < MP.n && !(MP.e[j].kind == kind && MP.e[j].h == h && !memcmp(&MP.e[j].key, key[i], size[i]))) j++;
+        if (j < MP.n) continue;
+        if (MP.n == MP.cap) {
+            uint32_t cap = MP.cap ? MP.cap * 2 : 64;
+            MeshPre *t = realloc(MP.e, cap * sizeof *t);
+            if (!t) return;
+            MP.e = t, MP.cap = cap;
+        }
+        MeshPre *e = &MP.e[MP.n++];
+        memset(e, 0, sizeof *e);
+        e->s = *s, e->k = *k, e->kind = kind, e->h = h, e->size = size[i];
+        memcpy(&e->key, key[i], size[i]);
+        MP.n_pr += kind == LIB_PR;
+    }
+}
+
+static void mesh_pre_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        int idle = MP.boot && !bf_waiting();   // as the boot's other builders: normal priority while the start waits
+        plat_thread_priority(idle ? PLAT_PRIO_IDLE : PLAT_PRIO_NORMAL);
+        int64_t i = plat_inc64(&MP.next) - 1;
+        if (i >= (int64_t)MP.n || MP.stop) break;
+        MeshPre *e = &MP.e[i];
+        double held = 0;
+        if (MP.boot && !gate_wait("mesh library prebuild", &MP.stop, &held)) {
+            char g[256];
+            if (!MP.stop)
+                rt_log("vk_pipeline: mesh library prebuild: ends here, at %lld of %u libraries: no commit headroom for "
+                       "another build (%s). The others are built when a draw first needs them", (long long)i, MP.n,
+                       gate_text(g, sizeof g));
+            break;
+        }
+        const char *why = NULL;
+        Bindings B = {0};
+        plat_thread_priority(PLAT_PRIO_NORMAL);   // P.lock is never held at idle priority: the replay takes it
+        plat_mutex_lock(&P.lock);
+        int have = lib_find(e->h, &e->key, e->size) != NULL;
+        Layout *l = have ? NULL : mesh_pair_layout(&e->s, &B, &why);
+        VkPipelineLayout lay = l ? half_layout(l, e->kind == LIB_FS) : VK_NULL_HANDLE;
+        plat_mutex_unlock(&P.lock);
+        if (idle) plat_thread_priority(PLAT_PRIO_IDLE);
+        VkPipeline pipe = VK_NULL_HANDLE;
+        double t0 = now_ms(), ms = 0;
+        if (lay) pipe = lib_create(e->kind, &e->s, &e->k, lay, &e->key);
+        if (pipe) {
+            ms = now_ms() - t0;
+            vkDestroyPipeline(P.device, pipe, NULL);
+            __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);   // autosave_once: no pipeline count tells of it
+        }
+        if (MP.boot) gate_leave(held);
+        plat_mutex_lock(&MP.stat);
+        if (have) MP.have++;
+        else if (!pipe) MP.fail++;
+        else MP.built++, MP.ms += ms, MP.max = ms > MP.max ? ms : MP.max;
+        plat_mutex_unlock(&MP.stat);
+    }
+    if (MP.boot)
+        rt_log("vk_pipeline: mesh library prebuild %s: of the %u shader libraries of the recorded mesh pipelines (%u of "
+               "task and mesh stages, %u fragment shader) %llu built into the caches (avg %.1f ms, longest %.0f ms; a "
+               "few milliseconds each when the caches held them), %llu made by a draw first, %llu failed; %.0f ms",
+               MP.stop ? "stopped" : "done", MP.n, MP.n_pr, MP.n - MP.n_pr, (unsigned long long)MP.built,
+               MP.built ? MP.ms / (double)MP.built : 0.0, MP.max, (unsigned long long)MP.have,
+               (unsigned long long)MP.fail, now_ms() - MP.t0);
+}
+
+// Boot: the noted libraries on one thread beside the game.
+static void mesh_pre_start(void) {
+    if (!MP.n || MP.th || MP.next) return;
+    MP.boot = 1, MP.t0 = now_ms();
+    MP.th = plat_thread_new(mesh_pre_worker, NULL, "mesh lib prebuild");
+}
+
+// Preparation: the noted libraries on up to `threads` threads; returns when all are built.
+static void mesh_pre_run(int threads) {
+    if (!MP.n) return;
+    PlatThread *t[16];
+    int n = 0;
+    MP.boot = 0, MP.t0 = now_ms();
+    for (int i = 0; i < threads && i < 16 && (uint32_t)i < MP.n; i++)
+        if ((t[n] = plat_thread_new(mesh_pre_worker, NULL, "mesh lib prebuild"))) n++;
+    if (!n) mesh_pre_worker(NULL);
+    for (int i = 0; i < n; i++) plat_thread_join(t[i]);
+}
+
+// NX2NAVI_PIPE_SEED_BOOT (auto, the default; 1; 0): whether the boot builds the pipelines of the shared list that this
+// install has never drawn (keys_open_seed), 1, or leaves them to their first draw, 0. Built at boot they are there
+// when a draw first needs them, which is what the list is for, and every one is a pipeline the driver holds for the
+// whole run: with the list of 0.9.1 the boot's pipeline stage went from about 1.6 GB of commit (0.8.0, 3,256
+// pipelines on an RTX 5080) to 3.9-4.4 GB (8,531 on an RTX 2080 Ti, 6,977 on an RTX 5070 Ti) and 0.3-0.6 GiB of
+// video memory, 1.5-1.8 GB of commit on AMD's driver, of which the list's share is half to nearly all. On a machine
+// that has that to spare it buys the first visit of every area without a wait. On one that starts short of the
+// commit the game takes in play (mem_need.h, the start's own warning) it is memory taken from the game for
+// pipelines that may never be drawn, and running out of commit ends the game (a failed allocation or a lost device).
+// auto leaves them out there and only there. A pipeline left out is made at its first draw as any new one is, from
+// pipeline-cache.bin when the preparation built it (0.5-0.8 ms on a worker), and is the install's own from then on:
+// the next start builds it at boot. Mesh pipelines are built at boot either way. Without stage libraries a draw
+// waits for their whole build. With them (mesh_libs) the first draw of one would be linked from its libraries, but
+// those are the largest modules the game has, and the few frames they take to come out of the caches are frames in
+// which a kind of foliage is missing from a place the player has just entered: built here, it is there from the
+// first frame. The list's pairs still count in the vertex output unions, so the modules stay the ones the
+// preparation built.
+static int seed_boot(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    const char *e = cfg_get("NX2NAVI_PIPE_SEED_BOOT");
+    if (e && (!strcmp(e, "0") || !strcmp(e, "1"))) return on = e[0] == '1';
+    double proc, used, limit, need = strtod(cfg_value("NX2NAVI_MEM_NEED_MB"), NULL);
+    plat_commit_info(&proc, &used, &limit);
+    return on = !mem_need_short(proc, used, limit, need);
 }
 
 static void prewarm_run(void) {
@@ -5354,7 +6009,9 @@ static void prewarm_run(void) {
         return;
     }
     pm_set();
-    uint32_t queued = 0, dropped = 0, known = 0;
+    bf_decide();
+    uint32_t queued = 0, dropped = 0, known = 0, listed = 0;
+    int at_boot = seed_boot();
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
     K.loading = 1;
@@ -5381,9 +6038,15 @@ static void prewarm_run(void) {
         }
         GKey k;
         gkey_fill(&s, &k);
-        if (!is_mesh(&s)) {   // the stage libraries lb_start prebuilds are for vertex pipelines
+        if (!is_mesh(&s)) {   // the state of the single shaders' libraries (lb_state): vertex pipelines decide it
             pr_hist[(k.clamp & 1) | (k.poly_mode & 3) << 1 | (k.minus_w & 1) << 3]++;
             fs_hist[k.samples >= 8 ? 3 : k.samples >= 4 ? 2 : k.samples >= 2 ? 1 : 0]++;
+        } else if (mesh_libs()) {   // a mesh pipeline's libraries are built with its own state (mesh_pre_start)
+            mesh_pre_note(&s, &k);
+        }
+        if (!at_boot && i >= K.own_n && !is_mesh(&s)) {   // of the shared list alone: made at its first draw (seed_boot)
+            listed++;
+            continue;
         }
         uint64_t h = key_hash(&k, sizeof k);
         int q = 0;
@@ -5392,13 +6055,30 @@ static void prewarm_run(void) {
     }
     K.loading = 0;
     plat_mutex_unlock(&P.lock);
+    if (listed) {
+        const char *e = cfg_get("NX2NAVI_PIPE_SEED_BOOT");
+        rt_log("vk_pipeline: prewarm: %u records of the shared pipeline list that this install has not drawn are left to "
+               "their first draw, when pipeline-cache.bin gives them (NX2NAVI_PIPE_SEED_BOOT=%s%s)", listed,
+               e && !strcmp(e, "0") ? "0" : "auto",
+               e && !strcmp(e, "0") ? "" : ": this machine started with less commit free than the game takes in play");
+    }
     free(ids), free(sh);
 
     __atomic_store_n(&pw_pipe_done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&pw_pipe_total, (int64_t)queued, __ATOMIC_RELAXED);
     __atomic_store_n(&pw_phase, 2, __ATOMIC_RELEASE);
     const char *full = cfg_get("NX2NAVI_PREWARM_FULL");
-    K.until = P.gpl && !(full && !strcmp(full, "1")) ? now_ms() + PREWARM_PIPE_MS : 0;   // before the builders start
+    // A cache file of another device or driver (a driver update: cache_data_read) leaves every recorded pipeline to be
+    // built from nothing, and the ones the boot left after PREWARM_PIPE_MS were built beside the game: on an 8-core
+    // integrated GPU that start had 2,141 of 8,122 left after 20 s and took 296 s to finish them. The whole warm
+    // (bf_decide) waits for all of them, with its count on the boot screen, as a start without the library does.
+    int all = (full && !strcmp(full, "1")) || (BF.on && queued);
+    if (P.gpl && all && BF.on && !(full && !strcmp(full, "1")))
+        rt_log("vk_pipeline: prewarm: the start waits for the %u recorded pipelines as long as the whole warm after a "
+               "driver change may take, and not %d s", queued, (int)(PREWARM_PIPE_MS / 1000));
+    K.until = P.gpl && !all ? now_ms() + PREWARM_PIPE_MS : 0;   // before the builders start
+    // the whole warm's own limit: what it leaves goes to the pool's workers, as after PREWARM_PIPE_MS
+    if (P.gpl && BF.on && BF.t_end && !(full && !strcmp(full, "1"))) K.until = BF.t_end;
     PlatThread *t[64];
     int nt = 0;
     if (queued) warm_builder((void *)1);   // the first alone (warm_builder)
@@ -5440,6 +6120,7 @@ static void prewarm_run(void) {
     vk_mem_stage_log("the recorded pipelines' prebuild");
     vk_pipeline_prewarm_marker_clear();   // the boot's share is done; what the pool builds later runs during play
     lb_start(pr_hist, fs_hist);
+    if (BF.on) bf_wait();
 }
 
 // ---- boot prebuild crash marker
@@ -5451,29 +6132,81 @@ static void prewarm_run(void) {
 // each one is built at its first draw instead, as with NX2NAVI_PIPE_PREBUILD=0. Another driver version, or deleting
 // the file, brings the prebuild back. Only the boot's own share is covered: a crash during play, where the pool also
 // builds what the boot left, says nothing about these builds. An orderly end of the process during the boot (the
-// window closed, the guest's ExitProcess, a --seconds run) deletes the marker as well: only a process that died leaves it.
+// window closed, the guest's ExitProcess, a --seconds run) deletes the marker as well.
+// A marker left over is not yet a driver crash: a start stopped from outside (the task manager, a program that ends
+// the game, the power) leaves one too, and since the whole warm (bf_decide) the boot builds for minutes. So the crash
+// handler says which it was (vk_pipeline_crash_note: <dir>/boot-build-crash.txt, written while the boot's builds
+// run): with that file the next start skips the prebuild as before; without it the end is taken for a stopped start
+// and only counted, in the marker itself. BOOT_QUIET_ENDS such ends in a row skip the prebuild after all: a driver
+// that takes the process down without a fault our handler sees would otherwise end every start (boot_warm.h
+// boot_end_decide).
 static int cache_dir(char *dir, size_t n);
 static void gpu_key(char *out, size_t n);
-static char PM_run[PLAT_PATH_MAX * 2 + 48];
+static char PM_run[PLAT_PATH_MAX * 2 + 48], PM_crash[PLAT_PATH_MAX * 2 + 48];
 static volatile int32_t pm_on;
+static volatile int32_t jr_boot_on;   // the boot's journal of library builds is open (journal_open)
+static int pm_quiet;                  // starts in a row before this one that ended in the boot's builds without a crash report
+
+static void crash_path_init(const char *dir) {
+    if (!PM_crash[0]) snprintf(PM_crash, sizeof PM_crash, "%s/boot-build-crash.txt", dir);
+}
+
+// main.c crash_handler, before its report: a fault while the boot's pipeline builds or its journalled library builds
+// run. The file is all the next start needs; nothing here allocates.
+void vk_pipeline_crash_note(void) {
+    static const char text[] = "the process faulted while the boot built pipelines or stage libraries "
+                               "(runtime/vk_pipeline.c vk_pipeline_crash_note)\n";
+    if (!PM_crash[0] || (!__atomic_load_n(&pm_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&jr_boot_on, __ATOMIC_ACQUIRE)))
+        return;
+    plat_file_write(PM_crash, text, sizeof text - 1);
+}
+
+// 1 when the last start left the crash handler's note; asked once a start, and the note goes.
+static int crash_noted(void) {
+    static int was = -1;
+    if (was < 0) {
+        was = PM_crash[0] && plat_file_exists(PM_crash);
+        if (was) plat_file_delete(PM_crash);
+    }
+    return was;
+}
 
 static int pm_skipped(void) {
     char dir[PLAT_PATH_MAX * 2], sp[sizeof PM_run], key[32];
     if (!cache_dir(dir, sizeof dir)) return 0;
     snprintf(PM_run, sizeof PM_run, "%s/pipeline-prewarm-running.txt", dir);
     snprintf(sp, sizeof sp, "%s/pipeline-prewarm-skip.txt", dir);
+    crash_path_init(dir);
     gpu_key(key, sizeof key);
     uint64_t n = 0;
-    uint8_t *left = plat_file_read(PM_run, &n);
+    char *left = (char *)plat_file_read(PM_run, &n);
     if (left) {
-        char text[256];
-        int len = snprintf(text, sizeof text,
-                           "# The boot's pipeline prebuild did not finish on this GPU and driver (runtime/vk_pipeline.c "
-                           "pm_skipped): starts skip it\n# while this line matches. Delete this file to build ahead of play "
-                           "again.\n%s\n", key);
-        if (plat_file_write_atomic(sp, text, (size_t)len)) plat_file_delete(PM_run);
-        rt_log("vk_pipeline: the last start died while the boot built pipelines (%s was left); %s now skips that "
-               "prebuild on this GPU and driver (%s)", PM_run, sp, key);
+        char head[64];
+        snprintf(head, sizeof head, "%.*s", (int)(n < sizeof head - 1 ? n : sizeof head - 1), left);
+        int crashed = crash_noted(), quiet = 0, what = boot_end_decide(head, key, crashed, &quiet);
+        if (what == BOOT_END_OTHER) {   // another GPU or driver's builds
+            plat_file_delete(PM_run);
+        } else if (what == BOOT_END_SKIP) {
+            char text[256];
+            int len = snprintf(text, sizeof text,
+                               "# The boot's pipeline prebuild did not finish on this GPU and driver (runtime/vk_pipeline.c "
+                               "pm_skipped): starts skip it\n# while this line matches. Delete this file to build ahead of play "
+                               "again.\n%s\n", key);
+            if (plat_file_write_atomic(sp, text, (size_t)len)) plat_file_delete(PM_run);
+            if (crashed)
+                rt_log("vk_pipeline: the last start crashed while the boot built pipelines (%s was left, with the crash "
+                       "handler's note); %s now skips that prebuild on this GPU and driver (%s)", PM_run, sp, key);
+            else
+                rt_log("vk_pipeline: %d starts in a row ended while the boot built pipelines, none with a crash report "
+                       "(%s was left each time); %s now skips that prebuild on this GPU and driver (%s)", quiet, PM_run,
+                       sp, key);
+        } else {
+            pm_quiet = quiet;
+            plat_file_delete(PM_run);
+            rt_log("vk_pipeline: the last start ended while the boot built pipelines and reported no crash: taken for a "
+                   "start that was closed or stopped, and the pipelines are built again (%d in a row; at %d the prebuild "
+                   "is skipped on this GPU and driver)", pm_quiet, BOOT_QUIET_ENDS);
+        }
         free(left);
     }
     uint8_t *skip = plat_file_read(sp, &n);
@@ -5494,14 +6227,83 @@ static int pm_skipped(void) {
 
 static void pm_set(void) {
     if (!PM_run[0]) return;
-    char key[32];
+    char key[32], text[64];
     gpu_key(key, sizeof key);
+    int len = snprintf(text, sizeof text, "%s %d\n", key, pm_quiet);
     // straight to the disk: the file has to be there if the driver takes the process down a moment later
-    if (plat_file_write_atomic(PM_run, key, strlen(key))) plat_xchg32(&pm_on, 1);
+    if (plat_file_write_atomic(PM_run, text, (size_t)len)) plat_xchg32(&pm_on, 1);
 }
 
 void vk_pipeline_prewarm_marker_clear(void) {
     if (plat_xchg32(&pm_on, 0)) plat_file_delete(PM_run);
+}
+
+// ---- the whole warm on the boot screen after a driver change
+// A start that finds pipeline-cache.bin written by another device or driver (cache_data_read: a driver update, another
+// GPU) has nothing built: not the recorded pipelines, not the compute pipelines, and the driver's own cache of stage
+// libraries is empty as well. Left to the background as on any other start, all of it was compiled beside the game:
+// an 8-core integrated GPU drew fewer than 600 frames in its first 11 minutes, with the recorded pipelines done after
+// 296 s and the compute pipelines after 570 s, the game's own compute dispatches compiling on the replay thread until
+// then. Such a start waits for all of it on the boot screen instead, with its counts (boot.c boot_wait): the recorded
+// pipelines (prewarm_run, phase 2), then the compute pipelines on up to LB_MAX_THREADS threads at normal priority
+// (lb_start, phase 3), then, when a sample says the driver's cache does not hold the prepared stage libraries
+// (lw_check), every prepared variant on up to LW_BOOT_THREADS threads (lw_worker, phase 4). The memory gate
+// (gate_wait) holds for all of them. The large compute shaders (bg_main) are not waited for: their one thread runs
+// beside the library phase.
+// It takes minutes (with nothing in the driver's cache, an RTX 5090 and 16 CPU threads: 87 s for 5,775 recorded
+// pipelines, 19 s for 4,075 compute pipelines, 317 s for 42,231 prepared variants), once per driver:
+// <dir>/boot-warm-owed.txt names the GPU and driver and counts the starts that began the warm (boot_warm.h). A start
+// that finds its own GPU and driver there with a count goes on with a warm that an earlier start did not end; what
+// was built comes back from the caches in a moment. The start whose warm ends writes "done" there, which keeps the
+// next starts ordinary ones: pipeline-cache.bin keeps the earlier driver's header until the play cache is folded
+// into it (cache_load), some starts later. After BOOT_WARM_TRIES starts that did not end the warm the file stays as
+// well, and starts on this GPU and driver are ordinary ones again. While the boot waits, the library builds write
+// the preparation's journal (journal_mark), so a variant the driver's compiler dies on is skipped from the next
+// start on (skip_init) instead of ending every start; a start that was only closed or stopped then blames no variant
+// (the crash handler's note decides, as at pm_skipped).
+// The wait has a limit, NX2NAVI_PREWARM_FULL_S seconds from here (default 600, 0 none): the 425 s above are a fast
+// machine's, and a slow one would sit on the screen for half an hour. At the limit the game starts and what is left
+// goes on as on any other start: the recorded pipelines on the pool's workers, the compute pipelines and the library
+// warm on their idle threads (vk_pipeline_prewarm_detach). The file then says "done" as well: the boot screen had its
+// turn, and the rest is the background's, as it always was. NX2NAVI_PREWARM_WAIT_MS and a minute without progress
+// end the wait the same way, as for any prewarm (boot_wait).
+// NX2NAVI_PREWARM_FULL=0 turns the whole warm off. Not for a --shot image, which no build timing may change and
+// which nobody watches.
+static void bf_decide(void) {
+    const char *full = cfg_get("NX2NAVI_PREWARM_FULL");
+    char dir[PLAT_PATH_MAX * 2], key[32], line[100];
+    if ((full && !strcmp(full, "0")) || rt_config()->shot || !cache_dir(dir, sizeof dir)) return;
+    snprintf(BF.owed, sizeof BF.owed, "%s/boot-warm-owed.txt", dir);
+    gpu_key(key, sizeof key);
+    uint64_t n = 0;
+    char *f = (char *)plat_file_read(BF.owed, &n);
+    if (f) snprintf(line, sizeof line, "%.*s", (int)(n < sizeof line - 1 ? n : sizeof line - 1), f);
+    int tries = 0, what = boot_warm_decide(f ? line : NULL, key, cache_foreign, &tries);
+    if (what == BOOT_WARM_NO) {
+        if (f) plat_file_delete(BF.owed);   // another GPU's or driver's
+    } else if (what == BOOT_WARM_DONE) {
+        if (cache_foreign)
+            rt_log("vk_pipeline: the whole warm for this GPU and driver was done by an earlier start (%s); the "
+                   "pipeline cache's file keeps the earlier driver's header until the play cache is folded into it",
+                   BF.owed);
+    } else if (what == BOOT_WARM_GAVE_UP) {
+        rt_log("vk_pipeline: the whole warm after a driver change did not end in %d starts on this GPU and driver (%s): "
+               "this start builds in the background like any other. Delete %s to have it tried again", BOOT_WARM_TRIES,
+               key, BF.owed);
+    } else {
+        int len = snprintf(line, sizeof line, "%s %d\n", key, tries);
+        if (!plat_file_write_atomic(BF.owed, line, (size_t)len)) rt_log("vk_pipeline: cannot write %s", BF.owed);
+        BF.on = 1;
+        const char *se = cfg_get("NX2NAVI_PREWARM_FULL_S");
+        double secs = se && *se ? atof(se) : 600;
+        BF.t_end = secs > 0 ? now_ms() + secs * 1000 : 0;
+        rt_log("vk_pipeline: the whole warm on the boot screen (%s, start %d of %d at most): the start waits for the "
+               "recorded pipelines, the compute pipelines and the driver's cache of stage libraries, for %.0f s at most "
+               "(NX2NAVI_PREWARM_FULL_S; 0 = no limit). NX2NAVI_PREWARM_FULL=0 leaves them to the background",
+               cache_foreign ? "the pipeline cache was written by another device or driver" : "an earlier start began it",
+               tries, BOOT_WARM_TRIES, secs > 0 ? secs : 0.0);
+    }
+    free(f);
 }
 
 // ensure_init's hook: without a prewarm (NX2NAVI_PIPE_PREBUILD=0, or the device came up first elsewhere) the records
@@ -5622,23 +6424,69 @@ static uint32_t *spirv_fog_keep_froxels(const uint32_t *w, uint64_t n) {
     return o;
 }
 
+// Successful cache-only warm requests. Input ids can differ while their final SPIR-V and pipeline layouts match.
+// Only preparation that destroys its pipeline may reuse these entries; a dispatch still needs its own live handle.
+// The code is hashed after overrides and fog changes. Subgroup requirements follow that code and the fixed device
+// capabilities. Layout handles and creation flags distinguish otherwise identical shader modules.
+typedef struct {
+    uint8_t code[32];
+    VkPipelineLayout layout;
+    uint64_t words;
+    VkPipelineCreateFlags flags;
+    VkPipelineShaderStageCreateFlags stage_flags;
+} ComputeWarmKey;
+typedef struct ComputeWarmEntry {
+    ComputeWarmKey key;
+    struct ComputeWarmEntry *next;
+} ComputeWarmEntry;
+#define COMPUTE_WARM_BUCKETS 1024
+static ComputeWarmEntry *compute_warm[COMPUTE_WARM_BUCKETS];
+static PlatMutex compute_warm_lock = PLAT_MUTEX_INIT;
+static uint64_t compute_warm_reused;
+
+// No in-flight entries: concurrent identical requests may both build, but a failed request never suppresses a retry.
+static int compute_warm_remember(const ComputeWarmKey *key, int completed) {
+    uint64_t h = fnv(FNV0, key, sizeof *key);
+    plat_mutex_lock(&compute_warm_lock);
+    ComputeWarmEntry **head = &compute_warm[h % COMPUTE_WARM_BUCKETS], *e = *head;
+    while (e && memcmp(&e->key, key, sizeof *key)) e = e->next;
+    int have = e != NULL;
+    if (!have && completed && (e = malloc(sizeof *e))) e->key = *key, e->next = *head, *head = e;
+    plat_mutex_unlock(&compute_warm_lock);
+    return have;
+}
+
+static void compute_warm_clear(void) {
+    plat_mutex_lock(&compute_warm_lock);
+    for (size_t i = 0; i < COMPUTE_WARM_BUCKETS; i++) {
+        for (ComputeWarmEntry *e = compute_warm[i], *n; e; e = n) n = e->next, free(e);
+        compute_warm[i] = NULL;
+    }
+    plat_mutex_unlock(&compute_warm_lock);
+}
+
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
 // cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
 // neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
-static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only) {
+// already_warm is only supplied by callers that need cache coverage, not a live pipeline: 1 and VK_NULL_HANDLE mean
+// an identical request already succeeded in this process. NULL preserves normal creation and has no hashing cost.
+// NX2NAVI_COMPUTE_WARM_REUSE=0 disables this reuse for comparisons without changing the prepared inventory.
+static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only, int *already_warm) {
+    if (already_warm) *already_warm = 0;
     uint64_t words;
-    const uint32_t *code = gfx_shader_spirv(cs, &words);
+    // pinned until the pipeline is made: a dispatch on the drawing thread that creates its pipeline here decodes a
+    // compressed shader first, about 60 us for a mean module against the creation's milliseconds (gfx_shader.c
+    // "SPIR-V at rest", counted in the memory report)
+    const uint32_t *code = gfx_shader_spirv_pin(cs, &words);
     uint64_t ow = 0;
     uint32_t *over = spv_override(code, words, &ow);
     if (over) code = over, words = ow;
     uint32_t *fog = spirv_fog_keep_froxels(code, words);
     if (fog) free(over), over = fog, code = fog;
-    VkShaderModule m = make_module(code, words, 0);
-    if (!m) return free(over), VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"},
                                       .layout = l->layout, .flags = noopt_flag()};
     if (cached_only) ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     pin_subgroup32(&ci.stage, &rqc, code, words);
@@ -5648,12 +6496,31 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     uint32_t lx = local_size_x(code, words);
     if (P.f_full_subgroups && vk_caps.sg_size && lx && lx % vk_caps.sg_size == 0 && uses_subgroup_ops(code, words))
         ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    ComputeWarmKey warm_key = {0};
+    const char *reuse = already_warm ? cfg_get("NX2NAVI_COMPUTE_WARM_REUSE") : NULL;
+    int remember = already_warm && (!reuse || strcmp(reuse, "0"));
+    if (remember) {
+        rt_sha256(code, (size_t)words * 4, warm_key.code);
+        warm_key.layout = l->layout, warm_key.words = words;
+        warm_key.flags = ci.flags, warm_key.stage_flags = ci.stage.flags;
+        if (compute_warm_remember(&warm_key, 0)) {   // before the module: a reused request makes none
+            *already_warm = 1;
+            __atomic_fetch_add(&compute_warm_reused, 1, __ATOMIC_RELAXED);
+            free(over);
+            gfx_shader_spirv_unpin(cs);
+            return VK_NULL_HANDLE;
+        }
+    }
+    VkShaderModule m = make_module(code, words, 0);
+    if (!m) return free(over), gfx_shader_spirv_unpin(cs), VK_NULL_HANDLE;
+    ci.stage.module = m;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipelineCreationFeedbackCreateInfo fci;
     VkPipelineCreationFeedback fb;
     ci.pNext = fb_chain(&fci, &fb, ci.pNext);
     crash_note("a compute pipeline", cs, NULL, NULL);
     if (pipe_create(2, &ci, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (pipe && remember) compute_warm_remember(&warm_key, 1);
     plat_crash_context(NULL);
     if (pipe) fb_note(FB_COMPUTE, &fb);
     cc_hit = !pipe ? -1 : pb_last ? 1
@@ -5666,6 +6533,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
                (double)fb.duration / 1e6);
     vkDestroyShaderModule(P.device, m, NULL);
     free(over);
+    gfx_shader_spirv_unpin(cs);
     return pipe;
 }
 
@@ -5733,19 +6601,27 @@ static struct {
     int32_t keep_n;
     int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
     int tail_one;                                      // automatic boot policy: only worker 0 takes the warming tail
+    int bg_threads;                                    // boot: the workers that go on beside the game (lb_next)
     PlatMutex stat;
 } LB = {.stat = PLAT_MUTEX_INIT};
 static __thread int lb_me = -1;        // on a boot prebuild thread (lb_worker): its index in LB.th
+
+// The boot's builders run beside the game, at idle priority; not while the start waits for them (bf_waiting).
+static int lb_idle(void) {
+    return LB.idle && !bf_waiting();
+}
 
 // Claim a boot job without dropping one when the extra workers finish the recent-pipeline prefix. Recent pipelines
 // retain parallel creation; a single worker continues the complete tail. Explicit thread counts override this
 // policy, and installer preparation uses its own queue at full concurrency. The CAS makes the prefix boundary
 // exact even when two workers reach it together. No pipeline creation or dispatch waits on this queue lock.
+// The whole warm (bf_wait) starts more workers than go on beside a game: those end here once the game runs.
 static size_t lb_next(int worker) {
     int64_t next = __atomic_load_n(&LB.next, __ATOMIC_RELAXED);
     for (;;) {
-        if (LB.stop || (size_t)next >= LB.n ||
-            (LB.idle && LB.tail_one && worker > 0 && (size_t)next >= LB.n_keep)) return LB.n;
+        int bg = lb_idle();
+        if (LB.stop || (size_t)next >= LB.n || (bg && worker >= LB.bg_threads) ||
+            (bg && LB.tail_one && worker > 0 && (size_t)next >= LB.n_keep)) return LB.n;
         if (__atomic_compare_exchange_n(&LB.next, &next, next + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
             return (size_t)next;
     }
@@ -5766,11 +6642,13 @@ static size_t lb_next(int worker) {
 #define JR_SLOTS 64   // lb_warm_prepared's thread cap
 
 static struct {
-    PlatFile *journal;     // while lb_warm_prepared builds
+    PlatFile *journal;     // while lb_warm_prepared builds, and while the start waits for the library warm (bf_wait)
+    PlatMutex jlock;       // journal: bf_wait and the process's end close it while workers write
+    char jpath[PLAT_PATH_MAX * 2 + 48];   // the boot's journal, "" without one
     uint8_t (*iid)[32];    // the skip list's variants for this GPU and driver
     size_t n;
     int loaded;
-} SK;
+} SK = {.jlock = PLAT_MUTEX_INIT};
 
 static int cache_dir(char *dir, size_t n) {   // the folder of pipeline-cache.bin and shader-prepared.bin
     snprintf(dir, n, "%s", P.cache_path);
@@ -5793,53 +6671,76 @@ static int hex_digit(int c) {
     return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
 }
 
-// A journal a crashed run left into the skip list, then the skip list's variants for this GPU and driver into SK.
+// The variants a leftover journal j (jn bytes, of file jp) names join the skip list's text *s (*sn bytes; NULL
+// without a list) for this GPU and driver, and the list's file sp is written again. 1 when the journal may go:
+// nothing in it, or the list holds it now.
+static int journal_fold(const uint8_t *j, uint64_t jn, const char *jp, const char *sp, const char *key, char **s,
+                        uint64_t *sn) {
+    static const char head[] =
+        "# Shader variants the graphics driver was building when the process died during preparation\n"
+        "# (runtime/vk_pipeline.c skip_init): input id, stage, GPU vendor:device:driver version. Preparation skips\n"
+        "# them on that GPU and driver. Delete this file to build them again.\n";
+    size_t cap = (*s ? *sn : sizeof head) + (jn / JR_SLOT + 1) * 128, len = 0;
+    char *out = malloc(cap);
+    int added = 0;
+    if (!out) return 1;
+    len = *s ? *sn : sizeof head - 1;
+    memcpy(out, *s ? *s : head, len);
+    if (len && out[len - 1] != '\n') out[len++] = '\n';
+    for (uint64_t o = 0; o + 33 <= jn; o += JR_SLOT) {
+        int set = 0;
+        for (int b = 0; b < 32; b++) set |= j[o + b];
+        if (!set) continue;
+        char hex[65];
+        for (int b = 0; b < 32; b++) snprintf(hex + 2 * b, 3, "%02x", j[o + b]);
+        len += (size_t)snprintf(out + len, cap - len, "%s %s %s\n", hex, stage_name(j[o + 32]), key);
+        added++;
+    }
+    out[len] = 0;   // parsed by skip_init as the list's text
+    if (added && plat_file_write_atomic(sp, out, len)) {
+        rt_log("vk_pipeline: the last shader preparation, or the last start's warm on the boot screen, died while "
+               "the driver built %d variants; %s now lists them and they are skipped ahead of play on this GPU and "
+               "driver (%s)", added, sp, key);
+        free(*s), *s = out, *sn = len;
+        return 1;
+    }
+    if (added) rt_log("vk_pipeline: cannot write %s; %s stays for the next run", sp, jp);
+    free(out);
+    return !added;
+}
+
+// A journal a run that died left into the skip list, then the skip list's variants for this GPU and driver into SK.
+// The preparation's journal (shader-prepare-journal.bin) always counts. The boot's (shader-warm-journal.bin,
+// journal_open) counts only with the crash handler's note (crash_noted): without it the start was closed or stopped
+// while it waited, and the variants it happened to be building are no one's fault.
 static void skip_init(const char *dir) {
     if (SK.loaded) return;
     SK.loaded = 1;
-    char jp[PLAT_PATH_MAX * 2 + 48], sp[PLAT_PATH_MAX * 2 + 48], key[32];
+    char jp[PLAT_PATH_MAX * 2 + 48], bj[PLAT_PATH_MAX * 2 + 48], sp[PLAT_PATH_MAX * 2 + 48], key[32];
     snprintf(jp, sizeof jp, "%s/shader-prepare-journal.bin", dir);
+    snprintf(bj, sizeof bj, "%s/shader-warm-journal.bin", dir);
     snprintf(sp, sizeof sp, "%s/shader-prepare-skip.txt", dir);
+    crash_path_init(dir);
     gpu_key(key, sizeof key);
-    uint64_t jn = 0, sn = 0;
-    uint8_t *j = plat_file_read(jp, &jn);
+    uint64_t jn = 0, bn = 0, sn = 0;
+    uint8_t *j = plat_file_read(jp, &jn), *b = plat_file_read(bj, &bn);
     char *s = (char *)plat_file_read(sp, &sn);
-    int keep_journal = 0;
-    if (j) {
-        static const char head[] =
-            "# Shader variants the graphics driver was building when the process died during preparation\n"
-            "# (runtime/vk_pipeline.c skip_init): input id, stage, GPU vendor:device:driver version. Preparation skips\n"
-            "# them on that GPU and driver. Delete this file to build them again.\n";
-        size_t cap = (s ? sn : sizeof head) + (jn / JR_SLOT + 1) * 128, len = 0;
-        char *out = malloc(cap);
-        int added = 0;
-        if (out) {
-            len = s ? sn : sizeof head - 1;
-            memcpy(out, s ? s : head, len);
-            if (len && out[len - 1] != '\n') out[len++] = '\n';
-            for (uint64_t o = 0; o + 33 <= jn; o += JR_SLOT) {
-                int set = 0;
-                for (int b = 0; b < 32; b++) set |= j[o + b];
-                if (!set) continue;
-                char hex[65];
-                for (int b = 0; b < 32; b++) snprintf(hex + 2 * b, 3, "%02x", j[o + b]);
-                len += (size_t)snprintf(out + len, cap - len, "%s %s %s\n", hex, stage_name(j[o + 32]), key);
-                added++;
-            }
-            out[len] = 0;   // parsed below as the list's text
+    if (!j || journal_fold(j, jn, jp, sp, key, &s, &sn)) plat_file_delete(jp);
+    if (b) {
+        int marked = 0;
+        for (uint64_t o = 0; o + 33 <= bn; o += JR_SLOT)
+            for (int k = 0; k < 32; k++)
+                if (b[o + k]) { marked++; break; }
+        if (marked && !crash_noted()) {
+            rt_log("vk_pipeline: the last start ended during the library warm on the boot screen, with %d variants in "
+                   "the driver's hands, and reported no crash: taken for a start that was closed or stopped; no variant "
+                   "is skipped for it", marked);
+            plat_file_delete(bj);
+        } else if (journal_fold(b, bn, bj, sp, key, &s, &sn)) {
+            plat_file_delete(bj);
         }
-        if (added && plat_file_write_atomic(sp, out, len)) {
-            rt_log("vk_pipeline: the last shader preparation died while the driver built %d variants; %s now lists them "
-                   "and preparation skips them on this GPU and driver (%s)", added, sp, key);
-            free(s), s = out, sn = len, out = NULL;
-        } else if (added) {
-            rt_log("vk_pipeline: cannot write %s; %s stays for the next run", sp, jp);
-            keep_journal = 1;
-        }
-        free(out);
-        free(j);
     }
-    if (!keep_journal) plat_file_delete(jp);
+    free(j), free(b);
     for (char *line = s, *next; line && *line; line = next) {
         next = strchr(line, '\n');
         if (next) *next++ = 0;
@@ -5847,10 +6748,10 @@ static void skip_init(const char *dir) {
         uint8_t iid[32];
         int ok = line[0] != '#' && sscanf(line, "%64s %15s %31s", hex, st, k) == 3 && strlen(hex) == 64 &&
                  !strcmp(k, key);
-        for (int b = 0; ok && b < 32; b++) {
-            int hi = hex_digit(hex[2 * b]), lo = hex_digit(hex[2 * b + 1]);
+        for (int b2 = 0; ok && b2 < 32; b2++) {
+            int hi = hex_digit(hex[2 * b2]), lo = hex_digit(hex[2 * b2 + 1]);
             if (hi < 0 || lo < 0) ok = 0;
-            else iid[b] = (uint8_t)(hi << 4 | lo);
+            else iid[b2] = (uint8_t)(hi << 4 | lo);
         }
         uint8_t (*grown)[32] = ok ? realloc(SK.iid, (SK.n + 1) * sizeof *SK.iid) : NULL;
         if (grown) memcpy(grown[SK.n++], iid, 32), SK.iid = grown;
@@ -5873,10 +6774,47 @@ static void skip_count(void) {
 
 // Journal slot `slot`: the variant e its worker hands to the driver next, or zeros (e NULL) when the build returned.
 static void journal_mark(int slot, const GfxWarmEnt *e) {
-    if (!SK.journal || slot < 0 || slot >= JR_SLOTS) return;
+    if (slot < 0 || slot >= JR_SLOTS) return;
     uint8_t rec[JR_SLOT] = {0};
     if (e) memcpy(rec, e->iid, 32), rec[32] = e->stage;
-    plat_file_pwrite(SK.journal, rec, sizeof rec, (uint64_t)slot * JR_SLOT);
+    plat_mutex_lock(&SK.jlock);
+    if (SK.journal) plat_file_pwrite(SK.journal, rec, sizeof rec, (uint64_t)slot * JR_SLOT);
+    plat_mutex_unlock(&SK.jlock);
+}
+
+// The boot's journal, for the library builds the start waits for (bf_wait), in a file of its own: skip_init treats
+// one left over differently from the preparation's. skip_init has run (lb_start) and has dealt with a leftover one.
+static void journal_open(void) {
+    char dir[PLAT_PATH_MAX * 2];
+    if (!cache_dir(dir, sizeof dir)) return;
+    crash_path_init(dir);
+    snprintf(SK.jpath, sizeof SK.jpath, "%s/shader-warm-journal.bin", dir);
+    PlatFile *j = plat_fs_create(SK.jpath, NULL);
+    if (!j) {
+        rt_log("vk_pipeline: cannot create %s: a driver crash in this start's library warm will not be recorded", SK.jpath);
+        SK.jpath[0] = 0;
+        return;
+    }
+    plat_mutex_lock(&SK.jlock);
+    SK.journal = j;
+    plat_mutex_unlock(&SK.jlock);
+    __atomic_store_n(&jr_boot_on, 1, __ATOMIC_RELEASE);
+}
+
+// Ends the boot's journal: when the library warm is done, when the game starts beside it (a crash in play says
+// nothing about the variant a background builder has in hand) and when the process ends in order during the wait
+// (vk_pipeline_save_exit), so that only a process that died while the start waited leaves one. The builds still in
+// flight write nothing afterwards (journal_mark).
+static void journal_close(void) {
+    if (!SK.jpath[0]) return;
+    __atomic_store_n(&jr_boot_on, 0, __ATOMIC_RELEASE);
+    plat_mutex_lock(&SK.jlock);
+    PlatFile *j = SK.journal;
+    SK.journal = NULL;
+    plat_mutex_unlock(&SK.jlock);
+    if (!j) return;
+    plat_file_close(j);
+    plat_file_delete(SK.jpath);
 }
 
 // Compute shaders whose pipeline a thread is compiling now (P.lock): a cold driver takes about 2 s for one of Ocarina's
@@ -6211,7 +7149,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             plat_mutex_unlock(&P.lock);   // the compile runs without the lock
             uint64_t p0 = perf_begin();
             double c0 = now_ms();
-            pipe = compute_create(cs, l, 0);
+            pipe = compute_create(cs, l, 0, NULL);
             double cms = now_ms() - c0;
             int hit = cc_hit;
             perf_end(PERF_PIPE, p0);
@@ -6238,6 +7176,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         CF.pre_used += p->pre;
         if (p->info.pipeline) cu_note(cs);
     }
+    if (p) pipe_used(p);
     plat_mutex_unlock(&P.lock);
     if (!p) return VK_NULL_HANDLE;
     if (info) *info = &p->info;
@@ -6251,7 +7190,7 @@ static void lb_lock(void) {
 
 static void lb_unlock(void) {
     plat_mutex_unlock(&P.lock);
-    if (LB.idle) plat_thread_priority(PLAT_PRIO_IDLE);
+    if (lb_idle()) plat_thread_priority(PLAT_PRIO_IDLE);
 }
 
 static void lb_count(int kind, int what, double ms) {   // what: 0 built, 1 already there, 2 failed, 3 cache only
@@ -6461,7 +7400,7 @@ static void bg_main(void *arg) {
         if (P.cache && vkCreatePipelineCache(P.device, &oci, NULL, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
         double t0 = now_ms();
         own_cache = own;   // without one the build goes into P.cache as before
-        VkPipeline pipe = compute_create(cs, l, 0);
+        VkPipeline pipe = compute_create(cs, l, 0, NULL);
         own_cache = VK_NULL_HANDLE;
         double ms = now_ms() - t0;
         if (held >= 0) gate_leave(held);
@@ -6505,13 +7444,12 @@ static void bg_start(void) {
 // keep 0: the pipeline is built for the pipeline cache only and destroyed at once, unless a dispatch came to wait for
 // it meanwhile; a shader over LB.big_words is then not built at all (comment at compute-used.bin). cs may be a copy
 // the caller releases afterwards when keep is 0: nothing here holds on to it then.
-static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
+static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep, int private_shader) {
     struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
     const char *why = NULL;
-    uint64_t words = 0;
-    gfx_shader_spirv(cs, &words);
+    uint64_t words = gfx_shader_words(cs);
     int big = LB.big_words && words > LB.big_words;   // only from the caches (LB_BIG_WORDS)
     if (big && !keep) {   // no run dispatched it: a pipeline of it would hold about 100 MiB of device memory unused
         plat_mutex_lock(&LB.stat);
@@ -6542,13 +7480,16 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     // at idle priority under load held that frame for seconds. The dispatch may have come between the unlock and the
     // call below, which would undo its raise, hence the look at the slot after it. Without a slot or a handle nobody
     // could raise the thread, so it compiles at normal priority.
-    if (LB.idle && flight && me) {
+    if (lb_idle() && flight && me) {
         plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
         if (cs_flight_is_wanted(cs)) plat_thread_priority(PLAT_PRIO_NORMAL);
-    } else if (LB.idle) {
+    } else if (lb_idle()) {
         plat_thread_priority(PLAT_PRIO_NORMAL);
     }
-    VkPipeline pipe = compute_create(cs, l, big);
+    int reused = 0;
+    // A private shader cannot have a dispatch waiting on its cs_flight slot. Shared/kept shaders always create their
+    // handle so a dispatch that arrives while the build is in flight still receives the pipeline it is waiting for.
+    VkPipeline pipe = compute_create(cs, l, big, !keep && private_shader ? &reused : NULL);
     double ms = now_ms() - t0;
     int compiled = pipe && cc_hit != 1, kept = 0;
     lb_lock();
@@ -6568,7 +7509,7 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     lb_unlock();
     if (!pipe && big && bg_on()) bg_queue(cs, iid, words);
     else if (!pipe && big) lb_defer(iid, words);
-    else lb_count(2, !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
+    else lb_count(2, reused ? 1 : !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -6648,7 +7589,8 @@ static void lb_report(const char *how) {
            "%llu vertex/fragment skipped (graphics pipeline library off), %llu skipped (the driver crashed on them before, "
            "shader-prepare-skip.txt), %llu large compute shaders left to their first dispatch (NX2NAVI_LIB_PREBUILD_BIG), %zu "
            "queued for the background builder (NX2NAVI_LIB_PREBUILD_BIG_BG), %llu large compute shaders not built because "
-           "no run has dispatched them; process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
+           "no run has dispatched them; %llu compute requests the same as one built before, not built again "
+           "(NX2NAVI_COMPUTE_WARM_REUSE); process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
            now_ms() - LB.t0, (unsigned long long)LB.built[0], LB.built[0] ? LB.ms[0] / LB.built[0] : 0.0,
            (unsigned long long)LB.have[0], (unsigned long long)LB.built[1], LB.built[1] ? LB.ms[1] / LB.built[1] : 0.0,
            (unsigned long long)LB.have[1], (unsigned long long)LB.built[2], LB.built[2] ? LB.ms[2] / LB.built[2] : 0.0,
@@ -6657,7 +7599,8 @@ static void lb_report(const char *how) {
            (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
            (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
            (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (unsigned long long)LB.skipped,
-           (unsigned long long)LB.deferred, BG.n, (unsigned long long)LB.big_unused, (double)mem_proc);
+           (unsigned long long)LB.deferred, BG.n, (unsigned long long)LB.big_unused,
+           (unsigned long long)__atomic_load_n(&compute_warm_reused, __ATOMIC_RELAXED), (double)mem_proc);
     plat_mutex_unlock_shared(&LB.stat);
 }
 
@@ -6665,7 +7608,7 @@ static void lb_report(const char *how) {
 // cache) and kept libraries.
 static void lb_worker(void *arg) {
     lb_me = (int)(intptr_t)arg;        // its handle is LB.th[lb_me]
-    plat_thread_priority(PLAT_PRIO_IDLE);
+    if (lb_idle()) plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
         size_t i = lb_next(lb_me);
         if (i >= LB.n) break;
@@ -6697,13 +7640,13 @@ static void lb_worker(void *arg) {
         plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
         const GfxShader *sh = keep || LB.e[i].stage != GFX_STAGE_CS ? gfx_shader_load_input(LB.e[i].iid, 0)
                                                                     : gfx_shader_load_private(LB.e[i].iid, &owned);
-        plat_thread_priority(PLAT_PRIO_IDLE);
+        if (lb_idle()) plat_thread_priority(PLAT_PRIO_IDLE);
         if (!sh) {
             plat_mutex_lock(&LB.stat);
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh, LB.e[i].iid, keep);
+            lb_compute(sh, LB.e[i].iid, keep, owned);
         } else if (!owned && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
             if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);   // a kept library points at sh: never a copy
             else lb_skip_lib();
@@ -6753,27 +7696,47 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 // and "done" with the driver and a count of the times the cache was cold again right after a finished warm. At two in
 // a row the driver does not keep stage libraries at all and warming stops being tried (NX2NAVI_LIB_WARM=0 turns it off;
 // =force warms at every start).
+// The check times builds, which a busy CPU only makes longer: as the guest starts beside the boot's background builds,
+// a sample built at below-normal priority read a warm cache as cold on an RTX 5080 (0.9.2, a median of 136 ms on 16
+// logical processors), and the whole list of 42,231 libraries was built again in 873 s on 4 idle threads, although
+// --warm-shaders gave all of them back in 10.6 s and the driver's cache file did not change. So the sample is built
+// at normal priority, into the driver's cache only (no_cache: a library our own pipeline cache holds would read fast
+// whatever the driver has), and a sample that says cold is built again 10 s later before the cache counts as cold,
+// except while the start waits for the whole warm after a driver change, where cold is the expected answer. The cache
+// counts as warm when LW_WARM_SHARE of the sample was fast: a cache the driver has partly evicted (a size limit keeps
+// some of the libraries and drops others) is to be warmed, and one or two fast builds say little.
+// shader-warm.txt also keeps how far a warm came ("warming <driver> <strikes> <variant>"), written every 8,000 variants:
+// a run that ends before the warm does is followed by one that goes on from there, not from the first variant again,
+// which on a PC whose sessions were shorter than a warm under play (15 minutes) began the list again at every start.
 #define LW_SAMPLE 12
+#define LW_WARM_SHARE 0.75
 #define LW_COLD_MS 15.0
 #define LW_MAX_THREADS 6
+#define LW_BOOT_THREADS 32   // while the start waits for the warm (bf_wait): every core, as the preparation
 static struct {
     GfxWarmEnt *e;
     size_t n;
     volatile int64_t next, done;
     volatile int32_t running, stop, started;
     volatile int32_t short_mem;   // the memory gate refused a build for GATE_WAIT_MS: the warm ended for this run
-    PlatThread *th[LW_MAX_THREADS + 1];
+    volatile int32_t checked;     // lw_main has returned: the workers it started, if any, are counted in running
+    size_t from;                  // the variant this run's warm began at (an earlier run's progress, lw_check)
+    PlatThread *th[LW_BOOT_THREADS + 1];
     int threads, strikes;
+    int bg_threads;               // the workers that go on beside the game (lw_worker)
     uint32_t vendor;   // the GPU's vendor id, for what a cold cache's log line adds (vk_warm_hint.h)
     double t0;
     char stamp[PLAT_PATH_MAX * 2 + 32], id[64];
 } LW;
 
-static void lw_stamp(const char *state, int strikes) {
-    char line[128];
-    int n = snprintf(line, sizeof line, "%s %s %d\n", state, LW.id, strikes);
+// at: for "warming", the variant a later run goes on from (all before it are built).
+static void lw_stamp_at(const char *state, int strikes, size_t at) {
+    char line[160];
+    int n = snprintf(line, sizeof line, "%s %s %d %zu\n", state, LW.id, strikes, at);
     if (!plat_file_write_atomic(LW.stamp, line, (size_t)n)) rt_log("vk_pipeline: cannot write %s", LW.stamp);
 }
+
+static void lw_stamp(const char *state, int strikes) { lw_stamp_at(state, strikes, 0); }
 
 // One prepared vertex or fragment variant's library into the driver's cache; its time in ms, negative when the
 // variant is on the skip list, not in the shader cache or of another stage.
@@ -6792,10 +7755,14 @@ static double lw_build(const GfxWarmEnt *e) {
 }
 
 static void lw_worker(void *arg) {
-    (void)arg;
-    plat_thread_priority(PLAT_PRIO_IDLE);
+    int me = (int)(intptr_t)arg, idle = 0;   // me: its journal slot while the start waits (bf_wait)
     no_cache = 1;   // into the driver's own cache only (see no_cache)
     for (;;) {
+        // Beside the game: idle priority, and of the workers the whole warm started only the background's count.
+        if (!bf_waiting()) {
+            if (me >= LW.bg_threads) break;
+            if (!idle) plat_thread_priority(PLAT_PRIO_IDLE), idle = 1;
+        }
         size_t i = (size_t)plat_inc64(&LW.next) - 1;
         if (i >= LW.n || LW.stop) break;
         // The memory gate (gate_wait): without room the warm waits, and after GATE_WAIT_MS it ends for this run.
@@ -6810,22 +7777,29 @@ static void lw_worker(void *arg) {
             }
             break;
         }
+        journal_mark(me, &LW.e[i]);   // from here to its clearing, a process that dies names this variant
         lw_build(&LW.e[i]);
+        journal_mark(me, NULL);
         gate_leave(held);
         int64_t d = plat_inc64(&LW.done);
-        if (d % 8000 == 0)
-            rt_log("vk_pipeline: library warm: %lld of %zu prepared variants in %.0f s", (long long)d, LW.n,
-                   (now_ms() - LW.t0) / 1000);
+        if (d % 8000 == 0) {
+            // the workers take the variants in order, each holds at most one unbuilt: all below this are built
+            size_t at = LW.from + (size_t)(d > LW.threads ? d - LW.threads : 0);
+            lw_stamp_at("warming", LW.strikes, at);
+            rt_log("vk_pipeline: library warm: %lld of %zu prepared variants in %.0f s (up to variant %zu)", (long long)d,
+                   LW.n - LW.from, (now_ms() - LW.t0) / 1000, at);
+        }
     }
     if (!plat_dec32(&LW.running) && !LW.stop && !LW.short_mem) {
         lw_stamp("done", LW.strikes);
-        rt_log("vk_pipeline: library warm: done, %zu prepared variants in %.0f s on %d idle threads; new pipelines "
+        rt_log("vk_pipeline: library warm: done, %zu prepared variants in %.0f s on %d threads; new pipelines "
                "link from the driver's cache from here on", LW.n, (now_ms() - LW.t0) / 1000, LW.threads);
     }
 }
 
-// The median time of LW_SAMPLE prepared fragment libraries spread over the list; negative without that many.
-static double lw_probe(void) {
+// The median time of LW_SAMPLE prepared fragment libraries spread over the list, in ms, and in *fast how many were
+// under LW_COLD_MS, in *got how many were built; negative without enough of them.
+static double lw_time_sample(int *fast, int *got_out) {
     double ms[LW_SAMPLE];
     int got = 0;
     size_t step = LW.n / LW_SAMPLE ? LW.n / LW_SAMPLE : 1, at = (size_t)(plat_now_ns() / 1000) % step;
@@ -6836,7 +7810,9 @@ static double lw_probe(void) {
             if (t >= 0) ms[got++] = t;
             break;
         }
+    *fast = 0, *got_out = got;
     if (got < LW_SAMPLE / 2) return -1;
+    for (int i = 0; i < got; i++) *fast += ms[i] <= LW_COLD_MS;
     for (int i = 1; i < got; i++)
         for (int j = i; j > 0 && ms[j] < ms[j - 1]; j--) {
             double t = ms[j];
@@ -6845,60 +7821,103 @@ static double lw_probe(void) {
     return ms[got / 2];
 }
 
-static void lw_main(void *arg) {
-    (void)arg;
-    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+// 1 when the sample says the driver's cache has the prepared libraries.
+static int lw_warm_sample(int fast, int got) {
+    return got > 0 && fast >= (int)(got * LW_WARM_SHARE + 0.999);
+}
+
+// lw_time_sample at normal priority, and once more 10 s later when it says cold, unless the start waits (bf_waiting).
+// The better of the two counts. The thread goes back to below normal afterwards when the game runs beside it.
+static double lw_probe(int *fast, int *got) {
+    plat_thread_priority(PLAT_PRIO_NORMAL);
+    double t = lw_time_sample(fast, got);
+    if (t >= 0 && !lw_warm_sample(*fast, *got) && !LW.stop && !bf_waiting()) {
+        for (int i = 0; i < 100 && !LW.stop; i++) plat_sleep_ms(100);
+        int f2 = 0, g2 = 0;
+        double t2 = lw_time_sample(&f2, &g2);
+        if (t2 >= 0 && lw_warm_sample(f2, g2) >= lw_warm_sample(*fast, *got) && f2 * (*got) > (*fast) * g2)
+            t = t2, *fast = f2, *got = g2;
+    }
+    if (!bf_waiting()) plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    return t;
+}
+
+static void lw_check(void) {
+    if (!bf_waiting()) plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    no_cache = 1;   // the sample's libraries go into the driver's cache only, as the workers' do (see no_cache)
     char was[16] = "", id[64] = "";
     int strikes = 0;
+    unsigned long long at = 0;
     uint64_t size = 0;
     char *f = (char *)plat_file_read(LW.stamp, &size);
     if (f && size < 200) {
         char line[200];
         memcpy(line, f, size), line[size] = 0;
-        if (sscanf(line, "%15s %63s %d", was, id, &strikes) < 2) was[0] = 0;
+        if (sscanf(line, "%15s %63s %d %llu", was, id, &strikes, &at) < 2) was[0] = 0;   // no count: from the start
     }
     free(f);
     int same = !strcmp(id, LW.id), resume = same && !strcmp(was, "warming");
     const char *mode = cfg_value("NX2NAVI_LIB_WARM");
-    double median = resume ? 0 : lw_probe();
+    // A resumed warm is not sampled: the variants the earlier run built are in the driver's cache and the rest are not,
+    // so a sample would read the cache as warm or cold by how far it came. It goes on from where it stopped.
+    int fast = 0, got = 0;
+    double median = resume ? 0 : lw_probe(&fast, &got);
     if (LW.stop) return;
-    int cold = median > LW_COLD_MS || !strcmp(mode, "force");
+    int cold = (median >= 0 && !lw_warm_sample(fast, got)) || !strcmp(mode, "force");
+    LW.from = resume && at < LW.n ? (size_t)at : 0;
+    LW.next = (int64_t)LW.from;
     if (!resume && !cold) {
         if (same && strikes) lw_stamp("done", 0);   // the driver kept them this time
-        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (a sample's median %.1f ms)",
-               median);
+        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (%d of %d sampled built in "
+               "under %.0f ms, median %.1f ms)", fast, got, LW_COLD_MS, median);
         return;
     }
     if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
-        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
-               "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
+        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (%d of %d sampled fast, median %.0f "
+               "ms) after two finished warms on this driver: it does not keep them, so pipelines compile when a draw "
+               "first needs them (NX2NAVI_LIB_WARM=force warms anyway).%s", fast, got, median,
                lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
         return;
     }
     LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
-    lw_stamp("warming", LW.strikes);
-    int cpus = (int)plat_cpu_usable(), t = cpus / 4;
+    lw_stamp_at("warming", LW.strikes, LW.from);
+    int cpus = (int)plat_cpu_usable(), t = cpus / 4, boot = bf_waiting();
     t = t < 2 ? 2 : t > LW_MAX_THREADS ? LW_MAX_THREADS : t;
-    if (resume)
-        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
-               "idle threads", LW.n, t);
+    LW.bg_threads = t;
+    if (boot) t = cpus < 1 ? 1 : cpus > LW_BOOT_THREADS ? LW_BOOT_THREADS : cpus;
+    if (boot) {
+        char why[64];
+        if (resume) snprintf(why, sizeof why, "an earlier run began the warm, which goes on from variant %zu", LW.from);
+        else snprintf(why, sizeof why, "%d of %d sampled fast, median %.0f ms", fast, got, median);
+        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (%s): building %zu "
+               "prepared variants into it on %d threads while the start waits (the whole warm after a driver change)",
+               why, LW.n - LW.from, t);
+    } else if (resume)
+        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began, from variant %zu of %zu, on %d "
+               "idle threads", LW.from, LW.n, t);
     else   // cold right after a finished warm on this driver says more than a first cold (vk_warm_hint.h)
-        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
-               "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
-               "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
-               "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
+        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (%d of %d sampled "
+               "fast, median %.0f ms; a driver update or a change of what they are built with): building %zu prepared "
+               "variants into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first "
+               "needs may compile, which skips that draw for some frames or makes it wait.%s", fast, got, median, LW.n,
+               t,
                lw_cold_hint(LW.vendor,
-                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                            lw_warm_sample(fast, got) ? LW_WARM_FORCED   // warm, but lib_warm = force
                             : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
                             LW_ON_WINDOWS));
     LW.t0 = now_ms();
     LW.running = t;
     int started = 0;
     for (int i = 0; i < t; i++)
-        if ((LW.th[1 + started] = plat_thread_new(lw_worker, NULL, "lib warm"))) started++;
+        if ((LW.th[1 + started] = plat_thread_new(lw_worker, (void *)(intptr_t)i, "lib warm"))) started++;
     LW.threads = started;
     if (plat_add32(&LW.running, started - t) == 0 && !started) rt_log("vk_pipeline: library warm: no thread started");
+}
+
+static void lw_main(void *arg) {
+    (void)arg;
+    lw_check();
+    plat_xchg32(&LW.checked, 1);
 }
 
 // Boot, once the library state is known (lb_state): the prepared list is read and the check starts on its own thread.
@@ -6926,7 +7945,7 @@ static void lw_start(void) {
 
 static void lw_stop(void) {
     plat_xchg32(&LW.stop, 1);
-    for (int i = 0; i <= LW_MAX_THREADS; i++)
+    for (int i = 0; i <= LW_BOOT_THREADS; i++)
         if (LW.th[i]) plat_thread_join(LW.th[i]), LW.th[i] = NULL;
 }
 
@@ -6937,8 +7956,10 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *te = cfg_get("NX2NAVI_LIB_PREBUILD_THREADS");   // no fixed default: 2 when unset (1 under 4 CPUs)
     const char *be = cfg_get("NX2NAVI_LIB_PREBUILD_BIG");       // SPIR-V words; LB_BIG_WORDS when unset, 0 no limit
     if (!A.on || !cfg_bool("NX2NAVI_LIB_PREBUILD")) return;
+    mesh_pre_start();             // the recorded mesh pipelines' libraries
     lb_state(pr_hist, fs_hist);   // the libraries' state, also for lw_start
-    lw_start();
+    if (BF.on) BF.lw = 1;         // after the compute pipelines, with the start waiting (bf_wait)
+    else lw_start();
     LB.big_words = be && *be ? strtoull(be, NULL, 10) : LB_BIG_WORDS;
     char dir[PLAT_PATH_MAX * 2];
     if (cache_dir(dir, sizeof dir)) skip_init(dir);
@@ -6980,6 +8001,10 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     int t = te && *te ? atoi(te) : (cpus < 4 ? 1 : 2);   // idle priority; a cold driver takes ~2 s per large compute shader
     LB.tail_one = !(te && *te);
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
+    // The whole warm (bf_wait): no game runs beside these builds until they are done, so every core takes them, as
+    // in the preparation; should the game start first, the count above goes on (lb_next).
+    LB.bg_threads = t;
+    if (bf_waiting() && LB.tail_one) t = cpus < 1 ? 1 : cpus > LB_MAX_THREADS ? LB_MAX_THREADS : cpus;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();
     LB.running = t;
@@ -6994,22 +8019,90 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
                   P.cache_control ? "only from the pipeline caches" : "left to their first dispatch");
     rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines, of which %zu stay (the shaders dispatched most "
            "recently, NX2NAVI_COMPUTE_KEEP) and the others are built into the pipeline cache and destroyed, to be created "
-           "at their first dispatch; %zu recorded variants' libraries (NX2NAVI_LIB_PREBUILD_KEEP %d); on %d idle-priority "
+           "at their first dispatch; %zu recorded variants' libraries (NX2NAVI_LIB_PREBUILD_KEEP %d); on %d %s "
            "threads; library state clamp %u, polygon mode %u, depth -w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)",
-           n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly, LB.minus_w,
+           n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started,
+           bf_waiting() ? "normal-priority (the start waits for them)" : "idle-priority", LB.clamp, LB.poly, LB.minus_w,
            LB.samples, big);
-    if (LB.tail_one && started > 1)
+    if (LB.tail_one && started > 1 && !bf_waiting())
         rt_log("vk_pipeline: stage library prebuild: after the %zu recent compute pipelines, one worker continues the "
                "remaining list; NX2NAVI_LIB_PREBUILD_THREADS overrides this background limit", LB.n_keep);
 }
 
 static void lb_stop(void) {
     lw_stop();
+    plat_xchg32(&MP.stop, 1);
+    if (MP.th) plat_thread_join(MP.th), MP.th = NULL;
     plat_xchg32(&LB.stop, 1);
     for (int i = 0; i < LB.threads; i++)
         if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
     LB.threads = 0;
     if (BG.th) plat_thread_join(BG.th), BG.th = NULL;   // after its current build, if one runs
+}
+
+// 1 once the whole warm's time on the boot screen is up (BF.t_end): the builders go on as on any other start.
+static int bf_time_up(void) {
+    if (!BF.t_end || !bf_waiting() || now_ms() < BF.t_end) return 0;
+    vk_pipeline_prewarm_detach();
+    return 1;
+}
+
+// The whole warm's wait (comment at bf_decide), on the prewarm thread after the recorded pipelines: the compute
+// pipelines lb_start has just started, then the library warm. The counts go to the boot screen
+// (vk_pipeline_prewarm_progress). It ends with the warm, at the warm's time limit, or when the boot stops waiting
+// (vk_pipeline_prewarm_detach); in the last two the builders go on beside the game.
+static void bf_wait(void) {
+    double t0 = now_ms();
+    int up = bf_time_up();   // the recorded pipelines took all of it
+    if (LB.n && LB.threads) {
+        __atomic_store_n(&pw_pipe_done, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&pw_pipe_total, (int64_t)LB.n, __ATOMIC_RELAXED);
+        __atomic_store_n(&pw_phase, 3, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&LB.running, __ATOMIC_ACQUIRE) > 0 && !LB.stop && bf_waiting()) {
+            plat_sleep_ms(100);
+            plat_mutex_lock_shared(&LB.stat);
+            uint64_t d = LB.done;
+            plat_mutex_unlock_shared(&LB.stat);
+            __atomic_store_n(&pw_pipe_done, (int64_t)d, __ATOMIC_RELAXED);
+            up |= bf_time_up();
+        }
+    }
+    double t1 = now_ms();
+    int libs = 0;
+    if (BF.lw && !LB.stop) {
+        if (bf_waiting()) journal_open();
+        lw_start();   // beside the game when the wait is over: the check and the warm as on any other start
+        if (LW.th[0]) {
+            libs = 1;
+            __atomic_store_n(&pw_pipe_done, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&pw_pipe_total, (int64_t)LW.n, __ATOMIC_RELAXED);
+            __atomic_store_n(&pw_phase, 4, __ATOMIC_RELEASE);
+            while ((!LW.checked || LW.running > 0) && !LW.stop && bf_waiting()) {
+                plat_sleep_ms(100);
+                __atomic_store_n(&pw_pipe_done, (int64_t)LW.done, __ATOMIC_RELAXED);
+                __atomic_store_n(&pw_pipe_total, (int64_t)(LW.n - LW.from), __ATOMIC_RELAXED);   // a resumed warm's rest
+                up |= bf_time_up();
+            }
+        }
+        journal_close();   // the warm is over, or the game runs
+    }
+    int stopped = LB.stop || LW.stop;
+    int over = __atomic_load_n(&LB.running, __ATOMIC_ACQUIRE) <= 0 && (!libs || (LW.checked && LW.running <= 0));
+    rt_log("vk_pipeline: the whole warm %s: the compute pipelines (%zu) took %.0f ms of the wait, the driver's cache of "
+           "stage libraries %.0f ms (%s; %lld of %zu prepared variants built so far)",
+           stopped ? "stopped with the process" : over ? "is done"
+           : up ? "goes on beside the game: its time on the boot screen is up (NX2NAVI_PREWARM_FULL_S)"
+                : "goes on beside the game: the boot stopped waiting", LB.n, t1 - t0, now_ms() - t1,
+           !libs ? "not warmed: no prepared list, or the graphics pipeline library or NX2NAVI_LIB_WARM is off"
+                 : LW.done ? "being warmed" : "left as it is so far: the check found it warm, gave the warm up, or still runs",
+           (long long)LW.done, LW.n);
+    if (!stopped) {   // the boot screen's turn is over for this GPU and driver (boot_warm.h)
+        char key[32], line[64];
+        gpu_key(key, sizeof key);
+        int len = snprintf(line, sizeof line, "%s done\n", key);
+        if (!plat_file_write_atomic(BF.owed, line, (size_t)len)) rt_log("vk_pipeline: cannot write %s", BF.owed);
+    }
+    vk_pipeline_prewarm_detach();   // nothing waits from here on: later builders are the background's
 }
 
 // Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept). arg is
@@ -7036,9 +8129,10 @@ static void lb_warm_worker(void *arg) {
             Layout *l = compute_layout(sh, &B, &why);
             lb_unlock();
             double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
+            int reused = 0;
+            VkPipeline pipe = l ? compute_create(sh, l, 0, &reused) : VK_NULL_HANDLE;
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-            lb_count(2, pipe ? 3 : 2, now_ms() - t0);
+            lb_count(2, reused ? 1 : pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, st == GFX_STAGE_VS, 0);
             else lb_skip_lib();
@@ -7052,8 +8146,35 @@ static void lb_warm_worker(void *arg) {
     }
 }
 
-// Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+// --warm-shaders, before the whole list: LW_SAMPLE prepared fragment libraries spread over it, built into the driver's
+// own cache alone (no_cache, as the library warm in play builds) and timed, as the game's check at every start does
+// (lw_check). 1 when at least LW_WARM_SHARE of them came from the driver's cache. *fast and *got: the counts.
+static int prep_sample_warm(int *fast, int *got) {
+    double ms[LW_SAMPLE];
+    *fast = *got = 0;
+    size_t step = LB.n / LW_SAMPLE ? LB.n / LW_SAMPLE : 1;
+    int was = no_cache;
+    no_cache = 1;
+    for (size_t i = step / 2; i < LB.n && *got < LW_SAMPLE; i += step)
+        for (size_t j = i; j < i + step && j < LB.n; j++) {   // the next fragment variant from here
+            if (LB.e[j].stage != GFX_STAGE_FS) continue;
+            journal_mark(0, &LB.e[j]);   // a driver that dies on it names it, as the full pass would
+            double t = lw_build(&LB.e[j]);
+            journal_mark(0, NULL);
+            if (t >= 0) ms[(*got)++] = t;
+            break;
+        }
+    no_cache = was;
+    for (int i = 0; i < *got; i++) *fast += ms[i] <= LW_COLD_MS;
+    return *got >= LW_SAMPLE / 2 && lw_warm_sample(*fast, *got);
+}
+
+// Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority. sample: --warm-shaders
+// after an update, which first asks the driver's cache (prep_sample_warm) and builds nothing more when it has them.
+// It took 10 to 20 s on a player's PC at every update, all of it 42,000 libraries the driver gave back at once, and
+// it still takes the minutes of a full build when the driver no longer has them (a driver update, or a change of what
+// they are built with: 380 s on that PC once). NX2NAVI_LIB_WARM=force builds the whole list whatever the sample says.
+static void lb_warm_prepared(const char *dir, int sample) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     size_t n = 0;
@@ -7071,6 +8192,20 @@ static void lb_warm_prepared(const char *dir) {
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
+    int fast = 0, got = 0;
+    if (sample && P.gpl && strcmp(cfg_value("NX2NAVI_LIB_WARM"), "force") && prep_sample_warm(&fast, &got)) {
+        if (SK.journal) plat_file_close(SK.journal), SK.journal = NULL, plat_file_delete(jp);
+        printf("prepare-shaders: progress build %zu %zu\n", n, n);
+        printf("prepare-shaders: the graphics driver's cache still has the prepared shaders (%d of %d sampled came from "
+               "it in under %.0f ms each): the %zu variants are not built again (%.0f ms)\n", fast, got, LW_COLD_MS, n,
+               now_ms() - LB.t0);
+        fflush(stdout);
+        free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0, LB.skipped = 0;
+        return;
+    }
+    if (sample && got)
+        printf("prepare-shaders: the graphics driver's cache does not have the prepared shaders (%d of %d sampled came "
+               "from it): all %zu variants are built into it again\n", fast, got, n);
     int cpus = (int)plat_cpu_usable(), k = 0;
     PlatThread *t[JR_SLOTS];
     for (int i = 0; i < cpus && i < JR_SLOTS; i++)
@@ -7120,7 +8255,8 @@ static void lb_warm_prepared(const char *dir) {
 // (vk_caps_gpl: AMD's Windows driver for RDNA 2 and older) a vertex pipeline's outputs come from its own pair (no
 // independent layouts), so a listed one always is the one a draw asks for. A mesh pipeline, which has no stage
 // libraries, otherwise leaves its draws out of the picture for its whole compile (0.2 to 1.1 s each on a first visit
-// of a forest, 18 of them).
+// of a forest, 18 of them). Where mesh pipelines have stage libraries (mesh_libs) the listed ones are still built
+// whole, and the libraries of their stages are built after them (mesh_pre_run), for the mesh pipelines no list names.
 // A driver whose compiler crashes on one of these would crash at every preparation: seed-pipelines-running.txt marks
 // the step, and a run that finds the marker of a run that died skips the step for good on this folder (the pipelines
 // are then built at their first draw, as without a list) until the marker is deleted.
@@ -7212,6 +8348,7 @@ static int seed_pipelines(const char *dir) {
         }
         GKey k;
         gkey_fill(&s, &k);
+        if (is_mesh(&s) && mesh_libs()) mesh_pre_note(&s, &k);
         uint64_t hk = key_hash(&k, sizeof k);
         int q = 0;
         if (pipe_find(&k, sizeof k, hk)) known++;
@@ -7239,6 +8376,19 @@ static int seed_pipelines(const char *dir) {
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // those a pool worker took
     uint32_t built = K.built - built0, failed = K.failed - failed0;
     plat_mutex_unlock(&P.lock);
+    // The listed mesh pipelines' stage libraries, before the save and inside the marker: the file then holds them,
+    // and a driver that dies on one is met by the next preparation as one that died on a listed pipeline.
+    mesh_pre_run(cpus);
+    if (MP.n) {
+        char ml[320];
+        snprintf(ml, sizeof ml, "prepare-pipelines: %u stage libraries of the listed mesh pipelines (%u of task and mesh "
+                 "stages, %u fragment shader): %llu built (avg %.1f ms, longest %.0f ms), %llu failed; %.0f ms", MP.n,
+                 MP.n_pr, MP.n - MP.n_pr, (unsigned long long)MP.built, MP.built ? MP.ms / (double)MP.built : 0.0, MP.max,
+                 (unsigned long long)MP.fail, now_ms() - MP.t0);
+        printf("%s\n", ml);
+        fflush(stdout);
+        rt_log("vk_pipeline: %s", ml);
+    }
     int saved = cache_save(5000, 0) > 0;   // explicit preparation waits for a moment with no build running
     plat_file_delete(mark);
     char msg[640];
@@ -7292,7 +8442,7 @@ int vk_pipeline_prepare_shaders(void) {
     // The listed pipelines before the stage libraries: the pipeline cache is saved with them in it and without the
     // tens of thousands of libraries the next step builds, which would take the file past its size limit.
     if (!rc) seed_pipelines(dir);
-    if (!rc) lb_warm_prepared(dir);
+    if (!rc) lb_warm_prepared(dir, 0);
     return rc;
 }
 
@@ -7315,7 +8465,7 @@ int vk_pipeline_warm_shaders(void) {
         return 1;
     }
     seed_pipelines(dir);   // before the libraries, as in vk_pipeline_prepare_shaders
-    lb_warm_prepared(dir);
+    lb_warm_prepared(dir, 1);
     return 0;
 }
 
@@ -7369,9 +8519,8 @@ int vk_pipeline_probe_prewarm(void) {
         double l0 = now_ms();
         const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);   // from the disk: the boot released its copy
         double load = now_ms() - l0;
-        uint64_t words = 0;
         if (!sh || gfx_shader_stage(sh) != GFX_STAGE_CS) continue;
-        gfx_shader_spirv(sh, &words);
+        uint64_t words = gfx_shader_words(sh);
         if (LB.big_words && words > LB.big_words) continue;   // a first dispatch of one compiles it: not what is timed here
         const VkPipeInfo *info = NULL;
         double t0 = now_ms();
@@ -7575,6 +8724,25 @@ static int cache_save_one(int which, uint32_t wait_ms, int exiting) {
     size_t size = 0;
     void *data = NULL;
     int sized = vkGetPipelineCacheData(P.device, cache, &size, NULL) == VK_SUCCESS && size;
+    if (sized) __atomic_store_n(&P.held[which], (uint64_t)size, __ATOMIC_RELAXED);
+    // A cache past the limit is not written: the next start would drop the file whole (cache_data_read), so the file
+    // keeps its last save under the limit and only the pipelines made since then are compiled again. A preparation
+    // writes anyway: what it builds is the base every start reads, and a file it cannot write would leave none.
+    static int over_said[2];
+    uint64_t cap = cache_cap();
+    if (sized && cap && size > cap && !prep_mode) {
+        plat_mutex_unlock(&cache_rw);
+        if (exiting) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
+        if (!over_said[which]++)
+            rt_log("vk_pipeline: %s not written past its last save: the cache holds %.1f MB, over the limit of %llu MB; "
+                   "pipelines made from here on compile again at the next start (NX2NAVI_PIPELINE_CACHE_MAX_MB raises "
+                   "the limit)", path, size / 1048576.0, (unsigned long long)(cap >> 20));
+        return 1;
+    }
+    if (sized && cap && size > cap)
+        rt_log("vk_pipeline: %s holds %.1f MB, over the limit of %llu MB: written for the preparation, and dropped at "
+               "the next start unless NX2NAVI_PIPELINE_CACHE_MAX_MB is raised", path, size / 1048576.0,
+               (unsigned long long)(cap >> 20));
     int same = sized && size == P.saved[which];
     int got = sized && !same && (data = malloc(size)) && vkGetPipelineCacheData(P.device, cache, &size, data) == VK_SUCCESS;
     plat_mutex_unlock(&cache_rw);
@@ -7624,7 +8792,16 @@ static int cache_save(uint32_t wait_ms, int exiting) {
     }
     int ok = 1, r;
     if (!P.play || P.fold) ok = cache_save_one(0, wait_ms, exiting);
-    if (P.play && (r = cache_save_one(1, wait_ms, exiting)) < ok) ok = r;   // the worse of the two
+    // While a fold is not written yet (P.fold: refused at the limit, or no build-free moment) the play file still holds
+    // what was folded in memory only: written over with this run's play cache, that would be in neither file.
+    static int fold_kept_said;
+    if (P.play && P.fold) {
+        if (!fold_kept_said++)
+            rt_log("vk_pipeline: %s is kept as it is until %s holds what was folded from it; this run's new pipelines "
+                   "are saved once that write is done", P.play_path, P.cache_path);
+    } else if (P.play && (r = cache_save_one(1, wait_ms, exiting)) < ok) {
+        ok = r;   // the worse of the two
+    }
     plat_mutex_unlock(&save_lock);
     return ok;
 }
@@ -7641,24 +8818,41 @@ static int save_with(uint32_t wait_ms, int exiting) {
                "max %.2f ms, %llu failed), %llu lookups by a draw found a stage library not made in this process yet and "
                "left it to a worker (whether the driver's cache has it shows in the library times below), %llu optimised "
                "pipelines swapped in (%llu queued "
-               "low after their fast link), %llu drawing-thread links over 5 ms; %llu waiting draws built their libraries "
+               "low after their fast link; %llu replaced fast links given back), %llu drawing-thread links over 5 ms; %llu "
+               "waiting draws built their libraries "
                "(avg %.2f ms, max %.2f ms)",
                (unsigned long long)P.g.links, (unsigned long long)P.g.wlinks, (unsigned long long)P.g.flinks,
                (unsigned long long)P.g.fb_links,
                P.g.links ? P.g.link_ms / P.g.links : 0.0,
                P.g.link_max, (unsigned long long)P.g.link_fail, (unsigned long long)P.g.defer,
-               (unsigned long long)P.g.swaps, (unsigned long long)P.g.requeued, (unsigned long long)P.g.slow,
+               (unsigned long long)P.g.swaps, (unsigned long long)P.g.requeued, (unsigned long long)fast_retired,
+               (unsigned long long)P.g.slow,
                (unsigned long long)P.g.dlinks, P.g.dlinks ? P.g.dlink_ms / P.g.dlinks : 0.0, P.g.dlink_max);
         uint64_t rn = P.g.ready_n[0] + P.g.ready_n[1] + P.g.ready_n[2] + P.g.ready_n[3] + P.g.ready_n[4] + P.g.ready_n[5];
         rt_log("vk_pipeline: gpl: pipelines a draw missed were usable after under 4 ms %llu, 4-8 ms %llu, 8-17 ms %llu, "
                "17-50 ms %llu, 50-150 ms %llu, longer %llu (avg %.1f ms, longest %.0f ms); %llu of them had no fast link; "
-               "%llu were mesh pipelines (no stage libraries), %llu were named in pipeline-keys.bin and not prebuilt yet "
-               "(the others were new to this install), %llu had a shader translated in this session",
+               "%llu were mesh pipelines (counted by themselves below), %llu were named in pipeline-keys.bin and not "
+               "prebuilt yet (the others were new to this install), %llu had a shader translated in this session",
                (unsigned long long)P.g.ready_n[0], (unsigned long long)P.g.ready_n[1], (unsigned long long)P.g.ready_n[2],
                (unsigned long long)P.g.ready_n[3], (unsigned long long)P.g.ready_n[4], (unsigned long long)P.g.ready_n[5],
                rn ? P.g.ready_ms / (double)rn : 0.0, P.g.ready_max, (unsigned long long)P.g.ready_nofast,
                (unsigned long long)P.g.ready_mesh, (unsigned long long)P.g.ready_recorded,
                (unsigned long long)P.g.ready_fresh);
+        // The mesh pipelines by themselves: with stage libraries the first two numbers follow each other and the
+        // times are a link's; without (the start's line says why) none is linked and the time is a whole build's.
+        if (vk_ctx()->has_mesh_shader)
+            rt_log("vk_pipeline: gpl: mesh pipelines (%s): %llu fast links (avg %.2f ms, max %.2f ms); the %llu a draw "
+                   "missed were usable after avg %.1f ms, longest %.0f ms, %llu of them through a fast link (the others "
+                   "after their whole build); their libraries made in this run: %llu of task and mesh stages (avg %.1f "
+                   "ms, max %.0f ms), %llu fragment shader (avg %.1f ms, max %.0f ms)",
+                   mesh_libs() ? "linked from stage libraries" : "built whole, without stage libraries",
+                   (unsigned long long)P.g.m_links, P.g.m_links ? P.g.m_link_ms / (double)P.g.m_links : 0.0,
+                   P.g.m_link_max, (unsigned long long)P.g.ready_mesh,
+                   P.g.ready_mesh ? P.g.m_ready_ms / (double)P.g.ready_mesh : 0.0, P.g.m_ready_max,
+                   (unsigned long long)P.g.m_ready_fast, (unsigned long long)P.g.m_lib_n[0],
+                   P.g.m_lib_n[0] ? P.g.m_lib_ms[0] / (double)P.g.m_lib_n[0] : 0.0, P.g.m_lib_max[0],
+                   (unsigned long long)P.g.m_lib_n[1], P.g.m_lib_n[1] ? P.g.m_lib_ms[1] / (double)P.g.m_lib_n[1] : 0.0,
+                   P.g.m_lib_max[1]);
         if (P.g.hints)
             rt_log("vk_pipeline: gpl: looking ahead named %llu pipeline states not known yet and queued %llu stage libraries "
                    "for them", (unsigned long long)P.g.hints, (unsigned long long)P.g.hint_libs);
@@ -7703,17 +8897,42 @@ void vk_pipeline_save(void) {
 // The save as the process ends (window closed, the game's exit, a timed run's end): new builds wait while it waits up to
 // SAVE_WAIT_MS for the running ones to finish (cache_saving_at_exit).
 void vk_pipeline_save_exit(void) {
+    journal_close();   // an orderly end during the whole warm is not a driver crash
     save_with(SAVE_WAIT_MS, 1);
+}
+
+// The memory report's figure for the pipeline caches the driver keeps in process memory (vk_pipeline_mem): the size of
+// each cache's data, asked once a minute here on the autosave thread, and by every save (cache_save_one). The size is
+// asked as the save asks it, at a moment no build runs into either cache (cache_rw, tried once and never waited for),
+// and under save_lock, which the shutdown takes before it destroys the caches. The play file holds what this run
+// compiled, but pipeline-cache.bin is not written in play: its cache grows in memory with the compute pipelines the boot
+// builds for it alone, and only this query says by how much.
+#define SIZES_EVERY_MS 60000
+static void cache_sizes_ask(void) {
+    if (!plat_mutex_trylock(&save_lock)) return;
+    if (plat_mutex_trylock(&cache_rw)) {
+        for (int w = 0; w < 2; w++) {
+            VkPipelineCache cache = w ? P.play : P.cache;
+            size_t size = 0;
+            if (cache && vkGetPipelineCacheData(P.device, cache, &size, NULL) == VK_SUCCESS && size)
+                __atomic_store_n(&P.held[w], (uint64_t)size, __ATOMIC_RELAXED);
+        }
+        plat_mutex_unlock(&cache_rw);
+    }
+    plat_mutex_unlock(&save_lock);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
 // runs: at most every 20 s, and only after new pipelines were built or while a save that did not happen is still owed
 // (vk_save_retry.h). New pipeline keys are appended every 2 s.
 static void autosave_once(void) {
-    static uint64_t last_keys;
+    static uint64_t last_keys, last_sizes;
     static SaveRetry sr;
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
+    __atomic_store_n(&pipe_minute, minute_now(), __ATOMIC_RELAXED);
+    pressure_release(now);   // while video memory is short: the pipelines no draw used go
+    if (now - last_sizes >= SIZES_EVERY_MS && (P.cache || P.play)) last_sizes = now, cache_sizes_ask();
     if (now - last_keys >= 2000) {
         last_keys = now;
         if (*(volatile uint32_t *)&K.pend_n) keys_flush();
@@ -7758,6 +8977,7 @@ void vk_pipeline_autosave(void) {
 void vk_pipeline_shutdown(void) {
     if (!P.ready) return;
     lb_stop();
+    compute_warm_clear();
     workers_drain();   // jobs point at layouts and Pipe entries freed below
     vk_pipeline_save();
     plat_mutex_lock(&P.lock);
@@ -8044,4 +9264,61 @@ void vk_pipeline_sizes(PerfSizes *s) {
     perf_size(s, "library jobs queued", lq, 0, PERF_SIZE_NONE);
     perf_size(s, "pipeline jobs queued or running", jobs, 0, PERF_SIZE_NONE);
     perf_size(s, "pipeline keys seen", seen, 0, seen_b);
+}
+
+// The memory report's pipeline figures (vk_memory.c outside_log and system_log), once a report: what holds device
+// memory outside VMA, counted because the driver gives no size for a pipeline, and the host memory of the tables. A walk
+// of the hash chains under P.lock held shared, as vk_pipeline_sizes walks them (well under a millisecond: the draws'
+// lookups wait for it). A graphics entry's pipeline is whole (built in one piece, no fast link before it), fast-linked
+// (from its stage libraries, the optimised build not done or failed) or optimised (the whole build that replaced a fast
+// link). Not used lately: no lookup since idle_min wall minutes (pipe_used), never: none in this run (the boot's
+// prebuild made it from the key file or the shared list).
+void vk_pipeline_mem(VkPipeMem *m, uint32_t idle_min) {
+    memset(m, 0, sizeof *m);
+    m->idle_min = idle_min;
+    m->cache[0] = __atomic_load_n(&P.held[0], __ATOMIC_RELAXED);
+    m->cache[1] = __atomic_load_n(&P.held[1], __ATOMIC_RELAXED);
+    m->cache_asked = m->cache[0] || m->cache[1];
+    if (!m->cache[0]) m->cache[0] = P.cache ? P.cache_loaded : 0;
+    if (!m->cache[1]) m->cache[1] = P.play ? P.play_loaded : 0;
+    if (!P.ready) return;
+    uint32_t now = __atomic_load_n(&pipe_minute, __ATOMIC_RELAXED);
+    plat_mutex_lock_shared(&P.lock);
+    for (int i = 0; i < PIPE_BUCKETS; i++)
+        for (const Pipe *p = pipes[i]; p; p = p->next) {
+            m->ram_pipes += sizeof *p + p->key_size + (p->bindings ? p->info.n_bindings * sizeof *p->bindings : 0);
+            int comp = p->info.bind_point == VK_PIPELINE_BIND_POINT_COMPUTE;
+            VkPipeline pipe = p->info.pipeline;
+            if (!pipe) {
+                if (comp) m->comp_none++;
+                else m->gfx_none++;
+                continue;
+            }
+            int never = !p->used_min, idle = !never && now - p->used_min >= idle_min;
+            if (comp) {
+                m->comp++, m->comp_never += never, m->comp_idle += idle;
+                continue;
+            }
+            m->gfx++, m->gfx_never += never, m->gfx_idle += idle;
+            if (p->fast && pipe == p->fast) m->gfx_fast++;
+            else if (p->optimised) m->gfx_opt++;
+            else m->gfx_whole++;
+        }
+    for (int i = 0; i < LIB_BUCKETS; i++)
+        for (const Lib *b = libs[i]; b; b = b->next) {
+            m->ram_pipes += sizeof *b + b->size;
+            uint32_t kind;
+            memcpy(&kind, b->key, sizeof kind);   // every library key starts with its LIB_* kind
+            if (!b->pipe) m->lib_none++;
+            else if (kind < 4) m->lib[kind]++;
+        }
+    for (int i = 0; i < LAYOUT_BUCKETS; i++)
+        for (const Layout *l = layouts[i]; l; l = l->next) m->layouts++, m->ram_pipes += sizeof *l + l->n * sizeof *l->b;
+    m->ram_keys = (uint64_t)K.seen_cap * sizeof *K.seen + (uint64_t)K.pend_cap * sizeof(KeyRec) +
+                  (K.file ? K.own_n * sizeof(KeyRec) : 0);
+    m->ram_seed = K.file && K.file_n > K.own_n ? (K.file_n - K.own_n) * sizeof(KeyRec) : 0;
+    plat_mutex_unlock_shared(&P.lock);
+    plat_mutex_lock(&PB.lock);
+    m->ram_binaries = (uint64_t)PB.cap * sizeof *PB.slot + PB.pend_cap;
+    plat_mutex_unlock(&PB.lock);
 }

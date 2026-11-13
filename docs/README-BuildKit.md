@@ -121,6 +121,13 @@ memory runs short, it ends the process, so while less than the larger of 4 GB an
 drops stale textures and evicts idle ones. The log names the limits at the first check (`platform: memory limits`). That
 cannot give back what the game needs after its start: about 10 GB in Kokiri Forest at a 2160p game resolution.
 
+Without NVIDIA's driver, the game hands its memory to the GPU through `/dev/udmabuf` instead of copying it there for
+every submission, which is faster on AMD cards (61 frames a second instead of 40 in Kokiri Forest on an RX 6800 XT).
+That needs the device readable and writable by you (recent systemd gives it to the logged-in user) and udmabuf's
+`size_limit_mb` (`/sys/module/udmabuf/parameters/size_limit_mb`) at 1024 or more (`udmabuf.size_limit_mb=1024` on the
+kernel command line raises it). Otherwise the game copies as before, and the log's `mem:` lines say why
+(`docs/building.md`, "Memory").
+
 AMD FSR 3.1 loads AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu offers neither
 FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the
 game's own scaling and swapchain as they are (the log says so). AMD FSR 4 is in the Windows build alone for the same

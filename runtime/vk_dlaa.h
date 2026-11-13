@@ -23,8 +23,13 @@ int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, 
 int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
 // Frame generation (vk_fg.cpp): the depth and motion vectors of the frame DLSS or FSR 3.1 last ran on, with its jitter
 // and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the
-// next frame's scene draws over them, after this present.
+// next frame's scene draws over them, after this present. Without an upscaler, while frame generation runs, the same
+// of the last frame armed for it alone (vk_dlaa.c fg_only_frame): the scene's size, a jitter of 0.
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset);
+// 1 while frame generation runs without an upscaler and the frame is armed for its inputs alone (vk_dlaa.c
+// fg_only_frame): the motion passes run as for the upscaler (vk_usnap.c, vk_exec_draw.c, vk_mvprev.c), nothing is
+// jittered. Read at each present.
+int vk_dlaa_fg_only(void);
 // ... their views, and this frame's camera for DLSS Frame Generation (vk_dlssg.c): matrices for row vectors (v * M, the
 // rows stored in order), as Streamline takes them; 0 without a camera that frame.
 // znear and zfar: the view distances the depth buffer holds as 0 and 1 (1 and 0 when inverted), from the frame's own
@@ -40,8 +45,8 @@ typedef struct {
 } VkDlaaCamera;
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
-// RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
-// evaluation.
+// RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it), from the
+// upscaler's picture or, without an upscaler, from the game's own scaled picture; 1 once per evaluation.
 extern int vk_dlaa_hudless_wanted;
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt);
 int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is AMD FSR 3.1 (NX2NAVI_TAA = fsr3) instead of DLSS
@@ -65,9 +70,19 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+// vk_exec.c vk_exec_pass_begin, in every replay thread, after the pass hooks: with the upscaler run before the bloom to
+// the picture's size (NX2NAVI_DLSS_PREBLOOM), the passes after it that draw into the light target or the bloom
+// composite's target are moved to images of the picture's size (vk_dlaa.c "before the bloom").
+void vk_dlaa_retarget(VkExec *ex);
+// The scale from the game's viewport and scissor to such a moved pass; 0 for any other pass (vk_exec.c vk_exec_scissor,
+// vk_dlaa_viewport).
+int vk_dlaa_target_scale(const VkExec *ex, float *sx, float *sy);
 // vk_exec_draw.c untranslated_dispatch_fallback, after the stand-in of the game's own upscaler wrote its output image
 // (in GENERAL, of format fmt and w x h): DLSS or FSR runs there on the armed scene and its picture goes over it.
 void vk_dlaa_upscaler(VkExec *ex, VkImage out, VkFormat fmt, uint32_t w, uint32_t h);
+// 1 while DLSS or FSR 3.1 runs on the scene (the setting is on, the upscaler came up and has not failed): it scales the
+// scene itself, and vk_dlaa_upscaler puts its picture over the stand-in's. The thread that records the frame asks.
+int vk_dlaa_active(void);
 void vk_dlaa_frame(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);

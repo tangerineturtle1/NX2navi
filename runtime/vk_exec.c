@@ -448,9 +448,15 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
     if (img && !depth_slot && bc_target(t, v, has_v, img, o)) return;   // a 3D BC image: its stand-in
     VkImageUsageFlags need = depth_slot ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     int is3d = img && img->type == VK_IMAGE_TYPE_3D && !depth_slot;   // slices drawn through 2D views (2D_ARRAY_COMPATIBLE)
+    // A replay worker's lookup that needs its turn returns no image (vk_texture_deferred), and the op is replayed again
+    // in turn (resolve_rt's callers): not a target left out, so not logged as one. Logged, the first such lookup read
+    // as if the game drew into depth or cube targets the replay could not render.
+    if (!img && vk_texture_deferred()) return;
     if (!img || !(img->usage & need) || (img->type != VK_IMAGE_TYPE_2D && !is3d)) {
-        warn_once(W_UNRENDERABLE, "render target format %#x target %d (%ux%u) is not renderable here: left out",
-                  t->d.format, t->d.target, t->d.width, t->d.height);
+        warn_once(W_UNRENDERABLE, "render target format %#x target %d (%ux%u) is not renderable here (%s): left out",
+                  t->d.format, t->d.target, t->d.width, t->d.height,
+                  !img ? "no image" : !(img->usage & need) ? (depth_slot ? "no depth attachment usage" : "no colour attachment usage")
+                                    : "not a 2D image");
         return;
     }
     uint32_t level = has_v && v->set_levels ? v->base_level : 0;
@@ -817,6 +823,7 @@ void vk_exec_pass_begin(VkExec *ex) {
         vk_contact_pass_begin(ex);
         vk_dlaa_pass(ex);   // DLAA runs before the bloom chain's first pass (vk_dlaa.c)
     }
+    vk_dlaa_retarget(ex);   // after DLSS ran before the bloom: the passes it moves to the picture's size (vk_dlaa.c)
     // Learned targets (VkTexImage.fb_learned) are attached in the feedback layout
     VkImage want[9];
     VkImageAspectFlags wasp[9];
@@ -967,6 +974,12 @@ VkRect2D vk_exec_scissor(const VkExec *ex) {
     int64_t k = ex->pass_scale > 1 ? ex->pass_scale : 1;
     int64_t x0 = ex->scissor.x * k, y0 = ex->scissor.y * k;
     int64_t x1 = x0 + (int64_t)ex->scissor.w * k, y1 = y0 + (int64_t)ex->scissor.h * k;
+    float sx, sy;
+    if (vk_dlaa_target_scale(ex, &sx, &sy)) {   // a pass DLSS moved to the picture's size (vk_dlaa.c vk_dlaa_retarget)
+        x0 = (int64_t)floor(ex->scissor.x * (double)sx), y0 = (int64_t)floor(ex->scissor.y * (double)sy);
+        x1 = (int64_t)ceil(((double)ex->scissor.x + ex->scissor.w) * sx);
+        y1 = (int64_t)ceil(((double)ex->scissor.y + ex->scissor.h) * sy);
+    }
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;
@@ -1122,7 +1135,7 @@ static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 
-// ---- the early tail (NX2NAVI_TAIL_EARLY, default 0)
+// ---- the early tail (NX2NAVI_TAIL_EARLY, default 1 since 0.10.0; 0 turns it off)
 // Standing in Hyrule Field with FSR 4 (RX 7900 XT, 2026-11-13) a frame's main submission ends with one part of 4.7 ms
 // of GPU time, the temporal upscaler and the interface drawn after it, and one of 1.4 ms, the write-backs of what the
 // shaders wrote into VRAM mirrors. The game waits for all of it before it writes the next frame's data (the wait after
@@ -1596,9 +1609,10 @@ static void evo_resume(VkExec *ex) {
 // a shader not in memory is queued for its disk read or translation by the lookup itself. The draws then find their
 // libraries built, or building on several workers at once.
 // What the scan does not follow: the op stream past a wait for another queue's signal (what follows may be held), a
-// change of the texture pool, mesh draws (their pipelines have no libraries), and whatever would take it past
-// AHEAD_NS. Render targets are read from their descriptors (format, view format, sample count), which is what the
-// replay resolves them to unless a target is left out; a guess that misses costs two libraries at most.
+// change of the texture pool, mesh draws where their pipelines have no stage libraries (vk_pipeline_mesh_libs), and
+// whatever would take it past AHEAD_NS. Render targets are read from their descriptors (format, view format, sample
+// count), which is what the replay resolves them to unless a target is left out; a guess that misses costs two
+// libraries at most.
 #define AHEAD_NS 3000000ull
 #define AHEAD_OPS 400000u
 static struct {
@@ -1674,7 +1688,7 @@ void vk_exec_ahead(VkExec *ex) {
         case OP_DEPTH_CLAMP: sx.pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
         case OP_RASTER_DISCARD: sx.pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
         case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_TEX: case OP_BIND_IMG:
-        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
             vk_exec_ahead_op(&sx, h->op, a);
             break;
         default: break;
@@ -1835,8 +1849,9 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     }
 }
 
-// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread; the
-// Game tab's CPU helper threads row sets it)
+// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default auto: as many as the CPU's cores make worth it,
+// vk_exec_replay_workers_auto; 0: the replay records every op on the submitting thread; the Game tab's CPU helper
+// threads row sets it)
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
 // Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
@@ -2046,9 +2061,40 @@ static void rw_main(void *arg) {
     }
 }
 
+// NX2NAVI_REPLAY_WORKERS = auto: the workers this PC gets. The game's own threads, the submitting thread, the present
+// thread and the pipeline builders already keep about half of the cores busy, and on the 8-core CPU above 3 workers
+// gave all there was (5 and 7 measured the same), so the count is half the physical cores less one: 2 on 6 cores, 3 on
+// 8, 5 on 12, at most 6. Four cores or fewer get none: a worker would take a core from the game's threads. AMD's
+// Windows driver for RX 6000 and older (vk_caps.amd_sc) gets none either, as that is where a player's device was lost
+// with workers on and the cause is not known; a number set in nx2navi.ini or the menu still applies there, with a
+// warning in the log (rw_init). Physical cores of the process's affinity (plat_cpu_cores), or half the usable logical
+// processors where that is unknown.
+#define RW_AUTO_MAX 6
+int vk_exec_replay_workers_auto(const char **why) {
+    uint64_t all, first;
+    int cores = plat_cpu_cores(&all, &first);
+    if (cores <= 0) cores = (int)plat_cpu_usable() / 2;
+    int n = cores <= 4 ? 0 : cores / 2 - 1;
+    if (n > RW_AUTO_MAX) n = RW_AUTO_MAX;
+    const char *w = cores <= 4 ? "four cores or fewer" : "half the cores less one";
+    if (vk_caps.amd_sc) n = 0, w = "AMD's driver for RX 6000 and older, where a game with workers lost its device";
+    if (why) *why = w;
+    return n;
+}
+
 static void rw_init(void) {
-    int n = cfg_int("NX2NAVI_REPLAY_WORKERS");
+    const char *set = cfg_value("NX2NAVI_REPLAY_WORKERS"), *why = NULL;
+    int autoset = !strcmp(set, "auto");
+    int n = autoset ? vk_exec_replay_workers_auto(&why) : atoi(set);
     RW.n = n < 0 ? 0 : n > RW_MAX ? RW_MAX : n;
+    if (autoset) {
+        uint64_t all, first;
+        rt_log("vk: replay workers automatic: %d for %d physical cores (%s; NX2NAVI_REPLAY_WORKERS = a number sets "
+               "them)", RW.n, plat_cpu_cores(&all, &first), why);
+    } else if (RW.n && vk_caps.amd_sc) {   // the player's number stays (vk_exec_replay_workers_auto)
+        rt_log("vk: WARNING: %d replay workers set on AMD's driver for RX 6000 and older, where a game with workers lost "
+               "its device; NX2NAVI_REPLAY_WORKERS = auto or 0 avoids it", RW.n);
+    }
     for (int k = 0; k < RW.n; k++) {
         RwWorker *w = calloc(1, sizeof *w);
         if (!w) rt_fatal("vk: out of memory (replay worker)");
@@ -2063,6 +2109,11 @@ static void rw_init(void) {
     RW.pipe = RW.n <= 0 || pipe <= 0 ? 0 : pipe > LIVE_GROUPS ? LIVE_GROUPS : pipe;
     if (RW.pipe) RW.help_dc = vk_exec_draw_ctx_new();
     RW.small = RW.pipe ? cfg_int("NX2NAVI_REPLAY_SMALL") : 0;
+    if (RW.small >= 2 * CHUNK_DRAWS) {   // a group that large is cut into chunks (group_start): no group would match
+        rt_log("vk: NX2NAVI_REPLAY_SMALL = %d: groups of %d draws or more are shared out anyway, so %d is used (0..%d)",
+               RW.small, 2 * CHUNK_DRAWS, 2 * CHUNK_DRAWS - 1, 2 * CHUNK_DRAWS - 1);
+        RW.small = 2 * CHUNK_DRAWS - 1;
+    }
     if (RW.small > 0)
         rt_log("vk: a group of %d draws or more goes whole to one replay worker (NX2NAVI_REPLAY_SMALL)", RW.small);
     else RW.small = 0;

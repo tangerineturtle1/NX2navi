@@ -670,17 +670,16 @@ steam->send(0, bytes, n, 1);           /* to every other member, reliable */
 steam->stop();                         /* leaves the room, signs out */
 ```
 
-- **What the player needs** is what the game's co-op needs ([coop.md](coop.md)): Steam running and signed in, and
+- **What the player needs**: Steam running and signed in, at least one Steam game from 2021 or later installed, and
   `steam_api64.dll` beside `ocarina.exe`, which the launcher copies there from a Steam game the player has (at every
   start of the game, a mod's `api.play` included). `status()` says which of the two is missing
   (`NX2_STEAM_WHY_NO_LIBRARY`, `NX2_STEAM_WHY_OLD_LIBRARY`, `NX2_STEAM_WHY_NO_CLIENT`) with a sentence for the log in
   `says`; an unavailable Steam is tried again every five seconds, and `NX2_STEAM_EV_STATE` comes when that changes.
   Steam shows the player as playing Spacewar from `start` to `stop`: start when the player opens your multiplayer
   page, not when the game starts.
-- **One user of Steam at a time.** While the game's own co-op is on (`coop_steam = 1`), `start` returns 0 and
-  `status().why` is `NX2_STEAM_WHY_GAME_COOP`: tell the player to turn it off in the menu's Co-op tab. Co-op turned
-  on while a plugin has Steam finds Steam in use until the plugin stops. A second plugin's `start` returns 0 while
-  the first has it. With no plugin using Steam the game's co-op runs exactly as without this interface.
+- **One user of Steam at a time.** A second plugin's `start` returns 0 while the first has it. A build that
+  has a co-op of the game's own (`coop_steam = 1`; this runtime has none) refuses `start` with
+  `NX2_STEAM_WHY_GAME_COOP`.
 - **Whose rooms.** `start` takes a tag (`a-z`, `0-9`, `-`, `_`, `.`; up to 31 characters): the room your plugin makes
   carries it as lobby data (`nx2navi_plugin = <tag>`), and a lobby entered that does not is left at once
   (`NX2_STEAM_EV_ROOM_FAILED` with `NX2_STEAM_FAIL_NOT_OURS`). The app id is shared with every program that uses

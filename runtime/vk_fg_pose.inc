@@ -206,12 +206,13 @@ static float pose_rotation_trace_limit(void) {
     }
     return limit;
 }
-static int pose_sharp_rotation(const ActorPose *now, const ActorPose *prev) {
-    if (!now || !prev || prev->frame + 1 != now->frame || now->size[3] < 48 || prev->size[3] < 48) return 0;
+// Two 3x4 matrices (rows of four floats) of one part or bone, this frame's and last frame's: 1 when both are plain
+// rotations and the turn between them is past the guard threshold. vk_skin_motion.inc asks it for each bone of a palette.
+static int pose_matrix_sharp(const uint8_t *now, const uint8_t *prev) {
     float m[2][12];
-    const ActorPose *p[2] = {now, prev};
+    const uint8_t *p[2] = {now, prev};
     for (int k = 0; k < 2; ++k) {
-        memcpy(m[k], p[k]->bytes + p[k]->size[0] + p[k]->size[1] + p[k]->size[2], sizeof m[k]);
+        memcpy(m[k], p[k], sizeof m[k]);
         for (int a = 0; a < 3; ++a) {
             for (int b = a; b < 3; ++b) {
                 float dot = 0.0f;
@@ -227,6 +228,11 @@ static int pose_sharp_rotation(const ActorPose *now, const ActorPose *prev) {
     // trace(R1 * transpose(R0)) = 1 + 2*cos(angle). The selected threshold controls
     // when this part needs visibility filtering; equipment retains its separate raw policy.
     return trace < pose_rotation_trace_limit();
+}
+static int pose_sharp_rotation(const ActorPose *now, const ActorPose *prev) {
+    if (!now || !prev || prev->frame + 1 != now->frame || now->size[3] < 48 || prev->size[3] < 48) return 0;
+    return pose_matrix_sharp(now->bytes + now->size[0] + now->size[1] + now->size[2],
+                             prev->bytes + prev->size[0] + prev->size[1] + prev->size[2]);
 }
 
 static int pose_guard_needed(const PoseRange *range, const ActorPose *now, const ActorPose *previous) {
@@ -257,16 +263,24 @@ static void pose_select(uint64_t frame, uint64_t camera, VkImage depth) {
     pose_guarded_parts += guarded;
     pose_raw_parts += raw;
     pose_rigid_parts += rigid;
-    if (frame % 120 == 0)
-        rt_log("selective motion: body %u/%u, attached equipment %u/%u matched/written; missing blocks %u, "
-               "unowned draws %u, history capacity misses %u; selected parts guarded %u, raw %u, rigid equipment %u",
-               pose_seen[1], pose_written[1], pose_seen[2], pose_written[2], pose_missing, pose_unowned, pose_full,
-               pose_guarded_parts, pose_raw_parts, pose_rigid_parts);
     static int trace = -1;
     if (trace < 0) trace = rt_knob("MOTION_POLICY_TRACE", "0");
     if (trace && (guarded || raw))
         rt_log("motion policy: world %.3f frame %llu guarded %u raw %u rigid %u depth-unavailable %u",
                frame_step_world_us() / 1e6, (unsigned long long)frame, guarded, raw, rigid, missing_depth);
+}
+
+// The motion status line, every 120 frames with motion vectors: the player's parts (ownership records), then the
+// other skinned draws (vk_skin_motion.inc skin_status).
+static int skin_status(char *out, size_t cap);
+static void pose_status(uint64_t frame) {
+    if (frame % 120) return;
+    char skinned[1200];
+    skin_status(skinned, sizeof skinned);
+    rt_log("selective motion: body %u/%u, attached equipment %u/%u matched/written; missing blocks %u, "
+           "unowned draws %u, history capacity misses %u; selected parts guarded %u, raw %u, rigid equipment %u%s",
+           pose_seen[1], pose_written[1], pose_seen[2], pose_written[2], pose_missing, pose_unowned, pose_full,
+           pose_guarded_parts, pose_raw_parts, pose_rigid_parts, skinned);
 }
 
 static void pose_shutdown(void) {

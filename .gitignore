@@ -20,6 +20,10 @@ __pycache__/
 # The shared pipeline list a release carries (tools/pipeline_list.py merge; tools/prepare_shaders.py reads it here)
 /tools/data/pipeline_list.bin
 /data/pipeline_list.bin
+# Execution profiles of the game's code (tools/pgo.py merge writes them under build/; a release carries one in data/)
+*.profdata
+*.profraw
+/data/pgo-*.json
 *.xci
 *.xcz
 *.nsp

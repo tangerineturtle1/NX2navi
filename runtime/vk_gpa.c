@@ -19,8 +19,11 @@
 // writes (vk_exec_draw.c ssbo_info), so with the mirror alone the CPU never saw them, and a sync of a page the CPU wrote
 // copied the stale guest page over them. The game's compute passes write tree and foliage records this way, and a
 // record overwritten so drew a tree stretched into a column reaching the sky (Hyrule Field, Kakariko, Death Mountain).
-// A record a page entry names is never written: a new mapping takes a new record, and a record goes back to the free
-// list only once the GPU finished every submission issued while a page could still name it (vk_completion_add). Page
+// A record a page entry names is never written by the CPU: a new mapping takes a new record, and a record goes back
+// to the free list only once the GPU finished every submission issued while a page could still name it
+// (vk_completion_add). The one write to a record in use is the GPU's own, in queue order, when a pool's new mirror
+// takes its record over (vk_gpa_flip_cmd): what was queued before it reads the old addresses, what comes after it
+// the new ones. Page
 // and L1 entries are single 32-bit stores, so a shader that reads the table while it changes sees the old mapping or
 // the new one, never half of each. The CPU keeps a copy (shadow) for its reads: the GPU copy is often device memory
 // behind the PCIe BAR, slow to read back.
@@ -110,7 +113,8 @@ static int create(void) {
     G.free_recs = malloc(RECS * sizeof *G.free_recs);
     if (!G.cpu || !G.free_recs) return 0;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)WORDS * 4,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,   // vk_gpa_flip_cmd
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
                                   .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VmaAllocationInfo info;
@@ -319,20 +323,20 @@ void vk_gpa_clear(uint64_t lo, uint64_t hi) {
     blocks_release(p0, p1);
 }
 
-static uint32_t remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo, int keep_twin) {
-    if (!vk_gpa_on() || !buf) return old_rec;
-    uint64_t dev = vk_gpa_device_address(buf);
-    uint64_t p0 = (lo + 4095) >> PAGE_SHIFT, p1 = hi >> PAGE_SHIFT;
-    plat_mutex_lock(&gpa_lock);
-    // the twin: the buffer the pages named before (the pool's imported buffer), so writes reach guest memory too.
-    // NX2NAVI_GPA_TWIN=0 (diagnosis): no twin, the writes go to the mirror alone, as before patch 0034.
+// NX2NAVI_GPA_TWIN=0 (diagnosis): no twin, the writes go to the mirror alone, as before patch 0034.
+static int twins_on(void) {
     static int twins = -1;
     if (twins < 0) { const char *e = cfg_get("NX2NAVI_GPA_TWIN"); twins = !(e && !strcmp(e, "0")); }
-    uint64_t twin = old_rec && twins && keep_twin ? (uint64_t)G.cpu[REC_WORD + old_rec * REC_WORDS] |
-                                                        (uint64_t)G.cpu[REC_WORD + old_rec * REC_WORDS + 1] << 32
-                                                  : dev - buf_lo;
-    uint32_t r = dev ? rec_alloc(dev - buf_lo, twin) : 0;
-    if (!r) { plat_mutex_unlock(&gpa_lock); return old_rec; }
+    return twins;
+}
+
+// gpa_lock held: the first address of record rec (the buffer its pages read).
+static uint64_t rec_first(uint32_t rec) {
+    return (uint64_t)G.cpu[REC_WORD + rec * REC_WORDS] | (uint64_t)G.cpu[REC_WORD + rec * REC_WORDS + 1] << 32;
+}
+
+// gpa_lock held: the pages of [p0, p1) that name old_rec (or none) name r from here on.
+static void pages_move(uint64_t p0, uint64_t p1, uint32_t old_rec, uint32_t r) {
     for (uint64_t p = p0; p < p1; p++) {
         uint32_t w = page_word(p, 1);
         if (!w) {
@@ -342,9 +346,49 @@ static uint32_t remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, 
         }
         if (!G.cpu[w] || G.cpu[w] == old_rec) page_put(w, r);
     }
+}
+
+static uint32_t remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo, int keep_twin) {
+    if (!vk_gpa_on() || !buf) return old_rec;
+    uint64_t dev = vk_gpa_device_address(buf);
+    uint64_t p0 = (lo + 4095) >> PAGE_SHIFT, p1 = hi >> PAGE_SHIFT;
+    plat_mutex_lock(&gpa_lock);
+    // the twin: the buffer the pages named before (the pool's imported buffer), so writes reach guest memory too.
+    uint64_t twin = old_rec && twins_on() && keep_twin ? rec_first(old_rec) : dev - buf_lo;
+    uint32_t r = dev ? rec_alloc(dev - buf_lo, twin) : 0;
+    if (!r) {   // no record left: the pages keep the old one, and the caller its number
+        static int said;
+        plat_mutex_unlock(&gpa_lock);
+        if (!said++)
+            rt_log("vk_gpa: WARNING: no record left for a buffer that takes over %llu pages (%u records in all): they "
+                   "keep naming the buffer they named", (unsigned long long)(p1 > p0 ? p1 - p0 : 0), RECS - 1);
+        return old_rec;
+    }
+    pages_move(p0, p1, old_rec, r);
     plat_mutex_unlock(&gpa_lock);
     if (old_rec) vk_completion_add(vk_sync_issued() + 1, rec_free_cb, (void *)(uintptr_t)old_rec);
     return r;
+}
+
+// Records into cb the store that hands record rec over to buf, a pool's new VRAM mirror: from that point of the queue
+// on the pages that name rec read buf, and their twin is the buffer they read until then (keep_twin, with twins on) or
+// buf again. A change of the table made on the CPU is seen at once by every shader still running, the ones queued
+// before the mirror's first copy included, which would then read or write the mirror before anything had filled it;
+// this store runs where the command stands, after that copy (vk_memory.c vk_mem_mirror_prologue). The caller puts
+// barriers around it. No new record is taken, so there is none to run out of. The shadow takes the new words now:
+// the CPU never reads a record's addresses back for a record handed over this way. 0 when nothing was recorded.
+int vk_gpa_flip_cmd(VkCommandBuffer cb, uint32_t rec, VkBuffer buf, uint64_t buf_lo, int keep_twin) {
+    if (!rec || !buf || !vk_gpa_on()) return 0;
+    uint64_t dev = vk_gpa_device_address(buf);
+    if (!dev) return 0;
+    uint32_t at = REC_WORD + rec * REC_WORDS, w[REC_WORDS];
+    plat_mutex_lock(&gpa_lock);
+    uint64_t first = dev - buf_lo, twin = keep_twin && twins_on() ? rec_first(rec) : first;
+    w[0] = (uint32_t)first, w[1] = (uint32_t)(first >> 32), w[2] = (uint32_t)twin, w[3] = (uint32_t)(twin >> 32);
+    memcpy(G.cpu + at, w, sizeof w);
+    plat_mutex_unlock(&gpa_lock);
+    vkCmdUpdateBuffer(cb, G.buf, (VkDeviceSize)at * 4, sizeof w, w);
+    return 1;
 }
 
 uint32_t vk_gpa_remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo) {
@@ -353,6 +397,21 @@ uint32_t vk_gpa_remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, 
 
 uint32_t vk_gpa_remap_plain(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo) {
     return remap(lo, hi, old_rec, buf, buf_lo, 0);
+}
+
+// --probe-vkmem: what the table's own memory, as the GPU has it, resolves addr to: the device address a shader reads
+// there and the one it writes as well. 0 when no page maps addr. Slow (the table may be device memory), and only
+// meaningful with no submission in flight.
+int vk_gpa_probe(uint64_t addr, uint64_t *first, uint64_t *twin) {
+    if (G.state <= 0 || addr >> 40) return 0;
+    vmaInvalidateAllocation(vk_ctx()->vma, G.alloc, 0, VK_WHOLE_SIZE);
+    uint32_t blk = G.gpu[L1_WORD + (addr >> 24)];
+    uint32_t rec = blk ? G.gpu[L2_WORD + blk * L2_N + ((addr >> PAGE_SHIFT) & (L2_N - 1))] : 0;
+    if (!rec) return 0;
+    const volatile uint32_t *r = G.gpu + REC_WORD + rec * REC_WORDS;
+    *first = ((uint64_t)r[0] | (uint64_t)r[1] << 32) + addr;
+    *twin = ((uint64_t)r[2] | (uint64_t)r[3] << 32) + addr;
+    return 1;
 }
 
 void vk_gpa_report(void) {

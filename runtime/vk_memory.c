@@ -8,13 +8,18 @@
 // users. Virtual pools are a GPU-side page table
 // over device-local memory and dirty pages come from GetWriteWatch (mem_written_pages), so neither host VM aliasing
 // nor page protection (a fault handler) is needed.
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
+#include "flight.h"
 #include "gfx.h"
 #include "host.h"
+#include "logq.h"
+#include "mem_budget.h"
+#include "mem_growth.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
@@ -47,6 +52,7 @@ typedef struct PoolRec {
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
+    struct Span *span;                 // POOL_IMPORT as a dma-buf: the span whose memory buf is bound to ("dma-buf imports")
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
@@ -59,6 +65,8 @@ typedef struct PoolRec {
     // VRAM mirror (POOL_IMPORT, "VRAM mirror" below). mstate and mbuf change on the replay thread only.
     uint8_t mstate;                    // MS_NONE until the first buffer use, then MS_ON or MS_REFUSED
     uint32_t gpa_rec;                  // POOL_IMPORT: its record in the device address table (vk_gpa.c), 0 none
+    uint8_t gpa_flip;                  // as pend: the next prologue records the store that hands its table record to
+                                       // the mirror (gpa_flip_cmds); 0 when the table names the mirror, or none exists
     struct GpaMap { uint64_t lo, hi; uint32_t rec; } *vmaps;   // POOL_VIRT: its mapped ranges in the table
     int nvmaps, cvmaps;
     VkBuffer mbuf;                     // MS_ON: device-local copy of [import_lo, import_hi), same offsets as buf
@@ -158,9 +166,310 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     return -1;
 }
 
-// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+// ---------------------------------------------------------------- dma-buf imports
+// Where guest memory is a memfd's (Linux, NX2NAVI_DMABUF, on by default: platform/linux.c "Guest memory as a memfd's"), a
+// CPU-visible pool is imported as a dma-buf of its own pages, not as a host pointer and not as a shadow copy. It keeps
+// what an import is to the rest of this file (the GPU's writes are in guest memory once the GPU has made them, the
+// device address table's twin is guest memory, mirrors sync from it and write back into it), without amdgpu's costs
+// for host pointers: those are userptr objects, which the kernel looks up page by page at every submission and
+// invalidates whenever the write watch or a freeze re-protects their pages (about 0.2 frames a second in Kokiri
+// Forest), which is why Linux had shadow storage. A dma-buf's pages are pinned once and the process's page tables
+// never matter to it again: the write watch, the freezes and the lazy write-back's armed pages leave the GPU alone.
+// RADV puts every imported memory object in every submission, at about 0.6 us each (RX 6800 XT, Linux 7.3, Mesa 26.2:
+// 2.6 ms a vkQueueSubmit with 4096 of them, 0.04 ms with 64), and the game keeps over 4,000 pools, so a pool does not
+// get a dma-buf of its own: guest addresses are cut into aligned spans of NX2NAVI_DMABUF_MB (64 by default), the first
+// pool made in a span imports the span's dma-buf, and every pool is a buffer bound into the memory of a span that holds
+// it, at its offset. A pool that no span holds gets a new one over the aligned range around it, cut back at the spans
+// already there (span_get): spans overlap only where such a pool itself lies in an older span, because every span's
+// pages count in amdgpu's GTT use (an overlap twice) and stay pinned. A span whose
+// last pool is gone stays SPAN_KEEP frames for the pools the game makes again at the same addresses, then is freed
+// (span_gc); its dma-buf goes with the memory.
+// A new span pins its pages: about 13 us per MiB the game had touched and 260 us per MiB it had not, which are
+// allocated then (the same RX 6800 XT machine), so a 64 MiB span costs 1-17 ms once. A span over udmabuf's size limit
+// (/sys/module/udmabuf/parameters/size_limit_mb) is not made; such a pool, or one outside the memfd, falls back to a
+// host-pointer import, which a shared mapping's pages refuse on RADV: it gets no GPU buffer (logged).
+typedef struct Span { uint64_t lo, hi; VkDeviceMemory mem; int32_t refs; uint64_t idle_frame; } Span;
+#define SPAN_KEEP 600
+static int dmabuf_on;                  // mirror_mode
+static int dmabuf_exts;                // vk_mem_dmabuf_caps: the device has VK_KHR_external_memory_fd and _dma_buf
+static uint64_t dmabuf_limit;          // udmabuf's size limit, bytes
+static uint64_t span_size = 64ull << 20;
+static PlatMutex span_lock = PLAT_MUTEX_INIT;   // after pool_lock
+static Span **spans;                   // span_lock
+static int nspans, cspans;
+static uint32_t dmabuf_type = UINT32_MAX;   // span_lock: the memory type of the imports, asked at the first one
+static PFN_vkGetMemoryFdPropertiesKHR p_fd_props;
+static int64_t sp_live_bytes;          // span_lock
+static uint64_t sp_made, sp_made_bytes, sp_ns, sp_max_ns, sp_freed, sp_freed_bytes, sp_fail, sp_fallback;   // span_lock, since the log
+static uint64_t sp_fail_all;           // span_lock
+static volatile uint64_t span_frame;   // the frame vk_mem_census last saw
+#ifdef _WIN32
+static void dmabuf_close(int fd) { (void)fd; }
+#else
+#include <unistd.h>
+static void dmabuf_close(int fd) { close(fd); }
+#endif
+
+void vk_mem_dmabuf_caps(int exts) { dmabuf_exts = exts; }
+int vk_mem_dmabuf_on(void) { return dmabuf_on; }
+
+// The memory type of the imports, from the types the driver offers for the dma-buf fd: cached where offered, as guest
+// memory is to the CPU (RADV: the GPU snoops it); not one of AMD's device-coherent or device-uncached types, which the
+// third pass takes only when nothing else is offered. Sets dmabuf_type (UINT32_MAX: none fits); returns the offer.
+static uint32_t dmabuf_pick_type(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int fd) {
+    if (!p_fd_props) p_fd_props = (PFN_vkGetMemoryFdPropertiesKHR)vk_dpa(dev, "vkGetMemoryFdPropertiesKHR");
+    VkMemoryFdPropertiesKHR fp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    uint32_t bits = p_fd_props && p_fd_props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS
+                        ? fp.memoryTypeBits : 0;
+    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    dmabuf_type = UINT32_MAX;
+    for (int w = 0; w < 3 && dmabuf_type == UINT32_MAX; w++)
+        for (uint32_t i = 0; i < mp->memoryTypeCount && dmabuf_type == UINT32_MAX; i++) {
+            VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+            if ((bits >> i & 1) && (w == 0 ? f == (hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : w == 1 ? f == hv : (f & hv) == hv))
+                dmabuf_type = i;
+        }
+    rt_log("mem: dma-bufs of guest memory may have memory types %#x; type %d taken", bits,
+           dmabuf_type == UINT32_MAX ? -1 : (int)dmabuf_type);
+    return bits;
+}
+
+static uint64_t dmabuf_any;            // a page of guest memory a dma-buf can be made of (vk_mem_dmabuf_probe)
+
+// After device creation, before the first pool and before anything asks for the storage mode (vk_mem_lazy_decide): one
+// page of guest memory is made a dma-buf, imported and bound to a buffer, as every pool will be. Any step refused turns
+// the dma-buf imports off for the run: the pools are shadow copies, as with NX2NAVI_DMABUF=0. A refusal later, for
+// one span, leaves its pools without a GPU buffer (span_log counts them), so the probe asks once for what all need.
+static int s_learn, s_check;
+void vk_mem_dmabuf_probe(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, int bda) {
+    if (!dmabuf_on) return;
+    const char *no = NULL;
+    long err = 0;
+    uint32_t bits = 0;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    int fd = plat_mem_dmabuf(dmabuf_any, 4096);
+    if (fd < 0) {
+        no = "udmabuf refused a dma-buf of guest memory", err = errno;
+    } else if (bits = dmabuf_pick_type(dev, mp, fd), dmabuf_type == UINT32_MAX) {
+        no = "the device offers no host-visible coherent memory type for it";
+        dmabuf_close(fd);
+    } else {
+        VkImportMemoryFdInfoKHR im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+        VkMemoryAllocateFlagsInfo fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = bda ? (void *)&fi : (void *)&im,
+                                   .allocationSize = 4096, .memoryTypeIndex = dmabuf_type};
+        VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = 4096,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                          (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+                                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkMemoryRequirements req;
+        VkResult r = vkAllocateMemory(dev, &ai, NULL, &mem);
+        if (r != VK_SUCCESS) {
+            mem = VK_NULL_HANDLE;
+            dmabuf_close(fd);   // a failed import leaves the descriptor with us
+            no = "the device refused to import it", err = r;
+        } else if ((r = vkCreateBuffer(dev, &bi, NULL, &buf)) != VK_SUCCESS) {
+            buf = VK_NULL_HANDLE;
+            no = "no buffer for it", err = r;
+        } else if (vkGetBufferMemoryRequirements(dev, buf, &req), !(req.memoryTypeBits >> dmabuf_type & 1)) {
+            no = "a buffer cannot be bound to its memory type", err = (long)req.memoryTypeBits;
+        } else if ((r = vkBindBufferMemory(dev, buf, mem, 0)) != VK_SUCCESS) {
+            no = "binding a buffer to it failed", err = r;
+        }
+    }
+    if (buf) vkDestroyBuffer(dev, buf, NULL);
+    if (mem) vkFreeMemory(dev, mem, NULL);
+    if (fd >= 0) plat_mem_dmabuf_done(dmabuf_any, 4096);
+    if (!no) return;
+    dmabuf_on = 0, shadow_on = 1;
+    s_learn = rt_knob("SHADOW_TABLE_STORES", "0") == 1;
+    s_check = cfg_bool("NX2NAVI_SHADOW_CHECK");
+    rt_log("mem: dma-buf imports off: %s (%ld; memory types %#x): CPU-visible pools are host-visible copies of guest "
+           "memory (shadow storage), as with NX2NAVI_DMABUF=0", no, err, bits);
+}
+
+static void span_fail(const char *what, uint64_t lo, uint64_t hi, long err) {   // span_lock held
+    sp_fail++;
+    if (++sp_fail_all <= 8)
+        rt_log("mem: dma-buf of %#llx+%#llx: %s (%ld)%s", (unsigned long long)lo, (unsigned long long)(hi - lo), what, err,
+               sp_fail_all == 8 ? "; no more of these lines" : "");
+}
+
+// span_lock held: a new span over [lo, hi), NULL when udmabuf or the import refuses it.
+static Span *span_create(VkCtx *c, uint64_t lo, uint64_t hi) {
+    uint64_t t0 = qpc();
+    int fd = plat_mem_dmabuf(lo, hi - lo);
+    if (fd < 0) {
+        span_fail("udmabuf refused it", lo, hi, errno);
+        return NULL;
+    }
+    if (dmabuf_type == UINT32_MAX) {   // every dma-buf of guest memory has the same types: asked once
+        dmabuf_pick_type(c->device, &c->mem_props, fd);
+        if (dmabuf_type == UINT32_MAX) {
+            dmabuf_close(fd);
+            plat_mem_dmabuf_done(lo, hi - lo);
+            span_fail("no host-visible coherent memory type", lo, hi, 0);
+            dmabuf_type = UINT32_MAX - 1;   // not asked again: every span fails
+            return NULL;
+        }
+    }
+    if (dmabuf_type >= c->mem_props.memoryTypeCount) {
+        dmabuf_close(fd);
+        plat_mem_dmabuf_done(lo, hi - lo);
+        return NULL;
+    }
+    VkImportMemoryFdInfoKHR im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                  .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+    // A buffer with device address usage needs memory allocated for device addresses (vk_gpa.c).
+    VkMemoryAllocateFlagsInfo fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = vk_gpa_wanted() ? (void *)&fi : (void *)&im, .allocationSize = hi - lo,
+                               .memoryTypeIndex = dmabuf_type};
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult res = vkAllocateMemory(c->device, &ai, NULL, &mem);
+    Span *s = res == VK_SUCCESS ? calloc(1, sizeof *s) : NULL;
+    if (!s) {
+        if (res == VK_SUCCESS) vkFreeMemory(c->device, mem, NULL);
+        else dmabuf_close(fd);   // a failed import leaves the descriptor with us; a successful one took it
+        plat_mem_dmabuf_done(lo, hi - lo);
+        span_fail("the import failed", lo, hi, res);
+        return NULL;
+    }
+    s->lo = lo, s->hi = hi, s->mem = mem;
+    if (nspans == cspans) grow((void **)&spans, &cspans, sizeof *spans);
+    spans[nspans++] = s;
+    uint64_t ns = qpc() - t0;
+    sp_made++, sp_made_bytes += hi - lo, sp_ns += ns, sp_live_bytes += (int64_t)(hi - lo);
+    if (ns > sp_max_ns) sp_max_ns = ns;
+    return s;
+}
+
+// span_lock held: the span a pool's [lo, hi) is bound into, with a reference for it; NULL when none can be made. al is
+// the alignment the pool's buffer needs inside the span's memory.
+// A new span covers the span_size-aligned range around the pool, less what other spans hold below and above the pool:
+// a pool across an edge of an older span then pins only its own pages twice, not the older span's whole range. With
+// the whole aligned range, Hyrule Field's area loads left 11.5-11.7 GiB of spans counted in amdgpu's GTT use; cut back,
+// 9.5-9.6 GiB, over the same 9.3 GiB of distinct pages, at the same frame rate (RX 6800 XT, 2 pairs).
+static Span *span_get(VkCtx *c, uint64_t lo, uint64_t hi, uint64_t al) {
+    Span *best = NULL;
+    for (int i = 0; i < nspans; i++)
+        if (spans[i]->lo <= lo && hi <= spans[i]->hi && (!best || spans[i]->hi - spans[i]->lo > best->hi - best->lo))
+            best = spans[i];
+    if (!best) {
+        uint64_t a = lo / span_size * span_size, b = (hi + span_size - 1) / span_size * span_size;
+        for (int i = 0; i < nspans; i++) {   // no span holds [lo, hi): none reaches below lo and above hi at once
+            const Span *s = spans[i];
+            if (s->lo < lo && s->hi > a) a = s->hi < lo ? s->hi : lo;
+            if (s->hi > hi && s->lo < b) b = s->lo > hi ? s->lo : hi;
+        }
+        if (al > 1) a = lo - (lo - a) / al * al;   // the pool's offset in the span a multiple of al
+        if (b - a <= dmabuf_limit) best = span_create(c, a, b);
+        // the aligned range may leave the memfd's reservation: the pool's own pages then
+        if (!best && (a != lo || b != hi) && hi - lo <= dmabuf_limit) best = span_create(c, lo, hi);
+    }
+    if (best) best->refs++;
+    return best;
+}
+
+static void span_put(Span *s) {
+    plat_mutex_lock(&span_lock);
+    if (!--s->refs) s->idle_frame = __atomic_load_n(&span_frame, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&span_lock);
+}
+
+// Frees the spans no pool has used for SPAN_KEEP frames (all: every span without a pool). A span without a reference
+// is out of the GPU's work: a pool's reference goes when its record is destroyed, after the GPU is done with it.
+static void span_gc(uint64_t frame, int all) {
+    VkCtx *c = vk_ctx();
+    if (!c || !dmabuf_on) return;
+    Span *gone[64];
+    int ng;
+    do {
+        ng = 0;
+        plat_mutex_lock(&span_lock);
+        for (int i = 0; i < nspans && ng < 64;)
+            if (!spans[i]->refs && (all || frame - spans[i]->idle_frame >= SPAN_KEEP)) {
+                gone[ng++] = spans[i];
+                sp_freed++, sp_freed_bytes += spans[i]->hi - spans[i]->lo;
+                sp_live_bytes -= (int64_t)(spans[i]->hi - spans[i]->lo);
+                spans[i] = spans[--nspans];
+            } else {
+                i++;
+            }
+        plat_mutex_unlock(&span_lock);
+        for (int i = 0; i < ng; i++) {   // the dma-buf goes with the memory; then its pages are let go
+            vkFreeMemory(c->device, gone[i]->mem, NULL);
+            plat_mem_dmabuf_done(gone[i]->lo, gone[i]->hi - gone[i]->lo);
+            free(gone[i]);
+        }
+    } while (ng == 64);
+}
+
+static void span_log(uint64_t frame) {
+    if (!dmabuf_on) return;
+    plat_mutex_lock(&span_lock);
+    int64_t refs = 0;
+    for (int i = 0; i < nspans; i++) refs += spans[i]->refs;
+    rt_log("mem: dma-buf spans at frame %llu: %d live, %.0f MiB, %lld pools in them; since the last line %llu made "
+           "(%.0f MiB, %.1f ms, the longest %.1f ms), %llu freed (%.0f MiB), %llu refused, %llu pools left out",
+           (unsigned long long)frame, nspans, sp_live_bytes / 1048576.0, (long long)refs, (unsigned long long)sp_made,
+           sp_made_bytes / 1048576.0, qpc_ms(sp_ns), qpc_ms(sp_max_ns), (unsigned long long)sp_freed,
+           sp_freed_bytes / 1048576.0, (unsigned long long)sp_fail, (unsigned long long)sp_fallback);
+    sp_made = sp_made_bytes = sp_ns = sp_max_ns = sp_freed = sp_freed_bytes = sp_fail = sp_fallback = 0;
+    plat_mutex_unlock(&span_lock);
+}
+
+// A pool's buffer bound into a span's memory; 0 when no span can be made for it.
+static int import_dmabuf(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    r->import_lo = addr & ~0xfffull;
+    r->import_hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t n = r->import_hi - r->import_lo;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = n,
+                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkResult res = vkCreateBuffer(c->device, &bi, NULL, &r->buf);
+    if (res != VK_SUCCESS) {
+        r->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(c->device, r->buf, &req);
+    uint64_t need = ((req.size > n ? req.size : n) + 0xfff) & ~0xfffull;
+    plat_mutex_lock(&span_lock);
+    Span *s = span_get(c, r->import_lo, r->import_lo + need, req.alignment);
+    int ok = s && (r->import_lo - s->lo) % (req.alignment ? req.alignment : 1) == 0 && (req.memoryTypeBits >> dmabuf_type & 1);
+    if (!s) sp_fallback++;
+    plat_mutex_unlock(&span_lock);
+    if (ok && (res = vkBindBufferMemory(c->device, r->buf, s->mem, r->import_lo - s->lo)) != VK_SUCCESS) ok = 0;
+    if (!ok) {
+        if (s) {
+            rt_log("vk: pool %#llx+%#llx: binding into its dma-buf span failed (alignment %llu, types %#x, %d)",
+                   (unsigned long long)addr, (unsigned long long)size, (unsigned long long)req.alignment,
+                   req.memoryTypeBits, (int)res);
+            span_put(s);
+        }
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        r->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    r->span = s;
+    plat_inc32(&n_imports);
+    return 1;
+}
+
+// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host, or a
+// dma-buf of them: "dma-buf imports" above).
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
+    if (dmabuf_on && import_dmabuf(c, r, addr, size)) return 1;
     if (!p_host_props)
         p_host_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vk_dpa(c->device, "vkGetMemoryHostPointerPropertiesEXT");
     uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
@@ -295,6 +604,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->span) span_put(r->span);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
@@ -357,7 +667,7 @@ static int pool_init(pool_t *p) {
     // The imported pages, or the shadow that stands for them, go into the device address table: shaders that read a
     // pointer from memory reach them there. A shadow in the table is kept up to date for the table's readers whether
     // or not the replay resolves it (vk_mem_shadow_sync).
-    if (r->kind == POOL_IMPORT && (r->mem || r->smap) && r->buf && r->import_hi > r->import_lo) {
+    if (r->kind == POOL_IMPORT && (r->mem || r->span || r->smap) && r->buf && r->import_hi > r->import_lo) {
         r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
         if (r->smap && r->gpa_rec) shadow_table_add(r);
     }
@@ -658,6 +968,10 @@ static int shadow_check_on(void);
 static int dead_pending(void);
 
 static void vram_log(uint64_t frame);
+#define HOLES_PERIOD 3600   // frames between two "mem: holes" lines (holes_log)
+static void holes_log(uint64_t frame);
+static void owner_log(uint64_t frame);   // the memory report, after the staging pool (vk_mem_give_back)
+static void compact_look(void);
 static void outside_watch(uint64_t frame);
 static void up_ts_log(uint64_t frame);
 
@@ -670,12 +984,16 @@ void vk_mem_snapshot(uint64_t frame) {
 
 void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
+    __atomic_store_n(&span_frame, frame, __ATOMIC_RELAXED);
+    if (dmabuf_on && frame % 60 == 0) span_gc(frame, 0);
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
+    if (frame && frame % ((rt_trace & RT_TRACE_PERF) ? 600 : HOLES_PERIOD) == 0) holes_log(frame), owner_log(frame);
+    if (vk_texture_compact_due()) compact_look();   // NX2NAVI_TEX_COMPACT: 0 at once with the setting off
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame), up_ts_log(frame), vk_gtl_log(frame, 60);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
-        mirror_log(frame), shadow_log(frame);   // mirror_log also logs the write-watch line
+        mirror_log(frame), shadow_log(frame), span_log(frame);   // mirror_log also logs the write-watch line
     else if (shadow_check_on() && frame % 60 == 0)
         shadow_log(frame);   // NX2NAVI_SHADOW_CHECK: the shadow lines at that rate without the perf trace
     if (frame == 1200) {   // loading is over: the first window starts here
@@ -1305,8 +1623,8 @@ static uint64_t s_wb_seen, s_wb_ticks;            // shadow_lock: bytes the fenc
 static uint64_t s_q_ticks;                        // shadow_lock: the copy-ins' write-watch queries
 static int wb_no_reup(void);
 // Pages a shader stores into through the device address table. The two switches are read in mirror_mode.
-static int s_learn;                               // NX2NAVI_SHADOW_TABLE_STORES: such pages get a base copy and a write-back
-static int s_check;                               // NX2NAVI_SHADOW_CHECK: the counts below marked "check"
+// s_learn (NX2NAVI_SHADOW_TABLE_STORES: such pages get a base copy and a write-back) and s_check (NX2NAVI_SHADOW_CHECK:
+// the counts below marked "check") are defined with vk_mem_dmabuf_probe, which may turn shadow storage on late.
 static PoolRec **tpools;                          // shadow_lock: the pools that have such pages
 static int ntpools, ctpools;
 static uint64_t s_tab_pages;                      // shadow_lock: such pages, all pools
@@ -2200,6 +2518,40 @@ static void mirror_mode(int discrete, int nvidia_own) {
     // memory (vk_gpa.c). The pools stay imports unless NX2NAVI_SHADOW asks for the copies. The open driver for the same
     // cards keeps the copies: it is not measured. The AppImage's play.sh has set the same for this driver since 0.6.0.
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !nvidia_own;
+    // Guest memory a memfd's (NX2NAVI_DMABUF, platform/linux.c): the pools are dma-buf imports ("dma-buf imports"),
+    // whatever the driver, unless NX2NAVI_SHADOW=1 asks for the copies. A device that cannot import dma-bufs keeps the
+    // copies: a shared mapping's pages are no host-pointer import on RADV.
+    uint64_t lim = 0;
+    const char *dmwhy = "";
+    static char small[200];
+    if (plat_mem_dmabuf_ok(&lim, &dmabuf_any, &dmwhy)) {
+        int forced = sh && *sh && strcmp(sh, "0");
+        // The game's largest pools take about 300 MiB, each in one dma-buf: below 1 GiB (the module's default is 64 MB)
+        // some would get none, so the copies stay.
+        if (lim < (1ull << 30))
+            snprintf(small, sizeof small, "udmabuf's size_limit_mb is %llu, below the 1024 a pool of the game may need "
+                     "(/sys/module/udmabuf/parameters/size_limit_mb)", (unsigned long long)(lim >> 20));
+        dmabuf_on = dmabuf_exts && !forced && lim >= (1ull << 30);
+        shadow_on = !dmabuf_on;
+        dmabuf_limit = lim;
+        const char *mbs = cfg_get("NX2NAVI_DMABUF_MB");
+        int mb = mbs && *mbs ? atoi(mbs) : 64;
+        span_size = (uint64_t)(mb > 0 ? mb : 64) << 20;
+        if (span_size > dmabuf_limit) span_size = dmabuf_limit & ~0xfffull;
+        if (span_size < (2ull << 20)) span_size = 2ull << 20;
+        if (dmabuf_on)
+            rt_log("mem: guest memory is a memfd's: CPU-visible pools are imported as dma-bufs of it, in spans of %llu MiB "
+                   "(NX2NAVI_DMABUF_MB; udmabuf's limit %llu MiB)", (unsigned long long)(span_size >> 20),
+                   (unsigned long long)(dmabuf_limit >> 20));
+        else
+            rt_log("mem: guest memory is a memfd's, but its pools get shadow copies: %s",
+                   forced ? "NX2NAVI_SHADOW asks for them"
+                   : !dmabuf_exts ? "the device cannot import dma-bufs (VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf)"
+                                  : small);
+    } else if (*dmwhy) {
+        rt_log("mem: guest memory is not a memfd's (NX2NAVI_DMABUF): %s: CPU-visible pools are %s, as with NX2NAVI_DMABUF=0", dmwhy,
+               shadow_on ? "host-visible copies of guest memory (shadow storage)" : "host-pointer imports");
+    }
 #endif
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
                           sh && *sh ? " (NX2NAVI_SHADOW)" : "");
@@ -2416,6 +2768,60 @@ static int twin_wanted(const PoolRec *r) {
     return !twin_max || (int64_t)(r->import_hi - r->import_lo) <= twin_max;
 }
 
+// ---- when the device address table takes up a new mirror (NX2NAVI_GPA_LATE, default 1; 0 = at once, as before)
+// A mirror is made while the replay records a part of a submission, and its first copy of the pool is in that part's
+// prologue. The table is memory the shaders read as they run, so a change of it made here, at record time, reaches
+// every part already handed to the queue (the submissions before, and the earlier parts of this one), which run
+// before that copy: they read the mirror through the table, memory nothing had written yet, and wrote into it, and on
+// a card over its budget the block was one the driver had not made resident for them. A GTX 1650 4 GB lost its device
+// that way at area loads in every session: six reports of a GPU read fault at byte 0 of a mirror made in the faulting
+// submission, each the first byte of a new 2 MiB-aligned block, with mirrors being made over the budget; with the
+// table kept empty the same routes ran without a loss.
+// So the table is not touched here. The prologue that holds the mirror's first copy also holds, right after it, a
+// store into the pool's record (vk_gpa_flip_cmd): the GPU runs it in its place in the queue, so the parts before it
+// read and write guest memory through the table as if no mirror existed, and the parts from this one on read the
+// mirror and write both. What the earlier parts wrote through the table is in guest memory when the first copy reads
+// it there (a twinned pool's first copy is always the GPU's own copy from the imported buffer, mirror_capture), so
+// the mirror misses none of it, and no shader reads through the table a state older than the one its place in the
+// queue gives it.
+static int n_gpa_flip;                 // as pend: mirrors whose record the next prologue hands over (PoolRec.gpa_flip)
+static uint64_t n_gpa_late;            // replay: records handed to their mirror in queue order, so far
+
+static int gpa_late(void);
+int vk_mem_gpa_late(void) { return gpa_late(); }   // --probe-vkmem
+
+static int gpa_late(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("GPA_LATE", "1") == 1;
+        rt_log("mem: the device address table takes up a new VRAM mirror %s (NX2NAVI_GPA_LATE)",
+               on ? "in queue order, after the mirror's first copy" : "at once, as before");
+    }
+    return on;
+}
+
+static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds,
+                     VkAccessFlags2 da);
+
+// Prologue, after the copies into the mirrors: the stores that hand the new mirrors' records over. Everything queued
+// before is done with the table before the stores run, and everything after sees them.
+static void gpa_flip_cmds(VkCommandBuffer cb) {
+    if (!n_gpa_flip) return;
+    mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+             VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    plat_mutex_lock(&pool_lock);
+    for (int i = 0; i < nm && n_gpa_flip; i++) {
+        PoolRec *r = mlist[i];
+        if (!r->gpa_flip) continue;
+        r->gpa_flip = 0, n_gpa_flip--;
+        if (r->gpa_rec && r->mbuf && vk_gpa_flip_cmd(cb, r->gpa_rec, r->mbuf, r->import_lo, r->twin)) n_gpa_late++;
+    }
+    n_gpa_flip = 0;
+    plat_mutex_unlock(&pool_lock);
+    mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+}
+
 // Replay thread: the pool's mirror on its first buffer use.
 static void mirror_create(PoolRec *r) {
     VkCtx *c = vk_ctx();
@@ -2423,8 +2829,9 @@ static void mirror_create(PoolRec *r) {
     r->mstate = MS_REFUSED;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
+    const uint64_t lo = r->lo;   // the index is searched by it again when the mirror joins the list
     plat_mutex_lock_shared(&pool_lock);
-    int i = pidx_upper(&pool_index, r->lo) - 1;
+    int i = pidx_upper(&pool_index, lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
     int alone = i >= 0 && (i == 0 || pool_index.maxhi[i - 1] <= pool_index.e[i].lo) &&
                 (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= pool_index.e[i].hi);
@@ -2498,6 +2905,17 @@ static void mirror_create(PoolRec *r) {
         return refuse(r, MR_ALLOC, why);
     }
     plat_mutex_lock(&pool_lock);
+    // The pool may have been finalized on another thread since the check above, without a mirror to forget (its state
+    // said refused meanwhile): on the list, the mirror would outlive its record and be freed twice, or never. Its
+    // buffer goes once the GPU is past the submission being recorded, which nothing of it has reached.
+    int k = pidx_upper(&pool_index, lo) - 1;
+    while (k >= 0 && pool_index.e[k].buf != r) k--;
+    if (k < 0) {
+        plat_mutex_unlock(&pool_lock);
+        vk_defer_buffer(r->mbuf, r->malloc_);
+        r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
+        return;
+    }
     if (nm == mcap) grow((void **)&mlist, &mcap, sizeof *mlist);
     int at = nm;
     while (at > 0 && mlist[at - 1]->import_lo > r->import_lo) at--;
@@ -2508,16 +2926,24 @@ static void mirror_create(PoolRec *r) {
     r->acc_sub = msub;
     r->mstate = MS_ON;
     r->asked_room = 0;
-    // The device address table names the mirror from now on: the GPU's writes go there, and the sync copies the CPU's.
-    // With a twin they also go to the imported buffer; without one (twin_wanted) the record names the mirror twice.
+    // The device address table names the mirror: the GPU's writes go there, and the sync copies the CPU's. With a
+    // twin they also go to the imported buffer; without one (twin_wanted) the record names the mirror twice. The
+    // table takes the mirror up in queue order, after its first copy (gpa_late, above).
     r->twin = (uint8_t)twin_wanted(r);
     if (!r->twin) {
         plat_inc64(&m_untwinned_n);
         plat_add64(&m_untwinned_bytes, (int64_t)n);
     }
-    if (r->gpa_rec)
+    if (r->gpa_rec && gpa_late()) {
+        plat_mutex_lock(&pool_lock);   // as mirror_forget and gpa_flip_cmds, which count it down
+        r->gpa_flip = 1, n_gpa_flip++;   // vk_mem_mirror_prologue, with the copy range_add queues below
+        plat_mutex_unlock(&pool_lock);
+    } else if (r->gpa_rec) {
+        plat_mutex_lock(&pool_lock);
         r->gpa_rec = r->twin ? vk_gpa_remap(r->import_lo, r->import_hi, r->gpa_rec, r->mbuf, r->import_lo)
                              : vk_gpa_remap_plain(r->import_lo, r->import_hi, r->gpa_rec, r->mbuf, r->import_lo);
+        plat_mutex_unlock(&pool_lock);
+    }
     range_add(&pend, &npend, &cpend, r, 0, n);
     mrep.first_n++, mrep.first_bytes += n;
     plat_inc64(&m_live_n);
@@ -2526,6 +2952,7 @@ static void mirror_create(PoolRec *r) {
 
 static void mirror_forget(PoolRec *r) {
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
+    if (r->gpa_flip) r->gpa_flip = 0, n_gpa_flip--;   // gone before its first copy: its record stays as it is
     for (int i = 0; i < nm; i++)
         if (mlist[i] == r) {
             memmove(mlist + i, mlist + i + 1, (size_t)(nm - i - 1) * sizeof *mlist);
@@ -3642,7 +4069,7 @@ void vk_mem_mirror_begin(void) {
     slow_mem_call("mirror begin (its queries and freezes)", 0, ww_bytes - b0, q, qpc() - t0);
 }
 
-int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl; }
+int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl || n_gpa_flip; }
 
 // NX2NAVI_MIRROR_CAPTURE_KB: the pages the CPU wrote since a VRAM mirror's last sync are copied out of guest memory by
 // the CPU when the part that needs them is handed to the queue, up to this many KiB a part, into a host buffer the
@@ -3769,7 +4196,7 @@ static void mirror_capture(VkCommandBuffer cb) {
 }
 
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
-    if (!npend && snl_copied == nsnl) return;
+    if (!npend && snl_copied == nsnl && !n_gpa_flip) return;
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     mirror_capture(cb);
@@ -3782,6 +4209,7 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     }
     mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
              VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    gpa_flip_cmds(cb);   // after the new mirrors' first copies
     npend = 0;
     mrep.prologues++;
 }
@@ -4054,6 +4482,9 @@ static void mirror_log(uint64_t frame) {
            "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; flushed and not copied (write-watched) %.3f MiB%s",
            (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f,
            a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M, a.flush_skipped / f / M, capl);
+    if (n_gpa_late)
+        rt_log("mem: mirror frame %llu: the device address table took up %llu mirrors in queue order, after their first "
+               "copy, so far (NX2NAVI_GPA_LATE)", (unsigned long long)frame, (unsigned long long)n_gpa_late);
 }
 
 // After vram_log: every heap's usage as the driver reports it (VK_EXT_memory_budget) beside VMA's share of it, VMA by
@@ -4092,9 +4523,9 @@ static void census_main(void *arg) {
         snprintf(path, sizeof path, "%.*svma-frame%llu.json", sl ? (int)(sl - lp) + 1 : 0, lp, (unsigned long long)j.frame);
         char *json = NULL;
         vmaBuildStatsString(j.c->vma, &json, VK_TRUE);
-        FILE *f = json ? fopen(path, "wb") : NULL;
-        int ok = f && fputs(json, f) >= 0;
-        if (f && fclose(f)) ok = 0;
+        // Through a temporary file and a rename: nobody waits for this thread when the game closes, and a map cut short
+        // there would read as a whole one
+        int ok = json && plat_file_write_cached(path, json, strlen(json));
         rt_log("mem: vma detailed map %s %s", ok ? "written to" : "not written:", path);
         if (json) vmaFreeStatsString(j.c->vma, json);
     }
@@ -4200,6 +4631,77 @@ static void vram_use_log(VkCtx *c, uint64_t frame, const VmaBudget *vb, const Vk
            (unsigned long long)frame, usage / M, blocks / M, t->bytes_live / M, t->bytes_released / M, mir / M, phys / M,
            scratch / M, held / M, allocs > known ? (allocs - known) / M : 0.0, blocks > allocs ? (blocks - allocs) / M : 0.0,
            usage > blocks ? (usage - blocks) / M : 0.0, ds);
+}
+
+// The VRAM mirrors that lie in VMA's blocks, for the texture block table (vk_texture.c "compaction"): a mirror in a
+// block keeps the block. malloc'd, *n rows; NULL with none. Read under the shared pool lock: a mirror comes onto the
+// list and leaves it, with its allocation, under the exclusive one (mirror_create, mirror_evict, mirror_forget).
+static VkBlockRow *mirror_rows(VkCtx *c, int *n) {
+    VkBlockRow *rows = NULL;
+    *n = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    if (nm) rows = malloc(sizeof *rows * (size_t)nm);
+    for (int i = 0; rows && i < nm; i++) {
+        const PoolRec *r = mlist[i];
+        if (!r->malloc_) continue;
+        VmaAllocationInfo2 ai;
+        vmaGetAllocationInfo2(c->vma, r->malloc_, &ai);
+        if (ai.dedicatedMemory) continue;   // memory of its own: in no block
+        rows[(*n)++] = (VkBlockRow){(uint64_t)(uintptr_t)ai.allocationInfo.deviceMemory, ai.blockSize,
+                                    ai.allocationInfo.size, ai.allocationInfo.memoryType};
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    return rows;
+}
+
+// NX2NAVI_TEX_COMPACT, when vk_texture_compact_due says the holes are due a look: the texture cache gets the mirrors'
+// rows, taken here because the pool lock is not to be taken under the texture lock, and plans a pass or not
+// (vk_texture.c vk_texture_compact_plan).
+static void compact_look(void) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    int n;
+    VkBlockRow *rows = mirror_rows(c, &n);
+    vk_texture_compact_plan(rows, n);
+    free(rows);
+}
+
+// Every HOLES_PERIOD frames (600 with NX2NAVI_TRACE=perf), in every run: how much of VMA's device-local blocks is
+// holes, and how much of that a compaction of the textures could give back. The first two figures are VMA's own
+// (blocks and allocations, memory of its own counted in both). The rest is of the memory type the textures use most,
+// from the block table (vk_texture.c compact_table): the blocks that hold a texture, with the textures and VRAM
+// mirrors in them; what is left of those blocks is holes and whatever else VMA placed there, which the table cannot
+// tell apart. A block at most half full by what is listed is "sparse"; when everything listed in it is a texture that
+// could be copied elsewhere or dropped (vk_tex_compact.h), emptying it gives the whole block back. That last sum is the
+// most a compaction could return now: less when such a block holds memory of another kind too.
+// Without the perf trace the vram lines above are not logged, and a player's log of a long session said nothing about
+// the holes: four traced sessions of one PC ended with 1.4 to 2.2 GiB free inside 8.3 to 9.6 GiB of blocks.
+static void holes_log(uint64_t frame) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    int n;
+    VkBlockRow *rows = mirror_rows(c, &n);
+    VkTexHoles h;
+    vk_texture_holes(rows, n, &h);
+    free(rows);
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t blocks = 0, allocs = 0;
+    for (uint32_t i = 0; i < c->mem_props.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+        if (c->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            blocks += vb[i].statistics.blockBytes, allocs += vb[i].statistics.allocationBytes;
+    const double M = 1048576.0;
+    uint64_t listed = h.tex_bytes + h.other_bytes;
+    rt_log("mem: holes frame %llu: device-local VMA blocks %.0f MiB hold %.0f MiB of allocations, %.0f MiB free inside "
+           "them; memory type %u: %u blocks with textures, %.0f MiB: textures %.0f MiB (%.0f MiB could move, %.0f MiB "
+           "be dropped%s), VRAM mirrors %.0f MiB, free or of another kind %.0f MiB; %u of them at most half full, %.0f "
+           "MiB holding %.0f MiB; %u of those, %.0f MiB, hold nothing but textures that could move (%.0f MiB) or be "
+           "dropped (%.0f MiB)", (unsigned long long)frame, blocks / M, allocs / M,
+           blocks > allocs ? (blocks - allocs) / M : 0.0, h.type, h.blocks, h.block_bytes / M, h.tex_bytes / M,
+           h.move_bytes / M, h.drop_bytes / M, h.marks ? "" : "; the texture pool's marks are not in use, so none counts "
+           "as unsampled", h.other_bytes / M, h.block_bytes > listed ? (h.block_bytes - listed) / M : 0.0, h.sparse,
+           h.sparse_bytes / M, h.sparse_listed / M, h.emptiable, h.emptiable_bytes / M, h.emptiable_move / M,
+           h.emptiable_drop / M);
 }
 
 // With NX2NAVI_TRACE=perf every 60 frames: a line when the device-local memory VMA did not allocate (vram_use_log's
@@ -4514,6 +5016,17 @@ static void free_staging(VkCtx *c, Batch *b) {
     b->bytes = 0;
 }
 
+// An upload batch holding this much staging (its buffers and arena chunks) is submitted at the outermost vk_upload_end,
+// whatever NX2NAVI_UPLOAD_BATCH_MB says (the staging pool's comment, below).
+#define STG_FLUSH (64ull << 20)
+
+// cmd_lock held: the staging bytes of batch b (its buffers and arena chunks).
+static uint64_t batch_staging(const Batch *b) {
+    uint64_t n = (uint64_t)b->nchunk * ARENA_CHUNK;
+    for (int i = 0; i < b->nstg; i++) n += b->stg[i].size;
+    return n;
+}
+
 // The cached staging buffer that fits n with the least waste: at most four times the request, so a small upload does not
 // take a block-sized buffer another upload wanted.
 static int staging_cache_take(VkCtx *c, VkDeviceSize n, Staging *out, void **map) {
@@ -4683,9 +5196,12 @@ VkCommandBuffer vk_upload_begin(void) {
     return open_b.cb;
 }
 
-// NX2NAVI_UPLOAD_BATCH_MB (256 with low_end_gpu = 1; 0, the default, = no limit): once the open batch's staging buffers hold that much, the
-// outermost vk_upload_end submits it. A save load made thousands of textures between two replay submissions, and every
-// one of them went into one batch: about 1.5 GB of raw ASTC blocks plus the decoder's work in a single submission,
+// NX2NAVI_UPLOAD_BATCH_MB (256 with low_end_gpu = 1; 0, the default, = no limit of its own): once the open batch's
+// staging buffers hold that much, the outermost vk_upload_end submits it. It does so too once the batch's staging
+// reaches STG_FLUSH, so that an area load's staging stays inside the staging pool's blocks (the staging pool's
+// comment): 0 therefore means STG_FLUSH (64 MiB), not "never", and a value above STG_FLUSH changes nothing, the
+// low-end mode's 256 and the settings menu's 128 to 1024 included. A save load made thousands of textures between two replay submissions, and every one of them went into
+// one batch: about 1.5 GB of raw ASTC blocks plus the decoder's work in a single submission,
 // which AMD's 23.10 driver on an RX 580 refused with VK_ERROR_OUT_OF_DEVICE_MEMORY. Submitted early, a batch still
 // precedes the replay submission that uses its textures (the queue keeps order), and its staging is freed as it retires.
 static uint64_t upload_cap = UINT64_MAX - 1;   // UINT64_MAX - 1: not read yet
@@ -4697,9 +5213,10 @@ void vk_upload_end(void) {
         long mb = e && *e ? atol(e) : 0;
         upload_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
         if (mb > 0) rt_log("vk: upload batches submitted early above %ld MiB of staging (NX2NAVI_UPLOAD_BATCH_MB)", mb);
-        else rt_log("vk: upload batches not limited (NX2NAVI_UPLOAD_BATCH_MB=0)");
+        else rt_log("vk: upload batches submitted early above %llu MiB of staging only, the staging pool's limit "
+                    "(NX2NAVI_UPLOAD_BATCH_MB=0)", (unsigned long long)(STG_FLUSH >> 20));
     }
-    if (open_active && open_b.bytes >= upload_cap && cmd_lock.depth == 1) {
+    if (open_active && cmd_lock.depth == 1 && (open_b.bytes >= upload_cap || batch_staging(&open_b) >= STG_FLUSH)) {
         n_early++;
         if (n_early <= 4 || !(n_early & (n_early - 1)))
             rt_log("vk: upload batch submitted early with %.0f MiB of staging in %d buffers and %d arena chunks (%llu so far)",
@@ -4743,10 +5260,90 @@ void vk_mem_oom_report(const char *what, VkResult r) {
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
 // took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
 // pool.
+// The pool's blocks are also all the staging an area load gets (stg_create). Entering Hyrule Field uploads about 3,100
+// textures (1.2 GiB) in one frame; each upload kept its staging until its batch completed, so that frame made 221 new
+// staging buffers, 1.1 GiB of new host memory. On Linux every new block is a fresh kernel allocation that asks for
+// 2-4 MiB pages first, and with the free 2 MiB blocks used up the kernel compacted memory for each: on an RX 6800 XT
+// (amdgpu, 32 GB) the load frame then took 2.4 to 4.7 s instead of 0.4, the texture thread in the kernel all along,
+// the compaction scanning millions of pages per half second. Now a load stays inside the blocks made at boot: a
+// batch whose staging reaches STG_FLUSH is submitted at the end of that upload (vk_upload_end), and a staging buffer that
+// does not fit the blocks takes the room of the kept buffers and idle arena chunks, then of the batches in flight,
+// which it waits for in order (a wait covers all the queue's work submitted ahead of that batch, tens of ms on a heavy
+// frame, with cmd_lock held). Only when none of that makes room (the open batch's own staging, staging buffers their
+// callers hold, the blocks' fragmentation) does the pool grow by a block, and the log says so.
+// A discrete GPU keeps STG_MIN_BLOCKS blocks, 256 MiB of host memory for the whole run (128 MiB up to 0.9.2); an
+// integrated one, whose host memory is the machine's RAM and where low memory ended the game before
+// (vk_mem_give_back), keeps STG_MIN_BLOCKS_UMA, 128 MiB, and its loads wait for batches sooner.
 #define STG_BLOCK (64ull << 20)
-#define STG_MIN_BLOCKS 2
+#define STG_MIN_BLOCKS 4
+#define STG_MIN_BLOCKS_UMA 2
 static VmaPool stg_pool;
 static int stg_pool_tried;
+static uint64_t stg_room_cache, stg_room_wait, stg_room_new;   // cmd_lock: how stg_create found room (rt_log below)
+static uint64_t stg_wait_ticks, stg_wait_max;                  // cmd_lock: qpc ticks stg_create waited for batches
+
+// vmaCreateBuffer of a staging buffer (*ai names stg_pool) inside the pool's blocks: when they are full, the kept
+// staging buffers and the arena's idle chunks go, then the oldest batch in flight is waited for and retired, until the
+// buffer fits. chunk: the buffer is an arena chunk, and VK_INCOMPLETE says that a retired batch gave chunks back to
+// arena_free, to take one of those instead. Without a batch to wait for (or once the device is lost) the pool grows.
+// The wait runs with cmd_lock held, and cannot leave it: the caller is inside vk_upload_begin .. vk_upload_end with
+// the open batch's command buffer in hand, and the staging buffer it asks for belongs to that batch, so letting go of
+// the lock would let another thread submit the batch under it. Meanwhile a replay submission that wants to send its
+// uploads (vk_upload_flush) waits for the lock; its own commands would queue behind the same batches, so what it
+// loses is recording time, not GPU time. How long that is on a load is not measured anywhere yet: the waits are
+// timed here and logged (the first four, then at every doubling of their count), so a played session's log says.
+static VkResult stg_create(VkCtx *c, const VkBufferCreateInfo *bi, const VmaAllocationCreateInfo *ai, VkBuffer *b,
+                           VmaAllocation *a, VmaAllocationInfo *info, int chunk) {
+    VmaAllocationCreateInfo in = *ai;
+    in.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+    plat_rmutex_lock(&cmd_lock);
+    VkResult r;
+    for (;;) {
+        if ((r = vmaCreateBuffer(c->vma, bi, &in, b, a, info)) == VK_SUCCESS) break;
+        if (stg_ncache || narena_free) {
+            for (int i = 0; i < stg_ncache; i++) vmaDestroyBuffer(c->vma, stg_cache[i].buf, stg_cache[i].alloc);
+            for (int i = 0; i < narena_free; i++) vmaDestroyBuffer(c->vma, arena_free[i].buf, arena_free[i].alloc);
+            stg_ncache = 0, stg_cache_bytes = 0, narena_free = 0;
+            stg_room_cache++;
+            continue;
+        }
+        if (ninflight && !vk_device_is_lost()) {
+            int before = ninflight;
+            uint64_t w0 = qpc();
+            VkResult w = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            if (w != VK_SUCCESS) {
+                vk_device_lost_check(w, "the wait for an upload batch");
+                rt_fatal("vk: the wait for an upload failed (%d)", (int)w);
+            }
+            uint64_t took = qpc() - w0;
+            stg_wait_ticks += took;
+            if (took > stg_wait_max) stg_wait_max = took;
+            retire(c, 0);
+            stg_room_wait++;
+            if (stg_room_wait <= 4 || !(stg_room_wait & (stg_room_wait - 1)))
+                rt_log("vk: a staging buffer of %.1f MiB waited %.1f ms for an upload batch to finish, with the upload "
+                       "lock held (%llu such waits so far, %.0f ms in all, the longest %.1f ms; %d batches still in "
+                       "flight). A replay submission that sends its uploads waits for that lock",
+                       bi->size / 1048576.0, qpc_ms(took), (unsigned long long)stg_room_wait, qpc_ms(stg_wait_ticks),
+                       qpc_ms(stg_wait_max), ninflight);
+            if (chunk && narena_free) {
+                r = VK_INCOMPLETE;
+                break;
+            }
+            if (ninflight < before) continue;
+        }
+        r = vmaCreateBuffer(c->vma, bi, ai, b, a, info);
+        if (r == VK_SUCCESS && stg_room_new++ < 16)
+            rt_log("vk: the staging pool grew by a block for a buffer of %.1f MiB (the open upload batch holds %.0f MiB, "
+                   "%d batches in flight; room found so far by dropping kept buffers %llu times, by waiting for a batch "
+                   "%llu times; buffers callers hold and the blocks' fragmentation also take room)",
+                   bi->size / 1048576.0, open_active ? batch_staging(&open_b) / 1048576.0 : 0.0, ninflight,
+                   (unsigned long long)stg_room_cache, (unsigned long long)stg_room_wait);
+        break;
+    }
+    plat_rmutex_unlock(&cmd_lock);
+    return r;
+}
 
 // A staging buffer the driver refused (vk_staging): the buffers kept for reuse go back to the driver before one more
 // try, with the headroom's spare blocks (vk_headroom_release): the staging cache, the arena's free chunks and the
@@ -4775,6 +5372,316 @@ uint64_t vk_mem_give_back(void) {
     return freed + vk_headroom_release();
 }
 
+// ---- The memory report past VMA's figures: every report (owner_log) adds three lines. "mem: outside VMA" follows the
+// driver's usage and budget per heap against VMA's blocks in it, so that what VMA never allocated (the driver's usage
+// less VMA's blocks) can be followed over a session, and counts what the runtime itself made outside VMA where no size
+// can be known: the driver gives none for a pipeline, a stage library or a descriptor pool (the boot stage lines,
+// vk_mem_stage_log, place their memory by difference: 1.5 GiB for the recorded pipelines on an RTX 5090); the
+// swapchain's pixels and DLSS's and FSR's figures are sizes. "mem: system" splits the process's commit by owner: the
+// game's heap and physical maps, the device-local memory on Windows (the driver charges it to the process: in a session
+// of 2026-11-13 the commit rose 4.6 GB at the first area while VMA's device-local allocations rose 3.4 GiB, and fell
+// with them later), VMA's host-visible blocks, the C runtime heap with the shares of it the runtime can name, the data
+// of the driver's pipeline caches, and the rest. "mem: growth" names what grew by more than GROWTH_STEP since the report
+// before and since the first report in play; every RANK_EVERY_NS of play and at exit (vk_mem_exit_log) "mem: growth
+// ranking" ranks every category by its growth since play began and marks those that only climbed (mem_growth.h).
+// Every figure is read at the report: sums the owners keep, walks of the pipeline, shader and texture tables under
+// their locks (a fraction of a millisecond, once a report), the C runtime heap's summary. Nothing is counted per frame.
+#define IDLE_MIN 10                              // pipelines no lookup reached for this many minutes count as unused
+#define GROWTH_STEP (64ull << 20)                // growth_take names a category that grew by more than this
+#define RANK_EVERY_NS (600ull * 1000000000ull)   // the ranking's period in play
+#define HEAP_SLOW_NS 2000000ull                  // a heap summary that took longer is not asked for again
+
+typedef struct {
+    uint64_t usage, blocks, allocs;   // the device-local heaps: the driver's usage, VMA's blocks and allocations
+    uint64_t hblocks;                 // VMA's blocks on the other heaps
+    uint64_t tex, pools, vma_other;   // VMA's device-local allocations: textures, pools (mirrors and physical), the rest
+    uint64_t heap_c, maps;            // the game's heap as committed, its physical maps
+} ReportFig;
+
+// The game's memory imported for the GPU (VK_EXT_external_memory_host): the driver counts it in a host heap's usage.
+static uint64_t import_bytes(void) {
+    uint64_t b = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *r = pool_index.e[i].buf;
+        if (r->kind == POOL_IMPORT && r->buf) b += r->import_hi - r->import_lo;
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    return b;
+}
+
+static void outside_log(VkCtx *c, uint64_t frame, const VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp,
+                        const VmaBudget *vb, const VkPipeMem *pm) {
+    const double M = 1048576.0;
+    char line[2000];
+    size_t k = 0;
+    mg_put(line, sizeof line, &k, "mem: outside VMA frame %llu: by heap, the driver's usage of its budget, VMA's blocks "
+           "in it and the rest:", (unsigned long long)frame);
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        uint64_t use = c->has_memory_budget ? bp->heapUsage[h] : vb[h].usage;
+        uint64_t budget = c->has_memory_budget ? bp->heapBudget[h] : vb[h].budget, vma = vb[h].statistics.blockBytes;
+        mg_put(line, sizeof line, &k, "%s heap %u (%s) %.0f of %.0f MiB, VMA's blocks %.0f, outside VMA %.0f", h ? ";" : "",
+               h, c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device-local" : "host",
+               use / M, budget / M, vma / M, use > vma ? (use - vma) / M : 0.0);
+    }
+    uint64_t imp = import_bytes();
+    if (imp) mg_put(line, sizeof line, &k, " (the game's memory imported for the GPU, %.0f MiB, is in the host heaps' rest)",
+                    imp / M);
+    if (!c->has_memory_budget)
+        mg_put(line, sizeof line, &k, " (VMA's own estimates: without VK_EXT_memory_budget nothing outside VMA shows)");
+    mg_put(line, sizeof line, &k, ". Made outside VMA, counted where the driver gives no size: graphics pipelines %llu "
+           "(whole %llu, fast-linked %llu, optimised after a fast link %llu; no draw for %u minutes %llu, none in this run "
+           "%llu; building or failed %llu), stage libraries %llu (vertex input %llu, pre-rasterization %llu, fragment "
+           "shader %llu, fragment output %llu), compute pipelines %llu (no dispatch for %u minutes %llu, none in this run "
+           "%llu), pipeline layouts %llu", (unsigned long long)pm->gfx, (unsigned long long)pm->gfx_whole,
+           (unsigned long long)pm->gfx_fast, (unsigned long long)pm->gfx_opt, pm->idle_min,
+           (unsigned long long)pm->gfx_idle, (unsigned long long)pm->gfx_never, (unsigned long long)pm->gfx_none,
+           (unsigned long long)(pm->lib[0] + pm->lib[1] + pm->lib[2] + pm->lib[3]), (unsigned long long)pm->lib[0],
+           (unsigned long long)pm->lib[1], (unsigned long long)pm->lib[2], (unsigned long long)pm->lib[3],
+           (unsigned long long)pm->comp, pm->idle_min, (unsigned long long)pm->comp_idle,
+           (unsigned long long)pm->comp_never, (unsigned long long)pm->layouts);
+    VkDescMem dm;
+    vk_exec_desc_mem(&dm);
+    mg_put(line, sizeof line, &k, "; descriptor pools %llu of %llu sets each (%llu of them spare), the texture pool's %llu "
+           "sets", (unsigned long long)dm.pools, (unsigned long long)dm.sets_each, (unsigned long long)dm.spare,
+           (unsigned long long)dm.tex_sets);
+    uint32_t sn, sw, sh;
+    uint64_t sb;
+    vk_present_swapchain_mem(&sn, &sw, &sh, &sb);
+    mg_put(line, sizeof line, &k, "; the swapchain %u images of %ux%u, %.0f MiB of pixels", sn, sw, sh, sb / M);
+    int64_t dlss = vk_dlaa_vram();
+    int nfsr = 0;
+    uint64_t fg = 0, fsr = vk_ffx_vram(&nfsr, &fg);
+    if (dlss >= 0) mg_put(line, sizeof line, &k, "; DLSS %.0f MiB", dlss / M);
+    else mg_put(line, sizeof line, &k, "; DLSS reports nothing");
+    mg_put(line, sizeof line, &k, "; FSR upscaling %.0f MiB in %d contexts, FSR frame generation %.0f MiB (DLSS frame "
+           "generation gives no size)", fsr / M, nfsr, fg / M);
+    rt_log("%s", line);
+}
+
+// The figures of system_log that the growth bookkeeping follows.
+typedef struct { uint64_t commit, crt, shaders, pipes, texhost, pcache, other; } SysFig;
+
+static void system_log(uint64_t frame, const ReportFig *f, const VkPipeMem *pm, SysFig *out) {
+    const double M = 1048576.0;
+    uint64_t res, priv;
+    plat_process_memory(&res, &priv);
+    // The C runtime heap's summary holds the heap's lock while it adds up: asked at the report only, and no more once
+    // one was slow, so that a heap grown past what the summary handles quickly does not hold every malloc up again.
+    static int heap_off;
+    PlatHeapInfo hi = {0};
+    if (!heap_off) {
+        uint64_t t0 = plat_now_ns();
+        plat_heap_info(&hi);
+        uint64_t took = plat_now_ns() - t0;
+        if (took > HEAP_SLOW_NS)
+            heap_off = 1, rt_log("mem: the C runtime heap's summary took %.1f ms; it is not asked for again in this run",
+                                 took / 1e6);
+    }
+    GfxShaderRam sr;
+    gfx_shader_ram(&sr);
+    VkTexHost th;
+    vk_texture_host(&th);
+    uint64_t frec, fthumb;
+    flight_mem(&frec, &fthumb);
+    uint64_t lq = logq_bytes();
+    uint64_t shaders = sr.cache + sr.use + sr.pack + sr.records;
+    // The shaders' SPIR-V as held (gfx_shader.c "SPIR-V at rest"): against what it would be uncompressed, how many
+    // shaders hold it compressed alone, and the decodes readers' pins made, those on the drawing threads apart.
+    char spv[400];
+    if (sr.compress > 0)
+        snprintf(spv, sizeof spv, " (their SPIR-V %.0f, uncompressed %.0f; %llu shaders compressed; %llu decompressions "
+                 "in %.0f ms, %llu of them on the drawing threads in %.1f ms, the longest %.2f ms)", sr.spv_held / M,
+                 sr.spv_full / M, (unsigned long long)sr.spv_packed, (unsigned long long)sr.decodes, sr.decode_ns / 1e6,
+                 (unsigned long long)sr.draw_decodes, sr.draw_decode_ns / 1e6, sr.draw_decode_max_ns / 1e6);
+    else
+        snprintf(spv, sizeof spv, " (their SPIR-V %.0f, uncompressed%s)", sr.spv_held / M,
+                 sr.compress < 0 ? ": shader_compress = 0" : "");
+    uint64_t pipes = pm->ram_pipes + pm->ram_keys + pm->ram_seed + pm->ram_binaries;
+    uint64_t texhost = th.bytes + th.tmp, known = shaders + pipes + texhost + lq + frec;
+    uint64_t pcache = pm->cache[0] + pm->cache[1];
+    // Windows charges the device-local memory the driver allocates to the process's commit (platform.h
+    // plat_commit_counts_vram): the driver's figure, VMA's blocks and what VMA never allocated alike.
+    int charged = plat_commit_counts_vram();
+    uint64_t dev = charged ? f->usage : 0, crt = hi.committed ? hi.committed : known;
+    int64_t other = (int64_t)priv - (int64_t)(f->heap_c + f->maps + dev + f->hblocks + crt + pcache);
+    char line[2000];
+    size_t k = 0;
+    mg_put(line, sizeof line, &k, "mem: system frame %llu: process commit %.0f MiB%s = the game's heap %.0f + its physical "
+           "maps %.0f", (unsigned long long)frame, priv / M, charged ? "" : " (the resident anonymous pages)",
+           f->heap_c / M, f->maps / M);
+    if (charged) mg_put(line, sizeof line, &k, " + device-local memory, which Windows charges to the process, %.0f", dev / M);
+    mg_put(line, sizeof line, &k, " + VMA's host-visible blocks %.0f (the flight recorder's thumbnails %.0f of them)",
+           f->hblocks / M, fthumb / M);
+    if (hi.committed)
+        mg_put(line, sizeof line, &k, " + the C runtime heap %.0f (%.0f of it handed out; of it known: shader caches %.0f in "
+               "%llu shaders%s, pipeline tables %.0f, the texture cache %.0f with decode temporaries %.0f now and %.0f at most "
+               "since the last report, the log queue %.0f, the flight recorder's records %.0f; the rest %.0f)",
+               hi.committed / M, hi.used / M, shaders / M, (unsigned long long)sr.shaders, spv, pipes / M, texhost / M,
+               th.tmp / M, th.tmp_peak / M, lq / M, frec / M, ((double)hi.committed - (double)known) / M);
+    else
+        mg_put(line, sizeof line, &k, " + what the runtime knows it allocated %.0f (the C runtime heap's size is not "
+               "known: shader caches %.0f in %llu shaders%s, pipeline tables %.0f, the texture cache %.0f with decode "
+               "temporaries %.0f now and %.0f at most since the last report, the log queue %.0f, the flight recorder's "
+               "records %.0f)", known / M, shaders / M, (unsigned long long)sr.shaders, spv, pipes / M, texhost / M,
+               th.tmp / M, th.tmp_peak / M, lq / M, frec / M);
+    mg_put(line, sizeof line, &k, " + the driver's pipeline cache data %.0f (pipeline-cache.bin's %.0f, the play cache's "
+           "%.0f, %s) + other %.0f (the driver's own memory, thread stacks, the program's data; %u other heaps)",
+           pcache / M, pm->cache[0] / M, pm->cache[1] / M, pm->cache_asked ? "as last asked" : "as loaded at the boot",
+           other / M, hi.other_heaps);
+    char room[160];
+    mem_budget_text(room, sizeof room);   // the levels the owners that give memory back go by (mem_budget.h)
+    mg_put(line, sizeof line, &k, "; room: %s", room);
+    rt_log("%s", line);
+    *out = (SysFig){priv, crt, shaders, pipes, texhost, pcache, other > 0 ? (uint64_t)other : 0};
+}
+
+// ---- growth bookkeeping (mem_growth.h): the categories, in the order the lines name them
+enum { G_DEV, G_TEX, G_POOLS, G_VMA_OTHER, G_VMA_FREE, G_OUTSIDE, G_COMMIT, G_HEAP, G_MAPS, G_HOSTVMA, G_CRT, G_SHADERS,
+       G_PIPES, G_TEXHOST, G_PCACHE, G_OTHER, G_N };
+static const char *const grow_names[G_N] = {
+    "device-local in use", "textures", "pools and VRAM mirrors", "VMA's other allocations", "free inside VMA's blocks",
+    "outside VMA", "process commit", "the game's heap", "its physical maps", "VMA's host-visible blocks",
+    "the C runtime heap", "shader caches", "pipeline tables", "the texture cache's host memory",
+    "the driver's pipeline cache data", "other system memory"};
+static PlatMutex grow_lock = PLAT_MUTEX_INIT;   // the book, between the report's thread and the exit's
+static MgBook gbook;
+static uint64_t grow_t0, grow_ranked;           // plat_now_ns at the first report in play, at the last ranking
+
+static void rank_log_locked(const char *when, uint64_t now) {
+    char line[1900];
+    mg_rank(&gbook, line, sizeof line);
+    rt_log("mem: growth ranking %s %.1f min of play (%u reports; only climbs: rose in a report and fell in none): %s", when,
+           (now - grow_t0) / 60e9, gbook.play_lines, line);
+}
+
+static void growth_take(uint64_t frame, const uint64_t v[G_N]) {
+    plat_mutex_lock(&grow_lock);
+    if (!gbook.n)
+        for (int i = 0; i < G_N; i++) mg_cat(&gbook, grow_names[i]);
+    int was = gbook.play;
+    mg_take(&gbook, v, frame_step_world_us() >= 0);
+    uint64_t now = plat_now_ns();
+    if (gbook.play && !was) grow_t0 = grow_ranked = now;
+    char line[1800], when[48];
+    if (gbook.play) snprintf(when, sizeof when, "%.1f min of play", (now - grow_t0) / 60e9);
+    else snprintf(when, sizeof when, "before play");
+    if (mg_grew(&gbook, GROWTH_STEP, line, sizeof line))
+        rt_log("mem: growth frame %llu (%s), by more than %llu MiB: %s", (unsigned long long)frame, when,
+               (unsigned long long)(GROWTH_STEP >> 20), line);
+    if (gbook.play && now - grow_ranked >= RANK_EVERY_NS) grow_ranked = now, rank_log_locked("after", now);
+    plat_mutex_unlock(&grow_lock);
+}
+
+// At the process's end (the window's close, the game's exit, a timed run's end): the session's ranking, once it reached
+// play, from the figures of the last report; nothing is asked of the device here.
+void vk_mem_exit_log(void) {
+    plat_mutex_lock(&grow_lock);
+    if (gbook.play) rank_log_locked("at exit, after", plat_now_ns());
+    plat_mutex_unlock(&grow_lock);
+}
+
+static void beyond_log(VkCtx *c, uint64_t frame, const VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp, const VmaBudget *vb,
+                       const ReportFig *f) {
+    VkPipeMem pm;
+    vk_pipeline_mem(&pm, IDLE_MIN);
+    outside_log(c, frame, bp, vb, &pm);
+    SysFig s;
+    system_log(frame, f, &pm, &s);
+    uint64_t v[G_N] = {
+        [G_DEV] = f->usage, [G_TEX] = f->tex, [G_POOLS] = f->pools, [G_VMA_OTHER] = f->vma_other,
+        [G_VMA_FREE] = f->blocks > f->allocs ? f->blocks - f->allocs : 0,
+        [G_OUTSIDE] = f->usage > f->blocks ? f->usage - f->blocks : 0, [G_COMMIT] = s.commit, [G_HEAP] = f->heap_c,
+        [G_MAPS] = f->maps, [G_HOSTVMA] = f->hblocks, [G_CRT] = s.crt, [G_SHADERS] = s.shaders, [G_PIPES] = s.pipes,
+        [G_TEXHOST] = s.texhost, [G_PCACHE] = s.pcache, [G_OTHER] = s.other};
+    growth_take(frame, v);
+}
+
+// ---- The memory report: every HOLES_PERIOD presents (600 with NX2NAVI_TRACE=perf), after the holes line, in every run.
+// The device-local memory the driver counts for the game split by what holds it: VMA's allocations by owner
+// (vk_vma_budget.c, "owners"), with the textures split further by the texture cache's census (vk_texture_census) and
+// the pools into VRAM mirrors and physical pools; the free space inside VMA's blocks; and what VMA never allocated
+// (compiled pipelines, descriptor memory, the swapchain, the DLSS and frame generation features, the driver's own),
+// with DLSS's share as its statistics report it. Then the host-visible allocations (staging above all) and the
+// process's system memory with the game's own heap. Then the released textures' reuse (vk_texture_reuse_log).
+// A category that only climbs from line to line over a long session is a leak. The figures are sums the owners keep
+// already, one driver query, VMA's budget query and one walk of the texture entries (vk_texture_census): well under a
+// millisecond once a minute, at the present that logs.
+static void owner_log(uint64_t frame) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->vma) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    if (c->has_memory_budget) {
+        VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+        vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    }
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t usage = 0, blocks = 0, allocs = 0, hblocks = 0, hallocs = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            usage += c->has_memory_budget ? bp.heapUsage[h] : vb[h].statistics.blockBytes,
+                blocks += vb[h].statistics.blockBytes, allocs += vb[h].statistics.allocationBytes;
+        else hblocks += vb[h].statistics.blockBytes, hallocs += vb[h].statistics.allocationBytes;
+    }
+    uint64_t phys = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < nphys; i++)
+        if (phys_list[i]->alloc) phys += phys_list[i]->size;
+    plat_mutex_unlock_shared(&pool_lock);
+    VkTexCensus t;
+    vk_texture_census(&t);
+    uint64_t own[VK_OWN_N], hown[VK_OWN_N];
+    for (int o = 0; o < VK_OWN_N; o++) own[o] = vk_vma_owner_bytes(o, 1), hown[o] = vk_vma_owner_bytes(o, 0);
+    uint64_t stg_blocks = 0, kept;
+    if (stg_pool) {
+        VmaStatistics st;
+        vmaGetPoolStatistics(c->vma, stg_pool, &st);
+        stg_blocks = st.blockBytes;
+    }
+    // Read without their locks: an upload holds cmd_lock while it waits for a batch (stg_create), tens of milliseconds
+    // the present would wait too; a figure a log reads a moment late does no harm.
+    kept = __atomic_load_n(&stg_cache_bytes, __ATOMIC_RELAXED) +
+           (uint64_t)__atomic_load_n(&narena_free, __ATOMIC_RELAXED) * ARENA_CHUNK;
+    uint64_t snaps = __atomic_load_n(&snap_pool_bytes, __ATOMIC_RELAXED);
+    int64_t dlss = vk_dlaa_vram();
+    char ds[48] = "nothing";
+    if (dlss >= 0) snprintf(ds, sizeof ds, "%.0f MiB", dlss / 1048576.0);
+    const double M = 1048576.0;
+    uint64_t mir = (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED);
+    rt_log("mem: by owner frame %llu: device-local in use %.0f MiB (the driver's figure) = VMA's allocations %.0f + free "
+           "inside VMA's blocks %.0f + outside VMA %.0f (compiled pipelines, descriptor memory, the swapchain, DLSS and "
+           "frame generation features, the driver; DLSS reports %s). VMA's allocations: textures %.0f (live %.0f, of them "
+           "render targets and other GPU-drawn %.0f and idle %.0f; released %.0f, of them too lately to drop %.0f), pools "
+           "%.0f (VRAM mirrors %.0f, physical pools %.0f), upscalers %.0f, replay buffers %.0f, uniform snapshots %.0f, "
+           "device address table %.0f, ASTC decoder %.0f, present and post-processing %.0f, headroom spares %.0f, other "
+           "%.0f", (unsigned long long)frame, usage / M, allocs / M, blocks > allocs ? (blocks - allocs) / M : 0.0,
+           usage > blocks ? (usage - blocks) / M : 0.0, ds, own[VK_OWN_TEXTURES] / M, t.bytes_live / M,
+           t.bytes_live_gpu / M, t.bytes_live_idle / M, t.bytes_released / M, t.bytes_released_young / M,
+           own[VK_OWN_POOLS] / M, mir / M, phys / M, own[VK_OWN_UPSCALER] / M, own[VK_OWN_REPLAY] / M,
+           own[VK_OWN_USNAP] / M, own[VK_OWN_GPA] / M, own[VK_OWN_ASTC] / M, own[VK_OWN_PRESENT] / M,
+           own[VK_OWN_HEADROOM] / M, own[VK_OWN_OTHER] / M);
+    double proc, sys_used, sys_limit;
+    float ram_used, ram_total, ws;
+    plat_commit_info(&proc, &sys_used, &sys_limit);
+    plat_mem_info(&ram_used, &ram_total, &ws);
+    uint64_t heap, heap_c, maps;
+    mem_guest_usage(&heap, &heap_c, &maps);
+    rt_log("mem: host frame %llu: VMA's host-visible blocks %.0f MiB hold %.0f MiB: staging pool blocks %.0f (kept staging "
+           "buffers and arena chunks %.0f), write-back snapshots %.0f; by owner: pools and staging %.0f, textures %.0f, "
+           "upscalers %.0f, replay buffers %.0f, uniform snapshots %.0f, present and post-processing (the flight "
+           "recorder's thumbnails among them) %.0f, other %.0f. Process commit %.0f MB, working set %.0f MB; system commit "
+           "%.0f of %.0f MB; the game's heap %.0f MiB (%.0f committed), its physical maps %.0f MiB",
+           (unsigned long long)frame, hblocks / M, hallocs / M, stg_blocks / M, kept / M, snaps / M, hown[VK_OWN_POOLS] / M,
+           hown[VK_OWN_TEXTURES] / M, hown[VK_OWN_UPSCALER] / M, hown[VK_OWN_REPLAY] / M, hown[VK_OWN_USNAP] / M,
+           hown[VK_OWN_PRESENT] / M, (hown[VK_OWN_OTHER] + hown[VK_OWN_GPA] + hown[VK_OWN_ASTC] + hown[VK_OWN_HEADROOM]) / M,
+           proc, (double)ws, sys_used, sys_limit, heap / M, heap_c / M, maps / M);
+    uint64_t tex = own[VK_OWN_TEXTURES], pools = own[VK_OWN_POOLS];
+    ReportFig f = {usage, blocks, allocs, hblocks, tex, pools, allocs > tex + pools ? allocs - tex - pools : 0, heap_c, maps};
+    beyond_log(c, frame, &bp, vb, &f);
+    vk_texture_reuse_log(frame);
+}
+
 // NX2NAVI_STAGING_FAIL_AT=n (test): the n-th staging buffer the driver makes is taken as refused for memory once, so
 // the give-back runs (vk_mem_give_back).
 static int staging_fail_now(void) {
@@ -4794,13 +5701,14 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
         plat_rmutex_lock(&cmd_lock);
         if (!stg_pool_tried) {
             uint32_t type;
-            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
+            int keep = c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? STG_MIN_BLOCKS : STG_MIN_BLOCKS_UMA;
+            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = (size_t)keep};
             if (vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &aci, &type) == VK_SUCCESS) {
                 pi.memoryTypeIndex = type;
                 if (vmaCreatePool(c->vma, &pi, &stg_pool) != VK_SUCCESS) stg_pool = NULL;
             }
             rt_log("vk: staging pool %s (%d blocks of %llu MiB kept)", stg_pool ? "created" : "unavailable: default pool",
-                   STG_MIN_BLOCKS, (unsigned long long)(STG_BLOCK >> 20));
+                   keep, (unsigned long long)(STG_BLOCK >> 20));
             __atomic_store_n(&stg_pool_tried, 1, __ATOMIC_RELEASE);
         }
         plat_rmutex_unlock(&cmd_lock);
@@ -4819,7 +5727,7 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VmaAllocationInfo info;
     VkBuffer b;
     VmaAllocation a;
-    VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+    VkResult r = aci.pool ? stg_create(c, &bi, &aci, &b, &a, &info, 0) : vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
     if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && aci.pool) {
         // The staging pool can grow only in 64 MiB blocks of its one memory type. A smaller allocation may
         // still fit in a default block or another host-visible type. Keep the same mapping requirements.
@@ -4868,23 +5776,27 @@ void *vk_staging_at(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off) {
     VkDeviceSize at = (open_b.chunk_used + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1);
     if (!open_b.nchunk || at + size > ARENA_CHUNK) {
         StgChunk k;
-        if (narena_free) {
-            k = arena_free[--narena_free];
-        } else {
+        VkResult r = VK_INCOMPLETE;
+        if (!narena_free) {
             VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ARENA_CHUNK,
                                      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
             VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                            .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                                                     VMA_ALLOCATION_CREATE_MAPPED_BIT};
-            if (stg_pool) aci.pool = stg_pool;   // half of a staging block (STG_BLOCK)
+            if (stg_pool) aci.pool = stg_pool;   // an eighth of a staging block (STG_BLOCK)
             VmaAllocationInfo info;
-            if (vmaCreateBuffer(c->vma, &bi, &aci, &k.buf, &k.alloc, &info) != VK_SUCCESS)
-                return vk_staging(size, buf, NULL);
-            k.map = info.pMappedData;
-            vk_texstat_add(VK_TS_STG_NEW, 1, ARENA_CHUNK);
-            if (arena_made++ < 16) rt_log("vk: staging arena chunk %llu made (%llu MiB)", (unsigned long long)arena_made,
-                                          (unsigned long long)(ARENA_CHUNK >> 20));
+            r = stg_pool ? stg_create(c, &bi, &aci, &k.buf, &k.alloc, &info, 1)
+                         : vmaCreateBuffer(c->vma, &bi, &aci, &k.buf, &k.alloc, &info);
+            if (r != VK_SUCCESS && r != VK_INCOMPLETE) return vk_staging(size, buf, NULL);
+            if (r == VK_SUCCESS) {
+                k.map = info.pMappedData;
+                vk_texstat_add(VK_TS_STG_NEW, 1, ARENA_CHUNK);
+                if (arena_made++ < 16)
+                    rt_log("vk: staging arena chunk %llu made (%llu MiB)", (unsigned long long)arena_made,
+                           (unsigned long long)(ARENA_CHUNK >> 20));
+            }
         }
+        if (r == VK_INCOMPLETE) k = arena_free[--narena_free];   // one already free, or one a waited-for batch gave back
         if (open_b.nchunk == open_b.cap_chunk) grow((void **)&open_b.chunk, &open_b.cap_chunk, sizeof *open_b.chunk);
         open_b.chunk[open_b.nchunk++] = k;
         open_b.bytes += ARENA_CHUNK;   // the staging the batch holds (upload_cap)
@@ -4917,6 +5829,28 @@ uint64_t vk_upload_flush(int wait) {
         open_b.sub_ns = plat_now_ns();
         VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
         vk_queue_unlock();
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            // The driver had no memory to take the batch, which ended the game here (five logs of three reports, all on
+            // integrated GPUs, one with 9 GB of commit to spare: the device's own heap was full). A refused
+            // submit leaves the command buffer and the fence as they were, so it can be made again: first the batches
+            // in flight are waited for, which gives their staging back and lets the objects that waited for them be
+            // destroyed, then the kept buffers and spare blocks go back to the driver (vk_mem_give_back), as for a
+            // refused staging buffer. Only a second refusal ends the run.
+            VkResult first = r;
+            int flying = ninflight;
+            retire(c, 1);
+            collect_locked(c);
+            uint64_t freed = vk_mem_give_back();
+            vk_queue_lock();
+            open_b.sub_ns = plat_now_ns();
+            r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
+            vk_queue_unlock();
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 16)
+                rt_log("vk: upload submit refused (%d): waited for %d batches in flight, %.1f MiB of kept buffers and "
+                       "spare blocks given back, %s", (int)first, flying, freed / 1048576.0,
+                       r == VK_SUCCESS ? "taken at the second try" : "refused again");
+        }
         if (r != VK_SUCCESS) {
             vk_mem_oom_report("upload submit", r);
             vk_device_lost_check(r, "the submit of an upload batch");
@@ -5061,7 +5995,7 @@ void vk_mem_shutdown(void) {
     plat_mutex_lock(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
     pool_index.n = 0;
-    nm = npend = nwbl = nsnl = snl_copied = nswl = 0;   // mirrors went with their pools
+    nm = npend = nwbl = nsnl = snl_copied = nswl = n_gpa_flip = 0;   // mirrors went with their pools
     swl_marks = -1;
     plat_mutex_lock(&snap_pool_lock);
     for (int i = 0; i < nsnap_pool; i++) vmaDestroyBuffer(c->vma, snap_pool[i].buf, snap_pool[i].alloc);
@@ -5077,6 +6011,7 @@ void vk_mem_shutdown(void) {
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;
     plat_mutex_unlock(&pool_lock);
+    span_gc(0, 1);   // every pool is gone: so are the spans' references
     plat_mutex_lock(&gen_lock);
     for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL, free(cgen_chunk[i]), cgen_chunk[i] = NULL;
     plat_mutex_unlock(&gen_lock);

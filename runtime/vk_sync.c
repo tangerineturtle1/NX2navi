@@ -18,6 +18,7 @@
 #include "nvn_api.h"
 #include "prof.h"
 #include "vk.h"
+#include "vk_lowlat.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
@@ -106,6 +107,7 @@ static struct {
     VkSubmitInfo2 si[HOLD_CAP];
     VkCommandBufferSubmitInfo cbi[HOLD_CAP][SUB_CBS];
     VkSemaphoreSubmitInfo sig[HOLD_CAP][2];
+    VkLatencySubmissionPresentIdNV lat[HOLD_CAP];   // the frame's number for the driver's low latency (vk_lowlat.c)
     uint64_t last;                    // the newest timeline value a held submission signals, 0 none
     uint64_t batches, subs;           // vkQueueSubmit2 calls and the submissions they carried
 } H;
@@ -322,6 +324,9 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
         memcpy(H.sig[i], si->pSignalSemaphoreInfos, sizeof H.sig[i][0] * si->signalSemaphoreInfoCount);
         H.si[i].pSignalSemaphoreInfos = H.sig[i];
     }
+    // NVIDIA's low latency on (vk_lowlat.c): the submission carries the number of the frame being replayed, so the
+    // driver counts its GPU time to that frame. The callers' submissions have no chain of their own.
+    if (vk_lowlat_submit_tag(&H.lat[i])) H.si[i].pNext = &H.lat[i];
     if (value) H.last = value;
     uint64_t now = kern_now_ns();
     if (i == 0) __atomic_store_n(&held_t0, now, __ATOMIC_RELEASE);

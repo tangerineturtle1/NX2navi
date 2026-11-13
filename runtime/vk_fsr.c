@@ -39,7 +39,25 @@ static struct {
     uint32_t w, h;                 // their size
     VkImageView src_view[SLOTS];   // the source view each slot's last frame read
     int logged;
+    uint32_t used_slots, since;    // slots whose frames used the images / that recorded without them since the last use
+    uint32_t idle;                 // presents recorded without them since their last use
 } F;
+
+// The two images while the upscaler is not fsr (or the picture needs no scaling): they stayed for the rest of the run,
+// two RGBA16F pictures of the window's size, 168 MiB at 5120x2142. They go once IDLE_FREE presents recorded without
+// them and every slot that ever used them has recorded since: the caller waited for that slot's fence before it
+// recorded (see the top of the file), so no submission still reads them. Taking fsr up again makes them as a window
+// size change does (ensure_images: a wait for the idle device and two images).
+#define IDLE_FREE 600
+static void free_images(VkCtx *c);
+static void idle_note(unsigned slot) {
+    if (!F.img[0]) return;
+    F.since |= 1u << (slot % SLOTS);
+    if (++F.idle < IDLE_FREE || (F.since & F.used_slots) != F.used_slots) return;
+    rt_log("vk: FSR's images unused for %u presents: freed (%ux%u)", F.idle, F.w, F.h);
+    free_images(vk_ctx());
+    F.used_slots = F.since = F.idle = 0;
+}
 
 static VkPipeline make_pipeline(VkCtx *c, const uint32_t *code, size_t size) {
     VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = code};
@@ -202,17 +220,19 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
                   VkImage dst, const int out[4]) {
     int cw = crop[2], ch = crop[3];
     uint32_t dw = (uint32_t)out[2], dh = (uint32_t)out[3];
-    if (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || !fmt || (dw == (uint32_t)cw && dh == (uint32_t)ch)) return 0;
+    if (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || !fmt || (dw == (uint32_t)cw && dh == (uint32_t)ch))
+        return idle_note(slot), 0;
     int sharp = cfg_int("NX2NAVI_SHARPNESS");
     if (sharp < 0) sharp = 0;
     if (sharp > 100) sharp = 100;
     // EASU only enlarges: a picture smaller than the crop in either direction takes the shrink path, which without
     // sharpening is the plain blit of the caller
     int shrink = dw < (uint32_t)cw || dh < (uint32_t)ch;
-    if (shrink && !sharp) return 0;
+    if (shrink && !sharp) return idle_note(slot), 0;
     VkCtx *c = vk_ctx();
     if (!F.tried) init(c);
     if (!F.ok || !ensure_images(c, dw, dh)) return 0;
+    F.used_slots |= 1u << (slot % SLOTS), F.since = 0, F.idle = 0;
     if (shrink) return shrink_sharpen(cb, src, crop, dst, out, sharp);
     slot %= SLOTS;
     if (F.src_view[slot]) vkDestroyImageView(c->device, F.src_view[slot], NULL);

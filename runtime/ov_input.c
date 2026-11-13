@@ -3,7 +3,8 @@
 // runtime/input_win.c; nothing pressed with NX2NAVI_INPUT=none). Docked (default) it is a full-key controller as player 1 (id 0, style bit 0); with
 // NX2NAVI_OPERATION_MODE=handheld it is the handheld controller (id 0x20, style bit 1) and player 1 is not connected,
 // which is the controller the game reads in that mode. Mouse and keyboard report no input. The controller has two
-// vibration devices (left, right) played on the gamepad's motors (NX2NAVI_RUMBLE=0: none) and a six-axis sensor fed by
+// vibration devices (left, right), played on the gamepad's motors or, with NX2NAVI_RUMBLE_HD=1, as they are on a Switch
+// controller's linear actuators (NX2NAVI_RUMBLE=0: no devices), and a six-axis sensor fed by
 // the gamepad's gyro and accelerometer (NX2NAVI_MOTION=0, live: reads at rest). State layouts follow the HID shared-memory format.
 #include <math.h>
 #include <stdint.h>
@@ -12,10 +13,13 @@
 
 #include "debug_tools.h"
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "input.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "sprint.h"
+#include "text_speed.h"
 
 typedef struct { int64_t sampling; uint64_t buttons; int32_t lx, ly, rx, ry; uint32_t attributes, pad; } NpadState;
 typedef struct { int64_t sampling; int32_t x, y, dx, dy, wx, wy; uint32_t buttons, attributes; } MouseState;
@@ -90,12 +94,17 @@ static void npad_states(Cpu *c, uint32_t want) {
     NpadState s = {.sampling = ++sample};
     int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
     plat_mutex_unlock(&lock);
+    // A frame's first pad read is where a driver's low-latency sleep belongs (vk_lowlat.c vk_lowlat_frame_start): the
+    // wait comes before the input is sampled, so the frame is drawn from the newest input. Nothing while that is off.
+    if (gfx_backend()->input_read) gfx_backend()->input_read();
     if (live) {
         s.attributes = ATTR_CONNECTED;
         input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
     }
     dbg_tick(c);   // the debug menu's changes to the game, between two of its frames (debug_tools.c)
     if (live) dbg_pad(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);   // its free camera takes the sticks while it flies
+    if (live) sprint_pad(&s.buttons);   // the sprint button's presses, kept from the game during gameplay (sprint.c)
+    if (live) text_speed_poll();   // the text_speed setting onto the patch page (text_speed.c)
     *out = s;
     ret_x(c, 1);
 }
@@ -192,7 +201,8 @@ static void once(volatile int32_t *flag, const char *fmt, uint32_t v) {
 // default 0.6). HD rumble is strong at low amplitude, an ERM motor hardly turns there, so weak values are lifted by the
 // curve (0.1 -> 0.25) and the strength scales the result (saturating at 65535; 0.66 and up reach full drive at 130 %).
 // Both are live settings (the menu): read again whenever cfg_version changes.
-static float rumble_strength = 1.3f, rumble_curve = 0.6f;
+#define RUMBLE_STRENGTH_DEFAULT 1.3f   // cfg.c RUMBLE_STRENGTH's default, as a factor
+static float rumble_strength = RUMBLE_STRENGTH_DEFAULT, rumble_curve = 0.6f;
 static volatile int32_t rumble_cfg_logged;
 static unsigned rumble_cfg_seen = ~0u;
 static float cfg_float(const char *name, float lo, float hi) {
@@ -297,6 +307,24 @@ static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -
 // neutral frequency), all at 320 Hz and above (the high band's), log scale between.
 static float light_share(float f) { return f > 160 ? (f < 320 ? log2f(f / 160) : 1) : 0; }
 
+// Switch HD rumble as it is, for a gamepad whose actuators take it (input.h input_rumble_hd_on; NX2NAVI_RUMBLE_HD):
+// each side's newest value goes on with both bands' frequency and amplitude, the amplitude scaled by the rumble
+// strength over its default alone: the default strength is above 100 % to make up for what two motors lose, and an
+// actuator that plays the value itself needs none of that, so at the default it gets the game's amplitude exactly and
+// the setting makes it weaker or stronger from there (the curve is for motors). A side the game has not updated for 250 ms,
+// or any side while vibration is not permitted, is at rest. input.c writes the reports and no longer drives that
+// gamepad's motors, so rumble_update's own call below reaches only the DualShock 3 reader then. Under vib_lock.
+static void hd_update(uint64_t now) {
+    if (!input_rumble_hd_on()) return;
+    RumbleHdValue v[2];
+    int live[2];
+    for (int s = 0; s < 2; s++) {
+        v[s] = (RumbleHdValue){vib_last[s].amp_low, vib_last[s].freq_low, vib_last[s].amp_high, vib_last[s].freq_high};
+        live[s] = vib_allowed && vib_at[s] && now - vib_at[s] <= RUMBLE_STALE_NS;
+    }
+    input_rumble_hd(v, live, rumble_strength / RUMBLE_STRENGTH_DEFAULT);
+}
+
 // Switch HD rumble -> SDL_RumbleGamepad. Each side's two bands split by frequency between the heavy (low) and the light
 // (high) motor (light_share) and add up as energy per motor (root of the summed squares); the stronger side drives each
 // motor. A side the game has not updated for 250 ms is silent. Each send lasts 250 ms and is renewed every 50 ms while
@@ -304,6 +332,7 @@ static float light_share(float f) { return f > 160 ? (f < 320 ? log2f(f / 160) :
 static void rumble_update(uint64_t now) {
     float heavy = 0, light = 0;
     rumble_cfg();
+    hd_update(now);
     for (int s = 0; s < 2 && vib_allowed; s++) {
         if (!vib_at[s] || now - vib_at[s] > RUMBLE_STALE_NS) continue;
         const VibrationValue *v = &vib_last[s];

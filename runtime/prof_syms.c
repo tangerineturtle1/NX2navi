@@ -24,7 +24,8 @@ static int cmp_u64(const void *a, const void *b) {
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
-int prof_syms_write(FILE *out, const char *exe_path, uint64_t base, const uint64_t *addr, size_t n) {
+int prof_syms_each(const char *exe_path, uint64_t base, const uint64_t *addr, size_t n,
+                   void (*fn)(void *ctx, uint64_t addr, const char *name, uint32_t offset), void *ctx) {
     FILE *f = fopen(exe_path, "rb");
     if (!f) return -1;
     uint8_t h[0x400];
@@ -102,11 +103,19 @@ int prof_syms_write(FILE *out, const char *exe_path, uint64_t base, const uint64
         const CSym *c = &syms[j - 1];
         char sn[9] = {0};
         const char *nm = c->str ? (c->str < strsz ? strtab + c->str : "?") : (memcpy(sn, c->sname, 8), sn);
-        fprintf(out, "sym %llx %s+0x%x\n", (unsigned long long)a[i], nm, rva - c->rva);
+        fn(ctx, a[i], nm, rva - c->rva);
         named++;
     }
 done:
     free(a), free(raw), free(syms), free(strtab);
     fclose(f);
     return named;
+}
+
+static void write_line(void *ctx, uint64_t addr, const char *name, uint32_t offset) {
+    fprintf((FILE *)ctx, "sym %llx %s+0x%x\n", (unsigned long long)addr, name, offset);
+}
+
+int prof_syms_write(FILE *out, const char *exe_path, uint64_t base, const uint64_t *addr, size_t n) {
+    return prof_syms_each(exe_path, base, addr, n, write_line, out);
 }

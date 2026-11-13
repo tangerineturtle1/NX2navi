@@ -65,7 +65,6 @@ int romfs_owns(const char *path) { (void)path; return 0; }
 int mem_probing(void) { return 0; }   // write_file asks before each write: no probe, no lazy heap here
 void mem_kernel_access(uint64_t a, uint64_t n) { (void)a, (void)n; }
 void fs_trace(const char *what, const char *path) { (void)what, (void)path; }
-void coop_game_rom_open(const char *path) { (void)path; }   // co-op watches for the title screen's start: not here
 
 int main(int argc, char **argv) {
     if (argc < 3) return 2;

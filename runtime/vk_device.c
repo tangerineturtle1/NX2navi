@@ -11,11 +11,14 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "mem_budget.h"
 #include "vk.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_gpa.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
+#include "vk_lowlat.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
@@ -241,8 +244,9 @@ static int name_has(const char *s, const char *sub) {
     return 0;
 }
 
-// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue; NX2NAVI_GPU_INDEX (index) or
-// NX2NAVI_GPU_NAME (case-insensitive part of the name) overrides.
+// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue (of one GPU listed by two
+// drivers, the newer driver's listing); NX2NAVI_GPU_INDEX (index) or NX2NAVI_GPU_NAME (case-insensitive part of the
+// name) overrides.
 static int pick_device(void) {
     uint32_t n = 0;
     vk_dlssg_enumerate(g_vk.instance, &n, NULL);
@@ -253,6 +257,7 @@ static int pick_device(void) {
     int want = e && *e ? atoi(e) : -1;
     const char *name = cfg_get("NX2NAVI_GPU_NAME");
     int best = -1, best_score = -1, listed = 0;
+    uint32_t best_driver = 0;   // the driver version of the best one so far
 retry:
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
@@ -274,7 +279,19 @@ retry:
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
         int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        if (score > best_score) { best_score = score; best = (int)i; best_driver = p.driverVersion; continue; }
+        // The same GPU listed again by another installed driver (a laptop with the vendor's processor graphics and its
+        // card has both drivers list the card): the newer driver's listing. The older one, there to serve the processor
+        // graphics, was reported to crash in its shader compiler with the card.
+        if (score == best_score && best >= 0) {
+            VkPhysicalDeviceProperties b;
+            vkGetPhysicalDeviceProperties(pd[best], &b);
+            if (b.vendorID == p.vendorID && b.deviceID == p.deviceID && p.driverVersion > best_driver) {
+                if (!listed) rt_log("vk: gpu %u is gpu %d listed by a newer driver (%#x over %#x): gpu %u", i, best,
+                                    p.driverVersion, best_driver, i);
+                best = (int)i, best_driver = p.driverVersion;
+            }
+        }
     }
     // A chosen GPU that is not usable or no longer there (the menu's GPU row, an unplugged card, a driver that lists the
     // devices in another order): the best usable one instead, so the game still starts and the choice can be changed
@@ -311,6 +328,15 @@ retry:
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
     vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
+    {   // and by whether the device imports dma-bufs (vk_memory.c "dma-buf imports")
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
+        vk_mem_dmabuf_caps(has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+                           has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME));
+        free(ep);
+    }
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -387,6 +413,8 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDeviceAntiLagFeaturesAMD antilag;
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
@@ -492,6 +520,35 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // Guest memory imported as dma-bufs (vk_memory.c "dma-buf imports"; pick_device checked the extensions)
+    if (vk_mem_dmabuf_on() && n_ext + 4 <= sizeof ext / sizeof *ext) {
+        ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    }
+    // Low latency without frame generation (vk_lowlat.c): NVIDIA's extension, which needs VK_KHR_present_id enabled
+    // with it, or AMD's, whose calls need its feature. Each only where the driver lists it; a driver lists one of them
+    // at most. Not on a device the DLSS Frame Generation proxies make (vk_dlssg_create_device): that path's own
+    // low-latency plugin asks for what it needs there, and the direct path stays off for the run. And only in a run
+    // that starts with NX2NAVI_LOW_LATENCY on: with it off the device is made exactly as before the mode existed, and
+    // a driver that lists one of the two is only remembered (lists_low_latency), so the menu can say that turning the
+    // setting on takes a restart.
+    g_vk.lists_low_latency = 0;
+    if (!vk_dlssg_dpa() && n_ext + 2 <= sizeof ext / sizeof *ext) {
+        int nv = has_ext(ep, ne, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        int amd = !nv && has_ext(ep, ne, VK_AMD_ANTI_LAG_EXTENSION_NAME);
+        if (cfg_int("NX2NAVI_LOW_LATENCY") <= 0) {
+            g_vk.lists_low_latency = nv || amd;
+        } else if (nv) {
+            g_vk.has_low_latency2 = 1;
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+            CHAIN(pid, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+        } else if (amd) {
+            g_vk.has_anti_lag = 1;
+            ext[n_ext++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
+            CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
+        }
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -559,6 +616,10 @@ static int create_device(void) {
     }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
+    // The chain enables what the driver reported: a present carries a frame's number only with presentId, and
+    // vkAntiLagUpdateAMD may be called only with antiLag (the extension alone stays enabled and unused without it).
+    g_vk.has_present_id = g_vk.has_low_latency2 && c->pid.presentId;
+    if (g_vk.has_anti_lag && !c->antilag.antiLag) g_vk.has_anti_lag = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -644,6 +705,7 @@ static int create_device(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     vk_caps_init(&g_vk);
+    vk_mem_dmabuf_probe(g_vk.device, &g_vk.mem_props, vk_gpa_wanted_ctx(&g_vk));   // may turn shadow storage on
     vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
     rt_fatal_note_add(fatal_note);
 
@@ -666,6 +728,7 @@ static int create_device(void) {
         return 0;
     }
     vk_crumbs_init(&g_vk);
+    vk_lowlat_init(&g_vk);
     return 1;
 }
 
@@ -677,6 +740,7 @@ static void destroy_all(void) {
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
+    if (g_vk.device) vk_lowlat_release();   // the sleep's semaphore: the device still lives
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     if (lost_fence) vkDestroyFence(g_vk.device, lost_fence, NULL);   // vk_device_lost_poll
     lost_fence = VK_NULL_HANDLE;
@@ -700,7 +764,8 @@ int vk_init(void) {
     plat_mutex_lock(&g_lock);
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
-        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlaa_init();
+        if (create_instance() && pick_device() && create_device())
+            g_ready = 1, vk_headroom_start(), vk_dlaa_init(), mem_budget_vram(1);
         else destroy_all();
     }
     int ok = g_ready;
@@ -710,7 +775,7 @@ int vk_init(void) {
 
 void vk_shutdown(void) {
     plat_mutex_lock(&g_lock);
-    if (g_ready) { destroy_all(); g_ready = 0; }
+    if (g_ready) { mem_budget_vram(0); destroy_all(); g_ready = 0; }
     plat_mutex_unlock(&g_lock);
 }
 
@@ -863,3 +928,14 @@ int probe_vkdevice(void) {
 
 // The GPU has mesh shaders: the mesh emulation (NX2NAVI_MESH_EMULATION) does nothing there (the low-end GPU rows of the menu's Game tab).
 int vk_mesh_shader_native(void) { return g_vk.has_mesh_shader; }
+
+// The card the low-end GPU mode (cfg.c LOWEND) was written for: one without mesh shaders, or one whose driver reports
+// a video memory budget under 8 GiB. The menu offers the mode only there (ui/menu.cpp tab_game): on a GeForce RTX 5090
+// the mode's own-memory rule for overwritten textures moved the 1600x1600 sun shadow map and the scene depth to memory
+// of their own, and the ground's shadow was a dark patch with straight edges that turned with the camera.
+int vk_low_end_card(void) {
+    if (!g_vk.has_mesh_shader) return 1;
+    uint64_t used = 0, budget = 0;
+    int exact = 0;
+    return vk_mem_vram(&used, &budget, &exact) && budget && budget >> 20 < 8192;
+}

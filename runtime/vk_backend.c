@@ -9,7 +9,9 @@
 //
 // Back-edge pacing: the present thread submits the blit at once, then holds the host present (vkQueuePresentKHR) until
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
-// replay took. The blit is already on the queue, so the wait blocks no submission.
+// replay took. The blit is already on the queue, so the wait blocks no submission. While a driver's low latency holds
+// the frames where they start (vk_lowlat.c), the pacer's display time is the time of the game's present, and the host
+// present goes out as soon as the blit is submitted.
 //
 // Asynchronous replay (NX2NAVI_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
 // and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
@@ -34,6 +36,7 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
+#include "vk_lowlat.h"
 
 #define WEAK __attribute__((weak))
 
@@ -86,6 +89,7 @@ static void present_main(void *arg) {
         plat_mutex_unlock(&pl);
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
+        vk_lowlat_present_frame(j.frame);   // the frame's number for the blit's submit and the present's markers
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
@@ -530,6 +534,7 @@ static void replay_main(void *arg) {
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
+            vk_lowlat_submitted(frame);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
             sub_idx = 0;
         }
@@ -663,9 +668,11 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
     gfx_tl_present();
     vk_dlssg_game_present();
+    vk_lowlat_game_present();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
+        vk_lowlat_submitted(frame);
         vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
@@ -766,6 +773,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    vk_lowlat_submit_start();   // a frame's first submission: its simulation is over (nothing while low latency is off)
     if (!gfx_replay_async()) {
         vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
         return submit_sync(handles, n);
@@ -907,6 +915,15 @@ static void vk_be_cpu_synced(uint64_t fence) {
     vk_texture_write_back_small(fence);
 }
 
+// A frame of the game starts. DLSS Frame Generation's low latency sleeps at the acquire (vk_dlssg.c); the direct path
+// (vk_lowlat.c) at the acquire or the pad read, whichever the game makes first in the frame. At most one of the two
+// is in effect in a run, and each returns at once while it is not.
+static void vk_be_frame_start(void) {
+    vk_dlssg_frame_start();
+    vk_lowlat_frame_start(0);
+}
+static void vk_be_input_read(void) { vk_lowlat_frame_start(1); }
+
 const GfxBackend gfx_vulkan_backend = {
     .name = "vulkan",
     .pool_init = vk_be_pool_init,
@@ -922,7 +939,9 @@ const GfxBackend gfx_vulkan_backend = {
     .game_wait = vk_sync_game_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
-    .frame_start = vk_dlssg_frame_start,
+    .frame_start = vk_be_frame_start,
+    .input_read = vk_be_input_read,
+    .frame_paced = vk_lowlat_pace,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,

@@ -16,7 +16,7 @@ enum {
     ACTION_COUNT = 25
 };
 
-// Keys and mouse buttons. F1, F10, F11 and Esc belong to the menu and the window, F8 to the flight recorder: no ids.
+// Keys and mouse buttons. F1, F10, F11 and Esc belong to the menu and the window, F8 to the bug capture (bugcap.c): no ids.
 enum {
     KEY_NONE = 0,
     KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M,   // letters and digits are

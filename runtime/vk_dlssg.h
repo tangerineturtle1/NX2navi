@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-int vk_dlssg_wanted(void);   // NX2NAVI_FRAMEGEN = dlss with DLSS or FSR 3.1 upscaling on (read once)
+int vk_dlssg_wanted(void);   // NX2NAVI_FRAMEGEN = dlss, with any upscaler or none (read once)
 int vk_dlssg_early(void);    // before the instance exists: loads the DLL and Streamline; 1 when its proxies are there
 // vk_device.c: the instance and device through Streamline's proxies when vk_dlssg_early succeeded, else the loader's
 VkResult vk_dlssg_create_instance(const VkInstanceCreateInfo *ci, VkInstance *out);

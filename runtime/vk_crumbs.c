@@ -26,7 +26,7 @@
 static PFN_vkCmdWriteBufferMarkerAMD write_marker;
 static VkBuffer buf;
 static VmaAllocation alloc;
-static volatile uint32_t *words;   // 0, 1: crumbs; 2, 3: pass marks
+static volatile uint32_t *words;   // 0, 1: crumbs; 2, 3: pass marks; 4, 5: draw marks
 
 // Pass marks (below)
 int vk_pass_marks_on;
@@ -41,7 +41,7 @@ static volatile uint8_t pt_timed[VK_PASS_MARKS];   // the slot's mark writes tim
 
 static void buffer_init(VkCtx *c) {
     write_marker = (PFN_vkCmdWriteBufferMarkerAMD)vk_dpa(c->device, "vkCmdWriteBufferMarkerAMD");
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16,
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 24,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
@@ -53,7 +53,7 @@ static void buffer_init(VkCtx *c) {
         return;
     }
     words = info.pMappedData;
-    words[0] = words[1] = words[2] = words[3] = 0;
+    words[0] = words[1] = words[2] = words[3] = words[4] = words[5] = 0;
     rt_log("vk: GPU breadcrumbs on (VK_AMD_buffer_marker)");
 }
 
@@ -69,7 +69,7 @@ void vk_crumbs_release(void) {
     if (pt_pool && c) vkDestroyQueryPool(c->device, pt_pool, NULL);
     pt_pool = VK_NULL_HANDLE;
     buf = VK_NULL_HANDLE, alloc = NULL, words = NULL, write_marker = NULL;
-    vk_pass_marks_on = pm_amd = 0, set_checkpoint = NULL;
+    vk_pass_marks_on = pm_amd = vk_draw_marks_on = 0, set_checkpoint = NULL;
 }
 
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n) {
@@ -132,10 +132,49 @@ static void pass_marks_init(VkCtx *c) {
     else
         rt_log("vk: pass marks off (%s)", off ? "NX2NAVI_PASS_CRUMBS=0"
                                               : "no VK_AMD_buffer_marker; NX2NAVI_PASS_CRUMBS=1 asks for NVIDIA checkpoints");
+    vk_draw_marks_on = pm_amd && cfg_bool("NX2NAVI_DRAW_CRUMBS");
+    if (vk_draw_marks_on)
+        rt_log("vk: draw marks on (NX2NAVI_DRAW_CRUMBS): a mark at every change of shaders inside a pass, so a lost "
+               "device names the shaders of the draws the GPU had not finished");
+    else if (cfg_bool("NX2NAVI_DRAW_CRUMBS"))
+        rt_log("vk: draw marks off: NX2NAVI_DRAW_CRUMBS needs the pass marks of VK_AMD_buffer_marker");
 }
 
+// ---- draw marks (NX2NAVI_DRAW_CRUMBS=1, off by default; with VK_AMD_buffer_marker only)
+// A pass mark names the pass the GPU was in and the shaders of its first and last draw. The losses reported on RDNA 2
+// cards end inside one scene pass of 30 to 100 draws, and which draw the GPU never finished is not known. With this
+// on, the replay writes a mark each time the shaders or the pipeline state change inside a pass (vk_exec_draw.c
+// prepare_draw_ex), into words 4 and 5 of the breadcrumb buffer as a pass mark goes into words 2 and 3, and a ring
+// keeps the pass, the draw's index in it and the two shaders of each. After a loss word 5 names the last mark before
+// which every draw had finished: the draw that hung was recorded after it, with its shaders or those of one of the few
+// marks up to the one in word 4. It costs two marker writes per change, a few thousand a frame, so it is for the
+// player who can reproduce a loss, not for everyone.
+// The marks are numbered as they are recorded, by the replay thread and by its workers when a pass's chunks are
+// recorded side by side (vk_exec.c): the number is taken atomically and each number has its own slot of the ring, so
+// no two threads write one. The two marks the GPU names are exact either way. The numbers between them are in queue
+// order only where one thread recorded the pass; with workers some of them belong to chunks that ran earlier, which
+// the report says.
+#define VK_DRAW_MARKS 8192   // power of two
+typedef struct { uint32_t id, pass, draw; const GfxShader *vs, *fs; } DrawMark;
+static DrawMark dring[VK_DRAW_MARKS];
+static volatile uint32_t dseq;   // draw marks made; any recording thread takes the next number
+int vk_draw_marks_on;
+
+void vk_draw_mark(VkCommandBuffer cb, const VkPassMark *m, const GfxShader *vs, const GfxShader *fs, uint32_t draw) {
+    if (!vk_draw_marks_on || !cb) return;
+    uint32_t id = __atomic_add_fetch(&dseq, 1, __ATOMIC_RELAXED);
+    if (!id) id = __atomic_add_fetch(&dseq, 1, __ATOMIC_RELAXED);   // 0 means no mark
+    dring[id & (VK_DRAW_MARKS - 1)] = (DrawMark){id, m ? m->id : 0, draw, vs, fs};
+    rec_pass_mark(cb, id, 2);
+}
 
 void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+    if (end == 2) {   // a draw mark (vk_draw_mark): the same two points, into its own words
+        if (!pm_amd) return;
+        write_marker(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buf, 16, id);
+        write_marker(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, buf, 20, id);
+        return;
+    }
     if (pt_pool && pt_timed[id & (VK_PASS_MARKS - 1)] == 1)
         vkCmdWriteTimestamp(cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pt_pool,
                             (id & (VK_PASS_MARKS - 1)) * 2 + (end != 0));
@@ -188,9 +227,7 @@ static uint64_t gp_shader_hash(const GfxShader *s) {
     if (!s) return 0;
     uint32_t i = (uint32_t)(((uintptr_t)s * 0x9E3779B97F4A7C15ull) >> 54);
     if (memo[i].s == s) return memo[i].h;
-    uint64_t words = 0, h = 0xcbf29ce484222325ull;
-    const uint8_t *b = (const uint8_t *)gfx_shader_spirv(s, &words);
-    for (uint64_t k = 0; b && k < words * 4; k++) h = (h ^ b[k]) * 0x100000001b3ull;
+    uint64_t h = gfx_shader_spirv_fnv(s);   // kept by the shader: nothing is decoded here
     memo[i].s = s, memo[i].h = h;
     return h;
 }
@@ -238,7 +275,12 @@ static void gp_gap_close(uint32_t to) {
     gp_gap_from = UINT32_MAX, gp_gap_kinds = 0;
 }
 
+// The kinds of commands noted since the last mark ended (bits of VK_GAP_*), for a lost device's report: the next mark
+// takes them as the commands recorded before it (VkPassMark.gap). Replay thread only, as the notes are.
+static uint32_t gap_now;
+
 void vk_gpu_gap_note(int kind, uint64_t units) {
+    if (kind >= 0 && kind < VK_GAP_N) gap_now |= 1u << kind;
     if (!gp_capture || gp_part == UINT32_MAX || kind < 0 || kind >= VK_GAP_N) return;
     gp_gap_kinds |= 1u << kind;
     gp_kind_n[kind]++, gp_kind_units[kind] += units;
@@ -571,6 +613,7 @@ VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
     if (!id) id = ++seq;   // 0 means no mark
     VkPassMark *m = &ring[id & (VK_PASS_MARKS - 1)];
     m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX;
+    m->gap = gap_now, gap_now = 0;   // what was recorded between the mark before and this one
     // timed unless the slot's previous mark is still waiting to be read (its queries are not reset yet)
     if (pt_pool) pt_timed[id & (VK_PASS_MARKS - 1)] = !pt_timed[id & (VK_PASS_MARKS - 1)] ? 1 : 2;
     rec_pass_mark(cb, id, 0);
@@ -584,6 +627,7 @@ void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) {
     gp_in_mark = 0;
     gp_end(cb, m);
     rec_pass_mark(cb, m->id, 1);
+    gap_now = 0;   // the gap after this mark starts empty
 }
 
 int vk_pass_marks_read(uint32_t *started, uint32_t *finished) {
@@ -703,6 +747,73 @@ static void nv_report(void) {
     log_lines(t);
 }
 
+// The kinds of bits (VK_GAP_*) as text; "barriers and state only" when none was noted.
+static void gap_text(uint32_t kinds, char *o, size_t size) {
+    size_t n = 0;
+    o[0] = 0;
+    for (int b = 0; b < VK_GAP_N && n < size; b++)
+        if (kinds >> b & 1) n += (size_t)snprintf(o + n, size - n, "%s%s", n ? ", " : "", gp_kind_names[b]);
+    if (!n) snprintf(o, size, "barriers and state only");
+}
+
+// A GPU that finished the last mark it started stopped between two marks, where the two lines of
+// vk_pass_marks_format name nothing: in a player's log both were one compute dispatch, with 51 later marks made and
+// none of them started. This adds the mark that never started and what the replay recorded between the two (the gap
+// notes: copies, clears, the upscaler, write-backs), or what it recorded after the last mark of all.
+static void report_between(uint32_t started, uint32_t finished) {
+    if (!finished || started != finished) return;
+    char what[512], next[640];
+    const VkPassMark *m = vk_pass_mark_record(finished + 1);
+    if (m) {
+        describe_mark(finished + 1, next, sizeof next);
+        gap_text(m->gap, what, sizeof what);
+        rt_log("vk:   the GPU stopped after mark %u and before the next one, which it never started: %s", (unsigned)finished,
+               next);
+        rt_log("vk:   recorded between the two: %s", what);
+    } else if (finished == seq) {
+        gap_text(gap_now, what, sizeof what);
+        rt_log("vk:   the GPU stopped after mark %u, the last one made; recorded since: %s", (unsigned)finished, what);
+    } else {
+        rt_log("vk:   the GPU stopped after mark %u; the record of the mark after it is gone (a later mark took its slot)",
+               (unsigned)finished);
+    }
+}
+
+static void describe_draw_mark(uint32_t id, char *o, size_t size) {
+    const DrawMark *d = &dring[id & (VK_DRAW_MARKS - 1)];
+    if (!id) snprintf(o, size, "nothing yet");
+    else if (d->id != id) snprintf(o, size, "no record (a later mark took its slot)");
+    else
+        snprintf(o, size, "before draw %u of pass mark %u: vs %016llx fs %016llx", d->draw, d->pass, shader_id(d->vs),
+                 shader_id(d->fs));
+}
+
+// Words 4 and 5 (vk_draw_mark): the draws the GPU had not finished were recorded after the mark in word 5, so its
+// shaders and those of the marks up to the one in word 4 are the candidates; up to DRAW_MARK_LINES of them are listed.
+#define DRAW_MARK_LINES 12
+static void draw_marks_report(void) {
+    if (!vk_draw_marks_on || !words) return;
+    uint32_t reached = words[4], finished = words[5];
+    char t[256];
+    rt_log("vk: draw marks (NX2NAVI_DRAW_CRUMBS, %u made): the GPU last reached draw mark %u, and every draw before draw "
+           "mark %u had finished; the draws it had not finished follow these marks. The marks are numbered as they were "
+           "recorded: with replay workers on, the numbers between the two are not all later in the queue, and only the "
+           "two marks named here are certain:", (unsigned)__atomic_load_n(&dseq, __ATOMIC_RELAXED), (unsigned)reached,
+           (unsigned)finished);
+    uint32_t n = reached >= finished ? reached - finished + 1 : 1;
+    if (n > DRAW_MARK_LINES) n = DRAW_MARK_LINES;
+    for (uint32_t i = 0; i < n; i++) {
+        describe_draw_mark(finished + i, t, sizeof t);
+        rt_log("vk:   draw mark %u: %s", (unsigned)(finished + i), t);
+    }
+    if (reached >= finished && reached - finished + 1 > n)
+        rt_log("vk:   and %u more up to draw mark %u", (unsigned)(reached - finished + 1 - n), (unsigned)reached);
+    if (reached < finished || reached - finished + 1 > n) {   // the mark the GPU last reached, when the list left it out
+        describe_draw_mark(reached, t, sizeof t);
+        rt_log("vk:   draw mark %u, the last the GPU reached: %s", (unsigned)reached, t);
+    }
+}
+
 void vk_pass_marks_report(void) {
     if (!vk_pass_marks_on) return;
     uint32_t started, finished;
@@ -710,6 +821,8 @@ void vk_pass_marks_report(void) {
     if (vk_pass_marks_read(&started, &finished)) {
         vk_pass_marks_format("VK_AMD_buffer_marker", started, finished, t, sizeof t);
         log_lines(t);
+        report_between(started, finished);
+        draw_marks_report();
     }
     nv_report();
 }

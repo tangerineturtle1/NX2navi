@@ -30,6 +30,9 @@ int vk_ffx_framegen_available(void);
 int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                    const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam);
 void vk_ffx_release(void);   // before the device goes away
+// The upscale contexts of FSR 3.1 and FSR 4 (vk_dlaa.c retire_idle, the device idle): any held, and give them back.
+int vk_ffx_holds(void);
+void vk_ffx_release_idle(void);
 // FSR 3.1's contexts that no upscale used in the last `recent` calls, destroyed with the device idle (the caller waited
 // for it): room for an FSR 4 context whose creation failed. Their count.
 int vk_ffx_trim_idle(uint64_t recent);
@@ -47,9 +50,11 @@ int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImag
                     const VkFfxImage *out, float jx, float jy, int reset, float dt_ms,
                     const VkFfxCamera *cam);   // as vk_ffx_upscale
 void vk_ffx4_release(void);
+int vk_ffx4_holds(void);   // an FSR 4 upscale context is made
 int vk_ffx4_failed(void);         // it failed three times in a row: FSR 3.1 serves until vk_ffx4_retry
 void vk_ffx4_retry(void);         // the menu chose FSR 4 again: try it anew after such failures
 void vk_ffx4_trim(uint64_t now_ns);   // at each upscale: FSR 4's contexts unused for a while go
+uint64_t vk_ffx4_vram(int *contexts);   // FSR 4's upscale contexts and their video memory (vk_ffx_vram)
 int vk_ffx_fsr4(void);            // the setting asks for FSR 4 and it runs here: what vk_ffx_upscale uses, for the menu
 
 #if defined(__cplusplus) && !defined(VK_FFX_NO_API)

@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "coop_game.h"
 #include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -1266,7 +1265,6 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) {
-        coop_game_rom_open(path);   // coop_game.c: the title screen's start
         return romfs_open(out, path, mode);
     }
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);

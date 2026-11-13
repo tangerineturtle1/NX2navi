@@ -315,6 +315,10 @@ void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
 void vk_exec_evt(char what, const void *event, uint32_t value);
 void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged
+// The memory report's descriptor pools (vk_memory.c outside_log): the replay's pools, spare ones included, the sets
+// each holds, and the texture pool's sets (0 before it exists).
+typedef struct { uint64_t pools, spare, sets_each, tex_sets; } VkDescMem;
+void vk_exec_desc_mem(VkDescMem *d);
 int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
 int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img

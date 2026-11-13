@@ -8,3 +8,4 @@ void logq_init(LogqSink sink);              // before the first logq_write; line
 int logq_async(void);                       // from now on the log thread writes them; 0 when it could not be started
 void logq_write(const char *p, size_t n);   // queues the bytes, or writes them when the queue is off or has no room
 void logq_sync(void);                       // writes what is queued, on the calling thread, and turns the queue off
+size_t logq_bytes(void);                    // the queue's buffers, for the memory report (vk_memory.c system_log)

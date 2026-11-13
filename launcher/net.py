@@ -17,9 +17,11 @@ Two checks can accept a server's certificate, tried in turn by request():
 A certificate both refuse ends the request with CertificateError: what each check said, whether the PC's clock agrees
 with the server's, and what to do."""
 import email.utils
+import errno
 import hashlib
 import json
 import os
+import shutil
 import ssl
 import time
 import urllib.error
@@ -240,10 +242,57 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def download(url, dest, sha256=None, size=None, progress=None, cancel=None, headers=None, retries=4, version='dev'):
+SPACE_MARGIN = 32 << 20   # bytes a disk keeps free beyond what is about to be written to it (space_problem)
+
+
+class NoSpace(DownloadError):
+    """The disk has no room for the file. Asking again or another server gets the same answer, so download() does
+    not retry it, and it keeps the part file: the download goes on from it once there is room."""
+
+
+def free_bytes(folder):
+    """The free bytes of the disk that holds folder, asked of the nearest folder above it that exists; None when that
+    cannot be asked."""
+    p = Path(folder).absolute()
+    for d in (p, *p.parents):
+        try:
+            return shutil.disk_usage(d).free
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return None
+
+
+def space_problem(folder, need, what):
+    """'' when the disk of folder has room for need more bytes and SPACE_MARGIN, or when its free space cannot be
+    asked; else the sentence that says there is no room for what, how much it takes and how much is free. Asked
+    before a download or an unpack starts: a disk that fills in the middle otherwise ends it with an error that
+    names no cause and leaves half of it behind."""
+    free = free_bytes(folder)
+    if free is None or free >= max(0, need) + SPACE_MARGIN:
+        return ''
+    p = Path(folder).absolute()
+    return (f'there is no room for {what} on {p.anchor or p} ({(max(0, need) + SPACE_MARGIN) / 1e6:,.0f} MB needed, '
+            f'{free / 1e6:,.0f} MB free): make room there and try again')
+
+
+PART_OF = '.of'   # <dest>.part.of: what the part file beside it is a part of (download)
+
+
+def download(url, dest, sha256=None, size=None, progress=None, cancel=None, headers=None, retries=4, version='dev',
+             log=None):
     """Fetch url to dest through dest.part, resuming a part file a cut connection left. progress(done, total) after
     every chunk; cancel() returning True raises Cancelled. A wrong size or sha256 deletes the file and raises
-    DownloadError. A dest already holding the expected sha256 is kept without a request."""
+    DownloadError. A dest already holding the expected sha256 is kept without a request. NoSpace, before anything
+    is written, when the disk has no room for the rest of the file (the expected size, else the size the server
+    names).
+
+    A part file is resumed only as a part of the same file: dest.part.of beside it names the file it was begun
+    for, by the expected sha256 (the same file from any server) or, without one, by its address.
+    A part begun for another file under the same name (a release published again with other bytes) is deleted
+    with a line for log, where resuming it ended in "sha256 ..., expected ..." as if the download were damaged. A
+    part without that note (an older launcher's) is resumed as before."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if sha256 and dest.is_file() and sha256_file(dest) == sha256.lower():
@@ -251,6 +300,26 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
             progress(dest.stat().st_size, dest.stat().st_size)
         return dest
     part = dest.with_name(dest.name + '.part')
+    note = part.with_name(part.name + PART_OF)
+    wanted = f'sha256 {sha256.lower()}' if sha256 else url
+    if part.is_file():
+        try:
+            begun_for = note.read_text(encoding='utf-8').strip()
+        except (OSError, ValueError):
+            begun_for = ''
+        if begun_for and begun_for != wanted:
+            part.unlink(missing_ok=True)
+            if log:
+                log(f'{part.name} was begun for another file ({begun_for}), not this one ({wanted}): it is deleted '
+                    'and the download starts over')
+    try:
+        note.write_text(wanted, encoding='utf-8')
+    except OSError:   # without the note the part is resumed as it always was
+        pass
+    if size:
+        full = space_problem(dest.parent, size - (part.stat().st_size if part.is_file() else 0), dest.name)
+        if full:
+            raise NoSpace(full)
     last_error = None
     for attempt in range(retries):
         have = part.stat().st_size if part.is_file() else 0
@@ -262,7 +331,16 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
                 status = getattr(r, 'status', 200)
                 if have and status != 206:   # the server ignores Range: start over
                     have = 0
-                total = int(r.headers.get('Content-Length') or 0) + have or size or 0
+                # The whole file's size for progress: the expected one, else what the server says is still to come
+                # plus what the part file holds, else unknown (0: progress then gets the bytes so far as the total).
+                # "length + have or size or 0" took the part file's size for the whole when a resumed answer named
+                # no length, and the bar ran past its end.
+                coming = int(r.headers.get('Content-Length') or 0)
+                total = size or (coming + have if coming else 0)
+                if coming and not size:
+                    full = space_problem(dest.parent, coming, dest.name)
+                    if full:
+                        raise NoSpace(full)
                 with open(part, 'ab' if have else 'wb') as f:
                     done = have
                     while True:
@@ -279,7 +357,7 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
                         if progress:
                             progress(done, total or done)
             break
-        except (Cancelled, CertificateError):
+        except (Cancelled, CertificateError, NoSpace):
             raise
         except DownloadError:
             part.unlink(missing_ok=True)
@@ -293,6 +371,10 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
                 raise DownloadError(f'{url}: HTTP {e.code}') from e
             last_error = e
         except (urllib.error.URLError, OSError, IncompleteRead) as e:
+            if isinstance(e, OSError) and e.errno == errno.ENOSPC:   # the disk filled meanwhile: trying again cannot help
+                p = dest.parent.absolute()
+                raise NoSpace(f'{p.anchor or p} is full: {dest.name} could not be written. Make room there and try '
+                              'again') from e
             last_error = e
         time.sleep(min(2 ** attempt, 16))
     else:
@@ -307,4 +389,5 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
             part.unlink(missing_ok=True)
             raise DownloadError(f'{url}: sha256 {digest}, expected {sha256.lower()}')
     os.replace(part, dest)
+    note.unlink(missing_ok=True)
     return dest

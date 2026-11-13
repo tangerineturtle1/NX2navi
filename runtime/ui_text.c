@@ -55,6 +55,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_DESC] = "Stops screen tearing. Off lowers input delay slightly.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
     [UI_MENU_PRESENT_IN_USE] = "in use: %s",
+    [UI_MENU_LOW_LATENCY] = "Low latency",
+    [UI_MENU_LOW_LATENCY_DESC] = "The graphics driver holds each frame's start, so the controller is read as late as "
+                                 "possible (NVIDIA Reflex, AMD Anti-Lag). It keeps the frame rate limit too. Boost "
+                                 "keeps the graphics card at full clock.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "On + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "this graphics driver has no low-latency mode",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "DLSS frame generation uses its own",
+    [UI_MENU_LOW_LATENCY_FG] = "off while frame generation runs on this card",
+    [UI_MENU_LOW_LATENCY_FAILED] = "in use: off, the driver refused it (see lowlat in the log)",
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The graphics card that runs the game.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
@@ -73,6 +82,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                               "sharper than bilinear. Smaller window (Ocarina draws 2560 x 1440): the picture is shrunk "
                               "and FSR sharpens it by the strength below.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear",
+    [UI_MENU_UPSCALING_NATIVE] = "Native (100%)",
     [UI_MENU_GAME_ASPECT] = "Widescreen",
     [UI_MENU_GAME_ASPECT_DESC] = "Widens the view. HUD and menus stay 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (the game's)", [UI_MENU_GAME_ASPECT_WINDOW] = "Window shape",
@@ -91,6 +101,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TEX_DETAIL_FULL] = "Full", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduced", [UI_MENU_TEX_DETAIL_LOW] = "Low",
     [UI_MENU_LOWEND_INTRO] = "The settings of the low-end GPU mode. Each can be changed here; most take effect after a restart.",
     [UI_MENU_LOWEND_RESTART] = "The mode turns on after a restart. Its settings are listed here then.",
+    [UI_MENU_LOWEND_NOT_FOR_CARD] = "Not for this graphics card: it has mesh shaders and 8 GB of video memory or more. "
+                                    "The mode is for older cards and can break shadows on this one.",
     [UI_MENU_LOWEND_MEMORY] = "Video memory and textures",
     [UI_MENU_LOWEND_RENDER] = "Rendering",
     [UI_MENU_LOWEND_BUILD] = "Build",
@@ -112,15 +124,17 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_LOWEND_RESERVE] = "Video memory kept free",
     [UI_MENU_LOWEND_RESERVE_DESC] = "Room kept free in each video memory heap for what FidelityFX (FSR 3.1, frame generation) and the "
                                   "driver allocate on their own: a heap with less than this left takes no new allocation while "
-                                  "another heap can. Off: video memory can fill up with frame generation on, and the game ends.",
+                                  "another video memory heap can (an RX 580 has two; cards with one are not affected). Off: video "
+                                  "memory can fill up with frame generation on, and the game ends.",
     [UI_MENU_LOWEND_HEAP_LIMIT] = "Video memory heap limit",
     [UI_MENU_LOWEND_HEAP_LIMIT_DESC] = "Auto: on GPUs with a second video memory heap (an RX 580 shows 6 GB and 2 GB), "
                                      "each heap is filled only to its budget before the next one is used, so the "
                                      "driver does not run out. Off: no limit.",
     [UI_MENU_LOWEND_UPLOAD_BATCH] = "Upload batch limit",
     [UI_MENU_LOWEND_UPLOAD_BATCH_DESC] = "Texture uploads waiting in staging memory are sent to the GPU early once they "
-                                       "hold this much, so an area load cannot run video memory out.",
-    [UI_MENU_LOWEND_NO_LIMIT] = "No limit",
+                                       "hold this much, so an area load cannot run video memory out. Every batch is "
+                                       "sent at 64 MB at the latest, so none of these choices changes anything now.",
+    [UI_MENU_LOWEND_NO_LIMIT] = "64 MB",
     [UI_MENU_LOWEND_ASTC_KEEP] = "Keep the ASTC decode buffer",
     [UI_MENU_LOWEND_ASTC_KEEP_DESC] = "The buffer that GPU-decodes compressed textures is kept between upload batches "
                                     "instead of being allocated again for each one.",
@@ -168,7 +182,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                "decoder translated from the console. Lighter streaming while you move.",
     [UI_MENU_LOWEND_ASYNC] = "Asynchronous replay",
     [UI_MENU_LOWEND_ASYNC_DESC] = "Translates the game's GPU commands on a thread of their own instead of the game's, so "
-                                "the game prepares the next frame meanwhile.",
+                                "the game prepares the next frame meanwhile. Off by default: it can show a dark or "
+                                "flickering frame now and then.",
     [UI_MENU_LOWEND_PASS_TIMES] = "Pass times in the log",
     [UI_MENU_LOWEND_PASS_TIMES_DESC] = "GPU time of every render pass and dispatch goes to the log, with the largest "
                                      "viewport each kind of pass draws with. Costs a little frame time.",
@@ -276,6 +291,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_DOCKED] = "Docked", [UI_MENU_MODE_HANDHELD] = "Handheld",
     [UI_MENU_ASSUME_FOCUS] = "Keep running out of focus",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Keeps the game running when you switch to another window.",
+    [UI_MENU_TEXT_SPEED] = "Text speed",
+    [UI_MENU_TEXT_SPEED_DESC] = "How fast the game's message windows show their text. Fast types three times as fast; "
+                                "instant shows each page at once. Text the game does not let you hurry, such as "
+                                "lines timed to a cutscene or a voice, keeps its speed.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Normal", [UI_MENU_TEXT_SPEED_FAST] = "Fast",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Instant",
 
     [UI_MENU_MODS_BUILTIN] = "Built into the port", [UI_MENU_MODS_INSTALLED] = "Installed mods",
     [UI_MENU_MODS_NONE] = "No mods yet. Unpack a mod into the mods folder, one folder per mod with its romfs folder "
@@ -314,12 +335,28 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CHANNELS_AUTO] = "Automatic", [UI_MENU_CHANNELS_STEREO] = "Stereo", [UI_MENU_CHANNELS_51] = "5.1 surround",
 
     [UI_MENU_MOTION] = "Motion controls", [UI_MENU_MOTION_DESC] = "Aim with the controller's gyro.",
+    [UI_MENU_SPRINT_BUTTON] = "Sprint button",
+    [UI_MENU_SPRINT_BUTTON_DESC] = "A button that makes Link sprint without rolling first. L3, the left stick's "
+                                   "click, has no other use. The game's B button sprints only while Link moves and "
+                                   "puts the weapon away as usual otherwise; with the game's Swap Jump Controls on, B "
+                                   "is the jump, so use L3.",
+    [UI_MENU_SPRINT_OFF] = "Off", [UI_MENU_SPRINT_B] = "The game's B button",
+    [UI_MENU_SPRINT_L3] = "L3 (left stick)",
+    [UI_MENU_SPRINT_MODE] = "Sprint mode",
+    [UI_MENU_SPRINT_MODE_DESC] = "Toggle: press once to sprint and again to stop. The sprint goes on through jumps "
+                                 "and ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs. "
+                                 "Hold: Link sprints while the button is held.",
+    [UI_MENU_SPRINT_TOGGLE] = "Toggle", [UI_MENU_SPRINT_HOLD] = "Hold",
     [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
     [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the vibration is.",
     [UI_MENU_RUMBLE_CURVE] = "Vibration curve",
     [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make light vibration stronger.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Also vibrates the triggers on Xbox controllers.",
+    [UI_MENU_RUMBLE_HD] = "HD vibration (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Sends the game's detailed vibration to a Switch Pro Controller or Joy-Con as it is. "
+                               "The vibration strength still applies: its default is the game's own.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Needs a Switch Pro Controller or Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Button layout",
     [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A. Nintendo: by position, A right, B bottom, X top, Y "
                                 "left. Xbox and PlayStation: by label, A bottom, B right, X left, Y top (on a "
@@ -471,10 +508,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                  "prepares frames on a thread of their own. Measured on a Radeon RX 580 only: it can show a dark or flickering "
                                  "frame now and then, so leave it off on a newer card.",
     [UI_MENU_REPLAY_WORKERS] = "CPU helper threads (experimental)",
-    [UI_MENU_REPLAY_WORKERS_DESC] = "Uses more of your CPU's cores to prepare each frame for the graphics card. 0 turns it "
-                                    "off. 3 gave about 20% more frames a second on an 8-core CPU, and 5 a little more "
-                                    "with the settings below. Some players' games crashed with this on: set it back to "
-                                    "0 if yours does.",
+    [UI_MENU_REPLAY_WORKERS_DESC] = "Uses more of your CPU's cores to prepare each frame for the graphics card. Automatic "
+                                    "picks the number for your CPU: half its cores less one, none on four cores or fewer "
+                                    "and none on RX 6000 and older Radeon cards. 0 turns it off. 3 gave about 20% more "
+                                    "frames a second on an 8-core CPU. If your game crashes with this on, set it to 0.",
     [UI_MENU_REPLAY_PIPE] = "Helpers work ahead (experimental)",
     [UI_MENU_REPLAY_PIPE_DESC] = "The game carries on with the rest of the frame while the helper threads are still "
                                  "busy, instead of waiting for them. The number is how many batches of work the "
@@ -644,101 +681,17 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s was made by a newer NX2navi: update NX2navi first.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s is damaged: download it again.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
-    [UI_MENU_TAB_COOP] = "Co-op",
-    [UI_MENU_COOP_ON] = "Co-op (experimental)",
-    [UI_MENU_COOP_ON_DESC] = "Play with friends over Steam, each in their own game and save. Nobody sets up a router: rooms "
-                             "and invites go through Steam, which shows you as playing Spacewar, its test app. Needs Steam "
-                             "running; the launcher takes Steam's library file from a Steam game you have installed. Off: the "
-                             "game uses no network.",
-    [UI_MENU_COOP_NO_LIBRARY] = "Steam's library file, steam_api64.dll, is not beside the game. The launcher puts it there when "
-                                "it starts the game, from a Steam game you have installed: start the game from the launcher, with "
-                                "Steam and at least one game from 2021 or later installed. You can also copy the file yourself "
-                                "from a Steam game's folder into the folder of ocarina.exe.",
-    [UI_MENU_COOP_OLD_LIBRARY] = "The steam_api64.dll beside the game is too old for co-op. Replace it with one from a newer Steam "
-                                 "game.",
-    [UI_MENU_COOP_NO_CLIENT] = "Steam did not answer. Start Steam and sign in, then choose Look for Steam again.",
-    [UI_MENU_COOP_RETRY] = "Look for Steam again",
-    [UI_MENU_COOP_RETRY_DESC] = "Tries now to reach Steam; the game also tries by itself every few seconds.",
-    [UI_MENU_COOP_CREATE] = "Create a room",
-    [UI_MENU_COOP_CREATE_DESC] = "Makes a room for up to four players. You get a room ID to pass on, and you can invite Steam "
-                                 "friends.",
-    [UI_MENU_COOP_JOIN] = "Join a room",
-    [UI_MENU_COOP_JOIN_DESC] = "Joins the room whose ID a friend gave you.",
-    [UI_MENU_COOP_ROOM_ID] = "Room ID",
-    [UI_MENU_COOP_ROOM_ID_DESC] = "Friends type this into Join a room. Press to copy it. Anyone who has it can join, so pass it on "
-                                  "only to the people you want in your game.",
-    [UI_MENU_COOP_ROOM_ID_HINT] = "8 letters and digits, as XXXX-XXXX: any case, with or without the dash.",
-    [UI_MENU_COOP_ROOM_ID_BAD] = "This is not a room ID: check it for a mistyped character.",
-    [UI_MENU_COOP_PASTE] = "Paste",
-    [UI_MENU_COOP_PASTE_EMPTY] = "The clipboard has no text.",
-    [UI_MENU_COOP_COPIED] = "copied",
-    [UI_MENU_COOP_OK] = "OK",
-    [UI_MENU_COOP_JOINING] = "Getting into the room…",
-    [UI_MENU_COOP_STOP] = "Stop",
-    [UI_MENU_COOP_STOP_DESC] = "Stops trying to get into the room.",
-    [UI_MENU_COOP_INVITE] = "Invite a friend",
-    [UI_MENU_COOP_INVITE_DESC] = "Sends a Steam invite to a friend. It reaches a friend whose NX2navi is running with co-op on; "
-                                 "anyone else can use the room ID.",
-    [UI_MENU_COOP_INVITE_TITLE] = "Invite a Steam friend",
-    [UI_MENU_COOP_INVITE_NONE] = "Steam shows no friends.",
-    [UI_MENU_COOP_INVITE_SENT] = "Invite sent to %s.",
-    [UI_MENU_COOP_INVITE_IN_GAME] = "in co-op now",
-    [UI_MENU_COOP_INVITE_ONLINE] = "online",
-    [UI_MENU_COOP_INVITE_OFFLINE] = "offline",
-    [UI_MENU_COOP_INVITE_STEAM] = "Steam's invite window",
-    [UI_MENU_COOP_INVITE_CLOSE] = "Close",
-    [UI_MENU_COOP_INVITED] = "%s invites you to a room.",
-    [UI_MENU_COOP_INVITED_JOIN] = "Join their room",
-    [UI_MENU_COOP_INVITED_JOIN_DESC] = "Joins the room you were invited to.",
-    [UI_MENU_COOP_INVITED_NO] = "Not now",
-    [UI_MENU_COOP_INVITED_NO_DESC] = "Puts the invite away.",
-    [UI_MENU_COOP_PLAYERS] = "Players",
-    [UI_MENU_COOP_YOU] = "you",
-    [UI_MENU_COOP_HOST] = "host",
-    [UI_MENU_COOP_PLAYER_DESC] = "A player in the room, and the area their Link is in.",
-    [UI_MENU_COOP_PLAYER_REMOVE_DESC] = "A player in the room. As the host you can press to remove them from the room.",
-    [UI_MENU_COOP_PLAYER_AWAY] = "not in the world",
-    [UI_MENU_COOP_REMOVE] = "Remove",
-    [UI_MENU_COOP_REMOVE_CONFIRM] = "Remove %s from the room? They cannot come back into this room.",
-    [UI_MENU_COOP_LEAVE] = "Leave the room",
-    [UI_MENU_COOP_LEAVE_DESC] = "Leaves the room. Your game and save go on as they are.",
-    [UI_MENU_COOP_LEAVE_CONFIRM] = "Leave the room?",
-    [UI_MENU_COOP_LEAVE_HOST] = "You are the host: the room goes on with another player as its host.",
-    [UI_MENU_COOP_STAY] = "Stay",
-    [UI_MENU_COOP_CHAT] = "Chat",
-    [UI_MENU_COOP_CHAT_WRITE] = "Write a message",
-    [UI_MENU_COOP_CHAT_WRITE_DESC] = "Sends a line of text to everyone in the room.",
-    [UI_MENU_COOP_SEND] = "Send",
-    [UI_MENU_COOP_CHAT_JOINED] = "%s joined the room",
-    [UI_MENU_COOP_CHAT_LEFT] = "%s left the room",
-    [UI_MENU_COOP_SETTINGS] = "Co-op settings",
-    [UI_MENU_COOP_SHARE] = "Share progress",
-    [UI_MENU_COOP_SHARE_DESC] = "In a room, what anyone achieves counts for everyone: story progress, chests, doors, items and "
-                                "songs. Before anything from a room reaches your save, the save is copied to coop-backup in the "
-                                "profile folder. Small keys, rupees, ammunition and hearts stay your own. Off: only names and "
-                                "chat are shared.",
-    [UI_MENU_COOP_NAMES] = "Show player names",
-    [UI_MENU_COOP_NAMES_DESC] = "Shows the name of each other player where their Link stands in your world, with the distance. "
-                                "Needs DLSS, FSR or TAA on (the game tells the menu where the camera looks only then).",
-    [UI_MENU_COOP_CHAT_SHOW] = "Show chat over the game",
-    [UI_MENU_COOP_CHAT_SHOW_DESC] = "New chat lines and who joined or left show for a few seconds while the menu is closed.",
-    [UI_MENU_COOP_N_CREATE_FAILED] = "Steam could not make the room. Try again in a moment.",
-    [UI_MENU_COOP_N_NO_ROOM] = "No room has this ID: check it, or ask your friend whether the room is still open.",
-    [UI_MENU_COOP_N_FULL] = "The room is full.",
-    [UI_MENU_COOP_N_REFUSED] = "The room did not let you in.",
-    [UI_MENU_COOP_N_NOT_OURS] = "That is not an NX2navi room.",
-    [UI_MENU_COOP_N_OTHER_VERSION] = "The room's host runs another version of NX2navi or of the game: use the same versions.",
-    [UI_MENU_COOP_N_REMOVED] = "The host removed you from the room.",
-    [UI_MENU_COOP_N_HOST_SILENT] = "The room's host did not answer.",
-    [UI_MENU_COOP_N_LOST] = "Steam lost its connection; the room is gone.",
-    [UI_MENU_COOP_N_LEFT] = "You left the room.",
-    [UI_MENU_COOP_LOCAL] = "Test mode: a stand-in for Steam on this PC.",
-    [UI_MENU_COOP_TOAST_INVITE] = "%s invites you to a room: open the menu's Co-op tab.",
+    [UI_MENU_CAPTURE_SAVED] = "Bug capture %d saved",
+    [UI_MENU_CAPTURE_FOLDER] = "Folder: %s",
+    [UI_MENU_CAPTURE_FAILED] = "Bug capture %d could not be saved",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
+    [UI_BOOT_COMPUTE] = "Compute pipelines: %lld of %lld", [UI_BOOT_DRIVER_CACHE] = "Driver cache: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
-    [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window.",
-    [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window.",
+    [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene at "
+                               "the picture's full size with no upscaler: the sharpest, and the most GPU work.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene "
+                                   "at the picture's full size with no upscaler: the sharpest, and the most GPU work.",
     [UI_MENU_FRAMEGEN] = "Frame generation",
     [UI_MENU_FRAMEGEN_DESC] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1.",
     [UI_MENU_FRAMEGEN_OFF] = "Off",
@@ -748,8 +701,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
-    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
-                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene "
+                                      "at the picture's full size with no upscaler: the sharpest, and the most GPU "
+                                      "work. AMD FSR 3.1 is not offered here: it needs amd_fidelityfx_vk.dll, which "
+                                      "cannot be loaded.",
     [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
     [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
     [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
@@ -771,6 +726,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
     [UI_MENU_FRAMEGEN_UNAVAILABLE] = "in use: off: it needs an RTX 40 or newer; if you have one, see dlssg in the log",
     [UI_MENU_FRAMEGEN_OFF_FILES] = "in use: off, its files are missing",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Adds generated frames for smoother motion, with any Upscaling choice.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Adds generated frames for smoother motion. NVIDIA DLSS needs a DLSS mode under "
+                                  "Upscaling when the game starts; it then runs with any Upscaling choice.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "needs DLSS when the game starts",
     [UI_MENU_GAME_RES] = "Resolution",
     [UI_MENU_GAME_RES_DESC] = "Size of the game's picture; outside fullscreen the window takes it too. Higher is sharper "
                               "but costs more GPU power.",
@@ -809,6 +768,22 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
     [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
     [UI_MENU_PRESENT_IN_USE] = "сейчас: %s",
+    [UI_MENU_LOW_LATENCY] = "Низкая задержка",
+    [UI_MENU_LOW_LATENCY_DESC] = "Драйвер видеокарты задерживает начало каждого кадра, чтобы ввод считывался как "
+                                 "можно позже (NVIDIA Reflex, AMD Anti-Lag). Он же держит ограничение частоты кадров. "
+                                 "Boost не даёт видеокарте снижать частоту.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "Вкл. + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "у этого драйвера нет режима низкой задержки",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "генерация кадров DLSS использует свой режим",
+    [UI_MENU_LOW_LATENCY_FG] = "выключено, пока на этой видеокарте работает генерация кадров",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Добавляет сгенерированные кадры для более плавного движения, с любым выбором в "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Добавляет сгенерированные кадры для более плавного движения. Для NVIDIA DLSS "
+                                  "нужен режим DLSS в Upscaling при запуске игры; после этого генерация работает с "
+                                  "любым "
+                                  "выбором в Upscaling.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "нужен DLSS при запуске игры",
+    [UI_MENU_LOW_LATENCY_FAILED] = "сейчас: выкл., драйвер отказал (см. lowlat в журнале)",
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Видеокарта, на которой работает игра.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
@@ -826,6 +801,17 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                               "билинейного. Окно меньше (Ocarina рисует 2560 × 1440): картинка уменьшается, и FSR "
                               "повышает её резкость на величину ниже.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Билинейное",
+    [UI_MENU_UPSCALING_NATIVE] = "Родное (100%)",
+    [UI_MENU_UPSCALING_DESC] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену в "
+                               "полном размере картинки без апскейлера: самая чёткая картинка и самая большая "
+                               "нагрузка на видеокарту.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену в "
+                                   "полном размере картинки без апскейлера: самая чёткая картинка и самая большая "
+                                   "нагрузка на видеокарту.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену "
+                                      "в полном размере картинки без апскейлера: самая чёткая картинка и самая "
+                                      "большая нагрузка на видеокарту. AMD FSR 3.1 здесь не предлагается: ему нужен "
+                                      "amd_fidelityfx_vk.dll, который не удаётся загрузить.",
     [UI_MENU_GAME_ASPECT] = "Широкий экран",
     [UI_MENU_GAME_ASPECT_DESC] = "Расширяет обзор. Интерфейс и меню остаются 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (как в игре)", [UI_MENU_GAME_ASPECT_WINDOW] = "По окну",
@@ -941,6 +927,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_DOCKED] = "В док-станции", [UI_MENU_MODE_HANDHELD] = "Портативный",
     [UI_MENU_ASSUME_FOCUS] = "Работать без фокуса",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Игра продолжает работать, когда вы переключаетесь на другое окно.",
+    [UI_MENU_TEXT_SPEED] = "Скорость текста",
+    [UI_MENU_TEXT_SPEED_DESC] = "Как быстро окна сообщений игры показывают текст. Быстро: в три раза быстрее; "
+                                "мгновенно: каждая страница сразу целиком. Текст, который игра не даёт ускорить, "
+                                "например реплики в такт сценке или голосу, идёт с обычной скоростью.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Обычная", [UI_MENU_TEXT_SPEED_FAST] = "Быстро",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Мгновенно",
 
     [UI_MENU_MODS_BUILTIN] = "Встроенные в порт", [UI_MENU_MODS_INSTALLED] = "Установленные моды",
     [UI_MENU_MODS_NONE] = "Модов пока нет. Распакуйте мод в папку mods, каждый мод в свою папку с папкой romfs внутри, и "
@@ -983,6 +975,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Чем ниже, тем сильнее слабая вибрация.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Вибрация триггеров (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Вибрация также на курках контроллера Xbox.",
+    [UI_MENU_RUMBLE_HD] = "HD-вибрация (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Передаёт детальную вибрацию игры на Switch Pro Controller или Joy-Con без изменений. "
+                               "Сила вибрации по-прежнему действует: значение по умолчанию — как в игре.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Нужен Switch Pro Controller или Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Раскладка кнопок",
     [UI_MENU_PAD_LAYOUT_DESC] = "Какая кнопка работает как A. Nintendo: по положению, A справа, B снизу, X сверху, "
                                 "Y слева. Xbox и PlayStation: по подписи, A снизу, B справа, X слева, Y сверху (на "
@@ -1291,99 +1287,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s создан более новой версией NX2navi: сначала обновите NX2navi.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s повреждён: скачайте его заново.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
-    [UI_MENU_TAB_COOP] = "Кооператив",
-    [UI_MENU_COOP_ON] = "Кооператив (эксперимент)",
-    [UI_MENU_COOP_ON_DESC] = "Играйте с друзьями через Steam, каждый в своей игре и со своим сохранением. Настраивать роутер "
-                             "не нужно: комнаты и приглашения идут через Steam, который показывает, что вы играете в Spacewar, "
-                             "его тестовое приложение. Нужен запущенный Steam; файл его библиотеки лаунчер берёт из "
-                             "установленной у вас игры Steam. Выкл.: игра не использует сеть.",
-    [UI_MENU_COOP_NO_LIBRARY] = "Файла библиотеки Steam, steam_api64.dll, нет рядом с игрой. Лаунчер кладёт его туда при запуске "
-                                "игры, из установленной у вас игры Steam: запустите игру из лаунчера при установленном Steam и "
-                                "хотя бы одной игре 2021 года или новее. Можно и самому скопировать файл из папки любой игры "
-                                "Steam в папку с ocarina.exe.",
-    [UI_MENU_COOP_OLD_LIBRARY] = "Файл steam_api64.dll рядом с игрой слишком старый для кооператива. Замените его файлом из более "
-                                 "новой игры Steam.",
-    [UI_MENU_COOP_NO_CLIENT] = "Steam не ответил. Запустите Steam, войдите в аккаунт и выберите «Искать Steam снова».",
-    [UI_MENU_COOP_RETRY] = "Искать Steam снова",
-    [UI_MENU_COOP_RETRY_DESC] = "Пробует связаться со Steam сейчас; игра и сама пробует каждые несколько секунд.",
-    [UI_MENU_COOP_CREATE] = "Создать комнату",
-    [UI_MENU_COOP_CREATE_DESC] = "Создаёт комнату до четырёх игроков. Вы получите ID комнаты, который можно передать, и сможете "
-                                 "пригласить друзей из Steam.",
-    [UI_MENU_COOP_JOIN] = "Войти в комнату",
-    [UI_MENU_COOP_JOIN_DESC] = "Вход в комнату, ID которой вам дал друг.",
-    [UI_MENU_COOP_ROOM_ID] = "ID комнаты",
-    [UI_MENU_COOP_ROOM_ID_DESC] = "Друзья вводят его в «Войти в комнату». Нажмите, чтобы скопировать. Войти может любой, у кого он "
-                                  "есть, поэтому передавайте его только тем, кого хотите видеть в своей игре.",
-    [UI_MENU_COOP_ROOM_ID_HINT] = "8 букв и цифр в виде XXXX-XXXX: в любом регистре, с дефисом или без.",
-    [UI_MENU_COOP_ROOM_ID_BAD] = "Это не ID комнаты: проверьте, нет ли опечатки.",
-    [UI_MENU_COOP_PASTE] = "Вставить",
-    [UI_MENU_COOP_PASTE_EMPTY] = "В буфере обмена нет текста.",
-    [UI_MENU_COOP_COPIED] = "скопировано",
-    [UI_MENU_COOP_OK] = "ОК",
-    [UI_MENU_COOP_JOINING] = "Вход в комнату…",
-    [UI_MENU_COOP_STOP] = "Остановить",
-    [UI_MENU_COOP_STOP_DESC] = "Прекращает попытку войти в комнату.",
-    [UI_MENU_COOP_INVITE] = "Пригласить друга",
-    [UI_MENU_COOP_INVITE_DESC] = "Отправляет другу приглашение через Steam. Оно дойдёт до друга, у которого запущена NX2navi с "
-                                 "включённым кооперативом; остальные могут воспользоваться ID комнаты.",
-    [UI_MENU_COOP_INVITE_TITLE] = "Пригласить друга из Steam",
-    [UI_MENU_COOP_INVITE_NONE] = "Steam не показывает друзей.",
-    [UI_MENU_COOP_INVITE_SENT] = "Приглашение отправлено: %s.",
-    [UI_MENU_COOP_INVITE_IN_GAME] = "сейчас в кооперативе",
-    [UI_MENU_COOP_INVITE_ONLINE] = "в сети",
-    [UI_MENU_COOP_INVITE_OFFLINE] = "не в сети",
-    [UI_MENU_COOP_INVITE_STEAM] = "Окно приглашений Steam",
-    [UI_MENU_COOP_INVITE_CLOSE] = "Закрыть",
-    [UI_MENU_COOP_INVITED] = "%s приглашает вас в комнату.",
-    [UI_MENU_COOP_INVITED_JOIN] = "Войти в их комнату",
-    [UI_MENU_COOP_INVITED_JOIN_DESC] = "Вход в комнату, в которую вас пригласили.",
-    [UI_MENU_COOP_INVITED_NO] = "Не сейчас",
-    [UI_MENU_COOP_INVITED_NO_DESC] = "Убирает приглашение.",
-    [UI_MENU_COOP_PLAYERS] = "Игроки",
-    [UI_MENU_COOP_YOU] = "вы",
-    [UI_MENU_COOP_HOST] = "хост",
-    [UI_MENU_COOP_PLAYER_DESC] = "Игрок в комнате и область, в которой находится его Линк.",
-    [UI_MENU_COOP_PLAYER_REMOVE_DESC] = "Игрок в комнате. Как хост вы можете нажать, чтобы удалить его из комнаты.",
-    [UI_MENU_COOP_PLAYER_AWAY] = "не в мире",
-    [UI_MENU_COOP_REMOVE] = "Удалить",
-    [UI_MENU_COOP_REMOVE_CONFIRM] = "Удалить %s из комнаты? Вернуться в эту комнату он не сможет.",
-    [UI_MENU_COOP_LEAVE] = "Выйти из комнаты",
-    [UI_MENU_COOP_LEAVE_DESC] = "Выход из комнаты. Ваша игра и сохранение остаются как есть.",
-    [UI_MENU_COOP_LEAVE_CONFIRM] = "Выйти из комнаты?",
-    [UI_MENU_COOP_LEAVE_HOST] = "Вы хост: комната продолжит работу, хостом станет другой игрок.",
-    [UI_MENU_COOP_STAY] = "Остаться",
-    [UI_MENU_COOP_CHAT] = "Чат",
-    [UI_MENU_COOP_CHAT_WRITE] = "Написать сообщение",
-    [UI_MENU_COOP_CHAT_WRITE_DESC] = "Отправляет строку текста всем в комнате.",
-    [UI_MENU_COOP_SEND] = "Отправить",
-    [UI_MENU_COOP_CHAT_JOINED] = "%s входит в комнату",
-    [UI_MENU_COOP_CHAT_LEFT] = "%s выходит из комнаты",
-    [UI_MENU_COOP_SETTINGS] = "Настройки кооператива",
-    [UI_MENU_COOP_SHARE] = "Общий прогресс",
-    [UI_MENU_COOP_SHARE_DESC] = "В комнате достижения любого игрока засчитываются всем: сюжет, сундуки, двери, предметы и песни. "
-                                "Прежде чем что-либо из комнаты попадёт в ваше сохранение, оно копируется в coop-backup в папке "
-                                "профиля. Малые ключи, рупии, боеприпасы и сердца остаются вашими. Выкл.: общими остаются только "
-                                "имена и чат.",
-    [UI_MENU_COOP_NAMES] = "Показывать имена игроков",
-    [UI_MENU_COOP_NAMES_DESC] = "Показывает имя каждого другого игрока там, где его Линк стоит в вашем мире, и расстояние до "
-                                "него. Нужны включённые DLSS, FSR или TAA (только тогда меню знает, куда смотрит камера).",
-    [UI_MENU_COOP_CHAT_SHOW] = "Показывать чат поверх игры",
-    [UI_MENU_COOP_CHAT_SHOW_DESC] = "Новые строки чата и сообщения о входе и выходе игроков показываются несколько секунд, пока меню "
-                                    "закрыто.",
-    [UI_MENU_COOP_N_CREATE_FAILED] = "Steam не смог создать комнату. Попробуйте ещё раз чуть позже.",
-    [UI_MENU_COOP_N_NO_ROOM] = "Комнаты с таким ID нет: проверьте его или спросите друга, открыта ли ещё комната.",
-    [UI_MENU_COOP_N_FULL] = "Комната заполнена.",
-    [UI_MENU_COOP_N_REFUSED] = "Комната вас не впустила.",
-    [UI_MENU_COOP_N_NOT_OURS] = "Это не комната NX2navi.",
-    [UI_MENU_COOP_N_OTHER_VERSION] = "У хоста комнаты другая версия NX2navi или игры: используйте одинаковые версии.",
-    [UI_MENU_COOP_N_REMOVED] = "Хост удалил вас из комнаты.",
-    [UI_MENU_COOP_N_HOST_SILENT] = "Хост комнаты не ответил.",
-    [UI_MENU_COOP_N_LOST] = "Steam потерял соединение; комнаты больше нет.",
-    [UI_MENU_COOP_N_LEFT] = "Вы вышли из комнаты.",
-    [UI_MENU_COOP_LOCAL] = "Тестовый режим: замена Steam на этом ПК.",
-    [UI_MENU_COOP_TOAST_INVITE] = "%s приглашает вас в комнату: откройте вкладку «Кооператив» в меню.",
+    [UI_MENU_CAPTURE_SAVED] = "Снимок ошибки %d сохранён",
+    [UI_MENU_CAPTURE_FOLDER] = "Папка: %s",
+    [UI_MENU_CAPTURE_FAILED] = "Снимок ошибки %d не удалось сохранить",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
+    [UI_BOOT_COMPUTE] = "Вычислительные конвейеры: %lld из %lld", [UI_BOOT_DRIVER_CACHE] = "Кэш драйвера: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Некоторые читы меняют код игры и ещё не собраны в неё: они новые или изменены, "
                                     "либо прошлая пересборка не удалась или была отменена. Закрывает игру; установщик "
@@ -1449,6 +1358,21 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_DESC] = "Evita cortes na imagem. Desligado reduz um pouco o atraso.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Imediato",
     [UI_MENU_PRESENT_IN_USE] = "em uso: %s",
+    [UI_MENU_LOW_LATENCY] = "Baixa latência",
+    [UI_MENU_LOW_LATENCY_DESC] = "O driver de vídeo segura o início de cada quadro, para ler o controle o mais tarde "
+                                 "possível (NVIDIA Reflex, AMD Anti-Lag). Ele também mantém o limite de quadros. Boost "
+                                 "mantém a placa de vídeo em frequência máxima.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "Ligado + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "este driver de vídeo não tem modo de baixa latência",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "a geração de quadros DLSS usa o seu próprio",
+    [UI_MENU_LOW_LATENCY_FG] = "desligado enquanto a geração de quadros roda nesta placa",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Adiciona quadros gerados para um movimento mais suave, com qualquer opção em "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Adiciona quadros gerados para um movimento mais suave. O NVIDIA DLSS precisa de um "
+                                  "modo DLSS em Upscaling quando o jogo inicia; depois funciona com qualquer opção em "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "precisa do DLSS ao iniciar o jogo",
+    [UI_MENU_LOW_LATENCY_FAILED] = "em uso: desligado, o driver recusou (veja lowlat no log)",
     [UI_MENU_GPU] = "Placa de vídeo", [UI_MENU_GPU_DESC] = "A placa de vídeo usada pelo jogo.",
     [UI_MENU_GPU_AUTO] = "Automática",
     [UI_MENU_PERF_OVERLAY] = "Indicador de desempenho",
@@ -1466,6 +1390,15 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                               "mais nítidos que o bilinear. Janela menor (Ocarina desenha 2560 x 1440): a imagem é "
                               "reduzida e o FSR aumenta a nitidez com a intensidade abaixo.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear",
+    [UI_MENU_UPSCALING_NATIVE] = "Nativo (100%)",
+    [UI_MENU_UPSCALING_DESC] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no tamanho "
+                               "total da imagem, sem upscaler: a mais nítida, e a que mais exige da GPU.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no "
+                                   "tamanho total da imagem, sem upscaler: a mais nítida, e a que mais exige da GPU.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no "
+                                      "tamanho total da imagem, sem upscaler: a mais nítida, e a que mais exige da "
+                                      "GPU. O AMD FSR 3.1 não é oferecido aqui: ele precisa do amd_fidelityfx_vk.dll, "
+                                      "que não pode ser carregado.",
     [UI_MENU_GAME_ASPECT] = "Tela larga",
     [UI_MENU_GAME_ASPECT_DESC] = "Amplia a visão. A interface e os menus continuam em 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (o do jogo)", [UI_MENU_GAME_ASPECT_WINDOW] = "Formato da janela",
@@ -1480,6 +1413,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
     [UI_MENU_ASSUME_FOCUS] = "Continuar rodando fora de foco",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Mantém o jogo rodando quando você troca de janela.",
+    [UI_MENU_TEXT_SPEED] = "Velocidade do texto",
+    [UI_MENU_TEXT_SPEED_DESC] = "A rapidez com que as janelas de mensagem do jogo mostram o texto. Rápida escreve três "
+                                "vezes mais rápido; instantânea mostra cada página de uma vez. Textos que o jogo não "
+                                "deixa apressar, como falas sincronizadas com uma cena ou uma voz, mantêm a velocidade.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Normal", [UI_MENU_TEXT_SPEED_FAST] = "Rápida",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Instantânea",
     [UI_MENU_FPS_DISPLAY] = "Taxa do monitor", [UI_MENU_FPS_DISPLAY_HZ] = "Taxa do monitor (%.0f Hz)",
     [UI_MENU_FPS_UNLIMITED] = "Sem limite",
     [UI_MENU_FPS_RTSS] = "limitado pelo RivaTuner Statistics Server",
@@ -1506,6 +1445,10 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Valores menores reforçam a vibração fraca.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Vibração dos gatilhos (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Também vibra os gatilhos do controle Xbox.",
+    [UI_MENU_RUMBLE_HD] = "Vibração HD (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Envia a vibração detalhada do jogo a um Pro Controller do Switch ou Joy-Con como ela "
+                               "é. A intensidade da vibração continua valendo: o valor padrão é a do jogo.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Requer um Pro Controller do Switch ou Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Layout dos botões",
     [UI_MENU_PAD_LAYOUT_DESC] = "Define qual botão funciona como A. Nintendo: pela posição, A à direita, B embaixo, "
                                 "X em cima, Y à esquerda. Xbox e PlayStation: pela letra, A embaixo, B à direita, X à "
@@ -1923,98 +1866,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s foi feito por um NX2navi mais novo: atualize o NX2navi primeiro.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s está danificado: baixe-o de novo.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
-    [UI_MENU_TAB_COOP] = "Co-op",
-    [UI_MENU_COOP_ON] = "Co-op (experimental)",
-    [UI_MENU_COOP_ON_DESC] = "Jogue com amigos pela Steam, cada um no seu jogo e no seu save. Ninguém configura roteador: "
-                             "salas e convites passam pela Steam, que mostra você jogando Spacewar, o app de teste dela. "
-                             "Precisa da Steam aberta; o launcher pega o arquivo da biblioteca da Steam de um jogo da Steam "
-                             "que você tem instalado. Desligado: o jogo não usa a rede.",
-    [UI_MENU_COOP_NO_LIBRARY] = "O arquivo da biblioteca da Steam, steam_api64.dll, não está ao lado do jogo. O launcher o coloca "
-                                "lá ao iniciar o jogo, a partir de um jogo da Steam que você tem instalado: inicie o jogo pelo "
-                                "launcher, com a Steam e pelo menos um jogo de 2021 ou mais novo instalados. Você também pode "
-                                "copiar o arquivo da pasta de um jogo da Steam para a pasta do ocarina.exe.",
-    [UI_MENU_COOP_OLD_LIBRARY] = "O steam_api64.dll ao lado do jogo é antigo demais para o co-op. Troque por um de um jogo mais "
-                                 "novo da Steam.",
-    [UI_MENU_COOP_NO_CLIENT] = "A Steam não respondeu. Abra a Steam, entre na sua conta e escolha Procurar a Steam de novo.",
-    [UI_MENU_COOP_RETRY] = "Procurar a Steam de novo",
-    [UI_MENU_COOP_RETRY_DESC] = "Tenta falar com a Steam agora; o jogo também tenta sozinho a cada poucos segundos.",
-    [UI_MENU_COOP_CREATE] = "Criar uma sala",
-    [UI_MENU_COOP_CREATE_DESC] = "Cria uma sala para até quatro jogadores. Você recebe um ID da sala para passar adiante e pode "
-                                 "convidar amigos da Steam.",
-    [UI_MENU_COOP_JOIN] = "Entrar em uma sala",
-    [UI_MENU_COOP_JOIN_DESC] = "Entra na sala cujo ID um amigo passou para você.",
-    [UI_MENU_COOP_ROOM_ID] = "ID da sala",
-    [UI_MENU_COOP_ROOM_ID_DESC] = "Os amigos digitam isto em Entrar em uma sala. Pressione para copiar. Quem tiver o ID pode "
-                                  "entrar, então passe só para quem você quer no seu jogo.",
-    [UI_MENU_COOP_ROOM_ID_HINT] = "8 letras e números, como XXXX-XXXX: maiúsculas ou minúsculas, com ou sem o traço.",
-    [UI_MENU_COOP_ROOM_ID_BAD] = "Isto não é um ID de sala: veja se há algum caractere errado.",
-    [UI_MENU_COOP_PASTE] = "Colar",
-    [UI_MENU_COOP_PASTE_EMPTY] = "A área de transferência não tem texto.",
-    [UI_MENU_COOP_COPIED] = "copiado",
-    [UI_MENU_COOP_OK] = "OK",
-    [UI_MENU_COOP_JOINING] = "Entrando na sala…",
-    [UI_MENU_COOP_STOP] = "Parar",
-    [UI_MENU_COOP_STOP_DESC] = "Para de tentar entrar na sala.",
-    [UI_MENU_COOP_INVITE] = "Convidar um amigo",
-    [UI_MENU_COOP_INVITE_DESC] = "Envia um convite da Steam a um amigo. Ele chega a quem está com o NX2navi aberto e o co-op "
-                                 "ligado; os outros podem usar o ID da sala.",
-    [UI_MENU_COOP_INVITE_TITLE] = "Convidar um amigo da Steam",
-    [UI_MENU_COOP_INVITE_NONE] = "A Steam não mostra amigos.",
-    [UI_MENU_COOP_INVITE_SENT] = "Convite enviado para %s.",
-    [UI_MENU_COOP_INVITE_IN_GAME] = "no co-op agora",
-    [UI_MENU_COOP_INVITE_ONLINE] = "online",
-    [UI_MENU_COOP_INVITE_OFFLINE] = "offline",
-    [UI_MENU_COOP_INVITE_STEAM] = "Janela de convites da Steam",
-    [UI_MENU_COOP_INVITE_CLOSE] = "Fechar",
-    [UI_MENU_COOP_INVITED] = "%s convida você para uma sala.",
-    [UI_MENU_COOP_INVITED_JOIN] = "Entrar na sala",
-    [UI_MENU_COOP_INVITED_JOIN_DESC] = "Entra na sala para a qual você foi convidado.",
-    [UI_MENU_COOP_INVITED_NO] = "Agora não",
-    [UI_MENU_COOP_INVITED_NO_DESC] = "Dispensa o convite.",
-    [UI_MENU_COOP_PLAYERS] = "Jogadores",
-    [UI_MENU_COOP_YOU] = "você",
-    [UI_MENU_COOP_HOST] = "anfitrião",
-    [UI_MENU_COOP_PLAYER_DESC] = "Um jogador da sala e a área em que o Link dele está.",
-    [UI_MENU_COOP_PLAYER_REMOVE_DESC] = "Um jogador da sala. Como anfitrião, você pode pressionar para removê-lo da sala.",
-    [UI_MENU_COOP_PLAYER_AWAY] = "fora do mundo",
-    [UI_MENU_COOP_REMOVE] = "Remover",
-    [UI_MENU_COOP_REMOVE_CONFIRM] = "Remover %s da sala? Essa pessoa não poderá voltar a esta sala.",
-    [UI_MENU_COOP_LEAVE] = "Sair da sala",
-    [UI_MENU_COOP_LEAVE_DESC] = "Sai da sala. Seu jogo e seu save continuam como estão.",
-    [UI_MENU_COOP_LEAVE_CONFIRM] = "Sair da sala?",
-    [UI_MENU_COOP_LEAVE_HOST] = "Você é o anfitrião: a sala continua com outro jogador como anfitrião.",
-    [UI_MENU_COOP_STAY] = "Ficar",
-    [UI_MENU_COOP_CHAT] = "Chat",
-    [UI_MENU_COOP_CHAT_WRITE] = "Escrever uma mensagem",
-    [UI_MENU_COOP_CHAT_WRITE_DESC] = "Envia uma linha de texto a todos na sala.",
-    [UI_MENU_COOP_SEND] = "Enviar",
-    [UI_MENU_COOP_CHAT_JOINED] = "%s entrou na sala",
-    [UI_MENU_COOP_CHAT_LEFT] = "%s saiu da sala",
-    [UI_MENU_COOP_SETTINGS] = "Configurações do co-op",
-    [UI_MENU_COOP_SHARE] = "Compartilhar progresso",
-    [UI_MENU_COOP_SHARE_DESC] = "Em uma sala, o que qualquer um conquista vale para todos: história, baús, portas, itens e "
-                                "canções. Antes de algo da sala chegar ao seu save, ele é copiado para coop-backup na pasta do "
-                                "perfil. Chaves pequenas, rupias, munição e corações continuam seus. Desligado: só nomes e chat "
-                                "são compartilhados.",
-    [UI_MENU_COOP_NAMES] = "Mostrar nomes dos jogadores",
-    [UI_MENU_COOP_NAMES_DESC] = "Mostra o nome de cada outro jogador onde o Link dele está no seu mundo, com a distância. Precisa "
-                                "de DLSS, FSR ou TAA ligado (só assim o menu sabe para onde a câmera olha).",
-    [UI_MENU_COOP_CHAT_SHOW] = "Mostrar o chat sobre o jogo",
-    [UI_MENU_COOP_CHAT_SHOW_DESC] = "Novas linhas do chat e quem entrou ou saiu aparecem por alguns segundos com o menu fechado.",
-    [UI_MENU_COOP_N_CREATE_FAILED] = "A Steam não conseguiu criar a sala. Tente de novo em instantes.",
-    [UI_MENU_COOP_N_NO_ROOM] = "Nenhuma sala tem esse ID: confira, ou pergunte ao seu amigo se a sala ainda está aberta.",
-    [UI_MENU_COOP_N_FULL] = "A sala está cheia.",
-    [UI_MENU_COOP_N_REFUSED] = "A sala não deixou você entrar.",
-    [UI_MENU_COOP_N_NOT_OURS] = "Essa não é uma sala do NX2navi.",
-    [UI_MENU_COOP_N_OTHER_VERSION] = "O anfitrião da sala usa outra versão do NX2navi ou do jogo: usem as mesmas versões.",
-    [UI_MENU_COOP_N_REMOVED] = "O anfitrião removeu você da sala.",
-    [UI_MENU_COOP_N_HOST_SILENT] = "O anfitrião da sala não respondeu.",
-    [UI_MENU_COOP_N_LOST] = "A Steam perdeu a conexão; a sala acabou.",
-    [UI_MENU_COOP_N_LEFT] = "Você saiu da sala.",
-    [UI_MENU_COOP_LOCAL] = "Modo de teste: um substituto da Steam neste PC.",
-    [UI_MENU_COOP_TOAST_INVITE] = "%s convida você para uma sala: abra a aba Co-op do menu.",
+    [UI_MENU_CAPTURE_SAVED] = "Captura de bug %d salva",
+    [UI_MENU_CAPTURE_FOLDER] = "Pasta: %s",
+    [UI_MENU_CAPTURE_FAILED] = "Não foi possível salvar a captura de bug %d",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
+    [UI_BOOT_COMPUTE] = "Pipelines de computação: %lld de %lld", [UI_BOOT_DRIVER_CACHE] = "Cache do driver: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Alguns cheats alteram o código do jogo e ainda não foram compilados nele: são "
                                     "novos ou editados, ou a última recompilação falhou ou foi cancelada. Fecha o "
@@ -2087,6 +1944,18 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_VSYNC] = "垂直同步",
     [UI_MENU_PRESENT_IMMEDIATE] = "立即",
     [UI_MENU_PRESENT_IN_USE] = "使用中：%s",
+    [UI_MENU_LOW_LATENCY] = "低延迟",
+    [UI_MENU_LOW_LATENCY_DESC] = "显卡驱动推迟每一帧的开始，尽可能晚地读取手柄输入（NVIDIA Reflex、AMD Anti-Lag），"
+                                 "并由它保持帧率上限。增强让显卡保持最高频率。",
+    [UI_MENU_LOW_LATENCY_BOOST] = "开启 + 增强",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "此显卡驱动没有低延迟模式",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "DLSS 帧生成使用自带的低延迟",
+    [UI_MENU_LOW_LATENCY_FG] = "此显卡运行帧生成时关闭",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "添加生成的帧，使动作更流畅，可搭配 Upscaling 中的任意选项。",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "添加生成的帧，使动作更流畅。NVIDIA DLSS 需要在游戏启动时于 Upscaling 中选择 DLSS "
+                                  "模式；之后可搭配 Upscaling 中的任意选项。",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "需要在游戏启动时开启 DLSS",
+    [UI_MENU_LOW_LATENCY_FAILED] = "使用中：关闭，驱动拒绝了（见日志中的 lowlat）",
     [UI_MENU_GPU] = "显卡",
     [UI_MENU_GPU_DESC] = "运行游戏所用的显卡。",
     [UI_MENU_GPU_AUTO] = "自动",
@@ -2109,6 +1978,14 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
                               "窗口更小时（Ocarina 绘制 2560 × 1440）：画面被缩小，FSR 按下方强度锐化。",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1",
     [UI_MENU_UPSCALER_BILINEAR] = "双线性",
+    [UI_MENU_UPSCALING_NATIVE] = "原生（100%）",
+    [UI_MENU_UPSCALING_DESC] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                               "最清晰，GPU 负担也最大。",
+    [UI_MENU_UPSCALING_DESC_FSR] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                                   "最清晰，GPU 负担也最大。",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                                      "最清晰，GPU 负担也最大。此处不提供 AMD FSR 3.1：它需要 "
+                                      "amd_fidelityfx_vk.dll，但无法加载。",
     [UI_MENU_GAME_ASPECT] = "宽屏",
     [UI_MENU_GAME_ASPECT_DESC] = "扩大视野。界面和菜单保持 16:9。",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9（游戏原生）", [UI_MENU_GAME_ASPECT_WINDOW] = "窗口比例",
@@ -2166,6 +2043,11 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_HANDHELD] = "掌机模式",
     [UI_MENU_ASSUME_FOCUS] = "后台保持运行",
     [UI_MENU_ASSUME_FOCUS_DESC] = "切换到其他窗口时游戏继续运行。",
+    [UI_MENU_TEXT_SPEED] = "文字速度",
+    [UI_MENU_TEXT_SPEED_DESC] = "游戏对话框显示文字的速度。快速为三倍速度；即时则每页立即全部显示。"
+                                "游戏不允许加快的文字（例如与过场动画或语音同步的台词）保持原速。",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "正常", [UI_MENU_TEXT_SPEED_FAST] = "快速",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "即时",
     [UI_MENU_VOLUME] = "音量",
     [UI_MENU_MENU_SOUNDS] = "菜单音效", [UI_MENU_MENU_SOUNDS_DESC] = "本菜单的音效音量。",
     [UI_MENU_VOLUME_DESC] = "游戏总音量。",
@@ -2177,6 +2059,9 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "数值越低，轻微震动越强。",
     [UI_MENU_RUMBLE_TRIGGERS] = "扳机振动（Xbox）",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "同时震动 Xbox 手柄的扳机。",
+    [UI_MENU_RUMBLE_HD] = "HD 振动（Switch）",
+    [UI_MENU_RUMBLE_HD_DESC] = "将游戏的细腻振动原样发送到 Switch Pro 手柄或 Joy-Con。振动强度仍然有效：默认值即游戏原本的强度。",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "需要 Switch Pro 手柄或 Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "按键布局",
     [UI_MENU_PAD_LAYOUT_DESC] = "设置哪个按键作为 A 键。Nintendo：按位置，A 在右、B 在下、X 在上、Y 在左。Xbox 和 PlayStation："
                                 "按标注，A 在下、B 在右、X 在左、Y 在上（PlayStation 手柄上为叉、圆圈、方块和三角）。自动："
@@ -2645,87 +2530,12 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s 由更新版本的 NX2navi 制作：请先更新 NX2navi。",
     [UI_MENU_SAVE_E_DAMAGED] = "%s 已损坏：请重新下载。",
     [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
-    [UI_MENU_TAB_COOP] = "合作",
-    [UI_MENU_COOP_ON] = "合作（实验性）",
-    [UI_MENU_COOP_ON_DESC] = "通过 Steam 与朋友一起玩，各自运行自己的游戏和存档。无需设置路由器：房间和邀请都经由 Steam，Steam 会显示你正在玩它的测试应用 Spacewar。需要 Steam "
-                             "正在运行；启动器会从你已安装的 Steam 游戏里取得 Steam 的库文件。关闭：游戏不使用网络。",
-    [UI_MENU_COOP_NO_LIBRARY] = "游戏旁边没有 Steam 的库文件 steam_api64.dll。启动器在启动游戏时会从你已安装的 Steam 游戏里把它放到那里：请在安装了 Steam 和至少一款 2021 "
-                                "年或更新的游戏的情况下，从启动器启动游戏。你也可以自己从某个 Steam 游戏的文件夹里把这个文件复制到 ocarina.exe 所在的文件夹。",
-    [UI_MENU_COOP_OLD_LIBRARY] = "游戏旁边的 steam_api64.dll 对合作模式来说太旧。请换成较新的 Steam 游戏里的那个文件。",
-    [UI_MENU_COOP_NO_CLIENT] = "Steam 没有响应。请启动 Steam 并登录，然后选择“重新查找 Steam”。",
-    [UI_MENU_COOP_RETRY] = "重新查找 Steam",
-    [UI_MENU_COOP_RETRY_DESC] = "立即尝试连接 Steam；游戏每隔几秒也会自动尝试。",
-    [UI_MENU_COOP_CREATE] = "创建房间",
-    [UI_MENU_COOP_CREATE_DESC] = "创建一个最多四人的房间。你会得到一个可以告诉别人的房间 ID，也可以邀请 Steam 好友。",
-    [UI_MENU_COOP_JOIN] = "加入房间",
-    [UI_MENU_COOP_JOIN_DESC] = "加入朋友给你的房间 ID 对应的房间。",
-    [UI_MENU_COOP_ROOM_ID] = "房间 ID",
-    [UI_MENU_COOP_ROOM_ID_DESC] = "朋友在“加入房间”里输入它。按下即可复制。拿到它的人都能加入，所以只告诉你想一起玩的人。",
-    [UI_MENU_COOP_ROOM_ID_HINT] = "8 位字母和数字，形如 XXXX-XXXX：不分大小写，带不带连字符都可以。",
-    [UI_MENU_COOP_ROOM_ID_BAD] = "这不是房间 ID：请检查是否输错了字符。",
-    [UI_MENU_COOP_PASTE] = "粘贴",
-    [UI_MENU_COOP_PASTE_EMPTY] = "剪贴板里没有文字。",
-    [UI_MENU_COOP_COPIED] = "已复制",
-    [UI_MENU_COOP_OK] = "确定",
-    [UI_MENU_COOP_JOINING] = "正在进入房间…",
-    [UI_MENU_COOP_STOP] = "停止",
-    [UI_MENU_COOP_STOP_DESC] = "停止尝试进入房间。",
-    [UI_MENU_COOP_INVITE] = "邀请好友",
-    [UI_MENU_COOP_INVITE_DESC] = "向好友发送 Steam 邀请。只有正在运行 NX2navi 并开启了合作模式的好友能收到；其他人可以使用房间 ID。",
-    [UI_MENU_COOP_INVITE_TITLE] = "邀请 Steam 好友",
-    [UI_MENU_COOP_INVITE_NONE] = "Steam 没有显示任何好友。",
-    [UI_MENU_COOP_INVITE_SENT] = "已向 %s 发送邀请。",
-    [UI_MENU_COOP_INVITE_IN_GAME] = "正在合作模式中",
-    [UI_MENU_COOP_INVITE_ONLINE] = "在线",
-    [UI_MENU_COOP_INVITE_OFFLINE] = "离线",
-    [UI_MENU_COOP_INVITE_STEAM] = "Steam 的邀请窗口",
-    [UI_MENU_COOP_INVITE_CLOSE] = "关闭",
-    [UI_MENU_COOP_INVITED] = "%s 邀请你加入房间。",
-    [UI_MENU_COOP_INVITED_JOIN] = "加入对方的房间",
-    [UI_MENU_COOP_INVITED_JOIN_DESC] = "加入邀请你的那个房间。",
-    [UI_MENU_COOP_INVITED_NO] = "暂不",
-    [UI_MENU_COOP_INVITED_NO_DESC] = "忽略这次邀请。",
-    [UI_MENU_COOP_PLAYERS] = "玩家",
-    [UI_MENU_COOP_YOU] = "你",
-    [UI_MENU_COOP_HOST] = "房主",
-    [UI_MENU_COOP_PLAYER_DESC] = "房间里的一名玩家，以及其林克所在的区域。",
-    [UI_MENU_COOP_PLAYER_REMOVE_DESC] = "房间里的一名玩家。作为房主，你可以按下将其移出房间。",
-    [UI_MENU_COOP_PLAYER_AWAY] = "不在世界中",
-    [UI_MENU_COOP_REMOVE] = "移出",
-    [UI_MENU_COOP_REMOVE_CONFIRM] = "将 %s 移出房间？对方将无法再回到这个房间。",
-    [UI_MENU_COOP_LEAVE] = "离开房间",
-    [UI_MENU_COOP_LEAVE_DESC] = "离开房间。你的游戏和存档保持现状。",
-    [UI_MENU_COOP_LEAVE_CONFIRM] = "离开房间？",
-    [UI_MENU_COOP_LEAVE_HOST] = "你是房主：房间会继续存在，由另一名玩家担任房主。",
-    [UI_MENU_COOP_STAY] = "留下",
-    [UI_MENU_COOP_CHAT] = "聊天",
-    [UI_MENU_COOP_CHAT_WRITE] = "写消息",
-    [UI_MENU_COOP_CHAT_WRITE_DESC] = "向房间里的所有人发送一行文字。",
-    [UI_MENU_COOP_SEND] = "发送",
-    [UI_MENU_COOP_CHAT_JOINED] = "%s 加入了房间",
-    [UI_MENU_COOP_CHAT_LEFT] = "%s 离开了房间",
-    [UI_MENU_COOP_SETTINGS] = "合作设置",
-    [UI_MENU_COOP_SHARE] = "共享进度",
-    [UI_MENU_COOP_SHARE_DESC] = "在房间里，任何人取得的进展都算作所有人的：剧情、宝箱、门、道具和乐曲。在房间里的任何内容写入你的存档之前，存档会先复制到配置文件夹里的 "
-                                "coop-backup。小钥匙、卢比、弹药和心保持各自独立。关闭：只共享名字和聊天。",
-    [UI_MENU_COOP_NAMES] = "显示玩家名字",
-    [UI_MENU_COOP_NAMES_DESC] = "在其他玩家的林克所处的位置显示其名字和距离。需要开启 DLSS、FSR 或 TAA（只有这样菜单才知道摄像机的朝向）。",
-    [UI_MENU_COOP_CHAT_SHOW] = "在游戏画面上显示聊天",
-    [UI_MENU_COOP_CHAT_SHOW_DESC] = "菜单关闭时，新的聊天内容以及玩家加入或离开的提示会显示几秒钟。",
-    [UI_MENU_COOP_N_CREATE_FAILED] = "Steam 无法创建房间。请稍后再试。",
-    [UI_MENU_COOP_N_NO_ROOM] = "没有使用这个 ID 的房间：请检查一下，或者问问朋友房间是否还开着。",
-    [UI_MENU_COOP_N_FULL] = "房间已满。",
-    [UI_MENU_COOP_N_REFUSED] = "房间没有让你进入。",
-    [UI_MENU_COOP_N_NOT_OURS] = "那不是 NX2navi 的房间。",
-    [UI_MENU_COOP_N_OTHER_VERSION] = "房主使用的 NX2navi 或游戏版本与你不同：请使用相同的版本。",
-    [UI_MENU_COOP_N_REMOVED] = "房主已将你移出房间。",
-    [UI_MENU_COOP_N_HOST_SILENT] = "房主没有响应。",
-    [UI_MENU_COOP_N_LOST] = "Steam 断开了连接；房间已不存在。",
-    [UI_MENU_COOP_N_LEFT] = "你已离开房间。",
-    [UI_MENU_COOP_LOCAL] = "测试模式：在本机上代替 Steam。",
-    [UI_MENU_COOP_TOAST_INVITE] = "%s 邀请你加入房间：请打开菜单的“合作”页。",
+    [UI_MENU_CAPTURE_SAVED] = "错误快照 %d 已保存",
+    [UI_MENU_CAPTURE_FOLDER] = "文件夹：%s",
+    [UI_MENU_CAPTURE_FAILED] = "错误快照 %d 无法保存",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
+    [UI_BOOT_COMPUTE] = "计算管线：%lld / %lld", [UI_BOOT_DRIVER_CACHE] = "驱动缓存：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",
     [UI_MENU_CHEATS_REBUILD_DESC] = "有些金手指会修改游戏代码，但尚未构建进游戏：它们是新增或修改的，或上次重新构建失败或被取消。将关闭游戏；安装程序会把它们构建进去（几分钟）并重新启动游戏。上次存档之后的进度会丢失。",
     [UI_MENU_MODS_EXEFS_UNSUPPORTED] = "此模组修改游戏代码（exefs）的方式本移植无法应用，因此整个模组保持关闭。%s",

@@ -38,6 +38,29 @@ def ansi_safe(path):
         return False
 
 
+# Windows: a file's whole path may be 259 characters for the programs that do not ask for more, and the build's tools
+# (the MSYS2 compiler, linker and resource compiler, tar) are among them whatever the system's long path setting.
+# LONGEST_IN_GAME is the room the game folder's own files need below it: the longest path a built game folder held
+# was 106 characters (romfs-patches-playstation-label\System\Resource\ResourceSizeTable...rsizetable.zs), and a file
+# is written under a temporary name up to 22 characters longer before it gets its own.
+WINDOWS_PATH_MAX = 259
+LONGEST_IN_GAME = 128
+
+
+def long_path_problem(game_dir):
+    """'' when the files of a game built into game_dir fit Windows' path length, else the sentence that says how long
+    the folder's path is and how long it may be. Always '' elsewhere. Without it a build into a deep folder stops
+    somewhere in the middle with "file not found" for a file that is there."""
+    if os.name != 'nt' or not game_dir:
+        return ''
+    n, most = len(os.path.abspath(str(game_dir))), WINDOWS_PATH_MAX - 1 - LONGEST_IN_GAME
+    if n <= most:
+        return ''
+    return (f'the path of the game folder is {n} characters long, and the game\'s files need {LONGEST_IN_GAME} more: '
+            f'Windows and the build tools stop at {WINDOWS_PATH_MAX + 1} for a file\'s whole path. Choose a folder '
+            f'whose path has at most {most} characters, such as D:\\Games\\NX2navi')
+
+
 def fixed_drive(drive):
     """True when drive (X:\\) is a fixed disk (GetDriveTypeW DRIVE_FIXED), not a network, removable or optical drive.
     True where that cannot be asked."""
@@ -72,6 +95,9 @@ class Layout:
         self.cache = self.data / 'cache'
         self.downloads = self.data / 'downloads'
         self.settings = self.data / 'launcher.json'
+        # held by whichever process works in this folder: the window while it is open, launcher/cli.py for a command
+        # and every job that changes files (launcher/locks.py)
+        self.instance_lock = self.data / 'launcher.lock'
         tool_root = self.root
         if not ansi_safe(tool_root):
             tool_root = Path(os.environ.get('SystemDrive', 'C:') + '\\') / 'NX2navi'

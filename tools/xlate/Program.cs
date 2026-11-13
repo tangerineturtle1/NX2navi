@@ -54,7 +54,8 @@ static class SwshXlate
         // GenerateBindlessAccess): arrays of TexturePoolLength textures (handle bits 0-19) and SamplerPoolLength samplers
         // (bits 20-31; NVN sampler ids are below 4096). res.json marks them "pool": 1 (textures) / 2 (samplers); the
         // runtime binds them from its global pool set (vk_exec_draw.c, texture and sampler pools).
-        public const int TexturePoolLength = 32768, SamplerPoolLength = 4096;
+        // TexturePoolLength: the runtime's VK_POOL_TEX (vk.h), past Ocarina's pool of 33068 descriptors.
+        public const int TexturePoolLength = 40960, SamplerPoolLength = 4096;
         public int QuerySamplerArrayLengthFromPool() => SamplerPoolLength;
         public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
         public int QueryTextureArrayLengthFromPool() => TexturePoolLength;

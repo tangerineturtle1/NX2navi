@@ -21,16 +21,18 @@ Mods that change the game's code (code cheats, ExeFS patches) need the game buil
 code_waiting() names the enabled ones whose files the last build did not take in (build-cache/mod-code.json), and
 Play rebuilds the game first then. The build reads them from <game>/mods only.
 """
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
-from . import gameini
+from . import gameini, net
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import mod_files  # noqa: E402
@@ -385,11 +387,39 @@ def unwrap(folder):
     return True
 
 
-def _safe_members(names):
+# Names Windows keeps for devices, with or without an extension and in any case: a file called so is the device.
+WINDOWS_DEVICES = frozenset(('CON', 'PRN', 'AUX', 'NUL', *(f'{d}{n}' for d in ('COM', 'LPT') for n in '123456789¹²³')))
+
+
+def windows_name_problem(name):
+    """Why Windows cannot keep a file or folder under name, '' when it can: a device's name (CON, NUL.txt), a dot
+    or a space at its end (Windows drops them, so the file gets another name than the one the game asks for), or
+    a character Windows does not allow (a colon makes a hidden stream of another file)."""
+    if name.split('.')[0].rstrip(' ').upper() in WINDOWS_DEVICES:
+        return 'Windows keeps that name for a device'
+    if name != name.rstrip('. '):
+        return 'Windows drops a dot or a space at the end of a name'
+    bad = sorted({c for c in name if c in '<>:"|?*' or ord(c) < 32})
+    if bad:
+        return 'Windows allows no ' + ' '.join(c if ord(c) >= 32 else f'control character {ord(c)}' for c in bad) + ' in a name'
+    return ''
+
+
+def _safe_members(names, windows=None):
+    """ModError when a file of an archive (its member names) would land outside the archive's own folder, or, on
+    Windows (windows: None asks the system), under another name than its own or not at all (windows_name_problem):
+    unpacked all the same, such a file is missing where the game looks for it, with no word about it. The game
+    for Linux reads such names as they are, so there they pass."""
+    if windows is None:
+        windows = os.name == 'nt'
     for n in names:
         p = n.replace('\\', '/')
         if p.startswith('/') or re.match(r'^[A-Za-z]:', p) or '..' in p.split('/'):
             raise ModError(f'it holds a file outside its own folder ({n})')
+        for part in p.split('/') if windows else ():
+            why = windows_name_problem(part)
+            if why:
+                raise ModError(f'it holds a file Windows cannot keep under its name ({n}): {why}')
 
 
 def _tar():
@@ -407,6 +437,9 @@ def unpack(archive, dest):
             try:
                 with zipfile.ZipFile(archive) as z:
                     _safe_members(z.namelist())
+                    full = net.space_problem(dest, sum(i.file_size for i in z.infolist()), 'its files')
+                    if full:   # told before a file is written, not as an error halfway through
+                        raise ModError(full)
                     z.extractall(dest)
             except (zipfile.BadZipFile, NotImplementedError, RuntimeError) as e:
                 raise ModError(f'it is not a zip file the launcher can read ({e})')
@@ -446,6 +479,10 @@ def prepare(game_dir, log=None):
     for a in sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ARCHIVES):
         name = a.stem.strip().rstrip('.')
         target = folder / name
+        why = windows_name_problem(name) if os.name == 'nt' and name else ''
+        if why:   # before exists(): Windows says a device's name exists in every folder
+            note(f'{a.name} was not unpacked: no folder can be called {name} ({why}); rename the archive')
+            continue
         if not name or target.exists():
             continue
         try:
@@ -475,9 +512,52 @@ def prepare(game_dir, log=None):
     return done
 
 
+STAGING = '.adding-mod'   # beside the mods folder: where add() puts a mod together before it moves in
+STAGING_STALE = 24 * 3600   # seconds after which a staging folder is one a stopped launcher left
+
+
+def _staging(folder):
+    """A new, empty folder for add() to put a mod together in. It is beside the mods folder, not in it: the game
+    and the launcher take every folder of the mods folder for a mod, and beside it is the same disk, so the
+    finished mod moves in with one rename. The mods folder itself when nothing can be made beside it. What a
+    launcher that was stopped in the middle left there a day ago or longer is removed."""
+    try:
+        for old in folder.parent.glob(STAGING + '*'):
+            if old.is_dir() and time.time() - old.stat().st_mtime > STAGING_STALE:
+                shutil.rmtree(old, ignore_errors=True)
+        stage = _unique(folder.parent, STAGING)
+        stage.mkdir()
+    except OSError:
+        stage = _unique(folder, STAGING)
+        stage.mkdir()
+    return stage
+
+
+def _move_in(made, folder, name):
+    """Rename the finished mod folder made into the mods folder under name, or the first free name after it (looked
+    for now, not before the copy: a folder of that name may have come meanwhile). Returns where it is."""
+    for attempt in range(3):
+        target = _unique(folder, name)
+        try:
+            os.rename(made, target)
+            return target
+        except OSError as e:
+            if e.errno == errno.EXDEV:   # the mods folder is on another disk than its parent (a mount, a junction)
+                shutil.move(str(made), str(target))
+                return target
+            if attempt == 2:
+                raise
+            time.sleep(0.3)   # a scanner still holds a file just written
+
+
 def add(game_dir, src, log=None):
     """Add an archive or a folder the player picked as a mod: unpacked or copied into the mods folder under its name
-    (a free one), in order for the game. Returns the new mod's folder."""
+    (a free one), in order for the game. Returns the new mod's folder.
+
+    The mod is put together in a folder beside the mods folder (_staging) and moves in only when it is complete. A
+    copy that stops halfway (a full disk, a file that cannot be read, the launcher closed) leaves nothing in the
+    mods folder: copied straight into it, the half that had arrived was a mod of its own, switched on, at the
+    game's next start."""
     src = Path(src)
     folder = ensure_mods_dir(game_dir)
     if src.is_dir():
@@ -487,18 +567,27 @@ def add(game_dir, src, log=None):
         except ValueError:
             pass
         name = src.name if src.name.lower() not in MOD_TOP else UNNAMED
-        target = _unique(folder, name)
-        if src.name.lower() in MOD_TOP:   # the player picked the mod's romfs (or atmosphere) folder itself
-            target.mkdir()
-            shutil.copytree(src, target / src.name.lower() if src.name.lower() in LOOSE_PARTS else target / src.name)
-        else:
-            shutil.copytree(src, target)
     elif src.suffix.lower() in ARCHIVES:
-        target = _unique(folder, src.stem.strip().rstrip('.') or UNNAMED)
-        unpack(src, target)
+        name = src.stem.strip().rstrip('.') or UNNAMED
     else:
         raise ModError('it is no archive (.zip, .7z or .rar) and no folder')
-    unwrap(target)
+    why = windows_name_problem(name) if os.name == 'nt' else ''
+    if why:
+        raise ModError(f'no mod folder can be called {name} ({why}): rename it first')
+    stage = _staging(folder)
+    try:
+        made = stage / 'mod'
+        if not src.is_dir():
+            unpack(src, made)
+        elif src.name.lower() in MOD_TOP:   # the player picked the mod's romfs (or atmosphere) folder itself
+            made.mkdir()
+            shutil.copytree(src, made / src.name.lower() if src.name.lower() in LOOSE_PARTS else made / src.name)
+        else:
+            shutil.copytree(src, made)
+        unwrap(made)
+        target = _move_in(made, folder, name)
+    finally:   # also on Ctrl+C and when the window closes: nothing half made stays
+        shutil.rmtree(stage, ignore_errors=True)
     if log:
         log(f'mods: added {src} as {target.name}')
     return target

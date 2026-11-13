@@ -88,22 +88,6 @@ int probe_cfg(void) {
         CHECK(EQ(cfg_unknown_keys(&n), "") && n == 0, "a missing file leaves no unknown keys either");
     }
 
-    // A file from the co-op of versions up to 0.9.2: its lines are retired settings, not unknown keys, and its switch,
-    // coop = 1, does not turn the new co-op on, whose switch has a name of its own (coop_steam).
-    {
-        static const char old_coop[] = "[coop]\ncoop = 1\ncoop_beta = 1\ncoop_name = someone\ncoop_progress = shared\n";
-        cfg_setenv("NX2NAVI_COOP_STEAM", NULL);
-        CHECK(plat_file_write(path, old_coop, sizeof old_coop - 1) && cfg_load(path) == 1, "load a file of the old co-op");
-        int n = -1;
-        CHECK(EQ(cfg_unknown_keys(&n), "") && n == 0, "the old co-op's settings are no unknown keys");
-        CHECK(!cfg_bool("NX2NAVI_COOP_STEAM"), "the old co-op's coop = 1 does not turn the new co-op on");
-        static const char new_coop[] = "[coop]\ncoop = 0\ncoop_steam = 1\n";
-        CHECK(plat_file_write(path, new_coop, sizeof new_coop - 1) && cfg_load(path) == 1 && cfg_bool("NX2NAVI_COOP_STEAM"),
-              "coop_steam = 1 turns the new co-op on");
-        plat_file_delete(path);
-        CHECK(cfg_load(path) == 0, "the co-op file is gone again");
-    }
-
     // A player's file as a report showed it: settings the menu wrote, and three lines added by hand that are no
     // settings of this version (the player took the first for the fix of a crash). The three are named as such, a
     // repeated one once, a key of other characters is counted without being listed, and the menu's save keeps every
