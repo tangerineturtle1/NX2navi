@@ -195,6 +195,17 @@ site omovie main 3b5c908 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d
 # manager, last read at main+0xa682ec, and every path from the site reaches a call before it reads x13 again.
 site opickup main a68300 1e38000c 1e38000c 5ac0118d 53057dad 0b0d018c   # fcvtzs w12, s0; clz w13, w12; lsr w13, w13, #5; add w12, w12, w13
 
+# Ocarina song frame count: main+0x32932b0, an update of an object that waits a frame count at +0x265fc, adds
+# fcvtzu(frames per update) to that count once a frame (main+0x3293410), and the ocarina's melody playback waits on
+# it. Below one frame per update that is 0: above 60 fps the count never moved, and a scarecrow song played back stopped
+# on its first note (issue #777); at 60, while the step ran a little under one frame, it moved only on the frames that
+# ran late, and the song took minutes. The site keeps the cut fraction on the patch page (+768) and adds it to the next
+# step, so the count moves by the whole 60 Hz frames that have passed, at any frame rate, and at a step of exactly one
+# it is the game's own count. x10, s16 and s17 are not read again before they are written (the call at main+0x329342c
+# follows); fadd, fcvtzu, ucvtf and fsub write no flags.
+set osong NX2NAVI_SONG_COUNT 1
+site osong main 3293410 1e390008 @page:x10 bd430150 1e202a10 1e390208 1e230111 1e313a10 bd030150   # fcvtzu w8, s0 -> adrp x10, page; ldr s16, [x10, #0x300]; fadd s16, s16, s0; fcvtzu w8, s16; ucvtf s17, w8; fsub s16, s16, s17; str s16, [x10, #0x300]
+
 # Mouse camera: the camera's stick input update (main+0x37c300) puts the right stick through a radial dead zone of
 # 0.005, scales the radius to one, clamps it and raises it to StickExponent (2, the default of
 # game__component__PlayerCameraParam); then come the reset timer at +0x5e0 (the stick reads zero while it runs), the X/Y
