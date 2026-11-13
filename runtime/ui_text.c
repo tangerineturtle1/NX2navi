@@ -314,6 +314,17 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CHANNELS_AUTO] = "Automatic", [UI_MENU_CHANNELS_STEREO] = "Stereo", [UI_MENU_CHANNELS_51] = "5.1 surround",
 
     [UI_MENU_MOTION] = "Motion controls", [UI_MENU_MOTION_DESC] = "Aim with the controller's gyro.",
+    [UI_MENU_SPRINT_BUTTON] = "Sprint button",
+    [UI_MENU_SPRINT_BUTTON_DESC] = "A button that makes Link sprint without rolling first. L3, the left stick's "
+                                   "click, has no other use. The game's B button sprints only while Link moves and "
+                                   "puts the weapon away as usual otherwise.",
+    [UI_MENU_SPRINT_OFF] = "Off", [UI_MENU_SPRINT_B] = "Bottom button (Nintendo B)",
+    [UI_MENU_SPRINT_L3] = "L3 (left stick)",
+    [UI_MENU_SPRINT_MODE] = "Sprint mode",
+    [UI_MENU_SPRINT_MODE_DESC] = "Toggle: press once to sprint and again to stop. The sprint goes on through jumps "
+                                 "and ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs. "
+                                 "Hold: Link sprints while the button is held.",
+    [UI_MENU_SPRINT_TOGGLE] = "Toggle", [UI_MENU_SPRINT_HOLD] = "Hold",
     [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
     [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the vibration is.",
     [UI_MENU_RUMBLE_CURVE] = "Vibration curve",

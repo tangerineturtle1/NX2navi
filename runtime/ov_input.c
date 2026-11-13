@@ -16,6 +16,7 @@
 #include "input.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "sprint.h"
 
 typedef struct { int64_t sampling; uint64_t buttons; int32_t lx, ly, rx, ry; uint32_t attributes, pad; } NpadState;
 typedef struct { int64_t sampling; int32_t x, y, dx, dy, wx, wy; uint32_t buttons, attributes; } MouseState;
@@ -96,6 +97,7 @@ static void npad_states(Cpu *c, uint32_t want) {
     }
     dbg_tick(c);   // the debug menu's changes to the game, between two of its frames (debug_tools.c)
     if (live) dbg_pad(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);   // its free camera takes the sticks while it flies
+    if (live) sprint_pad(&s.buttons);   // the sprint button's presses, kept from the game during gameplay (sprint.c)
     *out = s;
     ret_x(c, 1);
 }
