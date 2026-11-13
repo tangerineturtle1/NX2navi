@@ -1162,8 +1162,11 @@ static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 // 50.7 against 42.5 standing and 56.0 against 45.9 along the field route, and with FSR 3.1, whose tail the GPU runs
 // for 1.2 ms where FSR 4's takes 3.5, 51.8 against 47.8 and 54.9 against 52.3. All but a few of the tails passed the
 // tests there; in area loads and some places a tail hands the CPU results and goes as before. The pictures matched
-// those without it standing, along the route and through warps to five areas. Not measured with the lazy write-back
-// (NVIDIA's and Intel's default), where a tail's uniform updates are noted as writes and no tail goes early.
+// those without it standing, along the route and through warps to five areas. With the lazy write-back (NVIDIA's and
+// Intel's Windows default) every tail was refused there until now: its uniform updates were noted as writes, since
+// their write-backs would run before the copies that make the bytes. They go the early way now too (vk_exec_draw.c
+// op_update_ub): the bytes reach guest memory at the fence instead of by write-back, and a range the lazy fetch path
+// has armed stays refused as before. Not yet measured on those cards.
 // Not with shadow storage, emulated mesh shaders, a frame dump or a pass capture, nor inside a chunk or a continuation.
 static struct {
     int on;                  // the submission's tail is being recorded
