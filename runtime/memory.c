@@ -227,6 +227,21 @@ static uint32_t lz_touch_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: plat_
 static uint8_t lz_touch_n[RT_ADDRESS_LIMIT >> FRZ_SHIFT];     // frz_lock: pieces given back in that run
 static uint32_t lz_heavy_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: ... of its last touch taken as a reader's
 static int lz_chunk;                    // the setting, read in mem_init
+// NX2NAVI_WB_LAZY_HOLD_CHUNK (0 by default; 1; ab: in the B blocks): a touch still gives back its whole range and fetches
+// it whole, as by default, but only the LZ_CHUNK piece around the address is held (lz_hots, as NX2NAVI_WB_LAZY_CHUNK
+// holds its pieces); the rest of the range is armed again at its next write-back. A reader going through the range
+// (LZ_HEAVY_N touches) holds its regions as before. By default each of those reads of a few words held every 2 MiB
+// region the range reached for 1 s doubling to 32 s, and in all that time each submission wrote the whole range back
+// through the write-back merge: in Hyrule Field at night (RTX 5080, 0.10.0) that was 23.4 MiB a frame, all of it
+// "in regions the CPU touched lately", and the merge's gap took 4.8 ms of a 14.5 ms GPU frame. It leaves out what
+// NX2NAVI_WB_LAZY_CHUNK changes besides the hold, splitting a segment around the touched piece and fetching the piece
+// alone, which the device losses after a save load came with; segments still start inside a buffer once the rest of a
+// range is armed around a held piece.
+static int lazy_hold_chunk(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("WB_LAZY_HOLD_CHUNK", "0");
+    return RT_KNOB_ON(mode);
+}
 static uint64_t lz_pieces, lz_piece_bytes, lz_heavy;   // frz_lock, since the last report
 static uint64_t lz_foreign;             // frz_lock, since the start: segments of another buffer mem_lazy_skip gave back
 // frz_lock: the first faults on armed pages since the last report, for its lines (trace perf)
@@ -260,7 +275,7 @@ static LzSeg lazy_take_locked(int i) {
     return s;
 }
 
-static void lazy_gone_locked(LzSeg s, int why);
+static void lazy_gone_locked(LzSeg s, int why, uint64_t at);
 
 // frz_lock held exclusively. Segment i goes: its bytes come down first when the mirror's are newer, then its pages
 // are read-write again. why: 0 a read fault, 1 a write fault (both hold the regions back), else a thaw or the mirror
@@ -269,11 +284,14 @@ static void lazy_drop_locked(int i, int why) {
     plat_mutex_lock(&lz_lock);
     LzSeg s = lazy_take_locked(i);
     plat_mutex_unlock(&lz_lock);
-    lazy_gone_locked(s, why);
+    lazy_gone_locked(s, why, 0);
 }
 
-// frz_lock held exclusively: the pages of s, out of the list already, get their bytes and their access back.
-static void lazy_gone_locked(LzSeg s, int why) {
+static uint8_t lazy_hold_piece_locked(uint64_t a);
+
+// frz_lock held exclusively: the pages of s, out of the list already, get their bytes and their access back. at: the
+// address of the fault when only its piece is held (NX2NAVI_WB_LAZY_HOLD_CHUNK), 0 to hold every region s reaches.
+static void lazy_gone_locked(LzSeg s, int why, uint64_t at) {
     if (s.stale && lz_fetch) {
         uint64_t t0 = plat_now_ns();
         __atomic_store_n(&lz_fetch_now, s.hi - s.lo, __ATOMIC_RELAXED);
@@ -291,6 +309,10 @@ static void lazy_gone_locked(LzSeg s, int why) {
     lazy_flags_locked(s.lo, s.hi);
     if (why > 1) { lz_other++; return; }
     lz_faults[why]++;
+    if (at) {
+        lazy_hold_piece_locked(at);
+        return;
+    }
     uint32_t now = (uint32_t)plat_now_ms();
     for (uint64_t r = s.lo >> FRZ_SHIFT; r <= (s.hi - 1) >> FRZ_SHIFT; r++) {
         int again = lz_hot[r] && (int32_t)(now - lz_hot[r]) < 60000;   // touched again within a minute of its last hold
@@ -358,13 +380,20 @@ static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
     if (c1 < s.hi) lazy_push_locked((LzSeg){c1, s.hi, s.h0, s.h1, s.delta, s.stale});
     lazy_flags_locked(s.lo, s.hi);
     lz_faults[write != 0]++, lz_pieces++, lz_piece_bytes += c1 - c0;
+    lazy_hold_piece_locked(a);
+    return c1 - c0;
+}
+
+// frz_lock held exclusively: the LZ_CHUNK piece around a is held, 1 s doubling to 32 s while it is touched again within a
+// minute of its last hold, as a region is. Returns the hold in seconds.
+static uint8_t lazy_hold_piece_locked(uint64_t a) {
     uint32_t now = (uint32_t)plat_now_ms();
     LzHot *e = lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1);
     int again = e->until && (int32_t)(now - e->until) < 60000;   // touched again within a minute of its last hold
     e->back = again ? (uint8_t)(e->back < 32 ? e->back * 2 : 32) : 1;
     if (!e->back) e->back = 1;
     e->until = (now + (uint32_t)e->back * 1000u) | 1;
-    return c1 - c0;
+    return e->back;
 }
 
 // frz_lock held exclusively: every segment that reaches into region r goes.
@@ -507,7 +536,7 @@ int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t o
             }
             plat_mutex_unlock(&lz_lock);
             if (i < 0) break;
-            lazy_gone_locked(s, 4);
+            lazy_gone_locked(s, 4, 0);
         }
         plat_mutex_lock(&lz_lock);
     }
@@ -637,7 +666,8 @@ static int lazy_fault(uint64_t a, int write) {
         uint64_t r = a >> FRZ_SHIFT, out = lzs[i].hi - lzs[i].lo;
         uint32_t now = (uint32_t)plat_now_ms();
         int reader = lz_heavy_ms[r] && (int32_t)(now - lz_heavy_ms[r]) < LZ_HEAVY_KEEP_MS;
-        if (lz_chunk && !reader) {
+        int piece_hold = !lz_chunk && lazy_hold_chunk();
+        if ((lz_chunk || piece_hold) && !reader) {
             if (lz_touch_ms[r] && (int32_t)(now - lz_touch_ms[r]) < LZ_HEAVY_MS) {
                 if (++lz_touch_n[r] > LZ_HEAVY_N) reader = 1, lz_heavy++;
             } else {
@@ -652,8 +682,9 @@ static int lazy_fault(uint64_t a, int write) {
         } else {   // the segment leaves the list under lz_lock; its pages come back without it
             LzSeg s = lazy_take_locked(i);
             plat_mutex_unlock(&lz_lock);
-            lazy_gone_locked(s, write != 0);
-            if (k >= 0) lz_note[k].hold = lz_back[r];
+            int piece = piece_hold && !reader;
+            lazy_gone_locked(s, write != 0, piece ? a : 0);
+            if (k >= 0) lz_note[k].hold = piece ? lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1)->back : lz_back[r];
         }
         if (k >= 0) lz_note[k].out = out;
         plat_mutex_unlock(&frz_lock);
@@ -1224,6 +1255,7 @@ void mem_init(void) {
         plat_mem_access_hook(access_fault);
         lz_want = 1;
         lz_chunk = cfg_bool("NX2NAVI_WB_LAZY_CHUNK");
+        lazy_hold_chunk();   // read here, not first inside an access fault
     }
     const char *fa = cfg_get("NX2NAVI_FREEZE_ASYNC");   // thaws outside frz_lock (FRZ_THAWING); unset: on
     frz_async = !fa || !*fa || atoi(fa) != 0;
