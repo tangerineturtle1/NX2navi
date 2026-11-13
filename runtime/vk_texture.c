@@ -713,9 +713,25 @@ static int tex_reuse_on(void) {
 
 static void destroy_tex(Tex *e);
 static int used_lately(const struct Tex *e, uint64_t now, uint64_t within);
+static int sampled_lately(const struct Tex *e, uint64_t now, uint64_t within);
+static int marks_tell(void);
 // The presents a released entry must have gone unused before its image may go to another texture (create_tex): the
 // pool's marks reach an entry a few presents after the draw that sampled it.
 #define REUSE_UNUSED 16
+// The same for an overwritten entry while the card is past the VRAM pressure's share of its budget (over_share): what
+// the marks need and no more. A mark is read at most MARKS_RB copies of MARKS_EVERY submissions after its draw
+// (vk_exec_draw.c vk_exec_pool_marks), three frames of six submissions, so after eight presents without a stamp none
+// is on its way. At 3840x2160 the targets moved in 16 presents hold 3.1 GiB, which a 16 GiB card does not have beside
+// the 10 GiB of a town.
+#define REUSE_UNUSED_FULL 8
+static int over_share;   // sweep_pressure: the driver's figure of the memory in use is past that share
+// The released entries of one parameter set create_tex looks at, newest release first. While the game's layout moves
+// in every frame, each frame releases every target of a set and none of them is unused yet for REUSE_UNUSED presents:
+// with 128 looked at, eight targets of one set a frame hid every older entry behind the young ones and each texture
+// got a new image.
+#define REUSE_LOOK 1024
+// since the last perf line: released entries create_tex passed by as released too lately, as used, as named by a slot
+static uint64_t n_reuse_young, n_reuse_used, n_reuse_slot;
 
 // NX2NAVI_TEX_REUSE_NAMED (default 0; 1: as before, any released entry's image may go): a registered slot that is not
 // finalized names e's descriptor, so a shader can still sample e through the pool. The game finalizes a texture object
@@ -1487,14 +1503,37 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         Tex *a = NULL, *kept = NULL;
         uint64_t best = UINT64_MAX, best_kept = UINT64_MAX;
         int n = 0;
-        for (Tex *q = nvn_hm_get(&reuse, &e->ik); q && n < 128; q = q->ru_next, n++) {
-            if (q->rel_epoch == submit_epoch || now - q->rel_frame < 2 || q->key.addr == k->addr) continue;
-            if (used_lately(q, now, REUSE_UNUSED)) continue;   // still drawn with or sampled: its content is asked for
+        // An overwritten one goes by what drew with it or sampled it (sampled_lately), whatever slot still holds or
+        // names it. The game finalizes the texture object of a target it has moved only when it needs the object
+        // again, and until then the object's slot holds the entry: the pool stamps such an entry as used in every
+        // submission (pool_touch), and the slot names it (slot_names). By those two an overwritten target's image
+        // could not go to the target that took its place. While a shadow map in Kokiri Forest changed its size in
+        // every frame (1141x1141 to 1917x1917, a texel or two a frame, as the camera moved), every target laid out
+        // behind it moved with it: 945 images were made in 60 frames and 17 reused, the released entries reached
+        // 1,931 with 8.6 GiB within five seconds of the area's load at 3416x1440, and a player's card of 20 GiB was
+        // full twice in five minutes (image creation failed, 4 fps, then the game ended). The slot of an entry whose
+        // image went shows its stand-in, as it does once drop_overwritten took the entry.
+        int marks = marks_tell();
+        for (Tex *q = nvn_hm_get(&reuse, &e->ik); q && n < REUSE_LOOK; q = q->ru_next, n++) {
+            if (q->key.addr == k->addr) continue;
+            if (q->rel_epoch == submit_epoch || now - q->rel_frame < 2) { n_reuse_young++; continue; }
+            int over = q->overwritten && marks;
+            // still drawn with or sampled: its content is asked for
+            if (over ? sampled_lately(q, now, over_share ? REUSE_UNUSED_FULL : REUSE_UNUSED)
+                     : used_lately(q, now, REUSE_UNUSED)) {
+                n_reuse_used++;
+                continue;
+            }
             uint64_t dist = q->key.addr > k->addr ? q->key.addr - k->addr : k->addr - q->key.addr;
             // not one a current slot still names (slot_names), asked only of a candidate that would be the best
             if (q->overwritten) {
-                if (dist < best && !slot_names(q)) best = dist, a = q;
-            } else if (dist < best_kept && !slot_names(q)) best_kept = dist, kept = q;
+                if (dist >= best) continue;
+                if (!over && slot_names(q)) { n_reuse_slot++; continue; }
+                best = dist, a = q;
+            } else if (dist < best_kept) {
+                if (slot_names(q)) { n_reuse_slot++; continue; }
+                best_kept = dist, kept = q;
+            }
         }
         if (!a) a = kept;
         if (a) {
@@ -2656,6 +2695,13 @@ static int used_lately(const Tex *e, uint64_t now, uint64_t within) {
     return now - e->use_frame < within || now - e->samp_frame < within;
 }
 
+// A draw bound e, the game or the replay read it, or a marked shader sampled a slot that shows it, within `within`
+// presents of now (samp_frame). used_lately also counts the pool's own stamp, which every GPU-owned entry a slot still
+// holds gets in each submission whether or not anything samples the slot (pool_touch): for such an entry "used" says
+// that the game has not finalized the slot's texture object yet. Asked only while the marks tell what is sampled
+// (marks_tell); without them a slot's sampling is not known and used_lately stands.
+static int sampled_lately(const Tex *e, uint64_t now, uint64_t within) { return now - e->samp_frame < within; }
+
 // Drops up to PRESSURE_STEP entries that were marked overwritten OVERWRITTEN_KEEP presents ago or earlier
 // (overwrite_others): the image reuse found no texture to give their images to in that time.
 // Not one that was used since (NX2NAVI_TEX_OVERWRITTEN_USED=0: those too, as before): the mark says another target was
@@ -2666,28 +2712,38 @@ static int used_lately(const Tex *e, uint64_t now, uint64_t within) {
 // 102 in the frames around it); the frames before and after were as usual. Whatever looks such an entry up after its
 // drop makes it again that way, so an entry something still uses stays; so does one the image reuse would take
 // (create_tex, REUSE_UNUSED).
-static void drop_overwritten(void) {
+// full: the card is past the VRAM pressure's share of its budget by the driver's own figure (sweep_pressure). The
+// wait is then OVERWRITTEN_FULL presents, four times what the image reuse leaves an entry alone for there: an image no
+// texture took in that time holds nothing the game can ask for, and the memory it keeps for ten seconds more is what
+// the next image fails for. Not sooner: at ten presents this took the images the reuse was about to hand on, 7,301 in
+// a run at 3840x2160 that then made 7,672 images and reused 5,226.
+#define OVERWRITTEN_FULL (REUSE_UNUSED_FULL * 4)
+static uint64_t n_over_full;   // since the last perf line: of n_over_drops, dropped with the card that full
+static void drop_overwritten(int full) {
     static int used_too = -1;
     static uint64_t n_kept;
     if (used_too < 0) used_too = !cfg_bool("NX2NAVI_TEX_OVERWRITTEN_USED");
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    int dropped = 0;
-    for (Tex *e = rel_head, *next; e && now - e->rel_frame >= OVERWRITTEN_KEEP && dropped < PRESSURE_STEP; e = next) {
+    // used: drawn with or sampled (sampled_lately); a slot that merely still holds the entry does not keep it
+    int dropped = 0, marks = marks_tell();
+    const uint64_t keep = full ? OVERWRITTEN_FULL : OVERWRITTEN_KEEP;
+    for (Tex *e = rel_head, *next; e && now - e->rel_frame >= keep && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
-        if (!e->overwritten || now - e->ow_frame < OVERWRITTEN_KEEP) continue;
-        if (!used_too && used_lately(e, now, OVERWRITTEN_KEEP)) {
+        if (!e->overwritten || now - e->ow_frame < keep) continue;
+        if (!used_too && (marks ? sampled_lately(e, now, keep) : used_lately(e, now, keep))) {
             if (e->kept_frame != now + 1 && (!n_kept++ || !(n_kept & (n_kept - 1))))   // the first, then at powers of two
                 rt_log("vk: an overwritten texture stays, it is still used: %#llx fmt %#x %ux%u, last used %llu presents "
                        "ago (%llu so far; NX2NAVI_TEX_OVERWRITTEN_USED=0 drops such a texture)",
                        (unsigned long long)e->key.addr, e->t.d.format, e->t.d.width, e->t.d.height,
-                       (unsigned long long)(now - (e->use_frame > e->samp_frame ? e->use_frame : e->samp_frame)),
+                       (unsigned long long)(now - (marks || e->samp_frame > e->use_frame ? e->samp_frame
+                                                                                                 : e->use_frame)),
                        (unsigned long long)n_kept);
             e->kept_frame = now + 1;
             e->ow_frame = now;   // looked at again OVERWRITTEN_KEEP presents from now
             continue;
         }
         drop_tex(e, DROP_OVERWRITTEN);
-        dropped++, n_over_drops++;
+        dropped++, n_over_drops++, n_over_full += full != 0;
     }
 }
 
@@ -2835,6 +2891,11 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
 #define HOLDS_MAX 65536
 static nvn_hmap holds = {.klen = sizeof(TexKey)};   // value: 1
 static uint32_t marks_reads;
+// Whether the pool's marks tell which textures the shaders sample: every module that indexes the pool is marked, no
+// read was missed and two have arrived.
+static int marks_tell(void) {
+    return vk_pool_marks_enabled() && !__atomic_load_n(&vk_pool_marks_missed, __ATOMIC_RELAXED) && marks_reads >= 2;
+}
 // Whether the scene is being drawn, from the marks: marks_peak is the most slots one read marked lately (in 1/256,
 // halving in about a minute of reads), marks_live the reads in a row that marked at least a quarter of it. A pause
 // screen, a menu or a fade draws next to nothing through the pool for longer than DISUSE_SECONDS: every texture of the
@@ -3145,6 +3206,9 @@ void vk_pool_marks_read(const uint32_t *marks, uint32_t n) {
             if (trace) marks_check(e, id, now, 0);
             continue;
         }
+        // Its own entry is released: the slot shows it where no live entry at the address is followed (slot_resolve),
+        // so it counts as sampled too. The image reuse and drop_overwritten go by this stamp (sampled_lately).
+        if (e) e->samp_frame = now;
         // The slot has no entry of its own: it samples another descriptor's image at its address (slot_resolve follows
         // one of the same target, as a second descriptor with another swizzle does). That image is what was sampled.
         // With the mark given to the slot's own key alone, a texture sampled only through such slots was never noted
@@ -3305,13 +3369,17 @@ static void sweep_pressure(void) {   // tex_lock held
     int low = commit_is_low(), more = 0;   // more: the released entries have stale ones left for the next check
     int held = low && commit_drops_held();   // the commit drops came back (commit_back_note)
     if (rel_head) {
-        drop_overwritten();
+        // The driver's figure, holes in VMA's blocks counted: the pressure above goes by the memory in use without
+        // them (vk_mem_vram_live), and a new block or an image with memory of its own cannot use a hole. A card
+        // at 100 % of its budget by this figure was at 81 % by the other, 3.1 GiB of it holes, and nothing gave way.
+        uint64_t cap = released_cap_bytes(), keep = cap, vused = 0, vbudget = 0;
+        int vexact, vknown = vk_mem_vram(&vused, &vbudget, &vexact);
+        over_share = vknown && vram_pressure && vused > vbudget / 100 * (uint64_t)vram_pressure;
+        drop_overwritten(over_share);
         drop_aged();
         // the bound, or more of it while the hold empties the released entries within minutes and the card and the
         // system have room (vk_tex_release.h trl_keep): a young entry dropped there is one the game may still take back
-        uint64_t cap = released_cap_bytes(), keep = cap, vused, vbudget;
-        int vexact;
-        if (rel_bytes > cap && released_hold() && vk_mem_vram(&vused, &vbudget, &vexact))
+        if (rel_bytes > cap && released_hold() && vknown)
             keep = trl_keep(released_hold(), cap,
                             trl_room(vused, vbudget, vram_pressure ? vram_pressure : VRAM_PRESSURE_DEFAULT,
                                      commit_free_now, commit_low_mark));
@@ -5119,8 +5187,11 @@ void vk_texture_new_submit(void) {
                "under VRAM pressure %llu, under commit pressure %llu (made again soon after %llu, checks pausing those drops %llu; "
                "%llu checks went on to live textures with the released ones still above their bound); idle live textures evicted %llu (%.1f MiB); "
                "unsampled ones evicted %llu (%.1f MiB), retiring %d (%.1f MiB), freed %llu, taken back while retiring "
-               "%llu, back %llu, held %u (marks read %u); images reused %llu, made %llu, pool bindings not tried %llu, "
-               "superseded taken back %llu; render targets overwritten at another address %llu, dropped unused %llu",
+               "%llu, back %llu, held %u (marks read %u); images reused %llu, made %llu (released ones of their "
+               "parameters passed by: %llu released too lately, %llu drawn with or sampled lately, %llu named by a "
+               "slot), pool bindings not tried %llu, "
+               "superseded taken back %llu; render targets overwritten at another address %llu, dropped unused %llu "
+               "(%llu of them early, with the card past its pressure share)",
                (unsigned long long)f * 60, nreleased, rel_bytes / 1048576.0, (unsigned long long)n_cap_drops,
                (unsigned long long)n_pressure_drops, (unsigned long long)n_commit_drops,
                (unsigned long long)n_commit_back, (unsigned long long)n_commit_held,
@@ -5128,12 +5199,14 @@ void vk_texture_new_submit(void) {
                (unsigned long long)n_disuse, n_disuse_bytes / 1048576.0, nretiring, retiring_bytes / 1048576.0,
                (unsigned long long)n_retire_freed, (unsigned long long)n_retire_cancel,
                (unsigned long long)n_disuse_back, holds.n, marks_reads, (unsigned long long)n_reused,
-               (unsigned long long)n_reuse_new, (unsigned long long)n_bind_skips, (unsigned long long)n_restarts,
-               (unsigned long long)n_overwritten, (unsigned long long)n_over_drops);
+               (unsigned long long)n_reuse_new, (unsigned long long)n_reuse_young, (unsigned long long)n_reuse_used,
+               (unsigned long long)n_reuse_slot, (unsigned long long)n_bind_skips, (unsigned long long)n_restarts,
+               (unsigned long long)n_overwritten, (unsigned long long)n_over_drops, (unsigned long long)n_over_full);
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_commit_back = n_commit_held = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
         n_reused = n_reuse_new = n_bind_skips = n_restarts = n_overwritten = n_over_drops = 0;
+        n_reuse_young = n_reuse_used = n_reuse_slot = n_over_full = 0;
         rt_log("perf: frame %llu: texture origins: released entries dropped past RELEASED_MAX %llu, replaced by another "
                "descriptor at their address %llu; entries the CPU does not write made without content at an address it "
                "can see: on their own %llu, over a released entry %llu, over a live one %llu; marked slots that met an "
@@ -5973,9 +6046,7 @@ typedef struct {
     int marks;         // the pool's marks tell which textures are sampled (compact_marks)
 } CompTable;
 
-static int compact_marks(void) {
-    return vk_pool_marks_enabled() && !__atomic_load_n(&vk_pool_marks_missed, __ATOMIC_RELAXED) && marks_reads >= 2;
-}
+static int compact_marks(void) { return marks_tell(); }
 
 static int compact_what(const Tex *e, uint64_t now, int marks, uint64_t most) {
     if (!e->pub.image || e->pub.gone || e->retiring || !comes_back_intact(e)) return TCP_STAY;
