@@ -1118,6 +1118,17 @@ static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
 // back: under this budget auto then goes one step lower. A card with 8 GiB that decoded on the CPU held two texture
 // arrays of 852 MiB each, was 560 MiB over its budget and lost its device.
 #define DETAIL_RGBA8_MB 20480
+// On a GPU that shares the system's memory (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: Intel's and AMD's integrated GPUs,
+// the handhelds built on them) the device-local budget is a share of the same RAM the game's own memory, the runtime
+// and the system live in, so it says little about what textures can take: an MSI Claw A1M (Core Ultra 155H, 16 GB,
+// upstream #560) reported a device-local budget of 9060 MiB, auto chose full, and the game needed a 48 GB page file
+// and lost its device; a Radeon 890M (#465) went the same way. There auto goes by the smaller of that budget and the
+// physical memory less DETAIL_UMA_RESERVE_MB for everything else: the guest heap alone is 7148 MiB, the runtime,
+// driver and system take about 2 GiB more. A 16 GB machine, whose system sees about 15.5 GiB, then gets reduced, 24 GB
+// and more full; a dedicated GPU is not concerned. The Steam Deck keeps the rule before (its device profile, cfg.c
+// DECK, was set up with it) until it is measured there. Measured on no integrated GPU yet: texture_detail sets the
+// level by hand.
+#define DETAIL_UMA_RESERVE_MB 9216
 #define EXACT_MAX 65536
 static nvn_hmap exact = {.klen = sizeof(TexKey)};   // keys made whole whatever the setting; value 1
 static uint64_t n_exact;                             // textures made whole again so far
@@ -1133,6 +1144,19 @@ int vk_texture_detail_auto(void) {
         uint64_t used = 0, budget = 0;
         int exact_budget = 0;
         mb = vk_mem_vram(&used, &budget, &exact_budget) ? (int64_t)(budget >> 20) : 0;
+        const VkCtx *c = vk_ctx();
+        if (mb && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+            strcmp(cfg_device_profile(), "deck")) {   // shared memory (above)
+            float ram_used = 0, ram_total = 0, proc = 0;
+            plat_mem_info(&ram_used, &ram_total, &proc);
+            int64_t room = (int64_t)ram_total - DETAIL_UMA_RESERVE_MB;
+            if (ram_total > 0 && room < mb) {
+                rt_log("vk: texture detail: this GPU shares the system's memory: auto goes by %lld MiB (%.0f MiB of RAM "
+                       "less %d MiB for the game and the system) instead of the device-local budget of %lld MiB",
+                       (long long)(room > 0 ? room : 0), ram_total, DETAIL_UMA_RESERVE_MB, (long long)mb);
+                mb = room > 1 ? room : 1;
+            }
+        }
         __atomic_store_n(&detail_budget_mb, mb, __ATOMIC_RELAXED);
     }
     int most = !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
