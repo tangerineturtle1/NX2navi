@@ -409,8 +409,9 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; } copy_prefix;
+// first_deferred: byte offset of the first deferred bind, zero when absent (OP_BEGIN is first).
+// pins: texture pins its ops name, counted in their refs (pin_refs).
+typedef struct { uint64_t magic, bytes, made_at, used_at, first_deferred, pins; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -497,32 +498,56 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
     return bytes;
 }
 
+// Only texture, sampler and image array binds read the game's handle table again at submit.
+static p_bind_handles *deferred_bind(op_hdr *h) {
+    if (h->op != OP_BIND_TEX && h->op != OP_BIND_IMG && h->op != OP_BIND_SAMP) return NULL;
+    size_t fixed = sizeof *h + offsetof(p_bind_handles, h);
+    if (h->size < fixed) rt_fatal("nvn: short handle bind (op %u size %u)", h->op, h->size);
+    p_bind_handles *b = (p_bind_handles *)(void *)(h + 1);
+    if (!b->src || b->n <= 0 || b->n > 32) return NULL;
+    if (h->size - fixed < (size_t)b->n * sizeof *b->h)
+        rt_fatal("nvn: short deferred handle array (op %u size %u, %d handles)", h->op, h->size, b->n);
+    return b;
+}
+
 // The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
 // into one host block of its exact size. One allocation and one copy: growing the copy record by record cost the
 // game's main thread about 1 ms a frame in reallocations and small copies (1.4.3, field).
 static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     uint8_t *out = realloc_wait(NULL, sizeof(copy_prefix) + n, "command copy");
     if (!out) rt_fatal("nvn: command copy allocation");
-    memcpy(out + sizeof(copy_prefix), p, n);
+    uint8_t *copy = out + sizeof(copy_prefix);
+    memcpy(copy, p, n);
     uint64_t pins_named = 0;
+    size_t first = 0;
+    p_bind_handles *previous = NULL;
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
-        op_hdr h;
-        memcpy(&h, p + at, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
-            (!at && h.op != OP_BEGIN))
-            rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        if (n - at < sizeof(op_hdr)) rt_fatal("nvn: recording ends without a full record at %zu bytes", at);
+        op_hdr *h = (op_hdr *)(void *)(copy + at);
+        if (h->size < 8 || (h->size & 7) || h->op >= OP_COUNT_ || h->op == OP_JUMP || h->op == OP_CALL || h->size > n - at ||
+            (!at && h->op != OP_BEGIN))
+            rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h->op, h->size);
+        p_bind_handles *bind = deferred_bind(h);
+        if (bind) {
+            if (previous) {
+                size_t distance = (uint8_t *)bind - (uint8_t *)previous;
+                previous->next_deferred = distance < UINT32_MAX ? (uint32_t)distance : UINT32_MAX;
+            } else first = at;
+            bind->next_deferred = 0;
+            previous = bind;
+        }
         const tex_t *pinned[9];
-        int k = PIN_OPS >> h.op & 1 ? op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned) : 0;
+        int k = PIN_OPS >> h->op & 1 ? op_pins(h->op, nvn_op_payload(h), pinned) : 0;
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
         pins_named += (uint64_t)k;
-        at += h.size;
-        if (h.op == OP_END) {
+        at += h->size;
+        if (h->op == OP_END) {
             if (at != n) rt_fatal("nvn: recording at %p ends at %zu of %zu bytes", (const void *)p, at, n);
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named};
-    return out + sizeof(copy_prefix);
+    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .first_deferred = first, .pins = pins_named};
+    return copy;
 }
 
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
@@ -1222,51 +1247,47 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 // as the submit returns). The result is written into the recording copy.
 static uint64_t def_reads, def_changed, n_clones;
 
-static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds
-    int nd = 0;
-    for (;;) {
-        op_hdr h;
-        memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
-            rt_fatal("nvn: corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p,
-                     h.op, h.size);
-        if (h.op == OP_END) return nd;
-        if (h.op == OP_JUMP) {
-            memcpy(&p, p + 8, 8);
-            continue;
-        }
-        if (h.op == OP_CALL) {
-            uint64_t t;
-            memcpy(&t, p + 8, 8);
-            if (depth >= 16) rt_fatal("nvn: deferred bind resolution: call depth over 16");
-            nd += resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
-        } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
-            p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
-            if (b->src && b->n > 0 && b->n <= 32) {
-                nd++;
-                uint64_t cur[32];
-                memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
-                __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
-                    if (__atomic_fetch_add(&def_changed, 1, __ATOMIC_RELAXED) < 6)
-                        NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx",
-                                b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
-                    memcpy(b->h, cur, 8 * (size_t)b->n);
-                }
+static void resolve_deferred(uint64_t handle) {
+    uint8_t *copy = (uint8_t *)(uintptr_t)handle;
+    const copy_prefix *pf = (const copy_prefix *)copy - 1;
+    if (!pf->first_deferred) return;
+    // The offsets in the copy work unchanged in an asynchronous clone. Walk the intervening records only if the
+    // next deferred bind was too far away for its distance to fit.
+    for (uint8_t *p = copy + pf->first_deferred;;) {
+        op_hdr *h = (op_hdr *)(void *)p;
+        if (h->size < 8 || (h->size & 7) || h->op >= OP_COUNT_)
+            rt_fatal("nvn: corrupt recording at %p while resolving deferred binds (op %u size %u)", (void *)p,
+                     h->op, h->size);
+        if (h->op == OP_END) return;
+        p_bind_handles *b = deferred_bind(h);
+        if (b) {
+            uint64_t cur[32];
+            memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
+            __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
+            if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
+                if (__atomic_fetch_add(&def_changed, 1, __ATOMIC_RELAXED) < 6)
+                    NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx",
+                            b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
+                memcpy(b->h, cur, 8 * (size_t)b->n);
+            }
+            if (!b->next_deferred) return;
+            if (b->next_deferred != UINT32_MAX) {
+                p += b->next_deferred;
+                continue;
             }
         }
-        p += h.size;
+        p += h->size;
     }
 }
 
 void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
-    for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+    for (int i = 0; i < n; i++) resolve_deferred(handles[i]);
 }
 
 // Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
-// deferred binds (or is not known to hold none), this submission gets a clone, resolved here and freed after its replay.
+// deferred binds, this submission gets a clone, resolved here and freed after its replay.
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     uint64_t replayed = gfx_replayed_submits();
@@ -1281,7 +1302,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
                      (unsigned long long)handles[i]);
         }
         out[i] = handles[i];
-        if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
+        if (pf->used_at > replayed && pf->used_at != now && pf->first_deferred) {
             size_t sz = sizeof *pf + pf->bytes;
             copy_prefix *cl = malloc(sz);
             if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
@@ -1298,10 +1319,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     }
     plat_mutex_unlock(&copy_lock);
     doom_free(doomed);
-    for (int i = 0; i < n; i++) {
-        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
-        if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
-    }
+    for (int i = 0; i < n; i++) resolve_deferred(out[i]);
     if (now % 7200 == 0)
         rt_log("nvn: asynchronous replay at submit %llu: %llu recording clones so far, %u copies waiting for the replay",
                (unsigned long long)now, (unsigned long long)__atomic_load_n(&n_clones, __ATOMIC_RELAXED), nzombies);

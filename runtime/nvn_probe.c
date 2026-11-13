@@ -395,7 +395,7 @@ static void begin(NVNcommandBuffer *c, uint8_t *ctl, uint64_t cmd_off) {
     CALL(nvnCommandBufferBeginRecording, U(c));
 }
 
-static uint64_t record_all(void) {
+static uint64_t record_all(uint64_t handles[3]) {
     NVNcommandBuffer *c = &cmd;
     begin(c, ctlmem1, 0x32000);
     static const float rgba[4] = {0.1f, 0.2f, 0.3f, 0.4f};
@@ -407,7 +407,6 @@ static uint64_t record_all(void) {
     struct { uint32_t stride, divisor; } stream[2] = {{16, 0}, {32, 1}};
     NVNbufferRange vb[2] = {{0x1000, 0x100}, {0x2000, 0x200}};
     uint8_t blend[8] = {1, 2, 3, 4, 5, 6, 7, 8}, poly[4] = {9, 10, 11, 12};
-    uint64_t handles[3] = {0x300005, 0x400006, 0x500007};
     cpu.x[30] = 0x7000001234ull;
     OBJ(NVNtexturePool, tp2);
     OBJ(NVNsamplerPool, sp2);
@@ -767,7 +766,8 @@ static void probe_commands(void) {
     ctlmem1 = mem_kernel_alloc(0x1000, 16);
     ctlmem2 = mem_kernel_alloc(0x1000, 16);
     ctlmem3 = mem_kernel_alloc(0x1000, 16);
-    uint64_t h = record_all();
+    uint64_t handles[3] = {0x300005, 0x400006, 0x500007};
+    uint64_t h = record_all(handles);
     parse_all(h);
 
     // CallCommands inlines the called recording at the call position
@@ -786,6 +786,18 @@ static void probe_commands(void) {
     CHECK(!forbidden && n == nexpect + 2 && barriers == 3 && inner == nexpect + 3, "CallCommands inlined: %d ops (expected %d), %d barriers",
           n, nexpect + 2, barriers);
     CHECK(nvn_op_first(h2)->op == OP_BEGIN && nvn_op_next(nvn_op_first(h2))->op == OP_BARRIER, "the first op before the call stays first");
+
+    // A deferred bind in the inlined recording still reads its source table on each submission.
+    for (int i = 0; i < 2; i++) {
+        handles[2]++;
+        nvn_submit_prepare(&h2, 1);
+        int updated = 0;
+        for (const op_hdr *o = nvn_op_first(h2); o->op != OP_END; o = nvn_op_next(o)) {
+            const p_bind_handles *b = nvn_op_payload(o);
+            if (o->op == OP_BIND_TEX && b->src && b->n == 3 && b->h[2] == handles[2]) updated++;
+        }
+        CHECK(updated == 1, "the inlined deferred bind read its updated handle at submit");
+    }
 
     // adding the control memory again retires the recordings made in it
     CALL(nvnCommandBufferAddControlMemory, U(&cmd2), U(ctlmem2), 0x1000);
