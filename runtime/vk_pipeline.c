@@ -2167,6 +2167,7 @@ out:
 }
 
 static int spirv_mark_list_test(const char *list);   // texture pool marks, below
+static int task_subgroup_selftest(void);
 
 // --selftest (main.c): spirv_nan_preserve on a small fragment module, without a device. Returns the number of failures.
 int vk_pipeline_spirv_selftest(void) {
@@ -2249,6 +2250,7 @@ int vk_pipeline_spirv_selftest(void) {
     }
     const char *list = cfg_get("NX2NAVI_SPV_MARK_TEST");
     if (list && *list) failures += spirv_mark_list_test(list);
+    failures += task_subgroup_selftest();
     return failures;
 }
 
@@ -2261,7 +2263,7 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
     st->pNext = rq;
 }
 
-// The x of a compute module's LocalSize (OpExecutionMode 17), 0 when it has none.
+// The x of a workgroup module's LocalSize (OpExecutionMode 17), 0 when it has none.
 static uint32_t local_size_x(const uint32_t *w, uint64_t words) {
     for (uint64_t i = 5; w && i < words;) {
         uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
@@ -2271,6 +2273,58 @@ static uint32_t local_size_x(const uint32_t *w, uint64_t words) {
         i += n;
     }
     return 0;
+}
+
+static void pin_task_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *rq,
+                                const uint32_t *w, uint64_t words) {
+    pin_subgroup32(st, rq, w, words);
+    // Task payload compaction uses warp-wide ballots and lane IDs. Pinning the mesh stage does not pin its task
+    // stage; partial subgroups can reuse the same payload slots and emit only part of the mesh work.
+    uint32_t lx = local_size_x(w, words);
+    if (P.f_full_subgroups && st->pNext == rq && vk_caps.sg_size && lx && lx % vk_caps.sg_size == 0)
+        st->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+}
+
+// Exercise the pipeline requirements without a device. These are only the SPIR-V declarations the policy reads.
+static int task_subgroup_selftest(void) {
+    static const struct {
+        const char *name;
+        uint32_t stages, full, width, capability, size;
+        int pin, require_full;
+    } cases[] = {
+        {"one warp", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 32, 64, 32, 1, 1},
+        {"two warps", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 64, 64, 32, 1, 1},
+        {"short workgroup", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 16, 64, 32, 1, 0},
+        {"unknown width", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 0, 64, 32, 1, 0},
+        {"full subgroups unsupported", VK_SHADER_STAGE_TASK_BIT_EXT, 0, 32, 64, 32, 1, 0},
+        {"only mesh pin supported", VK_SHADER_STAGE_MESH_BIT_EXT, 1, 32, 64, 32, 0, 0},
+        {"pin disabled", 0, 1, 32, 64, 32, 0, 0},
+        {"no subgroup operations", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 32, 1, 32, 0, 0},
+        {"configured size", VK_SHADER_STAGE_TASK_BIT_EXT, 1, 16, 64, 16, 1, 1},
+    };
+    uint32_t saved_stages = P.sg32_stages, saved_full = P.f_full_subgroups, saved_size = vk_caps.sg_size;
+    int failures = 0;
+    for (uint32_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t w[] = {0x07230203, 0x00010400, 0, 2, 0,
+                        2u << 16 | 17, cases[i].capability,                   // OpCapability
+                        6u << 16 | 16, 1, 17, cases[i].width, 1, 1};         // LocalSize
+        P.sg32_stages = cases[i].stages, P.f_full_subgroups = cases[i].full, vk_caps.sg_size = cases[i].size;
+        VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                               .stage = VK_SHADER_STAGE_TASK_BIT_EXT};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq = {0};
+        pin_task_subgroup32(&st, &rq, w, sizeof w / sizeof w[0]);
+        int pinned = st.pNext == &rq;
+        int full = !!(st.flags & VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT);
+        if (pinned != cases[i].pin || full != cases[i].require_full ||
+            (pinned && (rq.requiredSubgroupSize != cases[i].size ||
+                        rq.sType != VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO))) {
+            printf("spirv: task subgroup requirements, %s: FAIL\n", cases[i].name);
+            failures++;
+        }
+    }
+    P.sg32_stages = saved_stages, P.f_full_subgroups = saved_full, vk_caps.sg_size = saved_size;
+    printf("spirv: task subgroup requirements: %s\n", failures ? "FAIL" : "ok");
+    return failures;
 }
 
 // Pool arrays (the translator's bindless texture and sampler arrays of VK_POOL_TEX / VK_POOL_SAMP elements, found by
@@ -3818,9 +3872,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (!s->fs) stages[1] = stages[2];
         n_stages++;
     }
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf, rqt;
     if (!emu) pin_subgroup32(&stages[0], &rqv, vplain, vw0);   // vcode may be a patched copy that is freed by now
     if (s->fs) pin_subgroup32(&stages[1], &rqf, fplain, fw0);
+    if (tm) {
+        uint64_t tw;
+        const uint32_t *tcode = gfx_shader_spirv_pin(s->ts, &tw);
+        pin_task_subgroup32(&stages[n_stages - 1], &rqt, tcode, tw);
+        gfx_shader_spirv_unpin(s->ts);
+    }
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -4012,7 +4072,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkShaderModule m = VK_NULL_HANDLE, tm = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
     VkPipelineShaderStageCreateInfo mst[2];   // a mesh pipeline's pre-rasterization stages: mesh, then task
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq, rqt;
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -4053,8 +4113,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         pi.pVertexInputState = &vi, pi.pInputAssemblyState = &ia;
     } else if (kind == LIB_PR && mesh) {
         // The task and mesh stages as create_graphics builds them: the mesh module as translated, the task module with
-        // its bindings moved past the mesh stage's (task_off in a stage-independent layout); the mesh stage alone
-        // takes the subgroup pin there, so here too. No vertex outputs are added: what a fragment shader reads and
+        // its bindings moved past the mesh stage's (task_off in a stage-independent layout). Each stage requests its
+        // subgroup requirements independently. No vertex outputs are added: what a fragment shader reads and
         // the mesh stage does not write is filled in the fragment module (FsKey.fill).
         uint64_t vw, tw = 0;
         const uint32_t *vcode = gfx_shader_spirv_pin(pinned[0] = s->vs, &vw);
@@ -4068,6 +4128,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             patched = tcode && toff ? spirv_rebind(tcode, tw, toff) : NULL;
             if (!tcode || !(tm = make_module(patched ? patched : tcode, tw, 0))) goto out;
             mst[1] = st, mst[1].stage = VK_SHADER_STAGE_TASK_BIT_EXT, mst[1].module = tm;
+            pin_task_subgroup32(&mst[1], &rqt, tcode, tw);
             pi.stageCount = 2;
         }
         pi.pStages = mst, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
