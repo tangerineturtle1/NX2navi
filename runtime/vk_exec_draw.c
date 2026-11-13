@@ -1702,7 +1702,7 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     FmEnt *fm = ex->dc->fm;
     if (!fm && !(fm = ex->dc->fm = calloc(FM_N, sizeof *fm))) rt_fatal("vk: out of memory (feedback memo)");
     for (int r = 0; r < n; r++) {
-        // Only bound slots (0..127) are looked at. The texture and sampler pool arrays (res.pool: 32768 and 4096
+        // Only bound slots (0..127) are looked at. The texture and sampler pool arrays (res.pool: VK_POOL_TEX and 4096
         // descriptors, bindless handles) have slot -1: walking them ran up to about 100,000 empty iterations per scan,
         // about 3.6 ms of replay per frame in Kokiri Forest, and read tex[FS][0..127] for them by mistake.
         if (res[r].pool || res[r].slot < 0) continue;

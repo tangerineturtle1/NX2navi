@@ -650,7 +650,13 @@ int vk_sampler_slot_count_locked(void);
 // Bindless pools (vk_exec_draw.c, "texture and sampler pools"): set 2 of every pipeline layout. Shaders that index
 // the texture or sampler pool with handles from memory have their pool arrays moved there (vk_pipeline.c
 // spirv_pool_rebind); VK_POOL_KINDS image bindings, one per view kind, then the sampler pool.
-#define VK_POOL_TEX 32768                           // as the translator's Accessor.TexturePoolLength
+// VK_POOL_TEX covers the game's whole texture pool: Ocarina makes one of 33068 descriptors (nvnTexturePoolInitialize),
+// and with 32768 the translator's clamp sent every handle from 32768 up to slot 32767, so the textures the game
+// numbered there (some ground after an area load) were drawn with whatever slot 32767 held, often an empty image:
+// see-through ground until the area was loaded again (#569). 16 kinds x 40960 = 655,360 sampled images in set 2, under
+// NVIDIA's 1,048,576 update-after-bind limit with room for the bound slots. vk_texture_register logs a slot past it.
+#define VK_POOL_TEX 40960                           // as the translator's Accessor.TexturePoolLength
+#define VK_POOL_TEX_CARRIED 32768                   // the length before: carried translations still declare it
 #define VK_POOL_SAMP 4096                           // Accessor.SamplerPoolLength
 #define VK_POOL_KINDS 16                            // kind = depth * 8 + dim * 2 + arrayed, dim 1D 2D 3D CUBE
 extern volatile uint32_t vk_pool_kinds_used;        // bit k: a pipeline was made with a kind-k pool array

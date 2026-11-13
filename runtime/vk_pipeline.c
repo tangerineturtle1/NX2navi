@@ -2152,7 +2152,12 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
         } else if (op == OP_TYPE_ARRAY_ && len >= 4 && w[i + 1] < bound && w[i + 2] < bound && w[i + 3] < bound) {
             int32_t k = kind[w[i + 2]];
             uint32_t want = k == 100 ? VK_POOL_SAMP : VK_POOL_TEX;
-            kind[w[i + 1]] = k >= 0 && cval[w[i + 3]] == want ? k + 1000 : -1;   // + 1000: a pool array
+            // A translation carried over from a translator whose pool was VK_POOL_TEX_CARRIED long (gfx_shader.c,
+            // carry) is a pool array too: left in its own set, its textures were never bound and the scene drew
+            // with empty images until the background pass translated it again. It indexes the first
+            // VK_POOL_TEX_CARRIED entries of the larger binding, which Vulkan allows.
+            int pool = k >= 0 && (cval[w[i + 3]] == want || (k != 100 && cval[w[i + 3]] == VK_POOL_TEX_CARRIED));
+            kind[w[i + 1]] = pool ? k + 1000 : -1;   // + 1000: a pool array
         } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && w[i + 1] < bound && w[i + 3] < bound) {
             kind[w[i + 1]] = kind[w[i + 3]] >= 1000 ? kind[w[i + 3]] : -1;
         } else if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 1] < bound && w[i + 2] < bound) {

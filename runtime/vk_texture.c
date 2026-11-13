@@ -4402,6 +4402,12 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
 // ---------------------------------------------------------------- descriptor slots
 void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", id);
+    if (id >= VK_POOL_TEX) {   // the translator clamps pool handles to VK_POOL_TEX - 1: shaders cannot reach this slot
+        static int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+            rt_log("vk: texture slot %d registered, past the %d the shaders index (VK_POOL_TEX): a shader that samples it "
+                   "reads slot %d instead", id, VK_POOL_TEX, VK_POOL_TEX - 1);
+    }
     lock();
     if (id >= ntslots) {
         int n = ntslots ? ntslots : 1024;
