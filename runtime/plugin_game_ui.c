@@ -38,6 +38,7 @@ static const PluginGameUi table[] = {
         .cam_update = 0x4c48c0, .cam_actor = 0x10, .actor_name = 0x20, .cam_pos = 0xd8, .cam_at = 0x100, .cam_up = 0x128,
         .cam_lens = 0x18, .lens_proj = 0x10, .proj_near = 0x98, .proj_far = 0x9c, .proj_fovy = 0xa0, .proj_aspect = 0xb0,
         .cam_reset_button = 8,   // ZL, the game's "lock on and camera reset"
+        .frame_step = 0x3b4e300, .frame_step_ra = {0x6e70fc, 0x6e6ddc},
     },
 };
 
@@ -71,7 +72,7 @@ static const char *check(const PluginGameUi *g, uint64_t base) {
         g->screen_focus, g->find_control, g->control_set_check, g->title_setup, g->title_update, g->title_menu_update,
         g->entry_focus, g->entry_unfocus, g->wait_button_update, g->opt_build, g->opt_open, g->opt_focus, g->opt_decide,
         g->opt_caption, g->opt_dtor, g->sel_left_right, g->sel_text, g->tog_control, g->act_refresh,
-        g->save_node_update, g->trig_node_update, g->cam_update};
+        g->save_node_update, g->trig_node_update, g->cam_update, g->frame_step};
     for (size_t i = 0; i < sizeof fns / sizeof *fns; i++)
         if (!rt_dispatch_lookup(base + fns[i])) return "a function does not start where the table says";
     if (slot(base, g->title_vtable, 0x2e8) != g->title_setup || slot(base, g->title_vtable, 0x300) != g->title_update)

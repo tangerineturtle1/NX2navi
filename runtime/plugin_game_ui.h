@@ -54,6 +54,10 @@ typedef struct PluginGameUi {
     uint32_t cam_lens, lens_proj;    // state -> the camera's view object -> the perspective projection the renderer reads
     uint32_t proj_near, proj_far, proj_fovy, proj_aspect;   // in it, floats: the planes, the vertical angle, width / height
     uint32_t cam_reset_button;       // the bit (input_map.h B_*) of the button that puts the follow camera behind the player
+    // ---- the frame step (plugin_menu.c): the function moduleCalc_ calls once a frame on the game's calc thread after
+    // the frame's jobs have been waited on, and the two addresses its calls from there return to. A menu page's game
+    // calls are made there: the layout animator runs as a job, also while the finished picture is presented.
+    uint64_t frame_step, frame_step_ra[2];
 } PluginGameUi;
 
 // The table row for the running game, checked against the game's memory once (functions start where it says, the

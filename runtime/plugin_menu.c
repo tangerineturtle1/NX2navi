@@ -27,6 +27,17 @@
 // is gone the title menu's entry is pressed for the player (the A button, in plugin_menu_poll), with the new rows
 // armed, so the game opens its settings screen again with them. The plugin's on_select is not called for that press.
 //
+// Where the page's game calls are made. The game's layout animator (main+0x2d1380 in 1.1.1) runs as a job on the
+// game's worker threads, also while the finished picture is presented, which is when the plugins' frame callbacks run
+// (on the presenting thread). A row's update stops and restarts animations (anim_stop_at), which changes the lists
+// the animator walks: done from a frame callback it now and then left the animator walking a list without an end,
+// and the game made no more frames (seen when a page was updated at every typed character). So update_menu only
+// keeps the new rows, and they are put on the screen, the cursor is moved and a text row's typing is shown in a hook
+// of the frame step (PluginGameUi.frame_step), which the game calls on its calc thread once the frame's jobs have
+// been waited on: measured in the running game, the animator ran during 253 of 3664 presents and during none of
+// 3664 frame steps. Should the frame step not be called (it is, on the title screen too), the frame callback does
+// the work as before after half a second.
+//
 // A text row the player types into (Nx2MenuRow.text_max): choosing it takes the input from the game (capture_input)
 // and the characters and keys of the window's thread are queued; a frame callback, on the game's thread, puts them
 // into the text, shows it on the row's button with a cursor mark, and ends the entry at Enter or Escape.
@@ -90,6 +101,11 @@ static Ref edit_old;
 static PlatMutex edit_lock = PLAT_MUTEX_INIT;
 static uint32_t edit_queue[EDIT_QUEUE];
 static int edit_queued;
+static Set *pending_set;          // update_menu's rows that the frame step has not put on the screen yet
+static PlatMutex pending_lock = PLAT_MUTEX_INIT;
+static uint64_t step_seen;        // plat_now_ns of the last frame step (h_step), 0 none yet
+static unsigned step_applied, late_applied;   // sets put on the screen at the frame step / in the frame callback
+#define STEP_LATE_NS 500000000ull // no frame step for this long: the frame callback does the page's work
 static int focus_pending;         // 1 + the row the cursor is to go to (open_menu's and update_menu's focus_row, or off a
                                   // disabled row), taken between two frames once the page's cursor is live
 static int last_focus;            // the row the cursor was on last, of those that can be used
@@ -392,10 +408,22 @@ static void edit_on_pad(const Nx2PadEvent *e, void *u) {
     else if (e->button == NX2_PAD_X) edit_push(EDIT_PAD_GROUP);
 }
 
-// The game's thread, between two frames: the cursor's move that focus_row or a disabled row asked for, and what was
-// typed into a text row.
-static void edit_on_frame(const Nx2Frame *f, void *u) {
-    (void)f, (void)u;
+static void apply_set(Set *s);
+
+// The game's calc thread, at the frame step (h_step): the rows update_menu left, the cursor's move that focus_row or a
+// disabled row asked for, and what was typed into a text row.
+static void menu_work(int at_step) {
+    plat_mutex_lock(&pending_lock);
+    Set *p = pending_set;
+    pending_set = NULL;
+    plat_mutex_unlock(&pending_lock);
+    if (p) {
+        if (active && set && p->n == set->n && !__atomic_load_n(&reopen, __ATOMIC_ACQUIRE)) {
+            apply_set(p);
+            if (at_step) step_applied++;
+            else if (!late_applied++) rt_log("plugins: menu: no frame step for half a second: the page is updated in the frame callback");
+        } else set_free(p);   // the page it was for has gone
+    }
     int want = __atomic_load_n(&focus_pending, __ATOMIC_ACQUIRE);
     if (want && active && set && cursor_live && edit_row < 0) {
         uint64_t now = plat_now_ns();
@@ -450,6 +478,23 @@ static void edit_on_frame(const Nx2Frame *f, void *u) {
         }
     }
     if (changed && edit_row >= 0) edit_show(1);
+}
+
+// The frame step, on the game's calc thread, before the function itself runs.
+static void h_step(Nx2HookCall *c, void *u) {
+    (void)u;
+    uint64_t ra = c->lr - B;
+    if (ra != G->frame_step_ra[0] && ra != G->frame_step_ra[1]) return;
+    __atomic_store_n(&step_seen, plat_now_ns(), __ATOMIC_RELEASE);
+    if (active || __atomic_load_n(&focus_pending, __ATOMIC_ACQUIRE) || edit_row >= 0) menu_work(1);
+}
+
+// The presenting thread, between two frames: only when the frame step does not come.
+static void edit_on_frame(const Nx2Frame *f, void *u) {
+    (void)f, (void)u;
+    uint64_t seen = __atomic_load_n(&step_seen, __ATOMIC_ACQUIRE);
+    if (seen && plat_now_ns() - seen < STEP_LATE_NS) return;
+    menu_work(0);
 }
 
 // ---- the hooks
@@ -513,6 +558,15 @@ static void h_dtor(Nx2HookCall *c, void *u) {
     api->write(table, &saved_count, 4), api->write(table + 8, &saved_items, 8);
     active = 0, screen = 0, close_req = 0;
     if (edit_row >= 0) edit_end(0);
+    plat_mutex_lock(&pending_lock);
+    Set *p = pending_set;
+    pending_set = NULL;
+    plat_mutex_unlock(&pending_lock);
+    set_free(p);
+    if (step_applied || late_applied)
+        rt_log("plugins: menu: the page's rows were updated %u times at the frame step, %u times in the frame callback",
+               step_applied, late_applied);
+    step_applied = late_applied = 0;
     if (__atomic_load_n(&reopen, __ATOMIC_ACQUIRE) == 1 && next_set) {   // the page that replaces this one
         next_set->older = set;   // freed with it: the screen that is going still points into the old texts
         set = next_set, on_event = next_event, event_user = next_user, next_set = NULL;
@@ -657,6 +711,9 @@ static int ready(void) {
              api->hook_function(B + G->sel_left_right, h_left_right, NULL) &&
              api->hook_function(B + G->save_node_update, h_save, NULL) &&
              api->hook_function(B + G->trig_node_update, h_trig, NULL) ? 1 : -1;
+    // without it the frame callback does the work (edit_on_frame), as before the page's calls moved to the frame step
+    if (hooked > 0 && !api->hook_function(B + G->frame_step, h_step, NULL))
+        rt_log("plugins: menu: the frame step could not be hooked: the page is updated in the frame callback");
     for (int k = 0; k < MAX_CHOICES; k++) choice_vals[k] = (uint32_t)(CHOICE0 + k);
     if (hooked > 0)
         api->on_text(edit_on_text, NULL), api->on_key(edit_on_key, NULL), api->on_pad(edit_on_pad, NULL),
@@ -669,7 +726,7 @@ int plugin_menu_open(const Nx2Menu *menu) {
     if (active && hooked > 0) {   // a page is open: this one replaces it once the game has closed that one
         Set *s = set_make(menu);
         if (!s) return 0;
-        if (edit_row >= 0) edit_end(0);
+        // (a text row's entry ends with the page: h_dtor, on the game's thread)
         set_free(next_set);
         next_set = s, next_event = menu->on_event, next_user = menu->user;
         __atomic_store_n(&reopen, 1, __ATOMIC_RELEASE);
@@ -690,10 +747,11 @@ int plugin_menu_open(const Nx2Menu *menu) {
     return 1;
 }
 
-// New texts and values for the rows of the open page, which must be of the same kinds.
+// New texts and values for the rows of the open page, which must be of the same kinds. Any thread of a plugin's
+// callbacks: the rows are kept, and the frame step puts them on the screen (menu_work); rows that were not shown yet
+// when the next ones come are dropped for them.
 int plugin_menu_update(const Nx2Menu *menu) {
     if (!active || !set || !menu || menu->row_count != (uint32_t)set->n || __atomic_load_n(&reopen, __ATOMIC_ACQUIRE)) return 0;
-    if (edit_row >= 0) edit_end(0);
     Set *s = set_make(menu);
     if (!s) return 0;
     for (int i = 0; i < s->n; i++)
@@ -701,6 +759,18 @@ int plugin_menu_update(const Nx2Menu *menu) {
             set_free(s);
             return 0;
         }
+    plat_mutex_lock(&pending_lock);
+    Set *old = pending_set;
+    if (old && !s->focus) s->focus = old->focus;   // the cursor's move that came with the rows dropped still counts
+    pending_set = s;
+    plat_mutex_unlock(&pending_lock);
+    set_free(old);
+    return 1;
+}
+
+// The game's calc thread: the kept rows go on the screen.
+static void apply_set(Set *s) {
+    if (edit_row >= 0) edit_end(0);
     s->older = set, set = s;   // the game still points into the older texts until it has taken the new ones
     for (int i = 0; i < s->n; i++) {
         apply_row(i);
@@ -712,10 +782,9 @@ int plugin_menu_update(const Nx2Menu *menu) {
     // cursor comes to a row: the screen's own caption function is called again with the type it was last given, and
     // its text call gets the new description (h_text).
     if (caption_known) call(B + G->opt_caption, screen, caption_type, 0, 0);
-    // The cursor moves between this frame and the next (menu's frame callback), not inside the game's handling of a
-    // row's choice, where on_event runs. A row that is disabled now is not a place for it.
+    // The cursor moves at a later frame step, not inside the game's handling of a row's choice, where on_event runs.
+    // A row that is disabled now is not a place for it.
     if (s->focus && row_ctl[s->focus - 1] && !s->row[s->focus - 1].disabled) focus_ask(s->focus - 1);
-    return 1;
 }
 
 int plugin_menu_reopening(void) { return __atomic_load_n(&reopen, __ATOMIC_ACQUIRE) == 2; }

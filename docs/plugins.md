@@ -225,7 +225,9 @@ is not read: put the reason into an action row's `value` ("Unavailable"). The la
 heading font, which fits about 11 characters beside the button: when a page has a longer one, the labels of all its
 button rows are written smaller by the same share (down to 45%), so keep them short. `NX2_MENU_FOCUS` comes when the cursor moves to a row, `NX2_MENU_CLOSED` when the page is gone.
 `update_menu(&menu)` gives the open page new texts, values and disabled states for the same rows (same number, same
-kinds, same numbers of choices); call it in `on_event` or a frame callback. `close_menu()` closes the page as the
+kinds, same numbers of choices); call it in `on_event` or a frame callback. It only keeps the rows: the game puts
+them on the screen at its next frame step (on its calc thread, once the frame's jobs are done), so the page shows them one
+frame later, and of several updates in one frame the last one shows. `close_menu()` closes the page as the
 player's "back" does. Events come on the game's thread, inside the game's own handling: `guest_call` works.
 
 Version 4 added:
@@ -552,6 +554,14 @@ Three threads call a plugin, and they run at the same time:
   what the game itself guards with locks is not safe to change just because the frame is over.
 - **Any thread of the game** (hook callbacks): the one that calls the hooked function. A hook on the frame step is
   the place for changes that must happen at a fixed point of the game's own frame.
+  **The game's user interface is one of those things.** Its layout animations are advanced by a job on the worker
+  threads, and that job also runs while the finished picture is presented, which is when frame callbacks run (measured
+  in game 1.1.1: during 253 of 3664 presents, during none of 3664 frame steps). A game function that starts, stops or
+  sets an animation of a screen (most of what changes a button, a row or a cursor does) must therefore not be called
+  from a frame callback: now and then the animator is left walking a list without an end and the game makes no more
+  frames. Call such functions from a hook of the frame step (below; game 1.1.1: `main+0x3b4e300`, the calls that
+  return to `main+0x6e70fc` and `main+0x6e6ddc`), as the runtime's own menu page does since 2026-11-13 (until then
+  `update_menu` made those calls at once, and a page updated at every typed character could stop the game).
 - **The presenting thread** (overlay callbacks). Draw from data your frame callback prepared, guarded by a lock or
   atomics of your own. Do not call game functions here, and return quickly: the picture waits for you.
 - **The window's thread** (key and text callbacks). Queue the event for your frame callback and return.

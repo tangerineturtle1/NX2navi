@@ -289,6 +289,16 @@ def main():
     subprocess.check_call([tool('clang'), '-O2', '-Wall', '-Werror', '-shared', *([] if win else ['-fPIC']),
                            '-o', str(old), str(old_src)], env=env)
 
+    # A menu page's game calls are made at the frame step, never where a plugin calls update_menu (a frame callback
+    # runs while the game's layout animator may: docs/plugins.md "Threads"). Held here by the source: update_menu's
+    # body calls no game function, and the frame step's hook does the work.
+    menu_c = (rt / 'plugin_menu.c').read_text(encoding='utf-8')
+    body = menu_c.split('int plugin_menu_update(const Nx2Menu *menu) {', 1)[-1].split(chr(10) + '}' + chr(10), 1)[0]
+    if any(word in body for word in ('call(', 'apply_row(', 'apply_set(', 'edit_end(', 'focus_row(', 'guest_call')):
+        fails.append('plugin_menu.c: update_menu makes a game call where the plugin called it')
+    if 'static void h_step(' not in menu_c or 'G->frame_step, h_step' not in menu_c or 'pending_set = s;' not in body:
+        fails.append("plugin_menu.c: the page's rows are not put on the screen by a hook of the frame step")
+
     if len(sys.argv) == 2:
         game = sys.argv[1]
         if win and 'nx2navi_plugin_api' not in exports(game):
