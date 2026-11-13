@@ -1,0 +1,42 @@
+--- a/ffx-api/include/ffx_api/ffx_api.h
++++ b/ffx-api/include/ffx_api/ffx_api.h
+@@ -26,7 +26,11 @@
+ extern "C" {
+ #endif  // #if defined(__cplusplus)
+ 
++#if defined(_WIN32)
+ #define FFX_API_ENTRY __declspec(dllexport)
++#else
++#define FFX_API_ENTRY __attribute__((visibility("default")))
++#endif
+ #include <stdint.h>
+ 
+ enum FfxApiReturnCodes
+--- a/ffx-api/src/ffx_provider_fsr3upscale.cpp
++++ b/ffx-api/src/ffx_provider_fsr3upscale.cpp
+@@ -69,7 +69,7 @@
+ uint64_t ffxProvider_FSR3Upscale::GetId() const
+ {
+     // FSR Scale, version from header
+-    return 0xF5A5'CA1Eui64 << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
++    return 0xF5A5'CA1Eull << 32 | (FFX_SDK_MAKE_VERSION(FFX_FSR3UPSCALER_VERSION_MAJOR, FFX_FSR3UPSCALER_VERSION_MINOR, FFX_FSR3UPSCALER_VERSION_PATCH) & 0xFFFF'FFFF);
+ }
+ 
+ const char* ffxProvider_FSR3Upscale::GetVersionName() const
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -2017,6 +2017,14 @@
+ 
+     for (uint32_t i = 0; i < backendContext->numDeviceExtensions; i++)
+     {
++#if defined(__linux__)
++        // Linux build (NX2navi): the game enables neither subgroupSizeControl nor shaderFloat16/shaderInt16, so the
++        // wave64 and 16-bit permutations would be invalid there, and wave64 blurs the output on RADV
++        // Wave32 and 32-bit shaders only.
++        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) == 0 ||
++            strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0)
++            continue;
++#endif
+         if (strcmp(backendContext->extensionProperties[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) == 0)
+         {
+             // check if we the max subgroup size allows us to use wave64
