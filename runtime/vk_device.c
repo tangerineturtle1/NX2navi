@@ -15,6 +15,7 @@
 #include "vk.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_fsr3.h"
 #include "vk_gpa.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
@@ -738,6 +739,7 @@ static void destroy_all(void) {
     gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
+    if (g_vk.device) vk_fsr3_release();   // FSR 3.1's own passes and contexts, where they were made
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.device) vk_lowlat_release();   // the sleep's semaphore: the device still lives

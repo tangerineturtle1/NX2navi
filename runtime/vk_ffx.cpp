@@ -3,6 +3,10 @@
 // headers are in third_party/ffx_api (MIT); they are C++ in places, hence this file. Nothing of it runs unless the
 // upscaler or frame generation asks for FSR 3.1.
 //
+// AMD publishes that library for Windows only. The other builds upscale with the runtime's own build of FSR 3.1's
+// passes (vk_fsr3.c), which takes the same inputs, camera and sharpness, and have no FSR 3.1 frame generation
+// (vk_ffx_framegen_available).
+//
 // FSR 3.1 takes the same inputs vk_dlaa.c makes for DLSS: the scene's light target (linear HDR), its D32F depth (0
 // near, 1 far, with the near and far planes of the frame's own projection, vk_dlaa.c proj_planes) and the camera
 // motion vectors in render pixels from the current frame to the previous one, the convention both share, so the
@@ -29,6 +33,7 @@ extern "C" {
 #include "vk.h"
 #include "vk_ffx.h"
 #include "vk_fg.h"
+#include "vk_fsr3.h"
 }
 
 namespace {
@@ -45,9 +50,10 @@ struct Api {
 
 // What the settings menu may ask before anything has used FSR 3.1 (vk_ffx_available), from any thread.
 std::atomic<int> g_loaded{-1};    // what vk_ffx_load found: 1 or 0; -1 while it has not run
-std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
 
 #ifdef _WIN32
+std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
+
 // amd_fidelityfx_vk.dll next to the executable
 void library_path(char *path, size_t size) {
     DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
@@ -150,6 +156,7 @@ void trim(uint64_t now_ns) {
         if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) destroy_up(&u, "no upscale used it for 90 s");
 }
 
+#ifdef _WIN32   // the library's dispatch (vk_ffx_upscale); the other builds hand vk_fsr3.c the images themselves
 FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     VkImageCreateInfo ci = {};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -161,6 +168,7 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     ci.usage = i->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
     return ffxApiGetResourceVK((void *)i->image, ffxApiGetImageResourceDescriptionVK(i->image, ci, usage), state);
 }
+#endif
 
 // NX2NAVI_FFX_KEYS=<key>:<value>[,...] (test): FSR 3.1's tuning constants for each new context (ffx_upscale.h
 // FfxApiConfigureUpscaleKey: 0 velocity factor, 1 reactiveness scale, 2 shading change scale, 3 accumulation added per
@@ -259,9 +267,9 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
 }  // namespace
 
 extern "C" int vk_ffx_load(void) {
+#ifdef _WIN32
     if (A.tried) return A.ok;
     A.tried = 1;
-#ifdef _WIN32
     char path[MAX_PATH];
     library_path(path, sizeof path);
     HMODULE m = LoadLibraryA(path);
@@ -278,12 +286,11 @@ extern "C" int vk_ffx_load(void) {
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
     A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
     rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
-#else
-    // Only the Windows build loads AMD's library: there is nothing to load here
-    rt_log("ffx: this build has no FSR 3.1 (it needs amd_fidelityfx_vk.dll, which only the Windows build loads): FSR 3.1 off");
-#endif
     g_loaded.store(A.ok, std::memory_order_release);
     return A.ok;
+#else
+    return vk_fsr3_init();   // the runtime's passes, made once the device exists (0 before, and asked again then)
+#endif
 }
 
 extern "C" int vk_ffx_available(void) {
@@ -300,12 +307,19 @@ extern "C" int vk_ffx_available(void) {
     }
     return present;
 #else
-    return 0;
+    return vk_fsr3_available();   // the runtime's passes: 1 until the device shows it cannot run them
 #endif
 }
 
-// the same library, its API calls; and a queue for the frame generation swapchain's presents (vk_fg_has_queues)
-extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available() && vk_fg_has_queues(); }
+// Frame generation runs through the library's own API calls (vk_ffx_create and the rest), so only where the library
+// loads; and it needs a queue for the frame generation swapchain's presents (vk_fg_has_queues).
+extern "C" int vk_ffx_framegen_available(void) {
+#ifdef _WIN32
+    return vk_ffx_available() && vk_fg_has_queues();
+#else
+    return 0;
+#endif
+}
 
 // NX2NAVI_FSR4 (default 0, live): FSR 4 where it runs (vk_ffx4.cpp) and has not failed in a row, else FSR 3.1.
 extern "C" int vk_ffx_fsr4(void) { return cfg_bool("NX2NAVI_FSR4") && vk_ffx4_available() && !vk_ffx4_failed(); }
@@ -338,6 +352,15 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
         if (last) rt_log("ffx: the upscaler is AMD FSR 3.1");
         reset = 1, last = 3;
     }
+    // The sharpness slider (0-100) drives FSR's own RCAS, as it does for FSR 1. Below a render scale of three quarters
+    // it goes towards the maximum, all the way from Performance down, where FSR 3.1 is soft (vk_dlaa.c "FSR 3.1's
+    // second sharpening pass", which has the measurements); 0 still turns it off.
+    int sharp = cfg_int("NX2NAVI_SHARPNESS");
+    float sharpness = sharp > 100 ? 1.0f : sharp / 100.0f;
+    if (sharp > 0) sharpness += (1.0f - sharpness) * vk_dlaa_fsr3_boost(color->width, out->width);
+#ifndef _WIN32
+    return vk_fsr3_upscale(cb, color, depth, mv, out, jx, jy, reset, dt_ms, cam, sharp > 0, sharpness);   // vk_fsr3.c
+#else
     Up *u = context_for(color->width, color->height, out->width, out->height);
     if (!u) return 0;
     ffxDispatchDescUpscale d = {};
@@ -352,13 +375,8 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.motionVectorScale = {1.0f, 1.0f};
     d.renderSize = {color->width, color->height};
     d.upscaleSize = {out->width, out->height};
-    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1. Below a render scale of three
-    // quarters it goes towards the maximum, all the way from Performance down, where FSR 3.1 is soft (vk_dlaa.c
-    // "FSR 3.1's second sharpening pass", which has the measurements); 0 still turns it off.
-    int sharp = cfg_int("NX2NAVI_SHARPNESS");
     d.enableSharpening = sharp > 0;
-    d.sharpness = sharp > 100 ? 1.0f : sharp / 100.0f;
-    if (sharp > 0) d.sharpness += (1.0f - d.sharpness) * vk_dlaa_fsr3_boost(color->width, out->width);
+    d.sharpness = sharpness;
     d.frameTimeDelta = dt_ms;
     d.preExposure = 1.0f;
     d.reset = reset != 0;
@@ -374,10 +392,11 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
         return 0;
     }
     return 1;
+#endif
 }
 
 extern "C" ffxReturnCode_t vk_ffx_create(ffxContext *ctx, ffxCreateContextDescHeader *desc) {
-    return vk_ffx_load() ? create_counted(ctx, desc) : FFX_API_RETURN_ERROR;
+    return vk_ffx_load() && A.ok ? create_counted(ctx, desc) : FFX_API_RETURN_ERROR;   // the library's: never vk_fsr3.c
 }
 
 // What the library is handed as ffxCreateBackendVKDesc.vkDeviceProcAddr: the device's functions, with the two
@@ -400,8 +419,8 @@ extern "C" int vk_ffx_probe_cache(void) {
         printf("probe-ffx-cache: SKIP (no Vulkan device)\n");
         return 0;
     }
-    if (!vk_ffx_load()) {
-        printf("probe-ffx-cache: SKIP (no amd_fidelityfx_vk.dll beside the executable, or a build without FSR 3.1)\n");
+    if (!vk_ffx_load() || !A.ok) {
+        printf("probe-ffx-cache: SKIP (no amd_fidelityfx_vk.dll beside the executable, or a build without it)\n");
         return 0;
     }
     vk_pipeline_push_fn();   // the first vk_pipeline_* call reads the pipeline caches
@@ -439,14 +458,20 @@ extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDes
 }
 
 // The upscaler is off (vk_dlaa.c retire_idle; the device is idle): FSR 3.1's and FSR 4's upscale contexts go, made again
-// at the next upscale. Frame generation's contexts are not these.
+// at the next upscale; outside Windows FSR 3.1's are vk_fsr3.c's. Frame generation's contexts are not these.
 extern "C" int vk_ffx_holds(void) {
+#ifndef _WIN32
+    if (vk_fsr3_holds()) return 1;
+#endif
     for (Up &u : U)
         if (u.ctx) return 1;
     return vk_ffx4_holds();
 }
 extern "C" void vk_ffx_release_idle(void) {
     vk_ffx4_release();
+#ifndef _WIN32
+    vk_fsr3_release_idle();
+#endif
     if (!A.ok) return;
     for (Up &u : U)
         if (u.ctx) destroy_up(&u, "the upscaler is off");

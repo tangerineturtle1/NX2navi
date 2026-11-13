@@ -155,8 +155,9 @@ static int p_getull(const NgxParam *p, const char *n, unsigned long long *v) {
 
 // NGX is brought up only when DLSS is wanted at start: its device extensions can only be asked for at device creation,
 // and loading the driver's NGX core on every NVIDIA machine would cost start time and change the device with DLAA off.
-// So DLSS applies after a restart. FSR 3.1 (amd_fidelityfx_vk.dll, vk_ffx.cpp) asks nothing of the device: NX2NAVI_TAA
-// and dlaa follow the setting at once when NGX is not up, and vk_dlaa_frame loads the library the first time it is used.
+// So DLSS applies after a restart. FSR 3.1 (vk_ffx.cpp: amd_fidelityfx_vk.dll on Windows, the runtime's own passes in
+// vk_fsr3.c elsewhere) asks nothing of the device: NX2NAVI_TAA and dlaa follow the setting at once when NGX is not up,
+// and vk_dlaa_frame loads it the first time it is used.
 int vk_dlaa_wanted(void) {
     static int at_start = -1;
     if (at_start < 0) at_start = cfg_bool("NX2NAVI_DLAA");
@@ -167,8 +168,8 @@ int vk_dlaa_wanted(void) {
 // inputs. The DLSS mode setting (NX2NAVI_DLSS) is the render scale for both.
 static int fsr3(void) { return !N.ngx_up && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3"); }
 static int fsr_frame;   // fsr3() as vk_dlaa_init and then vk_dlaa_frame read it: the upscaler this frame runs with
-// FSR 3.1 is the upscaler and its library loads (vk_ffx_available): widescreen.c shrinks the scene only for an upscaler
-// that runs.
+// FSR 3.1 is the upscaler and can run (vk_ffx_available): widescreen.c shrinks the scene only for an upscaler that
+// runs.
 int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3() && vk_ffx_available(); }
 
 // The upscaler the menu has set cannot start in this run: DLSS when NGX was never tried (a device made without its
@@ -2275,8 +2276,9 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         uint64_t now = plat_now_ns();
         double dt = D.last_eval_ns ? (now - D.last_eval_ns) / 1e6 : 0;
         D.last_eval_ns = now;
-        VkFfxImage fc = {t->image, t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
-                   fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
+        VkFfxImage fc = {t->image, t->format, w, h, 0, cv}, fz = {z->image, z->format, w, h, 0, zv},
+                   fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1, e->mv_view},
+                   fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1, e->out_view};
         VkFfxCamera fcam;
         if (!vk_dlaa_ffx_camera(&fcam)) memset(&fcam, 0, sizeof fcam);   // no camera this frame: FSR's fixed values
         if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, &fcam))
@@ -2425,8 +2427,8 @@ evaluated:
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
     // for frame generation at this frame's present (vk_dlaa_fg_inputs)
-    D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
-    D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
+    D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0, zv};
+    D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1, e->mv_view};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
     D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
     if (D.jit_used) D.jittered++;

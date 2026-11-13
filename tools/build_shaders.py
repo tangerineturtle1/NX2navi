@@ -4,7 +4,9 @@ The repository holds the shaders as source only. Each becomes runtime/<name>_spv
 `static const uint32_t <name>_spv[]`; the headers are build outputs (ignored by git) and tools/build_game.py builds the
 missing and the stale ones before it compiles the runtime. Three kinds of source:
 
-    runtime/shaders/<name>.comp, .vert, .frag   GLSL, compiled with glslc (one name per shader) and checked with spirv-val
+    runtime/shaders/<name>.comp, .vert, .frag   GLSL, compiled with glslc (one name per shader) and checked with spirv-val;
+                                                an #include is looked for beside the file that has it, then in
+                                                runtime/shaders/ffx3 (the FSR 3.1 passes' headers)
     runtime/shaders/<name>.mesh, .task          the same for the mesh fallback probe's mesh and task shaders (SPIR-V 1.5)
     runtime/shaders/<name>.spvasm               SPIR-V assembly, assembled with spirv-as and checked with spirv-val
     tools/make_dlaa_mask.py, make_mvobj_fs.py   shaders assembled in Python (ASSEMBLED); they need no other tool
@@ -12,8 +14,8 @@ missing and the stale ones before it compiles the runtime. Three kinds of source
 One more kind of header is no shader: a file the runtime embeds (EMBEDDED: the menu's font, the SMAA lookup textures) as
 a list of its bytes, for a compiler without #embed (runtime/ui/menu.cpp, runtime/vk_aa.c include them). It needs no tool.
 
-A compiled or assembled header records the SHA-256 of its source (with the files a GLSL source includes from its folder)
-and is stale when that no longer matches; a Python one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
+A compiled or assembled header records the SHA-256 of its source (with the files a GLSL source includes, from its folder
+or runtime/shaders/ffx3) and is stale when that no longer matches; a Python one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
 Windows (packages mingw-w64-ucrt-x86_64-shaderc and mingw-w64-ucrt-x86_64-spirv-tools) and from PATH elsewhere
 (shaderc, spirv-tools). A folder that carries its headers ready-made (the build kit, tools/make_kit.py) needs none of
 them: nothing there is stale.
@@ -51,16 +53,25 @@ def embedded(src):
     return src.suffix not in STAGES and src.suffix not in (ASM, '.py')
 
 
-def included(src, seen=None):
-    """The files a GLSL source includes from its own folder (#include "name"), and theirs, in order of first use."""
+# Folders of runtime/shaders that glslc searches for an #include after the including file's own folder (-I)
+INCLUDE_DIRS = ('ffx3',)
+
+
+def included(src, seen=None, shaders=None):
+    """The files a GLSL source includes (#include "name"), found as glslc finds them: beside the including file, then in
+    INCLUDE_DIRS; and theirs, in order of first use."""
     seen = [] if seen is None else seen
+    shaders = src.parent if shaders is None else shaders
     for line in src.read_bytes().decode('latin-1').splitlines():   # the SMAA source is not UTF-8
         words = line.strip().split('"')
         if line.strip().startswith('#include') and len(words) >= 2:
-            inc = src.parent / words[1]
-            if inc.is_file() and inc not in seen:
-                seen.append(inc)
-                included(inc, seen)
+            for base in (src.parent, *(shaders / d for d in INCLUDE_DIRS)):
+                inc = base / words[1]
+                if inc.is_file():
+                    if inc not in seen:
+                        seen.append(inc)
+                        included(inc, seen, shaders)
+                    break
     return seen
 
 
@@ -160,7 +171,8 @@ def words_of(src):
             # tonemap, which runtime/vk_hdr.c splices into the game's shader by function)
             target = MESH_TARGET if src.suffix in ('.mesh', '.task') else TARGET
             opt = [] if '// build_shaders: keep functions' in src.read_text(encoding='utf-8') else ['-O']
-            subprocess.run([tool('glslc'), *opt, f'--target-env={target}', f'-fshader-stage={STAGES[src.suffix]}',
+            inc = [f'-I{src.parent / d}' for d in INCLUDE_DIRS if (src.parent / d).is_dir()]
+            subprocess.run([tool('glslc'), *opt, *inc, f'--target-env={target}', f'-fshader-stage={STAGES[src.suffix]}',
                             '-o', str(spv), str(src)], check=True)
         subprocess.run([tool('spirv-val'), '--target-env', target, str(spv)], check=True)
         data = spv.read_bytes()

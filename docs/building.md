@@ -726,6 +726,11 @@ pictures; on a device without mesh shaders only the fallback draws. A change to 
 A change to the texture detail (`runtime/vk_texture.c` "texture detail": `detail_skip`, `upload`, `astc_bl_regions`)
 passes it three times, with `NX2NAVI_TEXTURE_DETAIL` set to `full`, `reduced` and `low`: each time ASTC textures are
 uploaded and rewritten, and every level and layer of their images must hold the game's level it stands for.
+A change to FSR 3.1's own passes (`runtime/vk_fsr3.c`, `runtime/shaders/fsr3_*.comp`, `runtime/shaders/ffx3/`) passes
+`tests/fsr3_check.py`, which runs `--probe-fsr3` with `NX2NAVI_VK_VALIDATION=1`: the passes upscale a synthetic
+panning scene, checked against a supersampled reference, against bilinear and against the jitter and motion vector
+conventions `vk_dlaa.c` hands over, at two render sizes on one output, and one upscale at the docked sizes is timed.
+`amd_fidelityfx_vk.dll` given the same inputs meets the same thresholds, its output within 3 of 255 of the passes'.
 `--probe-prewarm` runs the boot's pipeline stages without the game, from the caches next to the exe (it skips when
 there are none): the pipeline cache load, the shader prewarm, the recorded pipelines and the compute pipeline prebuild,
 with a `mem: boot stage` log line after each that gives the device memory and the process commit so far. It then asks

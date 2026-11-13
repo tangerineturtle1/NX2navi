@@ -27,6 +27,7 @@
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
 //     --probe-meshfb    the mesh shader fallback: mesh programs drawn through VK_EXT_mesh_shader and through compute
 //                       passes, the pictures compared; needs no game files (mesh_fb_probe.c)
+//     --probe-fsr3      FSR 3.1 upscaling with the built-in passes (vk_fsr3.c) on a synthetic scene; no game files
 //     --probe-zstd      host zstd streams (ov_zstd.c) on frames made here; needs no game files
 //     --probe-input     gamepad polls on a virtual gamepad, also while SDL's update takes long; needs no game files
 //     --probe-movie     the host movie decoders on one RomFS movie (VP9 movie::Decoder, AV1 movie::VideoDecoder); skips without game data
@@ -599,7 +600,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-meshfb | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-crash-exit | --probe-discord | "
+                    "--probe-vkexec | --probe-meshfb | --probe-astc | --probe-fsr3 | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-crash-exit | --probe-discord | "
                     "--prepare-shaders | --warm-shaders | --prepare-pipelines | --probe-prewarm | --probe-buildgate | --probe-ffx-cache | --probe-memneed | --probe-devlost | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
@@ -760,6 +761,7 @@ static int main_run(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
     if (!strcmp(mode, "--probe-meshfb")) return probe_meshfb();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
+    if (!strcmp(mode, "--probe-fsr3")) return probe_fsr3();
     if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();

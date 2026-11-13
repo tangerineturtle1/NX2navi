@@ -665,9 +665,10 @@
 # is sized at the start for the mode set then, so dlaa chosen in the menu of a run that started with a smaller mode
 # (or with dlaa = 0) renders at 75 % until the next start.
 # dlss = dlaa
-# AMD FSR in DLSS's place, on any GPU (Windows): with taa = fsr3 and dlaa = 1 the scene is scaled by AMD FSR 3.1 in the
-# mode dlss names (dlaa is FSR's Native AA). The menu's Upscaling row sets all of these. Changes while the game runs
-# take effect at once.
+# AMD FSR in DLSS's place, on any GPU: with taa = fsr3 and dlaa = 1 the scene is scaled by AMD FSR 3.1 in the mode dlss
+# names (dlaa is FSR's Native AA), through amd_fidelityfx_vk.dll on Windows and through the game's own build of FSR
+# 3.1's passes elsewhere (Linux), which needs no library. The menu's Upscaling row sets all of these. Changes while the
+# game runs take effect at once.
 # taa = dlss
 # AMD FSR 4 in FSR 3.1's place (taa = fsr3, dlaa = 1): the machine-learned upscaler, a sharper and steadier picture
 # that costs more GPU time (on an RX 7900 XT at 3440x1440, Quality: 47 fps where FSR 3.1 gives 51) and about 220 MB of

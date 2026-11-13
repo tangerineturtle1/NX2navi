@@ -221,6 +221,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   `NX2NAVI_DLSS_PREBLOOM=1` (a test, off by default) runs them at the bloom chain's first pass on the scene's linear
   light instead, and draws the lens flares and the bloom composite after them at the picture's size (`vk_dlaa.c`,
   "before the bloom").
+- Temporal upscaling of the 3D scene (`vk_dlaa.c`, `NX2NAVI_DLAA`, `NX2NAVI_TAA`): NVIDIA DLSS through NGX, or AMD FSR
+  3.1 on the same inputs (the scene's colour, its D32F depth, camera and per-object motion vectors in render pixels,
+  the jitter, the frame's camera), or FSR 4 in its place (`vk_ffx4.cpp`). On Windows FSR 3.1 runs through
+  `amd_fidelityfx_vk.dll` (`vk_ffx.cpp`); the other builds, which have no such library, run `vk_fsr3.c`: FSR 3.1's
+  compute passes (`runtime/shaders/fsr3_*.comp` over the headers in `runtime/shaders/ffx3/`, options in
+  `fsr3_options.h`) compiled into the runtime like its other shaders, with the library's contexts: one per render size,
+  or one for every size up to the output's with the game's dynamic resolution. `--probe-fsr3` runs them on a synthetic
+  panning scene (`tests/fsr3_check.py`). FSR 3.1 frame generation (`vk_fg.cpp`) needs the library.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture

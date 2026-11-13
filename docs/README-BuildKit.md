@@ -128,10 +128,12 @@ That needs the device readable and writable by you (recent systemd gives it to t
 kernel command line raises it). Otherwise the game copies as before, and the log's `mem:` lines say why
 (`docs/building.md`, "Memory").
 
-AMD FSR 3.1 loads AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu offers neither
-FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the
-game's own scaling and swapchain as they are (the log says so). AMD FSR 4 is in the Windows build alone for the same
-reason, and `fsr4 = 1` does nothing on Linux.
+AMD FSR 3.1 upscaling runs on Linux on any GPU through the game's own build of FSR 3.1's passes, compiled into the
+runtime like its other shaders, so it needs no AMD library: the menu offers the FSR 3.1 modes under Upscaling, and
+`dlaa = 1` with `taa = fsr3` in `nx2navi.ini` selects it (`dlss` picks the mode). FSR 3.1 frame generation needs AMD's
+`amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu does not offer it, and
+`framegen = fsr3` leaves the game's own swapchain as it is (the log says so). AMD FSR 4 is in the Windows build alone
+for the same reason, and `fsr4 = 1` does nothing on Linux.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside
@@ -176,10 +178,10 @@ beside the game.
 - **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Texture detail (Reduced and Low
   leave out the largest versions of the big surface textures so that the game fits the video memory of 6 and 8 GB
   cards; Automatic picks by the card), Upscaling (DLSS on NVIDIA RTX cards,
-  FSR 3.1 on any card where `amd_fidelityfx_vk.dll` loads, FSR 4 on the Radeon cards AMD's FSR 4 libraries list it
-  for), Frame generation (NVIDIA DLSS on RTX 40 and 50 cards, with
-  a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card where it loads; it needs DLSS or FSR 3.1
-  upscaling on; the frame limit counts the frames the game draws and the generated ones come on top), HDR (the game's picture tone mapped to your display, or Native, the game's own HDR, with peak, game and HUD brightness; turn HDR on in Windows first) and the
+  FSR 3.1 on any card, through `amd_fidelityfx_vk.dll` on Windows and the game's own build of it on Linux, FSR 4 on the
+  Radeon cards AMD's FSR 4 libraries list it for), Frame generation (NVIDIA DLSS on RTX 40 and 50 cards, with
+  a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card where `amd_fidelityfx_vk.dll` loads; it
+  needs DLSS or FSR 3.1 upscaling on; the frame limit counts the frames the game draws and the generated ones come on top), HDR (the game's picture tone mapped to your display, or Native, the game's own HDR, with peak, game and HUD brightness; turn HDR on in Windows first) and the
   resolution. A setting that takes effect only when the game starts again says "after restart" once you change it,
   until you set it back, and the Restart button at the bottom then counts the settings waiting for it.
 - **Controls** in the menu has Button prompts: the game's own, or Xbox, PlayStation, Steam Deck or keyboard and mouse ones when

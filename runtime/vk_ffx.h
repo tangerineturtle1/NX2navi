@@ -1,4 +1,5 @@
-// AMD FidelityFX (vk_ffx.cpp): FSR 3.1 temporal upscaling through amd_fidelityfx_vk.dll, loaded at run time.
+// AMD FidelityFX (vk_ffx.cpp): FSR 3.1 temporal upscaling through amd_fidelityfx_vk.dll, loaded at run time, on
+// Windows, and through the runtime's own passes (vk_fsr3.c) in the other builds, which have no such library.
 #pragma once
 #include <vulkan/vulkan.h>
 
@@ -7,6 +8,7 @@ typedef struct {
     VkFormat format;
     uint32_t width, height;
     int storage;     // created with VK_IMAGE_USAGE_STORAGE_BIT (FSR writes it)
+    VkImageView view;   // a 2D view of level 0, layer 0 (the depth aspect for depth): vk_fsr3.c binds it
 } VkFfxImage;
 
 // The scene camera FSR takes, from the frame's projection (vk_dlaa.c proj_planes): the vertical field of view in
@@ -17,12 +19,16 @@ typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
 // vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
 float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
 
-int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
+// 1 when FSR 3.1 upscaling can run: on Windows the library is there with its entry points (loaded once); elsewhere the
+// runtime's passes are made (vk_fsr3_init: they need the device, so 0 before it exists, and asked again then).
+int vk_ffx_load(void);
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
-// whether the library file is there, asked once without loading it. 0 where the build has no FSR 3.1 to load.
+// on Windows whether the library file is there, asked once without loading it, elsewhere whether the runtime's passes
+// may run (vk_fsr3_available).
 int vk_ffx_available(void);
 // The same for frame generation (vk_fg.cpp), which runs through the library's own API calls (vk_ffx_create and the
-// rest below), not only an upscaler.
+// rest below), not only an upscaler: only where the library loads, so never outside Windows, and with a queue for its
+// swapchain's presents (vk_fg_has_queues).
 int vk_ffx_framegen_available(void);
 // Records FSR 3.1 into cb: color (the scene light, render size), depth (D32F), mv (R16G16F, render pixels, current to
 // previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took, render pixels. cam: the
