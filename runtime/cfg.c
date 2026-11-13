@@ -291,7 +291,7 @@ static const CfgMeta metas[] = {
     {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PIPE_SEED", "1", "0|1", RESTART},   // vk_pipeline.c keys_open_seed
     {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "", "0|1", RESTART},   // vk_caps.c vk_caps_gpl: by the driver, off with AMD's for RDNA 2 and older
     {"LIB_PREBUILD_BIG_BG", "1", "0|1", RESTART}, {"PIPE_FEEDBACK", "1", "0|1|2", RESTART},
-    {"PIPELINE_CACHE_MAX_MB", "512", "0..65536", RESTART},
+    {"PIPELINE_CACHE_MAX_MB", "", "0..65536", RESTART},   // vk_pipeline.c cache_cap: unset, from the RAM (512 to 4096)
     {"FFX_PIPE_CACHE", "1", "0|1", RESTART},   // vk_ffx.cpp vk_ffx_proc_addr: FSR 3.1's pipelines through the pipeline caches
     {"PIPELINE_CACHE_PLAY", "1", "0|1", RESTART}, {"PIPELINE_CACHE_PLAY_MB", "64", "1..65536", RESTART},   // vk_pipeline.c "the play cache": what a run compiles goes into a file of its own
     {"PIPE_BINARIES", "0", "0|1", RESTART}, {"ONESHOT_WAIT_MS", "30000", "0..60000", RESTART}, {"ONESHOT_BUDGET", "1", "0|1", RESTART}, {"PIPE_BINARIES_MAX_MB", "1024", "0..65536", RESTART}, {"BIG_BUILD_FREE_MB", "8192", "0..262144", RESTART},

@@ -746,7 +746,7 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
 // The data of the pipeline cache file at path for vkCreatePipelineCache (malloc'd, its size in *size), NULL when the
 // run starts without it, which the log says with the file's size. Cache data whose header names another device or
 // driver is dropped before Vulkan sees it.
-// NX2NAVI_PIPELINE_CACHE_MAX_MB (default 512; 0 no limit): a larger file starts the run empty, and the run's
+// NX2NAVI_PIPELINE_CACHE_MAX_MB (cache_cap; 0 no limit): a larger file starts the run empty, and the run's
 // saves replace it. The file only grows: entries of earlier translators and builds stay, and on NVIDIA
 // (621.01) an entry another executable wrote is neither used nor written again, so a renamed or updated exe
 // compiles while the file keeps its size (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). The
@@ -755,12 +755,44 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
 // read, so a file that is dropped never takes its size in memory. Sizes are 64-bit all the way
 // (vk_cache_file.h cache_file_read): a file past 2 GB is read with the limit raised or off, and refused by
 // its real size otherwise.
+// The limit is kept on the write side too (cache_load's fold, cache_save_one): a run never writes a file the next start
+// would refuse. Before, only the read checked it, all or nothing, and nothing kept the files under it: on an RTX 5080
+// (0.9.2, 2026-11-12) pipeline-cache-play.bin reached 524.9 MB in one session of about 15 minutes, the next start
+// dropped it whole ("starting empty") and the session after compiled its pipelines again (boot hits 13-18 %, about
+// 5,000 pipelines left to background builds at 250-273 ms each). pipeline-cache.bin itself grows 14-28 MB at each
+// fold (323 -> 448 -> 461 -> 489 MB in four starts) and so crosses 512 MB in a few sessions (0.8.0: a 766 MB file
+// dropped at a start). With the limit at 2048 MB the same files were read and folded: boot hits 84 %, nothing left to
+// background builds, the boot 17 s instead of 24.
+// cache_cap: NX2NAVI_PIPELINE_CACHE_MAX_MB when set (0: no limit); unset, the machine's RAM / 32 between 512 and
+// 4096 MB (16 GB: 512 as before; 32 GB: 1024; 64 GB: 2048). The RAM and not the commit headroom at the boot, so the
+// same file is not read on one start and refused on the next.
+static uint64_t cache_cap(void) {
+    static uint64_t cap = UINT64_MAX;
+    if (cap != UINT64_MAX) return cap;
+    const char *set = cfg_get("NX2NAVI_PIPELINE_CACHE_MAX_MB");
+    float used = 0, total = 0, proc = 0;
+    uint64_t mb;
+    if (set && *set) mb = strtoull(set, NULL, 10);
+    else {
+        plat_mem_info(&used, &total, &proc);
+        mb = total > 0 ? (uint64_t)total / 32 : 512;
+        mb = mb < 512 ? 512 : mb > 4096 ? 4096 : mb;
+    }
+    if (set && *set)
+        rt_log("vk_pipeline: pipeline cache files up to %llu MB%s (NX2NAVI_PIPELINE_CACHE_MAX_MB)",
+               (unsigned long long)mb, mb ? "" : ": no limit");
+    else
+        rt_log("vk_pipeline: pipeline cache files up to %llu MB (from %.0f GB of RAM; NX2NAVI_PIPELINE_CACHE_MAX_MB "
+               "sets it)", (unsigned long long)mb, total / 1024.0);
+    return cap = mb << 20;
+}
+
 static int cache_over_cap;   // the last file cache_data_read was asked for is over the limit
 static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
     *size = 0;
     cache_over_cap = 0;
     if (!path[0]) return NULL;
-    uint64_t cap = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_MAX_MB"), NULL, 10) << 20, len = 0;
+    uint64_t cap = cache_cap(), len = 0;
     int why = CACHE_FILE_NONE;
     void *data = cache_file_read(path, sizeof(VkPipelineCacheHeaderVersionOne), cap, &len, &why);
     if (!data) {
@@ -768,6 +800,7 @@ static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
             cache_over_cap = 1,
             rt_log("vk_pipeline: %s holds %.0f MB, over NX2NAVI_PIPELINE_CACHE_MAX_MB %llu: starting empty; it is "
                    "replaced when the play file is next folded in, at the next start that finds one", path, len / 1048576.0, (unsigned long long)(cap >> 20));
+        // (A file over the limit comes from before the limit was kept on the write side, or from a lower limit.)
         else if (why != CACHE_FILE_NONE)
             rt_log("vk_pipeline: %s (%llu bytes, %.1f MB) is not read: %s; starting empty", path,
                    (unsigned long long)len, len / 1048576.0, cache_file_why(why));
@@ -834,6 +867,38 @@ static void cache_load(VkCtx *c) {
     free(pdata);
     uint64_t fold_at = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_PLAY_MB"), NULL, 10) << 20;
     int fold = play && psize && (!on || psize >= fold_at || base_over);
+    if (fold && on && !base_over && cache_cap()) {
+        // Only a fold whose result fits: pipeline-cache.bin past the limit would be dropped whole at the next start
+        // (cache_data_read). The merge into P.cache is the one the kept play cache gets below anyway, so it is done
+        // here once and its size asked; a play file mostly holds what the other already has (461.2 + 524.9 MB folded
+        // to 489.0 MB, 2026-11-12), so the size of the two files says little.
+        VkResult r = vkMergePipelineCaches(c->device, P.cache, 1, &play);
+        size_t merged = 0;
+        if (r == VK_SUCCESS && vkGetPipelineCacheData(c->device, P.cache, &merged, NULL) == VK_SUCCESS &&
+            merged > cache_cap()) {
+            rt_log("vk_pipeline: %s: %.1f MB read, the driver holds %.1f MB of it; folding it in would make %s %.1f MB, "
+                   "over the limit of %llu MB: both files stay as they are, and this run's pipelines go into the play "
+                   "file as long as it stays under the limit", P.play_path, psize / 1048576.0, pkept / 1048576.0,
+                   P.cache_path, merged / 1048576.0, (unsigned long long)(cache_cap() >> 20));
+            fold = 0, psize = 0;   // merged already: the branch for a kept play file below is skipped
+        } else if (r != VK_SUCCESS) {
+            rt_log("vk_pipeline: %s did not merge into the cache of %s (%d); it is left as it is and not used in this run",
+                   P.play_path, P.cache_path, (int)r);
+            vkDestroyPipelineCache(c->device, play, NULL);
+            play = VK_NULL_HANDLE, fold = 0, on = 0, psize = 0;
+        } else {
+            rt_log("vk_pipeline: folding %s in makes %s %.1f MB (the limit is %llu MB)", P.play_path, P.cache_path,
+                   merged / 1048576.0, (unsigned long long)(cache_cap() >> 20));
+            vkDestroyPipelineCache(c->device, play, NULL);
+            play = VK_NULL_HANDLE;
+            P.fold = 1, P.saved[0] = 0;
+            rt_log("vk_pipeline: %s: %.1f MB read, the driver holds %.1f MB of it; merged into the cache of %s, which is "
+                   "written once now (it reached the size at which it is folded in, before play)", P.play_path,
+                   psize / 1048576.0, pkept / 1048576.0, P.cache_path);
+            play = cache_make(c, NULL, 0, &pkept), psize = 0;
+            fold = 0;   // done
+        }
+    }
     if (fold) {
         // Into P.cache now; the file is written by the first save, which then removes the play file. A run that ends
         // before that save finds both files as they were and merges again.
@@ -7575,6 +7640,24 @@ static int cache_save_one(int which, uint32_t wait_ms, int exiting) {
     size_t size = 0;
     void *data = NULL;
     int sized = vkGetPipelineCacheData(P.device, cache, &size, NULL) == VK_SUCCESS && size;
+    // A cache past the limit is not written: the next start would drop the file whole (cache_data_read), so the file
+    // keeps its last save under the limit and only the pipelines made since then are compiled again. A preparation
+    // writes anyway: what it builds is the base every start reads, and a file it cannot write would leave none.
+    static int over_said[2];
+    uint64_t cap = cache_cap();
+    if (sized && cap && size > cap && !prep_mode) {
+        plat_mutex_unlock(&cache_rw);
+        if (exiting) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
+        if (!over_said[which]++)
+            rt_log("vk_pipeline: %s not written past its last save: the cache holds %.1f MB, over the limit of %llu MB; "
+                   "pipelines made from here on compile again at the next start (NX2NAVI_PIPELINE_CACHE_MAX_MB raises "
+                   "the limit)", path, size / 1048576.0, (unsigned long long)(cap >> 20));
+        return 1;
+    }
+    if (sized && cap && size > cap)
+        rt_log("vk_pipeline: %s holds %.1f MB, over the limit of %llu MB: written for the preparation, and dropped at "
+               "the next start unless NX2NAVI_PIPELINE_CACHE_MAX_MB is raised", path, size / 1048576.0,
+               (unsigned long long)(cap >> 20));
     int same = sized && size == P.saved[which];
     int got = sized && !same && (data = malloc(size)) && vkGetPipelineCacheData(P.device, cache, &size, data) == VK_SUCCESS;
     plat_mutex_unlock(&cache_rw);

@@ -1150,7 +1150,7 @@ back.
 | 115 | Pipeline layouts, set layouts, update templates | `P.lock` | None found | Shutdown |
 | 116 | Stage libraries `libs[1024]` chained; failed builds cached as null | `P.lock` | None found | Shutdown (`libs_destroy`) |
 | 117 | Library and pipeline job queues | `P.lock` | None found | When built; dropped at shutdown |
-| 118 | `VkPipelineCache` in memory and `pipeline-cache.bin` | `cache_rw`, `save_lock` | File > `NX2NAVI_PIPELINE_CACHE_MAX_MB` (512) starts empty; in memory: the driver's, none found | Saved by "pipe autosave" at most every 20 s and at exit (waits ≤ 5 s) |
+| 118 | `VkPipelineCache` in memory and `pipeline-cache.bin` | `cache_rw`, `save_lock` | File > `NX2NAVI_PIPELINE_CACHE_MAX_MB` (RAM / 32, 512 to 4096 MB) starts empty, and no cache past it is written; in memory: the driver's, none found | Saved by "pipe autosave" at most every 20 s and at exit (waits ≤ 5 s) |
 | 119 | Pipeline binaries `pipeline-binaries.bin` | `PB.lock` | `NX2NAVI_PIPE_BINARIES_MAX_MB` 1024; `NX2NAVI_PIPE_BINARIES` default 0 | — |
 | 120 | `pipeline-keys.bin` and its `seen` set | `K.io` | None found (append-only) | Never |
 | 121 | `compute-used.bin` | `cu_io` | `NX2NAVI_COMPUTE_KEEP` 512 | — |

@@ -205,8 +205,10 @@
 # build_reserve_mb = 64
 # 1: the log says how many pipelines came from pipeline-cache.bin; 2 also logs every compute pipeline built. 0: off.
 # pipe_feedback = 1
-# pipeline-cache.bin larger than this (MB) starts empty and is rewritten (0: no limit).
-# pipeline_cache_max_mb = 512
+# The limit of pipeline-cache.bin and pipeline-cache-play.bin in MB (0: no limit). A file larger than this starts
+# empty, so the game never writes one past it: once a cache reaches the limit, pipelines compiled after that are
+# compiled again at the next start. Default: your RAM / 32, between 512 and 4096 (2048 with 64 GB).
+# pipeline_cache_max_mb = 2048
 # 1: the pipelines a run compiles go into pipeline-cache-play.bin, a small file of its own, so pipeline-cache.bin
 # (hundreds of MB) is not written again while you play; the small file is folded into the large one at a start once
 # it has grown. 0: one file, written whole whenever a run made a new pipeline.
