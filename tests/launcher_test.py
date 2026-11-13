@@ -3907,7 +3907,8 @@ class JobTest(Tmp):
 
 # Another launcher process: it takes the lock file argv[2] as argv[3], says so and holds it until its input closes.
 HOLDER = ('import sys; sys.path.insert(0, sys.argv[1]); from launcher import locks; '
-          'lock = locks.FileLock(sys.argv[2], sys.argv[3]); print("held", flush=True); sys.stdin.read()')
+          'import os; lock = locks.FileLock(sys.argv[2], sys.argv[3]); print("held", os.getpid(), flush=True); '
+          'sys.stdin.read()')
 
 
 class LockTest(Tmp):
@@ -3926,14 +3927,18 @@ class LockTest(Tmp):
             p.stdin.close()
             p.stdout.close()
         self.addCleanup(end)
-        self.assertEqual(p.stdout.readline().strip(), 'held')
+        said = p.stdout.readline().split()
+        self.assertEqual(said[:1], ['held'])
+        # The lock names the process that took it. That is not always the one started here: a virtual
+        # environment's python.exe on Windows starts the real interpreter as a child of its own.
+        p.lock_pid = int(said[1])
         return p
 
     def test_a_second_launcher_is_refused_and_told_who_holds_the_folder(self):
         other = self.holder(self.layout)
         with self.assertRaises(locks.Busy) as refused:
             locks.FileLock(self.layout.instance_lock, 'the launcher window', where=self.layout.root)
-        self.assertIn(f'the launcher window (process {other.pid}, since ', str(refused.exception))
+        self.assertIn(f'the launcher window (process {other.lock_pid}, since ', str(refused.exception))
         self.assertIn(str(self.layout.root), str(refused.exception))
         try:
             from launcher.ui import app
@@ -3947,7 +3952,7 @@ class LockTest(Tmp):
             self.assertEqual(app.main(['--root', str(self.layout.root)]), 0)
         window.assert_not_called()                 # no second window
         self.assertEqual(len(said), 1)
-        self.assertIn(f'NX2navi is already running: the launcher window (process {other.pid}', said[0])
+        self.assertIn(f'NX2navi is already running: the launcher window (process {other.lock_pid}', said[0])
 
     def test_the_lock_goes_when_its_process_dies(self):
         other = self.holder(self.layout)
@@ -3975,7 +3980,7 @@ class LockTest(Tmp):
         other = self.holder(ctx.layout, '"rebuild" from the command line')
         j = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
         self.assertEqual(j.result, 'failed')
-        self.assertIn(f'"rebuild" from the command line (process {other.pid}', j.error)
+        self.assertIn(f'"rebuild" from the command line (process {other.lock_pid}', j.error)
         self.assertIn('try again', j.error)
         self.assertEqual({s.state for s in j.steps}, {jobs.PENDING})     # nothing of it ran
         self.assertFalse(any('working on' in ln for ln in j.lines))
@@ -4124,7 +4129,7 @@ class LockTest(Tmp):
             self.assertEqual(len(ran), 1)                                # neither ran, and no setting was written
             self.assertEqual(cli.main(root + ['check']), 0)              # the update check changes nothing: it runs
             self.assertEqual(ran[-1], ('check', False))
-        self.assertIn(f'error: the launcher window (process {other.pid}', err.getvalue())
+        self.assertIn(f'error: the launcher window (process {other.lock_pid}', err.getvalue())
         self.assertIn('try again', err.getvalue())
 
 
