@@ -54,6 +54,8 @@
 # step_steady = 1
 
 [performance]
+# Optimize large translated shaders with the optional SPIRV-Tools helper. Off by default; see tools/spirv_opt/README.md.
+# spirv_opt = 0
 # The keys of this section and of [diagnostics] are for testing and troubleshooting, and take effect at the next start.
 # The Advanced tab of the settings menu (F1) shows all of them except zstd_native and zstd_check.
 

@@ -1870,6 +1870,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
             copy_if_changed(KIT / 'bin' / name, out / name)
         if (KIT / 'bin' / FFX4_FG_DLL).is_file():   # its frame generation (runtime/vk_fg4.cpp)
             copy_if_changed(KIT / 'bin' / FFX4_FG_DLL, out / FFX4_FG_DLL)
+    opt_helper = 'nx2navi_spirv_opt.dll' if WIN else 'libnx2navi_spirv_opt.so'
+    if (KIT / 'bin' / opt_helper).is_file():
+        copy_if_changed(KIT / 'bin' / opt_helper, out / opt_helper)
     kept = place_dlss(out, linux=not WIN)   # NVIDIA DLSS (runtime/vk_dlaa.c): this platform's library from the kit
     if kept:
         say(f'  {kept}')

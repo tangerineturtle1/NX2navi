@@ -138,3 +138,5 @@ https://repo.msys2.org/mingw/ucrt64/; the MSYS2 CLANG64 clang it pins beside the
 Apache-2.0 with LLVM exception; libffi MIT; zlib; zstd BSD-3-Clause; libxml2 MIT; libiconv LGPL-2.1+), from
 https://repo.msys2.org/mingw/clang64/, which only compiles the lifted code; and zbic 1.0.1.post1 (GPL-2.0), from
 PyPI. The game build links them as a source build does.
+
+Optional SPIR-V optimization helper: SPIRV-Tools 1.4.363.0, Khronos Group and contributors, Apache-2.0. Full license: runtime/licenses/spirv-tools-Apache-2.0.txt. The helper links the unmodified upstream optimizer; its source is built separately from the game runtime.

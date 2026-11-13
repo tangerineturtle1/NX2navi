@@ -54,6 +54,7 @@
 #include "vk_build_gate.h"
 #include "vk_cache_file.h"
 #include "vk_save_retry.h"
+#include "vk_spirv_opt.h"
 #include "vk_warm_hint.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
@@ -2614,11 +2615,15 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
             rt_log("vk_pipeline: first module with NaN tests made integer: %u tests, %u selects of NaN bits", nb_tests,
                    nb_sels);
     }
+    uint64_t opt_words = 0;
+    uint32_t *optimized = vk_spirv_optimize(w, words, &opt_words);
+    if (optimized) w = optimized, words = opt_words;
     if (P.feedback >= 2) mm_hash = fnv(FNV0, w, (size_t)words * 4);
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(fixed);
+    free(optimized);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
