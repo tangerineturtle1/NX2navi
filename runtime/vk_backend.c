@@ -145,6 +145,12 @@ void vk_present_drain(void) {
 // And it covers an area load (vk_exec_draw.c vk_exec_pool_loading): while the texture pool still makes the area's
 // textures, the frames show the ground and the walls as black stand-ins, so the picture before the load stays for up
 // to LOAD_HOLD_NS, also beside the allowance.
+// And on Ocarina it covers the frame the game leaves empty when it opens a screen over the scene (the Conversation Log over a
+// line of dialogue): that frame clears the picture and draws a few interface parts, and the screen with its backdrop
+// follows one frame later, so one black frame was shown. A frame of fewer than THIN_DRAWS draws right after one of
+// SCENE_DRAWS or more is not shown; the frames after it follow a frame of few draws and are.
+#define THIN_DRAWS 32
+#define SCENE_DRAWS 200
 #define RESIZE_HOLD 6
 #define LOAD_HOLD_NS 2000000000ull
 static struct {
@@ -177,6 +183,12 @@ int vk_frame_hold_left(void) {
 // 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
 static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
     frame_hold_refill(kern_now_ns());
+    static uint64_t draws_at, thin_held;
+    static uint32_t prev_draws;
+    uint64_t d = vk_exec_frame.draws;   // counted up over the run; set back with NX2NAVI_TRACE=gfx
+    uint32_t draws = (uint32_t)(d >= draws_at ? d - draws_at : d);
+    int thin = RT_V111 && draws < THIN_DRAWS && prev_draws >= SCENE_DRAWS && FH.limit_ns > 0 && !vk_dlssg_active();
+    draws_at = d, prev_draws = draws;
     if (resized && FH.limit_ns > 0) {
         FH.resize_left = RESIZE_HOLD;
         rt_log("vk: frame %llu: the scene has a new size after a setting changed; the previous picture stays for %d "
@@ -197,6 +209,12 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
         rt_log("vk: frame %llu: the previous picture stayed for %llu frames, %.0f ms, while an area's textures were made",
                (unsigned long long)frame, (unsigned long long)FH.load_held, (double)(kern_now_ns() - FH.load_t0) / 1e6);
         FH.load_t0 = 0;
+    }
+    if (thin) {
+        if (thin_held++ < 16)
+            rt_log("vk: frame %llu: %u draws right after a frame of the scene; the previous picture stays for this frame",
+                   (unsigned long long)frame, draws);
+        return 1;
     }
     int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
     if (hold && !FH.holding) FH.runs++;
