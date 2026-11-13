@@ -12,8 +12,15 @@
 // picture to the window keeping its shape (gfx_present.c, NX2NAVI_ASPECT=fit).
 //
 // Setting NX2NAVI_GAME_ASPECT, read at start: "16:9" (the game's own, every set off), "window" (the shape of the window,
-// or of the monitor in fullscreen), or a fixed shape "21:9" (2560x1080 monitors, 64:27), "32:9". A shape within 1% of
-// 16:9 or narrower than it keeps the game's own sizes; the widest is 32:9.
+// or of the monitor in fullscreen), or a fixed shape "16:10", "21:9" (2560x1080 monitors, 64:27), "32:9". A shape within
+// 1% of 16:9 keeps the game's own sizes; the widest is 32:9 and the narrowest 16:10 (a narrower window gets a 16:10
+// picture with bars).
+//
+// Taller pictures (16:10, set wide_tall): the height is the setting's as for the wider ones and the width shrinks with
+// the shape. The view grows at the top and bottom instead of at the sides (Vert+: the horizontal view stays the game's,
+// wide_tall_camera_host widens the camera's vertical angle), and the HUD and menus, movies and a save's picture keep
+// the middle 16:9 band of the picture, its full width. That band shows what the game's own 16:9 picture shows, so the
+// markers that follow the 3D world stay on their targets as they do in the wider shapes.
 //
 // The page's layout is described at the top of recomp/patches-v111.txt.
 #include <math.h>
@@ -28,12 +35,18 @@
 #include "layout.h"
 #include "ui/menu.h"
 #include "vk_dlaa.h"
+#if __has_include("patches.h")
+#include "patches.h"   // RT_PATCH_PAGE: wide_tall_camera_host's slot
+#endif
 
 #define GAME_W 2560   // the picture, main+0x1202ee0 and main+0x31f39f4
 #define GAME_H 1440
 #define SCENE_H 1080
 #define GAME_DTA_KIB 312320.0     // the texture heap made for that picture (wide_heap_extra_kib)
-#define SAVE_W 543                // the width of the target a save's picture is drawn into (save_extra)
+#define SAVE_W 543                // the size of the target a save's picture is drawn into (save_extra)
+#define SAVE_H 306
+#define TALL_MIN (16.0 / 10.0)    // the narrowest picture: 16:10
+#define HOST_TALL_CAMERA 0xef0    // the patch page's slot the camera site of the set wide_tall calls
 
 // The window's size, or the monitor's in fullscreen; 0 when unknown.
 static int screen_size(int *w, int *h) {
@@ -46,6 +59,7 @@ static int screen_size(int *w, int *h) {
 // The shape the setting asks for as width / height; 0 for the game's own.
 static double wanted_ratio(void) {
     const char *s = cfg_value("NX2NAVI_GAME_ASPECT");
+    if (!strcmp(s, "16:10")) return 16.0 / 10.0;
     if (!strcmp(s, "21:9")) return 64.0 / 27.0;
     if (!strcmp(s, "32:9")) return 32.0 / 9.0;
     if (strcmp(s, "window")) return 0;
@@ -286,9 +300,10 @@ int wide_scene_restart(void) {
 static int picture_size(unsigned *ow, unsigned *oh, int quiet) {
     double r = wanted_ratio(), game = (double)GAME_W / GAME_H;
     *oh = picture_height();
-    if (r <= 0 || r < game * 1.01) {
-        if (r > 0 && !quiet) rt_log("widescreen: a %.4f picture is not wider than 16:9; the game's 16:9", r);
-        r = game;
+    if (r <= 0 || fabs(r / game - 1) < 0.01) r = game;   // 16:9 within 1% (1366x768 counts)
+    if (r < TALL_MIN) {
+        if (!quiet) rt_log("widescreen: a %.4f picture is narrower than 16:10; a 16:10 picture", r);
+        r = TALL_MIN;
     }
     if (r == game && *oh == GAME_H) return 0;
     if (r > 32.0 / 9.0) r = 32.0 / 9.0;
@@ -329,19 +344,54 @@ uint64_t wide_heap_extra_kib(void) {
     return kib;
 }
 
-// The save's picture (recomp/patches-v111.txt, set wide_save): the game draws the whole picture into a target 543
-// pixels wide, which squeezes a picture wider than 16:9. The viewport of that draw is made wider than its target by the
-// picture's ratio over 16:9, half of it on each side, so the target, which the scissor keeps to, holds the middle 16:9
-// of the picture. Returns the pixels added for a picture of ow x oh: an even number, so the picture's middle stays in
-// the target's middle; 0 for a picture that is not wider than 16:9, taller or not.
+// The save's picture (recomp/patches-v111.txt, set wide_save): the game draws the whole picture into a target of
+// 543x306, which squeezes a picture of another shape than 16:9. The viewport of that draw is made wider than its target
+// by the picture's ratio over 16:9 (taller by 16:9 over the ratio for a taller picture, set wide_tall), half of it on
+// each side, so the target, which the scissor keeps to, holds the middle 16:9 of the picture. Returns the pixels added
+// to the width (to the height for a taller picture) for a picture of ow x oh: an even number, so the picture's middle
+// stays in the target's middle; 0 for a 16:9 picture.
 static int32_t save_extra(unsigned ow, unsigned oh) {
     double wider = (double)ow * GAME_H / ((double)oh * GAME_W);
+    if (wider < 1) return 2 * (int32_t)lround(SAVE_H * (1 / wider - 1) / 2);
     return wider > 1 ? 2 * (int32_t)lround(SAVE_W * (wider - 1) / 2) : 0;
 }
 
+// The camera update's site of the set wide_tall (recomp/patches-v111.txt, page +0xef0), right after the game halves
+// the camera's vertical angle (s0) into s8. For a 16:9 camera (its ratio at +0x140 within the page's tolerance of the
+// page's 16:9, as the ratio site after it decides) the half grows so its tangent is the page's +124 times the game's:
+// the horizontal view stays the game's 16:9 one and the picture's added height shows more above and below. s0 becomes
+// the whole angle, which the game stores at +0xa0, and the game computes the sine, cosine and tangent it stores from s8.
+// Other cameras (other ratios) keep theirs.
+void wide_tall_camera_host(Cpu *c) {
+    const uint8_t *page = rt_patch_page();
+    float match, tolerance, k, ratio;
+    memcpy(&match, page + 112, 4);
+    memcpy(&tolerance, page + 120, 4);
+    memcpy(&k, page + 124, 4);
+    memcpy(&ratio, (const void *)(uintptr_t)(c->x[19] + 0x140), 4);
+    if (!(fabsf(ratio - match) <= tolerance) || !(k > 1.0f)) return;
+    uint32_t bits = (uint32_t)c->v[8];
+    float half;
+    memcpy(&half, &bits, 4);
+    if (!(half > 0.0f && half < 1.5f)) return;   // a usable half-angle (under 86 degrees), else the game's
+    half = atanf(tanf(half) * k);
+    float whole = 2.0f * half;
+    memcpy(&bits, &half, 4);
+    c->v[8] = bits;
+    memcpy(&bits, &whole, 4);
+    c->v[0] = bits;
+}
+
+#ifdef RT_PATCH_PAGE
+__attribute__((constructor)) static void wide_tall_register(void) {
+    if (RT_V111) rt_register_host(RT_PATCH_PAGE + HOST_TALL_CAMERA, wide_tall_camera_host);
+}
+#endif
+
 void wide_init(void) {
     int so = rt_patch_set("wide_out"), ss = rt_patch_set("wide_scene"), sa = rt_patch_set("wide_aspect"),
-        sh = rt_patch_set("wide_hud"), sm = rt_patch_set("wide_movie"), sv = rt_patch_set("wide_save");
+        sh = rt_patch_set("wide_hud"), sm = rt_patch_set("wide_movie"), sv = rt_patch_set("wide_save"),
+        st = rt_patch_set("wide_tall");
     // The scene's share of the picture is not a size in this set: the game's GPU-time dynamic resolution sets it each
     // frame (3/4 of the picture at most), and writing other sizes into wide_scene's constant or the 1920x1080 render
     // sizes left the light target where the controller put it. DLSS's modes fix the share through res_fixed instead
@@ -366,11 +416,21 @@ void wide_init(void) {
                "the game's own 2560x1440 picture");
         return;
     }
+    // A picture taller than 16:9 (16:10) needs the set wide_tall, which C generated before it does not have
+    int tall = (double)ow / oh < game * 0.99;   // picture_size keeps 16:9 within 1% as 16:9
+    if (tall && st < 0) {
+        rt_log("widescreen: the generated C has no set wide_tall for a picture taller than 16:9 (rebuild the game); "
+               "the game's own 16:9 picture");
+        return;
+    }
     // The scene 3/4 of both sides, its width in whole multiples of 8 pixels and its height even.
     unsigned sw = (unsigned)lround(ow * f / 8) * 8;
     unsigned sch = (unsigned)lround(oh * f / 2) * 2;
     uint64_t out = (uint64_t)oh << 32 | ow, scene = (uint64_t)sch << 32 | sw;
-    float match = 16.0f / 9.0f, ratio = (float)ow / oh, tolerance = 0.01f, squeeze = match / ratio;
+    // The UI's squeeze and the movie's margin are horizontal for a wider picture and vertical for a taller one (set
+    // wide_tall): the middle 16:9 of the picture either way. tan_k is the vertical view's growth (wide_tall_camera_host).
+    float match = 16.0f / 9.0f, ratio = (float)ow / oh, tolerance = 0.01f;
+    float squeeze = tall ? ratio / match : match / ratio, tan_k = tall ? match / ratio : 1.0f;
     float ui[2] = {2.0f / 3840.0f, 2.0f / 2160.0f}, squeeze4[4] = {squeeze, squeeze, squeeze, squeeze};
     float margin = (1.0f - squeeze) / 2;
     // the screens whose UI keeps the whole picture (recomp/patches-v111.txt, set wide_hud): the item-wheel, pause and
@@ -383,22 +443,32 @@ void wide_init(void) {
     memcpy(page + 112, &match, 4);
     memcpy(page + 116, &ratio, 4);
     memcpy(page + 120, &tolerance, 4);
+    memcpy(page + 124, &tan_k, 4);
     memcpy(page + 144, ui, 8);
     memcpy(page + 160, keep, 16);
     memcpy(page + 176, squeeze4, 16);
     memcpy(page + 192, &margin, 4);
     memcpy(page + 208, keep2, 16);
-    // the save's picture: what its viewport gets added to its x and to its width. The set is not one wide_available
-    // asks for: C generated before it existed keeps the other sets and squeezes the save's picture as before.
+    // the save's picture: what its viewport gets added to its x and to its width (to its y and height for a taller
+    // picture). The set wide_save is not one wide_available asks for: C generated before it existed keeps the other
+    // sets and squeezes the save's picture as before.
     int32_t extra = save_extra(ow, oh), save[2] = {-(extra / 2), extra};
     memcpy(page + 224, save, 8);
     rt_patch_switch(so, 1);
     rt_patch_switch(ss, 1);
+    scale_k = oh > GAME_H ? (double)oh / GAME_H : 1.0;
+    if (tall) {
+        // wide_tall's sites are those of wide_aspect, wide_hud, wide_movie and wide_save, which stay off
+        rt_patch_switch(st, 1);
+        rt_log("widescreen: picture %ux%u, scene %ux%u (%.0f%% of it), camera aspect ratio %.4f (16:9 is %.4f) with the "
+               "vertical view %.1f%% taller, UI, movies and a save's picture in the middle %.1f%% of the height", ow, oh,
+               sw, sch, f * 100, ratio, game, (tan_k - 1) * 100, squeeze * 100);
+        return;
+    }
     rt_patch_switch(sa, 1);
     rt_patch_switch(sh, 1);
     rt_patch_switch(sm, 1);
     if (extra > 0) rt_patch_switch(sv, 1);
-    scale_k = oh > GAME_H ? (double)oh / GAME_H : 1.0;
     rt_log("widescreen: picture %ux%u, scene %ux%u (%.0f%% of it), camera aspect ratio %.4f (16:9 is %.4f), UI and movies "
            "in the middle %.1f%%", ow, oh, sw, sch, f * 100, ratio, game, squeeze * 100);
     if (extra > 0 && sv >= 0)

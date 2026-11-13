@@ -28,6 +28,7 @@
 uint8_t rt_patch_on[RT_PATCH_COUNT > 0 ? RT_PATCH_COUNT : 1];   // read by the generated C at every patched site
 
 // The debug menu's free camera (debug_tools.c dbg_freecam_host): the site of the set freecam calls the page's +0xf70.
+// The set wide_tall's camera site calls +0xef0 (widescreen.c wide_tall_camera_host, registered there).
 // Registered here, in the file that has the game version's page address.
 #ifdef RT_PATCH_PAGE
 #include "debug_tools.h"
