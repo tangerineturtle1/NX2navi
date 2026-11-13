@@ -391,6 +391,26 @@ static void drop_swapchain_locked(VkCtx *c) {
 // sets it again, where clearing it at the end lost that resize and kept a swapchain of the old size, whose acquires
 // then timed out frame after frame behind AMD's presenter (the picture stopped).
 static void ng_drain(void);
+// Surface-format lists can exceed 64 entries when a compositor advertises several colour spaces.
+// Requery on VK_INCOMPLETE: the available list may grow between the count and data calls.
+static VkSurfaceFormatKHR *surface_formats(VkPhysicalDevice phys, VkSurfaceKHR surface, uint32_t *count) {
+    *count = 0;
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        uint32_t n = 0;
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &n, NULL) != VK_SUCCESS || !n) return NULL;
+        VkSurfaceFormatKHR *formats = malloc((size_t)n * sizeof *formats);
+        if (!formats) return NULL;
+        VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &n, formats);
+        if (result == VK_SUCCESS && n) {
+            *count = n;
+            return formats;
+        }
+        free(formats);
+        if (result != VK_INCOMPLETE) return NULL;
+    }
+    return NULL;
+}
+
 static int create_swapchain(void) {
     flip_locked();   // the acquired image goes out before its swapchain is replaced
     ng_drain();      // and what the NGX frame generation presenter still holds (nothing unless it runs)
@@ -404,11 +424,9 @@ static int create_swapchain(void) {
                                                             : (VkExtent2D){(uint32_t)cw, (uint32_t)ch};
     if (!ext.width || !ext.height) return plat_xchg32(&g_dirty, 1), 0;
     uint32_t nf = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, g_surface, &nf, NULL);
-    VkSurfaceFormatKHR fmts[64];
-    if (nf > 64) nf = 64;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, g_surface, &nf, fmts);
-    if (!nf) return plat_xchg32(&g_dirty, 1), 0;
+    VkSurfaceFormatKHR *fmts = surface_formats(c->phys, g_surface, &nf);
+    if (!fmts) return plat_xchg32(&g_dirty, 1), 0;
+    rt_log("gfx: queried all %u surface formats", nf);
     // UNORM: the blit writes the bytes the game wrote (no sRGB encode). NX2NAVI_HDR: HDR10 when the surface offers it.
     VkSurfaceFormatKHR sf = fmts[0];
     g_sc_hdr_wanted = vk_hdr_wanted();
@@ -417,6 +435,7 @@ static int create_swapchain(void) {
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
+    free(fmts);
     // NGX frame generation's presenter holds the generated frames' images too, and the rendered frame waits for it:
     // room for both
     const uint32_t ngx = vk_ngxfg_wanted() ? 1 : 0, most = ngx ? 12 : 8;
