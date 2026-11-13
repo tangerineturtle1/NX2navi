@@ -664,6 +664,14 @@ static void world_clock(double dt, double step) {
     int64_t w = atomic_load_explicit(&world_us, memory_order_relaxed);
     if (w < 0) {
         float p[3];
+        // Ocarina (the free-running build) has no player lookup: player_pos walks the scene of the game this
+        // runtime was first written for, at its slots, and never finds a player here. Its world clock counts from the
+        // first present instead, as the script's tick lines do: @ms lines, recordings and the A/B blocks then work.
+        if (frame_free_running()) {
+            rt_log("frame step: world clock starts at the first present (this game has no player lookup)");
+            atomic_store_explicit(&world_us, 0, memory_order_relaxed);
+            return;
+        }
         if (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f) return;   // a few guest reads, until the load ends
         rt_log("frame step: world clock starts at present %llu, %.2f s after the guest started (the player at %.1f %.1f %.1f)",
                (unsigned long long)presents, rt_guest_start_ns ? (kern_now_ns() - rt_guest_start_ns) / 1e9 : 0.0, p[0],
