@@ -425,6 +425,63 @@ void tab_memory(void) {
     ImGui::EndChild();
 }
 
+void tab_skulls(void) {
+    dbg_flags_refresh();
+    int found = 0;
+    if (dbg_names(&found) != 2 || !dbg_skulls()) {
+        ImGui::TextWrapped("Load a save to read Skulltula locations from your game files.");
+        return;
+    }
+    static char filter[112];
+    ImGui::InputTextWithHint("##skull_area", "Filter area", filter, sizeof filter);
+    int collected = 0, available = 0;
+    int values[100];
+    for (int i = 0; i < 100; i++) {
+        values[i] = dbg_skull_collected(i);
+        if (values[i] >= 0) available++, collected += values[i] != 0;
+    }
+    ImGui::Text("Collected: %d / %d", collected, available);
+    int tokens = dbg_skull_tokens();
+    if (tokens >= 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("   Token count: %d", tokens);
+        if (tokens != collected && available == 100) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Match the count")) dbg_skull_tokens_match();
+        }
+    }
+    ImGui::TextWrapped("These are the individual flags the game counts. A change also sets the token count, which the House of Skulltula and its rewards read, to the number collected. Save normally after changing them. Reload the area to refresh its spiders and tokens.");
+    ImGui::TextWrapped("Travel nearby uses the nearest named entrance, not the spider's exact position. The area may autosave. Area variants do not change Link's age.");
+    char travel_status[160];
+    dbg_status(travel_status);
+    if (travel_status[0]) ImGui::TextWrapped("%s", travel_status);
+    ImGui::BeginChild("##skull_rows", ImVec2(0, 0), false);
+    for (int i = 0; i < 100; i++) {
+        const char *area = dbg_skull_area(i);
+        if (!contains(area, filter)) continue;
+        ImGui::PushID(i);
+        bool on = values[i] > 0;
+        if (values[i] < 0) ImGui::BeginDisabled();
+        char label[144];
+        snprintf(label, sizeof label, "%03d  %s", i + 1, area);
+        if (ImGui::Checkbox(label, &on)) dbg_skull_set(i, on);
+        if (values[i] < 0) ImGui::EndDisabled();
+        float xyz[3];
+        if (dbg_skull_pos(i, xyz)) ImGui::TextDisabled("      Position: %.1f, %.1f, %.1f", xyz[0], xyz[1], xyz[2]);
+        const char *entrance = dbg_skull_entrance(i);
+        bool can_travel = entrance && !dbg_busy();
+        if (!can_travel) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Travel nearby")) dbg_skull_travel(i);
+        if (!can_travel) ImGui::EndDisabled();
+        if (entrance) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", entrance[0] ? entrance : "Default entrance");
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
 }  // namespace
 
 extern "C" void debug_menu_tab(int tab) { g_tab = tab; }
@@ -455,20 +512,34 @@ extern "C" void debug_menu_layout(uint32_t w, uint32_t h, float scale) {
         ImGui::Dummy(ImVec2(0, 2 * scale));
         if (!dbg_supported()) {
             ImGui::TextWrapped("The debug menu knows the structures of Ocarina of Time 1.1.1 only.");
-        } else if (ImGui::BeginTabBar("##tabs")) {
-            static const char *const names[DEBUG_MENU_TABS] = {"Flags", "Teleport", "Cutscenes", "World", "Memory"};
-            for (int t = 0; t < DEBUG_MENU_TABS; t++) {
-                if (ImGui::BeginTabItem(names[t], NULL, g_tab == t ? ImGuiTabItemFlags_SetSelected : 0)) {
-                    if (t == 0) tab_flags();
-                    else if (t == 1) tab_teleport();
-                    else if (t == 2) tab_events();
-                    else if (t == 3) tab_world();
-                    else tab_memory();
-                    ImGui::EndTabItem();
-                }
-            }
+        } else {
+            static const char *const names[DEBUG_MENU_TABS] = {"Flags", "Teleport", "Cutscenes", "World", "Memory", "Skulltulas"};
+            static int active_tab;
+            if (g_tab >= 0 && g_tab < DEBUG_MENU_TABS) active_tab = g_tab;
             g_tab = -1;
-            ImGui::EndTabBar();
+            // Wrap full labels into rows instead of letting a tab bar shorten them. The actual font and panel width
+            // decide the column count, so this also works with larger DPI scales and narrower windows.
+            const ImGuiStyle &style = ImGui::GetStyle();
+            const float available = std::max(1.0f, ImGui::GetContentRegionAvail().x), gap = style.ItemSpacing.x;
+            float widest = 1;
+            for (int t = 0; t < DEBUG_MENU_TABS; t++)
+                widest = std::max(widest, ImGui::CalcTextSize(names[t]).x + style.FramePadding.x * 2);
+            int columns = std::max(1, std::min(DEBUG_MENU_TABS, (int)((available + gap) / (widest + gap))));
+            float button_width = (available - gap * (columns - 1)) / columns;
+            for (int t = 0; t < DEBUG_MENU_TABS; t++) {
+                if (t % columns) ImGui::SameLine();
+                bool selected = active_tab == t;
+                if (selected) ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_ButtonActive]);
+                if (ImGui::Button(names[t], ImVec2(button_width, 0))) active_tab = t;
+                if (selected) ImGui::PopStyleColor();
+            }
+            ImGui::Separator();
+            if (active_tab == 0) tab_flags();
+            else if (active_tab == 1) tab_teleport();
+            else if (active_tab == 2) tab_events();
+            else if (active_tab == 3) tab_world();
+            else if (active_tab == 4) tab_memory();
+            else tab_skulls();
         }
     }
     ImGui::End();
