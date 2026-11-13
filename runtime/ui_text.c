@@ -221,13 +221,19 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sharper shadows. Higher costs more GPU power.",
     [UI_MENU_PCSS] = "Soft shadows",
-    [UI_MENU_PCSS_DESC] = "Sun shadows sharp where an object meets the ground and softer the further the shadow falls "
-                          "(PCSS). 0 keeps the game's filter. Takes effect at the next start.",
+    [UI_MENU_PCSS_DESC] = "Shadows are crisp where things touch the ground and blur the further they fall. 0 keeps the game's own shadows.",
+    [UI_MENU_GROUP_SHADOWS] = "Shadows",
+    [UI_MENU_FOL_SHADOW_CULL] = "Simple foliage shadows",
+    [UI_MENU_FOL_SHADOW_CULL_DESC] = "Leaf and grass shadows this far away are drawn a cheaper way. Off looks best and costs the most GPU power.",
+    [UI_MENU_FOL_SHADOW_VRS] = "Coarse foliage shadows",
+    [UI_MENU_FOL_SHADOW_VRS_DESC] = "Leaf and grass shadows this far away get rougher edges. Off looks best and costs the most GPU power.",
+    [UI_MENU_CASC_ALL] = "All shadows", [UI_MENU_CASC_MID] = "Middle and far", [UI_MENU_CASC_FAR] = "Far only",
+    [UI_MENU_CASC_NONE] = "Off",
     [UI_MENU_CONTACT_SHADOWS] = "Contact shadows",
-    [UI_MENU_CONTACT_SHADOWS_DESC] = "Small sun shadows the shadow maps miss: at feet, under stones, in grass and creases. "
-                                     "Traced on the screen after lighting. Takes effect at the next start.",
+    [UI_MENU_CONTACT_SHADOWS_DESC] = "Adds the small shadows the game leaves out: under feet, stones and grass.",
     [UI_MENU_SHADOW_RANGE] = "Shadow cascade range",
-    [UI_MENU_SHADOW_RANGE_DESC] = "Keeps shadows sharp further away.",
+    [UI_MENU_SHADOW_RANGE_DESC] = "How far away shadows reach. Higher spreads the same detail over more distance; raise "
+                                  "Shadow resolution to make up for it.",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS for the 3D scene (NVIDIA RTX GPUs; " DLSS_FILE " next to " EXE_FILE "): smoother "
                           "edges and less shimmer. The HUD is not touched. The mode below sets the resolution it works "

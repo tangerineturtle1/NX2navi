@@ -168,11 +168,18 @@ static double picture_ratio(void) {
     return (double)ow * oh / ((double)GAME_W * GAME_H);
 }
 
+// The most the widescreen picture's heap may grow: what the application pool has room for, less the growth for a larger
+// sun shadow map (resolution.c res_shadow_heap_kib), which comes first.
+static uint64_t room_kib(void) {
+    uint64_t most = mem_heap_extra_max_kib(), shadow = res_shadow_heap_kib();
+    return most > shadow ? most - shadow : 0;
+}
+
 // The most share of the picture the application pool has room for at the picture the settings ask for (the heap
 // grows with the share's square, see heap_share). Computed anew at each call, so the menu can tell whether a restart
 // would give a larger scene (wide_scene_restart).
 static double share_most(void) {
-    double room = (double)mem_heap_extra_max_kib() / GAME_DTA_KIB + 1;   // the heap's most over the shipped one
+    double room = (double)room_kib() / GAME_DTA_KIB + 1;   // the heap's most over the shipped one
     return sqrt(room / picture_ratio()) * PLAIN_SHARE;
 }
 
@@ -184,7 +191,7 @@ static double share_most(void) {
 // to run only once the device is up. A mode chosen in the menu later that renders more keeps the start's share until
 // a restart (dlss_share).
 // Never more than the application pool can take: the heap grows with the share's square (wide_heap_extra_kib), and
-// past mem_heap_extra_max_kib the game's own SetHeapSize is refused and nothing starts. A 10240x2880 picture has room
+// past room_kib the game's own SetHeapSize is refused and nothing starts. A 10240x2880 picture has room
 // for 80% there, not for all of it, and the scene is then that much.
 static double heap_share(void) {
     static double share = -1;
@@ -197,7 +204,7 @@ static double heap_share(void) {
             if (most < PLAIN_SHARE) most = PLAIN_SHARE;   // wide_heap_extra_kib says what a picture this large lacks
             rt_log("widescreen: the scene can be %.0f%% of the picture at most, not %.0f%%: the game's render-target "
                    "heap for more does not fit the application pool (%llu MiB of growth at most)", most * 100, s * 100,
-                   (unsigned long long)(mem_heap_extra_max_kib() >> 10));
+                   (unsigned long long)(room_kib() >> 10));
             s = most;
         }
         share = s;
@@ -311,12 +318,12 @@ static int picture_size(unsigned *ow, unsigned *oh, int quiet) {
 // 2560x1440 0 and 238, 3440x1440 105 and 424, 3840x2160 382 and 915, 5120x2160 610 and 1,322, 7680x2160 1,068 and
 // 2,135. The heap is committed as the game first writes it (memory.c, NX2NAVI_HEAP_LAZY), so the room a run does not
 // use costs address space and no memory.
-// At most mem_heap_extra_max_kib: heap_share has taken the scene's share down to what fits, and a picture too large
+// At most room_kib: heap_share has taken the scene's share down to what fits, and a picture too large
 // even with the game's own scene (above 10240x2880) gets the most there is, with a line that says so.
 uint64_t wide_heap_extra_kib(void) {
     double k = heap_share() / PLAIN_SHARE;
     double grow = picture_ratio() * k * k - 1;
-    uint64_t kib = grow > 0 ? (uint64_t)ceil(GAME_DTA_KIB * grow / 1024) * 1024 : 0, most = mem_heap_extra_max_kib();
+    uint64_t kib = grow > 0 ? (uint64_t)ceil(GAME_DTA_KIB * grow / 1024) * 1024 : 0, most = room_kib();
     if (kib > most) {
         static int said;
         if (!said++)

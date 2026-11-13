@@ -637,6 +637,8 @@
 # shadow_scale = 1
 # Sun shadow cascade range in percent of the game's (its cascades end at 20, 40, 80 and 160 m), 50 to 400: higher moves
 # the steps where shadows turn softer further away, and spreads the shadow map over more ground. Read at start.
+# Ocarina of Time: the distances its three cascades begin and end at are multiplied, and a change while the game runs
+# takes effect at once.
 # shadow_range = 100
 # Screen-space contact shadows, strength in percent (0 = off): after the game lights its scene, each pixel traces a
 # short way toward the sun through the depth buffer and darkens where something close blocks it, adding the small
@@ -652,6 +654,12 @@
 # camera moves. Costs a little GPU time. With shadow_scale above 1 it is on anyway. The log lists the filters of the
 # game's shadow samplers ("depth-compare sampler:"); where they are already linear this changes nothing. Read at start.
 # shadow_pcf = 0
+# Ocarina of Time: two savings on the foliage's draws into the sun's shadow cascades. Each names the first cascade it
+# covers: 0 the near one, 1 the middle, 2 the far, 3 = off. foliage_shadow_cull: the leaf and grass cards, which the
+# game draws two-sided, are drawn without their back faces (0f, 1f, 2f: without their front faces instead).
+# foliage_shadow_vrs: they shade one fragment per 2x2 texels. Read at start.
+# foliage_shadow_cull = 1
+# foliage_shadow_vrs = 2
 
 # NVIDIA DLSS / DLAA for the 3D scene, on NVIDIA RTX GPUs with the DLSS model from NVIDIA's DLSS SDK next to the
 # executable (Windows: nvngx_dlss.dll next to nx2navi.exe; Linux: libnvidia-ngx-dlss.so.<version> next to nx2navi, with the

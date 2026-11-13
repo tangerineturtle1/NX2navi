@@ -66,6 +66,7 @@ void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
 void res_sizes(unsigned out[2], unsigned scene[2]);
+int res_shadows_available(void);        // resolution.c: Ocarina's shadow patch sets are there
 int res_adjustable(void);
 int wide_available(void);
 int wide_scene_settable(void);
@@ -768,13 +769,24 @@ static void row_texture_detail(void) {
 static void row_shadow_scale(void) {
     static const char *const vals[] = {"1", "2", "3", "4"};
     static const char *const names[] = {"960 (1x)", "1920 (2x)", "2880 (3x)", "3840 (4x)"};
-    opt_choice_list("NX2NAVI_SHADOW_SCALE", UI_MENU_SHADOW_SCALE, vals, names, 4, UI_MENU_SHADOW_SCALE_DESC);
+    static const char *const times[] = {"1x", "2x", "3x", "4x"};   // Ocarina: of the shadow map size above
+    opt_choice_list("NX2NAVI_SHADOW_SCALE", UI_MENU_SHADOW_SCALE, vals, rt_game_version == 111 ? times : names, 4,
+                    UI_MENU_SHADOW_SCALE_DESC);
 }
 
 static void row_shadow_range(void) {
-    static const char *const vals[] = {"100", "150", "200", "300"};
-    static const char *const names[] = {"160 m (1x)", "240 m (1.5x)", "320 m (2x)", "480 m (3x)"};
-    opt_choice_list("NX2NAVI_SHADOW_RANGE", UI_MENU_SHADOW_RANGE, vals, names, 4, UI_MENU_SHADOW_RANGE_DESC);
+    static const char *const vals[] = {"100", "150", "200", "300", "400"};
+    static const char *const names[] = {"1x", "1.5x", "2x", "3x", "4x"};
+    opt_choice_list("NX2NAVI_SHADOW_RANGE", UI_MENU_SHADOW_RANGE, vals, names, 5, UI_MENU_SHADOW_RANGE_DESC);
+}
+
+// The sun shadow cascade a foliage saving starts at (vk_exec_draw.c foliage_shadow_cull, mesh_shading_rate): the value
+// is the first layer it covers. Ocarina draws three (layers 0 to 2, near to far), so 3 covers none.
+static void row_foliage_cascades(const char *key, UiTextId label, UiTextId desc) {
+    static const char *const vals[] = {"0", "1", "2", "3"};
+    const char *names[] = {menu_text(UI_MENU_CASC_ALL), menu_text(UI_MENU_CASC_MID), menu_text(UI_MENU_CASC_FAR),
+                           menu_text(UI_MENU_CASC_NONE)};
+    opt_choice_list(key, label, vals, names, 4, desc);
 }
 
 static void row_gpu(void) {
@@ -1351,6 +1363,20 @@ static void tab_screen(float scale) {
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
     row_texture_detail();
+    // Ocarina's sun shadows: the maps (resolution.c shadow_init, vk_texture.c "shadow map scale"), the cascades' reach
+    // (resolution.c res_shadow_frame), the filter (vk_exec_draw.c pcss_params), the screen-space pass (vk_contact.c) and
+    // the foliage's two savings in the cascades. The other builds' sets and frames differ: the rows are Ocarina's
+    // (resolution.c res_shadows_available)
+    if (res_shadows_available()) {
+        opt_group(UI_MENU_GROUP_SHADOWS);
+        row_shadow_res();
+        row_shadow_scale();
+        row_shadow_range();
+        opt_slider("NX2NAVI_PCSS", UI_MENU_PCSS, 0, 200, UI_MENU_PCSS_DESC, 10, "%.0f %%");
+        opt_slider("NX2NAVI_CONTACT_SHADOWS", UI_MENU_CONTACT_SHADOWS, 0, 100, UI_MENU_CONTACT_SHADOWS_DESC, 10, "%.0f %%");
+        row_foliage_cascades("NX2NAVI_FOLIAGE_SHADOW_CULL", UI_MENU_FOL_SHADOW_CULL, UI_MENU_FOL_SHADOW_CULL_DESC);
+        row_foliage_cascades("NX2NAVI_FOLIAGE_SHADOW_VRS", UI_MENU_FOL_SHADOW_VRS, UI_MENU_FOL_SHADOW_VRS_DESC);
+    }
     opt_end();
 }
 

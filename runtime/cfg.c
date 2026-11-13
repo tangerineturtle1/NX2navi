@@ -124,7 +124,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
-    {"PCSS", "display"},
+    {"PCSS", "display"}, {"FOLIAGE_SHADOW_CULL", "display"}, {"FOLIAGE_SHADOW_VRS", "display"},
     {"SHADOW_PCF", "display"},
     {"MODS_DIR", "mods"}, {"MODS_ORDER", "mods"}, {"MODS_DISABLED", "mods"}, {"MODS_REBUILD", "mods"},
     {"MENU_LANG", "language"}, {"LANG", "language"}, {"OPERATION_MODE", "language"}, {"TEXT_SPEED", "language"},
@@ -238,10 +238,12 @@ static const CfgMeta metas[] = {
     // vk_memory.c "Pages a shader stores into through the device address table"
     {"SHADOW_TABLE_STORES", "0", "0|1", RESTART}, {"SHADOW_CHECK", "0", "0|1", RESTART},
     {"SVC_SLOW_MS", "0", "0..60000", RESTART},   // kernel.c kern_svc: log services slower than this
-    {"SHADOW_RANGE", "100", "50..400", RESTART}, {"CONTACT_SHADOWS", "0", "0..100", RESTART},
+    {"SHADOW_RANGE", "100", "50..400", LIVE}, {"CONTACT_SHADOWS", "0", "0..100", RESTART},
     {"PCSS", "0", "0..200", RESTART},
     // vk_texture.c shadow_pcf: every depth-compare sampler filters linearly (2x2 percentage-closer filtering)
     {"SHADOW_PCF", "0", "0|1", RESTART},
+    // vk_exec_draw.c foliage_shadow_cull, mesh_shading_rate
+    {"FOLIAGE_SHADOW_CULL", "1", "0|1|2|3|0f|1f|2f", RESTART}, {"FOLIAGE_SHADOW_VRS", "2", "0|1|2|3", RESTART},
     // Game
     {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|165|240|display|unlimited", LIVE}, {"FPS60", "1", "0|1", LIVE},
     {"RTSS", "1", "0|1", RESTART},   // rtss_limit.c: RivaTuner Statistics Server takes the limit where it runs

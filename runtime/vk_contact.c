@@ -12,14 +12,26 @@
 // and the first sun cascade's depth row c4[44].xyz, whose negated direction points from a view-space position toward
 // the sun (the G-buffer shaders compare dot(c4[44].xyz, pos) + c4[44].w with the cascade map). The scene colour images
 // get STORAGE usage when the setting is on (vk_texture.c create_tex).
+//
+// Ocarina draws forward and has no such G-buffer. Its frame: a depth prepass of the scene, the linear depth made from
+// it (an R32F target of the scene's size, alone in its pass; view distance / far), the shadow maps, the lit scene into
+// the B10G11R11 scene colour with a depth image of its own, then grass and transparent surfaces with the prepass's
+// depth again. There the march runs when the lit scene's passes are over, at the start of the first pass that is not
+// one of them (forward_pass_begin): a dispatch or a copy in the middle of the lit scene only suspends its pass, and
+// what is drawn after it would cover the march. Its inputs come from two blocks seen at any pass's start: the camera
+// block (vertex stage, block 0, 0x3500 bytes: the view matrix in rows at +0, the projection at +0x70, the far distance
+// at +0xe4) and the sun block (fragment stage, block 4, 0x200 bytes: at +0 the direction the sun's light travels, in
+// world space).
 #include "vk.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
 #include "contact_shadow_spv.h"
 #include "host.h"
+#include "vk_dlaa.h"
 #include "vk_exec.h"
 
 static struct {
@@ -33,6 +45,12 @@ static struct {
     uint32_t w, h;
     int pending;                       // the composite into scene ran; the march waits for the next pass
     uint64_t c4;
+    // Ocarina (forward): the linear depth target seen last and whether the lit scene has followed it; the prepass's
+    // depth and colour images and the lit scene's depth; the camera and sun blocks
+    const VkTexImage *lin, *pre_depth, *pre_color, *lit_depth;
+    uint32_t lin_w, lin_h;
+    int lin_new, forward;
+    uint64_t cam, sun;
 } C;
 
 int vk_contact_strength(void) {
@@ -48,7 +66,7 @@ static int init(VkCtx *c) {
     vk_contact_strength();
     if (!C.strength) return 0;
     const char *e = cfg_get("NX2NAVI_CONTACT_DEBUG");   // 1: the frame shows the contact shadow factor in grey
-    C.debug = e && *e && strcmp(e, "0");
+    C.debug = e && *e ? atoi(e) : 0;   // 2: the linear depth, 50 m to white
     C.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     VkDescriptorSetLayoutBinding b[2] = {
         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
@@ -112,23 +130,30 @@ static void mem_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &d);
 }
 
-int vk_contact_pending(void) { return C.pending; }
+int vk_contact_pending(void) { return C.pending && !C.forward; }   // Ocarina's waits for a pass's start instead
 
-void vk_contact_flush(VkExec *ex) {
-    // The submitting thread past a group (vk_exec.c NX2NAVI_REPLAY_PIPE): the group's first chunk may have made the
-    // pass due and a later one records it where the replay would; only one still due after the group is this one's.
-    if (vk_exec_behind()) {
-        vk_exec_hooks_wait();
-        if (!C.pending) return;
-        vk_exec_turn();
-    }
-    if (!C.pending) return;
+// The march, recorded where the caller is in the stream.
+static void march(VkExec *ex) {
     C.pending = 0;
     if (ex->in_pass) return;
-    const float *u = (const float *)(uintptr_t)C.c4;
-    float lx = -u[44 * 4 + 0], ly = -u[44 * 4 + 1], lz = -u[44 * 4 + 2], ll = sqrtf(lx * lx + ly * ly + lz * lz);
-    float px = u[7 * 4 + 0], py = u[8 * 4 + 1], zfar = u[14 * 4 + 1];
-    if (!(ll > 1e-6f) || !(px > 0) || !(py > 0) || !(zfar > 1)) return;
+    float lx, ly, lz, px, py, zfar;
+    if (C.forward) {
+        // the sun's direction turned into view space by the view matrix's rows; the linear depth is a fraction of the
+        // camera's far distance
+        if (!C.cam || !C.sun) return;
+        const float *m = (const float *)(uintptr_t)C.cam, *s = (const float *)(uintptr_t)C.sun;
+        lx = -(m[0] * s[0] + m[1] * s[1] + m[2] * s[2]);
+        ly = -(m[4] * s[0] + m[5] * s[1] + m[6] * s[2]);
+        lz = -(m[8] * s[0] + m[9] * s[1] + m[10] * s[2]);
+        px = m[28], py = m[33], zfar = m[57];
+    } else {
+        const float *u = (const float *)(uintptr_t)C.c4;
+        lx = -u[44 * 4 + 0], ly = -u[44 * 4 + 1], lz = -u[44 * 4 + 2];
+        px = u[7 * 4 + 0], py = u[8 * 4 + 1], zfar = u[14 * 4 + 1];
+        if (!(zfar > 1)) return;
+    }
+    float ll = sqrtf(lx * lx + ly * ly + lz * lz);
+    if (!(ll > 1e-6f) || !(px > 0) || !(py > 0) || !(zfar > 0)) return;
     VkImageView in = vk_exec_target_view(C.depth, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                                          0, 0, 1, 0);
     VkImageView out = vk_exec_target_view(C.scene, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_IMAGE_VIEW_TYPE_2D,
@@ -138,7 +163,8 @@ void vk_contact_flush(VkExec *ex) {
     float pcv[16] = {px, py, zfar, (float)C.strength / 100.0f,
                      lx / ll, ly / ll, lz / ll, 0.6f,
                      (float)C.w, (float)C.h, 1.0f / (float)C.w, 1.0f / (float)C.h,
-                     (float)C.debug, 0, 0, 0};
+                     (float)C.debug, vk_dlaa_available() ? (float)(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) & 63) : 0,
+                     0, 0};
     if (!C.logged) {
         C.logged = 1;
         rt_log("vk: contact shadows on a %ux%u scene, sun toward %.3f %.3f %.3f (view space), far %g", C.w, C.h,
@@ -160,10 +186,62 @@ void vk_contact_flush(VkExec *ex) {
     vk_exec_draw_new_cb();   // the game's bound compute pipeline and descriptors were replaced: bind them again
 }
 
+void vk_contact_flush(VkExec *ex) {
+    if (C.forward) return;   // Ocarina: only another pass's start ends the lit scene (forward_pass_begin)
+    // The submitting thread past a group (vk_exec.c NX2NAVI_REPLAY_PIPE): the group's first chunk may have made the
+    // pass due and a later one records it where the replay would; only one still due after the group is this one's.
+    if (vk_exec_behind()) {
+        vk_exec_hooks_wait();
+        if (!C.pending) return;
+        vk_exec_turn();
+    }
+    if (!C.pending || C.forward) return;
+    march(ex);
+}
+
 // The lighting composite: the remembered scene colour as the only target, with a D16 depth of its size.
 static int is_composite(const VkExec *ex) {
     return C.scene && ex->pass_ncolor >= 1 && ex->color[0].img == C.scene && !ex->color[0].level &&
            ex->depth.format == VK_FORMAT_D16_UNORM && ex->pass_w == C.w && ex->pass_h == C.h;
+}
+
+// Ocarina's frame at a pass's start (the header's second part). The pass hooks run one after another in the order of
+// the stream (vk_exec.c vk_exec_pass_begin), and what is kept here is read only by them, except C.forward and
+// C.pending, which vk_contact_flush reads from any chunk: C.forward is set once, in turn, and while it is set the
+// flush does nothing whatever C.pending says.
+static void forward_pass_begin(VkExec *ex) {
+    const p_bind_buf *cb = &ex->ubo[0][0], *sb = &ex->ubo[1][4];
+    if (cb->addr && cb->size == 0x3500) {
+        const float *m = (const float *)(uintptr_t)cb->addr;
+        if (m[28] > 0 && m[42] == -1.0f && m[43] == 0) C.cam = cb->addr;   // a perspective projection: the camera's
+    }
+    if (sb->addr && sb->size == 0x200) C.sun = sb->addr;
+    if (!ex->pass_noatt && ex->pass_ncolor == 1 && !ex->depth.image && ex->pass_w >= 640 && !ex->color[0].level &&
+        ex->color[0].format == VK_FORMAT_R32_SFLOAT && ex->color[0].img) {
+        C.lin = ex->color[0].img, C.lin_w = ex->pass_w, C.lin_h = ex->pass_h, C.lin_new = 1, C.pending = 0;
+        return;
+    }
+    int scene_like = !ex->pass_noatt && ex->pass_ncolor == 1 && ex->depth.format == VK_FORMAT_D32_SFLOAT && ex->depth.img &&
+                     !ex->color[0].level && ex->color[0].img && ex->color[0].format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                     (ex->color[0].img->usage & VK_IMAGE_USAGE_STORAGE_BIT);
+    if (C.lin_new) {
+        // the lit scene: the prepass's colour image with another depth image
+        int lit = scene_like && ex->pass_w == C.lin_w && ex->pass_h == C.lin_h && ex->color[0].img == C.pre_color &&
+                  ex->depth.img != C.pre_depth;
+        if (!C.pending) {
+            if (lit) {
+                if (!C.forward) vk_exec_hook_turn();
+                C.scene = ex->color[0].img, C.lit_depth = ex->depth.img, C.depth = C.lin, C.w = ex->pass_w, C.h = ex->pass_h;
+                C.forward = 1, C.pending = 1;
+            }
+            return;
+        }
+        if (lit && ex->color[0].img == C.scene && ex->depth.img == C.lit_depth) return;   // the lit scene goes on
+        vk_exec_hook_turn();   // the march is recorded after everything drawn before this pass
+        march(ex);
+        C.lin_new = 0;
+    }
+    if (scene_like) C.pre_depth = ex->depth.img, C.pre_color = ex->color[0].img;
 }
 
 void vk_contact_pass_begin(VkExec *ex) {
@@ -174,6 +252,10 @@ void vk_contact_pass_begin(VkExec *ex) {
     // the newest one seen at any pass start serves.
     const p_bind_buf *b = &ex->ubo[1][1];
     if (b->addr && b->size == 0x940 && C.c4 != b->addr) vk_exec_hook_turn(), C.c4 = b->addr;
+    if (RT_V111) {   // Ocarina draws forward
+        forward_pass_begin(ex);
+        return;
+    }
     if (is_gbuffer(ex, &scene, &depth)) {
         vk_exec_hook_turn();
         C.pending = 0;

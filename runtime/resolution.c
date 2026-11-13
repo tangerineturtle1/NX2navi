@@ -184,8 +184,19 @@ static int bigger(void) {
     return res_adjustable() && (R.ow != BASE_W || R.oh != BASE_H || R.scene_set || shadow_kib());
 }
 
+// Ocarina's larger sun shadow map: the texture heap grows by this, in whole MiB (res_heap_extra_kib), and the
+// widescreen picture's growth leaves room for it (widescreen.c room_kib).
+uint64_t res_shadow_heap_kib(void) {
+    if (res_adjustable() || rt_patch_set("shadow") < 0) return 0;
+    decide();
+    return (shadow_kib() + 1023) & ~1023ull;
+}
+
 uint64_t res_heap_extra_kib(void) {
-    if (!res_adjustable()) return wide_heap_extra_kib();   // Ocarina: its widescreen picture (widescreen.c)
+    if (!res_adjustable()) {   // Ocarina: its widescreen picture (widescreen.c) and a larger sun shadow map
+        decide();
+        return wide_heap_extra_kib() + res_shadow_heap_kib();
+    }
     if (!bigger()) return 0;
     double grow = fmax(0.0, (double)R.ow * R.oh / (BASE_W * BASE_H) - 1.0) +
                   fmax(0.0, (double)R.hw * R.hh / (SCENE_W * SCENE_H) - 1.0);
@@ -288,7 +299,8 @@ int res_heapdef_ok(void) { return R.heapdef_ok; }
 
 // ---- sun shadow map size: each frame the engine sizes its shadow cascades to the area they cover, down to about 400 near
 // the ground, which draws foliage shadows blocky, and each change of size moves the shadow texels, so leaf shadows jump.
-// A fixed size (the shadow set, recomp/patches-v121.txt) keeps them still and sharper. Page +92.
+// A fixed size (the shadow set, recomp/patches-v121.txt; Ocarina's in recomp/patches-v111.txt) keeps them still and
+// sharper. Page +92.
 static void shadow_init(uint8_t *page) {
     if (!R.shadow) {
         rt_log("resolution: sun shadow map sized by the game (NX2NAVI_SHADOW_RES=game)");
@@ -314,7 +326,7 @@ static uint64_t pack(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
 // texels per metre (NX2NAVI_SHADOW_SCALE pays that back).
 static void res_shadow_range(void) {
     int pct = cfg_int("NX2NAVI_SHADOW_RANGE"), set = rt_patch_set("cascade");
-    if (pct == 100) return;
+    if (pct == 100 || RT_V111) return;   // Ocarina: res_shadow_frame
     if (set < 0) {
         rt_log("resolution: the generated C has no cascade patch set; shadow_range stays 100");
         return;
@@ -325,11 +337,35 @@ static void res_shadow_range(void) {
     rt_log("resolution: shadow cascades end at %g, %g, %g and %g m", d[0], d[1], d[2], d[3]);
 }
 
+// Ocarina sets its sun cascades up every frame from its data, three of them. With its cascade set
+// (recomp/patches-v111.txt) the distance each cascade after the first begins at and the far distance are multiplied by
+// the float in the patch page, which this keeps at NX2NAVI_SHADOW_RANGE: the setting acts at once.
+enum { PAGE_SHADOW_RANGE = 0x850 };
+
+void res_shadow_frame(void) {
+    static int set = -2, logged = -1;
+    if (set == -2) set = RT_V111 ? rt_patch_set("cascade") : -1;
+    if (set < 0) return;
+    int pct = cfg_int("NX2NAVI_SHADOW_RANGE");
+    pct = pct < 50 ? 50 : pct > 400 ? 400 : pct;
+    if (logged == pct) return;
+    logged = pct;
+    float k = (float)pct / 100.0f;
+    memcpy((uint8_t *)rt_patch_page() + PAGE_SHADOW_RANGE, &k, sizeof k);
+    rt_log("resolution: sun shadow cascade distances x%g", (double)k);
+}
+
+// The sun shadow settings all act: Ocarina's build with its shadow and cascade sets (the menu's Shadows group).
+int res_shadows_available(void) { return RT_V111 && rt_patch_set("shadow") >= 0 && rt_patch_set("cascade") >= 0; }
+
 void res_init(void) {
     res_shadow_range();
+    res_shadow_frame();   // the factor is in the page before the game's first frame
     if (!res_adjustable()) {
         rt_log("resolution: the game's own (this build has no output and scene patch sets; output_res and render_scale "
                "do nothing)");
+        decide();
+        shadow_init(rt_patch_page());   // Ocarina has the shadow set
         return;
     }
     if (!bigger()) {

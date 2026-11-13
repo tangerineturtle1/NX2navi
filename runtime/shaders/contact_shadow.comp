@@ -11,7 +11,7 @@ layout(push_constant) uniform Params {
     vec4 proj;    // projection x scale, y scale, far plane, strength (0..1)
     vec4 light;   // view-space direction toward the sun (xyz), march length in metres at 10 m (w)
     vec4 size;    // width, height, 1/width, 1/height
-    vec4 opt;     // x: debug (1: write the shadow factor as grey)
+    vec4 opt;     // x: debug (1: write the shadow factor as grey); y: the frame's index in the noise sequence
 } pc;
 
 vec3 view_pos(vec2 uv, float z) {   // z: distance in front of the camera
@@ -24,7 +24,11 @@ vec2 to_uv(vec3 p) {
     return vec2(0.5 + 0.5 * p.x * pc.proj.x / z, 0.5 - 0.5 * p.y * pc.proj.y / z);
 }
 
-float ign(vec2 px) {   // interleaved gradient noise: a per-pixel start offset that hides the step pattern
+// Interleaved gradient noise: a per-pixel start offset that hides the step pattern. Where a surface curves away from
+// the sun (an arm, a leg) the offset decides whether the march hits the surface itself, which shows as a pattern of dots.
+// With a temporal upscaler running the offsets move every frame (opt.y) and its accumulation averages them.
+float ign(vec2 px) {
+    px += 5.588238 * pc.opt.y;
     return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
 }
 
@@ -32,6 +36,10 @@ void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
     float d = texelFetch(lin_depth, px, 0).x;
+    if (pc.opt.x > 1.5) {   // debug: the depth, 50 m to white
+        imageStore(scene, px, vec4(vec3(d * pc.proj.z / 50.0), 1.0));
+        return;
+    }
     if (d <= 0.0 || d >= 0.999) return;   // nothing drawn, or the sky
     float z = d * pc.proj.z;
     if (z > 80.0) return;

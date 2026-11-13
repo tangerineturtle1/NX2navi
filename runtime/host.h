@@ -376,6 +376,9 @@ uint64_t wide_heap_extra_kib(void);                        // the texture heap's
 // The most res_heap_extra_kib may be (memory.c): with more the application pool passes the heap region and the
 // game's own SetHeapSize is refused. A whole number of 2 MiB.
 uint64_t mem_heap_extra_max_kib(void);
+void res_shadow_frame(void);                               // every frame: NX2NAVI_SHADOW_RANGE to Ocarina's cascades
+int res_shadows_available(void);                           // Ocarina's shadow and cascade patch sets are there
+uint64_t res_shadow_heap_kib(void);                        // Ocarina's texture heap growth for a larger sun shadow map
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 float res_dlss_lod_bias(void);                             // NX2NAVI_DLSS upscaling: texture LOD bias (<= 0)
 int res_dlss_mode(const char *mode);                       // NX2NAVI_DLSS changed while running: new scene size
