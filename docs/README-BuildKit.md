@@ -150,6 +150,10 @@ are not needed), installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
 beside the game.
 
+In the AppImage window, missing dependencies are named with an install command for Arch, Fedora or Debian-based
+distributions. Details displays the saved or current build log inside the setup, with scrolling and Copy. Open in
+editor optionally opens the log with the system's default application; launch failures are shown in the log window.
+
 ## Playing
 
 - **F1** opens the settings menu. Settings are saved in `nx2navi.ini` beside the game; saves go to `profile\`.
