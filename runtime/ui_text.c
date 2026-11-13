@@ -348,11 +348,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                  "Hold: Link sprints while the button is held.",
     [UI_MENU_SPRINT_TOGGLE] = "Toggle", [UI_MENU_SPRINT_HOLD] = "Hold",
     [UI_MENU_MINIMAP] = "Minimap",
-    [UI_MENU_MINIMAP_DESC] = "Hides the minimap and leaves the rest of the interface as the In-Game Interface option "
-                             "has it. The pause menu's map is unchanged.",
-    [UI_MENU_MINIMAP_SHOWN] = "Shown", [UI_MENU_MINIMAP_HIDDEN] = "Hidden",
+    [UI_MENU_MINIMAP_DESC] = "Shows or hides the minimap whatever the In-Game Interface option does with it, so Pro "
+                             "can have a minimap and Normal can go without. The rest of the interface and the pause "
+                             "menu's map are unchanged.",
+    [UI_MENU_MINIMAP_GAME] = "As the interface option", [UI_MENU_MINIMAP_SHOWN] = "Shown", [UI_MENU_MINIMAP_HIDDEN] = "Hidden",
     [UI_MENU_MINIMAP_BUTTON] = "Minimap button",
-    [UI_MENU_MINIMAP_BUTTON_DESC] = "A button that shows or hides the minimap during gameplay. In menus and "
+    [UI_MENU_MINIMAP_BUTTON_DESC] = "A button that shows or hides the minimap during gameplay, starting from what is on the screen. In menus and "
                                     "cutscenes it does what the game gives it; during gameplay the game does not "
                                     "get it.",
     [UI_MENU_MINIMAP_OFF] = "Off", [UI_MENU_MINIMAP_DOWN] = "D-pad down",

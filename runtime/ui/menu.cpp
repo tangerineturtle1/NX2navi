@@ -1697,9 +1697,9 @@ static void tab_controls(float scale) {
     }
     // The minimap (minimap.c), where the game version has the patch set minimap; both rows are live, in cfg.c order.
     if (minimap_available()) {
-        static const UiTextId minimap[] = {UI_MENU_MINIMAP_SHOWN, UI_MENU_MINIMAP_HIDDEN};
+        static const UiTextId minimap[] = {UI_MENU_MINIMAP_GAME, UI_MENU_MINIMAP_SHOWN, UI_MENU_MINIMAP_HIDDEN};
         static const UiTextId minimap_button[] = {UI_MENU_MINIMAP_OFF, UI_MENU_MINIMAP_DOWN};
-        opt_choice("NX2NAVI_MINIMAP", UI_MENU_MINIMAP, minimap, 2, UI_MENU_MINIMAP_DESC);
+        opt_choice("NX2NAVI_MINIMAP", UI_MENU_MINIMAP, minimap, 3, UI_MENU_MINIMAP_DESC);
         opt_choice("NX2NAVI_MINIMAP_BUTTON", UI_MENU_MINIMAP_BUTTON, minimap_button, 2, UI_MENU_MINIMAP_BUTTON_DESC);
     }
     opt_slider("NX2NAVI_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");

@@ -1,22 +1,27 @@
-// Minimap toggle for Ocarina of Time 1.1.1: a setting that hides the minimap (and nothing else of the interface), and
-// a button that switches it during gameplay (the patch set minimap, recomp/patches-v111.txt).
+// Minimap toggle for Ocarina of Time 1.1.1: a setting that shows or hides the minimap whatever the In-Game Interface
+// option does with it (Normal shows it, Pro and Master do not), and a button that switches it during gameplay (the
+// patch set minimap, recomp/patches-v111.txt).
 //
 // The minimap is the screen MapMenu_00 (class UIMapMenuScreen, vtable main+0x4be8300) in its small form: the game
 // finds it through the screen manager **[main+0x4c7e098] by the MurmurHash3 of its name (main+0xb25cd0), and the
-// pause menu's map is the same screen in its large form. SeqOneShotOpenMapMenu (main+0x32d8a30) writes which form it
-// opens at +0x2350 (its IsMiniMap, 1 for the minimap) before it asks the screen to open. A screen's +0x1a8 is whether it
-// is drawn: the game's own SeqOneShotSetScreenVisible (main+0x17c4b0) only writes that byte, and leaves the screen's
-// state (+0x1a6: closed, opening, open, closing) and requests (+0x1a5) alone. So hiding the minimap writes 0 there
-// while the screen is in its small form, and the screen keeps opening and closing as the game asks: nothing that
-// waits for the screen to open, or reads its state, sees a difference. The pause menu's map (+0x2350 = 0) is never
-// touched, and the byte goes back to 1 when the minimap is shown again or the screen is the map, only where this file
-// wrote the 0.
+// pause menu's map is the same screen in its large form. SeqOneShotOpenMapMenu (main+0x32d8a30) writes the form at
+// +0x2350 (its IsMiniMap, 1 for the minimap) and +0x2354 (its IsDirect), then asks the screen to open: vtable +0x28
+// with 3 (main+0x4b6100, which only raises the request byte +0x1a5); closing is vtable +0x30 with -4. The screen's
+// state is +0x1a6 (0 closed, 1 opening, 2 open, 3 closing). Its +0x1a8 is whether it is drawn: the game's own
+// SeqOneShotSetScreenVisible (main+0x17c4b0) only writes that byte.
 //
-// Settings (live): minimap (shown or hidden); minimap_button (off, or down: the D-pad's down) switches minimap and
-// saves it. The press counts only during gameplay, while Link's movement update runs (the set's site at the top of
-// main+0x4aaa80 calls minimap_link): a menu, a cutscene or a load stops that update, so the button keeps its own role
-// there. During gameplay the press is kept from the game until it is released, so it does not also do what the game
-// gives it.
+// hidden: while the screen is in its small form its drawn byte is 0, so it still opens and closes as the game asks
+// and nothing that waits for it sees a difference; the pause menu's map (+0x2350 = 0) is never touched.
+// shown: the drawn byte is 1 while the screen is the minimap, and when the game leaves the screen closed during
+// gameplay (the Pro interface never opens it) this file opens it in its small form as SeqOneShotOpenMapMenu does.
+// It does so only after the screen has stayed closed through REOPEN_POLLS polls in a row of gameplay, so a screen the
+// game closes on its way into a menu, a cutscene or a load (which stop Link's update) is not opened behind it.
+// game: the game decides, and only what this file changed is put back.
+//
+// Settings (live): minimap (game, shown or hidden); minimap_button (off, or down: the D-pad's down) switches between
+// shown and hidden, starting from what is on the screen, and saves it. The press counts only during gameplay, while
+// Link's movement update runs (the set's site at the top of main+0x4aaa80 calls minimap_link); during gameplay it is
+// kept from the game until it is released, so it does not also do what the game gives it.
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -35,30 +40,39 @@
 #define MAP_SCREEN_HASH 0xc3332ad4u    // MurmurHash3 of "MapMenu_00"
 #define MAP_SCREEN_VTABLE 0x4be8300ull
 #define LINK_VTABLE 0x4b4dfc0ull       // Link's actor class
-enum { SCR_VISIBLE = 0x1a8, MAP_IS_MINI = 0x2350 };
+enum { SCR_REQUEST = 0x1a5, SCR_STATE = 0x1a6, SCR_VISIBLE = 0x1a8, MAP_IS_MINI = 0x2350, MAP_IS_DIRECT = 0x2354 };
+enum { VT_OPEN = 0x28, VT_CLOSE = 0x30 };
+enum { ST_CLOSED, ST_OPENING, ST_OPEN, ST_CLOSING };
+enum { MODE_GAME, MODE_SHOWN, MODE_HIDDEN };
 
 #define BUTTON_DOWN (1u << 15)         // HidNpadButton Down
 #define GAMEPLAY_POLLS 8               // a press counts while Link's update ran within this many polls
+#define REOPEN_POLLS 20                // shown: polls of gameplay with the screen closed before it is opened
 
 static _Atomic int polls = GAMEPLAY_POLLS;   // polls since Link's last movement update (none yet: not gameplay)
 static int latched;                          // the press now held began in gameplay: kept from the game
 static int last_held;
-static uint64_t hid_screen;                  // the screen whose +0x1a8 this file set to 0, or 0
+static uint64_t drawn_screen;                // the screen whose drawn byte this file changed, or 0
+static uint8_t drawn_was;                    // ... and what it was before
+static int closed_polls;                     // shown: gameplay polls in a row with the screen closed
+static int opened;                           // shown: this file opened the screen (log only)
 
 static uint64_t rd64(uint64_t a) { return a ? *(const uint64_t *)(uintptr_t)a : 0; }
+static uint8_t rd8(uint64_t a) { return *(const volatile uint8_t *)(uintptr_t)a; }
+static void wr8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
 
 static int setting_button(void) {
     const char *v = cfg_value("NX2NAVI_MINIMAP_BUTTON");
     return v && !strcmp(v, "down");
 }
 
-static int setting_hidden(void) {
+static int setting_mode(void) {
     const char *v = cfg_value("NX2NAVI_MINIMAP");
-    return v && !strcmp(v, "hidden");
+    return !v ? MODE_GAME : !strcmp(v, "shown") ? MODE_SHOWN : !strcmp(v, "hidden") ? MODE_HIDDEN : MODE_GAME;
 }
 
-// Whether the set may run, read once after the start (NX2NAVI_MINIMAP_PATCH=0, or a mod whose code patches the same
-// site, leaves it off; switching it on later must not undo that).
+// Whether the set may run, read once after the start (NX2NAVI_MINIMAP_BUTTON_PATCH=0, or a mod whose code patches
+// the same site, leaves it off; switching it on later must not undo that).
 static _Atomic int allowed = -1;
 static int minimap_set(void) { return rt_patch_set("minimap"); }
 int minimap_available(void) {
@@ -79,6 +93,25 @@ static uint64_t map_screen(Cpu *c) {
     return s && rd64(s) == MOD_MAIN_BASE + MAP_SCREEN_VTABLE ? s : 0;
 }
 
+// Open or opening without a close asked for, or a request to open pending.
+static int screen_up(uint64_t s) {
+    int st = rd8(s + SCR_STATE), req = (int8_t)rd8(s + SCR_REQUEST);
+    return req > 0 || ((st == ST_OPENING || st == ST_OPEN) && req >= 0);
+}
+
+// The minimap is on the screen: up, in its small form and drawn.
+static int minimap_seen(uint64_t s) { return s && screen_up(s) && rd8(s + MAP_IS_MINI) && rd8(s + SCR_VISIBLE); }
+
+static void set_drawn(uint64_t s, uint8_t v) {
+    if (rd8(s + SCR_VISIBLE) == v) return;
+    if (!drawn_screen) drawn_screen = s, drawn_was = rd8(s + SCR_VISIBLE);
+    wr8(s + SCR_VISIBLE, v);
+}
+static void restore_drawn(uint64_t s) {
+    if (drawn_screen && drawn_screen == s) wr8(s + SCR_VISIBLE, drawn_was);
+    drawn_screen = 0;
+}
+
 void minimap_pad(Cpu *c, uint64_t *buttons) {
     if (!RT_V111) return;
     int avail = minimap_available(), button = avail && setting_button();
@@ -86,32 +119,54 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
 
     int n = atomic_load(&polls), gameplay = n < GAMEPLAY_POLLS;
     if (n <= GAMEPLAY_POLLS) atomic_store(&polls, n + 1);
+    int mode = setting_mode();
+    uint64_t s = 0;
+    int looked = 0;
+
     int held = button && buttons && (*buttons & BUTTON_DOWN);
     if (held && !last_held && gameplay) {
         latched = 1;
-        cfg_set("NX2NAVI_MINIMAP", setting_hidden() ? "shown" : "hidden");
+        if (mode == MODE_GAME) s = map_screen(c), looked = 1;
+        mode = mode == MODE_SHOWN || (mode == MODE_GAME && minimap_seen(s)) ? MODE_HIDDEN : MODE_SHOWN;
+        cfg_set("NX2NAVI_MINIMAP", mode == MODE_SHOWN ? "shown" : "hidden");
         cfg_save();
+        closed_polls = REOPEN_POLLS;   // a press shows it at once when the screen is closed
     }
     if (!held) latched = 0;
     last_held = held;
     if (latched && buttons) *buttons &= ~(uint64_t)BUTTON_DOWN;
 
-    // The drawn byte: 0 while hidden and the screen is the minimap, back to 1 where this file wrote the 0. Nothing is
-    // looked up while the minimap is shown and was never hidden here.
-    int hidden = setting_hidden();
-    if (!hidden && !hid_screen) return;
-    uint64_t s = map_screen(c);
-    volatile uint8_t *vis = s ? (volatile uint8_t *)(uintptr_t)(s + SCR_VISIBLE) : 0;
-    if (hid_screen && hid_screen != s) hid_screen = 0;   // the screen is gone or another: nothing of ours is left
+    // Nothing is looked up while the game decides and nothing of this file is left on the screen.
+    if (mode == MODE_GAME && !drawn_screen) return;
+    if (!looked) s = map_screen(c);
+    if (drawn_screen && drawn_screen != s) drawn_screen = 0;   // the screen is gone or another
     if (!s) return;
-    int mini = *(const volatile uint8_t *)(uintptr_t)(s + MAP_IS_MINI) != 0;
-    if (hidden && mini) {
-        if (*vis) *vis = 0;
-        hid_screen = s;
-    } else if (hid_screen) {
-        *vis = 1;
-        hid_screen = 0;
+    int mini = rd8(s + MAP_IS_MINI) != 0;
+    if (mode == MODE_GAME || !mini) {   // the game's, or the pause menu's map: as the game left it
+        restore_drawn(s);
+        closed_polls = 0;
+        return;
     }
+    if (mode == MODE_HIDDEN) {
+        set_drawn(s, 0);
+        closed_polls = 0;
+        return;
+    }
+    // shown
+    set_drawn(s, 1);
+    if (screen_up(s) || !gameplay) {
+        closed_polls = 0;
+        return;
+    }
+    // Link's update runs once between two pad reads during gameplay, so a read after none (the first of a menu, or a
+    // second read in one frame) does not count, and neither breaks the run of polls yet.
+    if (n > 0) return;
+    if (++closed_polls < REOPEN_POLLS) return;
+    closed_polls = 0;
+    wr8(s + MAP_IS_MINI, 1);
+    wr8(s + MAP_IS_DIRECT, 0);
+    rt_call(c, rd64(rd64(s) + VT_OPEN), 2, s, (uint64_t)3);
+    if (opened++ < 20) rt_log("minimap: opened the minimap the game left closed (state %d)", rd8(s + SCR_STATE));
 }
 
 // main+0x4aaabc, after ldr x21, [x0, #0x18] at the top of Link's movement update: x0 is the actor.
