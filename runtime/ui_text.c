@@ -317,7 +317,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SPRINT_BUTTON] = "Sprint button",
     [UI_MENU_SPRINT_BUTTON_DESC] = "A button that makes Link sprint without rolling first. L3, the left stick's "
                                    "click, has no other use. The game's B button sprints only while Link moves and "
-                                   "attacks as usual otherwise.",
+                                   "puts the weapon away as usual otherwise.",
     [UI_MENU_SPRINT_OFF] = "Off", [UI_MENU_SPRINT_B] = "Bottom button (Nintendo B)",
     [UI_MENU_SPRINT_L3] = "L3 (left stick)",
     [UI_MENU_SPRINT_MODE] = "Sprint mode",

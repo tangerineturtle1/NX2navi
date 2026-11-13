@@ -172,7 +172,7 @@ int main(int argc, char **argv) {
         assert(!dashing());
     }
 
-    // toggle on the bottom button: a sword press while not moving reaches the game and starts nothing
+    // toggle on the bottom button: a press while not moving (put the weapon away) reaches the game and starts nothing
     reset("b", "toggle");
     assert(frame(BB, WAIT_ID, link) == BB && !dashing());
     frame(0, WALK, link);   // Link moves: from the next poll the button is the sprint's
@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
     frame(BB, WALK, link);
     assert(!dashing() && poll_buttons == 0);
     frame(0, ATTACK, link);
-    assert(frame(BB, ATTACK, link) == BB && !dashing());   // not moving: an attack as usual
+    assert(frame(BB, ATTACK, link) == BB && !dashing());   // not moving: the button keeps its own job
 
     // hold on L3: sprint while held; L3 never reaches the game during play, other buttons do
     reset("l3", "hold");

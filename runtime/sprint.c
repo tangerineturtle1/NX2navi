@@ -7,7 +7,7 @@
 // layout, or l3 the left stick's click, which has no other use); sprint_mode is toggle (a press starts the sprint, the
 // next press or Link's state ends it) or hold (sprint while the button is held). During gameplay the button is kept
 // from the game (sprint_pad, called by ov_input.c npad_states), so it does not also fire its own action. B is kept only
-// while Link moves (Walk, Jump, Land, Fall, Clamber), so it attacks as usual otherwise.
+// while Link moves (Walk, Jump, Land, Fall, Clamber), so it puts the weapon away as usual otherwise.
 //
 // Link's state: the id at [[[[Link +0x18] +0x270] +0x188] +0x1c0] +0x28 (+0x4c when that reads 0x11a, a state that
 // wraps another), the same field main+0x4aed50 compares with 1 (Walk) before the game starts a sprint.
