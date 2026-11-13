@@ -4574,6 +4574,10 @@ static void overwrite_others(const Tex *e, uint64_t fr) {
         uint64_t qlo = q->key.addr, qhi = qlo + q->t.L.size;
         if (q->overwritten || qlo == lo || qhi <= lo || (lo >= qlo && hi <= qhi)) continue;
         if (fr - q->gw_frame < OVERWRITE_FRAMES) continue;
+        // An entry no draw ever wrote is not a moved render target. The game fills a pair of 1120x630 R8 targets
+        // another way, leaves them for some hundred frames and takes them back (Kokiri Forest): destroyed in
+        // between, they came back empty and the lit ground was dark for one frame.
+        if (!q->pub.gpu_owned) continue;
         q->overwritten = 1, q->ow_frame = fr;
         n_overwritten++;
         if (!q->released) mark_released(q), released = 1;
