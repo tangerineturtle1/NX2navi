@@ -279,7 +279,8 @@ folder can be deleted; `ocarina --warm-shaders` fills it again.
 
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,
 re-protecting imported memory invalidates the driver's userptr buffer on every submit (about 1.3 ms per 16 MiB on
-amdgpu), and importing pins the pages, which drops their write protection. Each CPU-visible pool therefore gets a
+amdgpu), and importing pins the pages, which drops their write protection. Where guest memory cannot be imported as
+dma-bufs (below), each CPU-visible pool therefore gets a
 host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wrote go in before each submit, and the GPU's
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
@@ -294,6 +295,30 @@ imports instead (`NX2NAVI_SHADOW=1` brings the copies back): it imports guest me
 copies are only the slower path. In Kokiri Forest on 0.7.1 (RTX 4090, driver 615.78), imports with VRAM mirrors ran at
 51.9 frames a second and the copies at 27.4; on that version the copies also flickered between two looks almost every
 frame, which the wait for the write-backs under shadow storage (`vk_sync_exec_wait`) has since addressed.
+
+On Linux the pools are imports after all where the system allows dma-bufs of guest memory (`runtime/platform/linux.c`,
+"Guest memory as a memfd's"; `runtime/vk_memory.c`, "dma-buf imports"). The watched reservations are then shared
+mappings of one memfd, `/dev/udmabuf` makes dma-bufs of page ranges of it, and the device imports those
+(`VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`). A dma-buf pins its pages once and is not tied to the
+process's page tables, so the write watch and the freezes leave the GPU's mapping alone, and nothing is copied. RADV
+puts every imported memory object into every submission (about 0.6 us each), and the game keeps over 4,000 pools, so
+pools share their imports: guest addresses are cut into spans of 64 MiB (`NX2NAVI_DMABUF_MB`), and a pool is a buffer
+bound into its span's memory at its offset. A new span is cut back at the spans already there, so spans overlap only
+where a pool itself lies across an older span's edge: amdgpu counts every span's pages in its GTT use, an overlap twice.
+A span pins all of its pages, those the game never touched included, until some frames after its last pool is gone. It
+takes `/dev/udmabuf` readable and writable by the player (recent systemd gives it to the logged-in user with its
+`uaccess` tag; elsewhere it is often `root` and group `kvm` only), udmabuf's `size_limit_mb`
+(`/sys/module/udmabuf/parameters/size_limit_mb`) at 1024 or more, since the largest pools need about 300 MiB in one
+dma-buf (where it is lower, `udmabuf.size_limit_mb=1024` on the kernel command line raises it), a device with both
+extensions, and NVIDIA's kernel module not loaded: NVIDIA's own driver imports host pointers without amdgpu's cost, as
+above. A start-up probe imports one page of guest memory as the pools will be; where anything is missing or refused, the
+pools keep their shadow copies and the log says why (`mem: dma-buf imports off`, `mem: guest memory is not a memfd's`).
+`NX2NAVI_DMABUF=0` keeps the copies, and `NX2NAVI_DMABUF=1` makes guest memory a memfd's even where NVIDIA's module is
+loaded; both only from the environment, since the reservations are made before `nx2navi.ini` is read. `NX2NAVI_SHADOW=1`
+still forces the copies. In Kokiri Forest (1.1.1, RX 6800 XT, Mesa 26.2) the imports ran at 60.7 frames a second and the
+copies at 40.3, in Hyrule Field at 55.7 and 42.4; the spans then held 8.0 to 9.6 GiB, and amdgpu counted 8.6 to 10.1 GiB
+of its 15.8 GiB host heap in use, against 5.2 to 5.6 GiB with the copies, which are memory of their own beside guest
+memory.
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
@@ -315,12 +340,13 @@ write-backs landed on pages the CPU had written since their copy-in, and what th
 plain CPU write and a guest submission that does not bind the table, and hold the written `0x2468ACE0` after one that
 does; and with `NX2NAVI_SHADOW_TABLE_STORES=1` the store: a GPU
 write into a shadow page that nothing notes must survive the CPU's writes of that page and reach guest memory. On
-Linux, run it for each backing:
+Linux, run it for each backing (with `NX2NAVI_DMABUF=1` and `NX2NAVI_SHADOW=0` the pools are dma-buf imports, with
+`NX2NAVI_DMABUF=0` and `NX2NAVI_SHADOW=0` host-pointer imports):
 
 ```sh
-for shadow in 0 1; do for memory in import mirror; do
-    NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
-done; done
+for dmabuf in 0 1; do for shadow in 0 1; do for memory in import mirror; do
+    NX2NAVI_DMABUF=$dmabuf NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
+done; done; done
 ```
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
