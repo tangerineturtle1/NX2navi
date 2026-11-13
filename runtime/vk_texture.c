@@ -3533,8 +3533,9 @@ static void upload(Tex *e) {
     }
     int check = bc1 || try1;
     // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
-    // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
-    // takes the raw blocks of every region from one buffer.
+    // records one copy per buffer into the open upload batch (vk_upload_end may submit a batch that holds much staging
+    // between two parts; queue order and the barriers keep them in order). The GPU decoder takes the raw blocks of
+    // every region from one buffer.
     for (uint32_t k0 = 0, k1; k0 < n; k0 = k1) {
         VkDeviceSize base = rg[k0].bufferOffset, size;
         for (k1 = k0 + 1; k1 < n && (agpu || (k1 + 1 < n ? rg[k1 + 1].bufferOffset : total) - base <= UPLOAD_PART);) k1++;
