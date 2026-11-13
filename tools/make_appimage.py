@@ -171,7 +171,6 @@ Name=NX2navi
 Comment=Build Ocarina of Time natively for Linux from your own dump
 Exec=AppRun
 Icon=nx2navi
-Terminal=true
 Categories=Game;
 '''
 
