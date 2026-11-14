@@ -5,8 +5,8 @@
 //   full     cfg_load on the file, then two cfg_set of keys the file does not have
 //   read     cfg_load on the file and cfg_init's check of the environment; then what cfg_get, cfg_bool and cfg_int give
 //            for a list of keys
-//   lowend   cfg_load on the file and cfg_init; then whether the low-end mode is on (cfg.c lowend_of, which reads its
-//            switch apart from cfg_get), what cfg_bool gives for its switch and what one of the mode's keys reads
+//   lowend   cfg_load on the file and cfg_init; then what cfg_bool gives for the switch of the low-end GPU mode,
+//            which is gone (cfg.c lowend_set), what two of the mode's keys read and the default of one of them
 //   norow    cfg_int and cfg_double of a key without a row whose value (the environment's) does not parse
 #include <stdarg.h>
 #include <stdint.h>
@@ -106,9 +106,9 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "lowend")) {
         if (!cfg_load(ini)) return printf("cfg_load failed\n"), 2;
         cfg_init();
-        const char *mesh = cfg_get("NX2NAVI_MESH_EMULATION");
-        printf("got: low_end %d bool %d mesh_emulation '%s'\n", cfg_low_end_active(), cfg_bool("NX2NAVI_LOW_END_GPU"),
-               mesh ? mesh : "(unset)");
+        const char *mesh = cfg_get("NX2NAVI_MESH_EMULATION"), *res = cfg_get("NX2NAVI_VRAM_RESERVE_MB");
+        printf("got: bool %d mesh_emulation '%s' vram_reserve_mb '%s' default '%s'\n", cfg_bool("NX2NAVI_LOW_END_GPU"),
+               mesh ? mesh : "(unset)", res ? res : "(unset)", cfg_default("NX2NAVI_VRAM_RESERVE_MB"));
         return 0;
     }
     if (!strcmp(argv[1], "norow")) {

@@ -99,98 +99,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TEX_DETAIL_DESC] = "Sharpness of large surface textures. Reduced and Low leave out their largest versions, so that an area fits the video memory of 6 and 8 GB cards; only surfaces seen up close look softer. Automatic picks by the card's video memory.",
     [UI_MENU_TEX_DETAIL_AUTO] = "Automatic: %s",
     [UI_MENU_TEX_DETAIL_FULL] = "Full", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduced", [UI_MENU_TEX_DETAIL_LOW] = "Low",
-    [UI_MENU_LOWEND_INTRO] = "The settings of the low-end GPU mode. Each can be changed here; most take effect after a restart.",
-    [UI_MENU_LOWEND_RESTART] = "The mode turns on after a restart. Its settings are listed here then.",
-    [UI_MENU_LOWEND_NOT_FOR_CARD] = "Not for this graphics card: it has mesh shaders and 8 GB of video memory or more. "
-                                    "The mode is for older cards and can break shadows on this one.",
-    [UI_MENU_LOWEND_MEMORY] = "Video memory and textures",
-    [UI_MENU_LOWEND_RENDER] = "Rendering",
-    [UI_MENU_LOWEND_BUILD] = "Build",
-    [UI_MENU_LOWEND_DIAG] = "Diagnostics",
-    [UI_MENU_LOWEND_RELEASED] = "Released textures kept",
-    [UI_MENU_LOWEND_RELEASED_DESC] = "How many textures the game has released are kept as they are; past it only those that "
-                                   "lose nothing when dropped go. Fewer leaves more video memory for the rest; more "
-                                   "saves making them again; too few lets some blink black for a moment. Auto: one per 2 MB "
-                                   "of the video memory budget, 2048 to 8192.",
-    [UI_MENU_LOWEND_CLOBBER] = "Fix overwritten textures",
-    [UI_MENU_LOWEND_CLOBBER_DESC] = "A texture the game reads after another image was drawn over its memory gets memory of "
-                                  "its own. Fixes the teal splotches in Kokiri Forest's fog.",
-    [UI_MENU_LOWEND_MIRROR_HOT] = "Pools copied every frame stay in system memory",
-    [UI_MENU_LOWEND_MIRROR_HOT_DESC] = "A game memory pool whose copies to and from video memory each frame reach this "
-                                     "percentage of its size is read by the GPU from system memory instead, if the "
-                                     "CPU does not write it (a pool it refills each frame stays in video memory: read "
-                                     "in place, the GPU saw the next frame's data). For GPUs and buses short of "
-                                     "bandwidth; 25 suits an RX 580. 0: off.",
-    [UI_MENU_LOWEND_RESERVE] = "Video memory kept free",
-    [UI_MENU_LOWEND_RESERVE_DESC] = "Room kept free in each video memory heap for what FidelityFX (FSR 3.1, frame generation) and the "
-                                  "driver allocate on their own: a heap with less than this left takes no new allocation while "
-                                  "another video memory heap can (an RX 580 has two; cards with one are not affected). Off: video "
-                                  "memory can fill up with frame generation on, and the game ends.",
-    [UI_MENU_LOWEND_HEAP_LIMIT] = "Video memory heap limit",
-    [UI_MENU_LOWEND_HEAP_LIMIT_DESC] = "Auto: on GPUs with a second video memory heap (an RX 580 shows 6 GB and 2 GB), "
-                                     "each heap is filled only to its budget before the next one is used, so the "
-                                     "driver does not run out. Off: no limit.",
-    [UI_MENU_LOWEND_UPLOAD_BATCH] = "Upload batch limit",
-    [UI_MENU_LOWEND_UPLOAD_BATCH_DESC] = "Texture uploads waiting in staging memory are sent to the GPU early once they "
-                                       "hold this much, so an area load cannot run video memory out. Every batch is "
-                                       "sent at 64 MB at the latest, so none of these choices changes anything now.",
-    [UI_MENU_LOWEND_NO_LIMIT] = "64 MB",
-    [UI_MENU_LOWEND_ASTC_KEEP] = "Keep the ASTC decode buffer",
-    [UI_MENU_LOWEND_ASTC_KEEP_DESC] = "The buffer that GPU-decodes compressed textures is kept between upload batches "
-                                    "instead of being allocated again for each one.",
-    [UI_MENU_LOWEND_MESH_EMU] = "Mesh shader emulation",
-    [UI_MENU_LOWEND_MESH_EMU_DESC] = "Draws grass, moss and other foliage on GPUs without mesh shaders (AMD RX 400/500 "
-                                   "and Vega, GTX 10-series and older), with compute shaders. GPUs with mesh shaders "
-                                   "ignore it.",
-    [UI_MENU_LOWEND_MESH_NATIVE] = "this GPU has mesh shaders",
-    [UI_MENU_LOWEND_MESH_MB] = "Mesh emulation memory",
-    [UI_MENU_LOWEND_MESH_MB_DESC] = "Video memory for the emulated meshes' vertices and indices, in MB.",
-    [UI_MENU_LOWEND_MESH_BATCH] = "Mesh emulation before the pass",
-    [UI_MENU_LOWEND_MESH_BATCH_DESC] = "The emulated mesh stages of a render pass run before the pass in a command buffer "
-                                     "of their own, instead of splitting the pass at every emulated draw. Off: the "
-                                     "split, as before.",
-    [UI_MENU_LOWEND_MESH_TASKS] = "Mesh emulation task records",
-    [UI_MENU_LOWEND_MESH_TASKS_DESC] = "Task records per submission for the emulated meshes. Raise it when the log reports "
-                                     "that a submission asked for more.",
-    [UI_MENU_LOWEND_VEC_INDEX] = "Vector index fix",
-    [UI_MENU_LOWEND_VEC_INDEX_DESC] = "Shaders read uniform vector components at computed indices whole and select the "
-                                    "component, for drivers that get such reads wrong. Auto: on AMD's own drivers.",
-    [UI_MENU_LOWEND_VEC_AUTO] = "Auto (AMD)",
-    [UI_MENU_LOWEND_GUEST_OPT] = "Optimised game code (-O2)",
-    [UI_MENU_LOWEND_GUEST_OPT_DESC] = "The next Rebuild the Game in the launcher compiles the game's code at -O2 instead "
-                                    "of -O1: the game's own threads run faster on a slower CPU. The build takes "
-                                    "several times longer.",
-    [UI_MENU_LOWEND_GUEST_OPT_NOTE] = "at the next rebuild",
-    [UI_MENU_LOWEND_FREEZE] = "Freeze idle memory after",
-    [UI_MENU_LOWEND_FREEZE_DESC] = "Submissions a memory region stays unwritten before it is made read-only, so the write "
-                                 "tracking can skip it. 1800 (about 15 s): few thaws and small tracking queries. 60: "
-                                 "the game thaws regions all the time and every thaw stalls a frame. Off: no stalls, but "
-                                 "the tracking scans all memory every frame.",
-    [UI_MENU_LOWEND_FOLIAGE] = "Foliage",
-    [UI_MENU_LOWEND_FOLIAGE_DESC] = "Full: all of it. Reduced: no small grass or moss on the ground; ferns, leaves and "
-                                  "other plants stay. Off: no foliage. Terrain, rocks and buildings always stay.",
-    [UI_MENU_LOWEND_FOLIAGE_FULL] = "Full",
-    [UI_MENU_LOWEND_FOLIAGE_REDUCED] = "Reduced",
-    [UI_MENU_LOWEND_RESULTS] = "Wait for GPU results",
-    [UI_MENU_LOWEND_RESULTS_DESC] = "After a frame's first submission the game waits until the GPU wrote the results it "
-                                  "reads back. All: events, counter and occlusion reports, write-backs. Without events: "
-                                  "a shorter wait; on an RX 580 nothing flickered.",
-    [UI_MENU_LOWEND_RESULTS_ALL] = "All",
-    [UI_MENU_LOWEND_RESULTS_NO_EVENTS] = "Without events",
-    [UI_MENU_LOWEND_ZSTD] = "Native data decompression",
-    [UI_MENU_LOWEND_ZSTD_DESC] = "Decompresses the game's zstd data with the PC's libzstd instead of the game's own "
-                               "decoder translated from the console. Lighter streaming while you move.",
-    [UI_MENU_LOWEND_ASYNC] = "Asynchronous replay",
-    [UI_MENU_LOWEND_ASYNC_DESC] = "Translates the game's GPU commands on a thread of their own instead of the game's, so "
-                                "the game prepares the next frame meanwhile. Off by default: it can show a dark or "
-                                "flickering frame now and then.",
-    [UI_MENU_LOWEND_PASS_TIMES] = "Pass times in the log",
-    [UI_MENU_LOWEND_PASS_TIMES_DESC] = "GPU time of every render pass and dispatch goes to the log, with the largest "
-                                     "viewport each kind of pass draws with. Costs a little frame time.",
-    [UI_MENU_LOWEND_DUMP_KEY] = "Frame dump key",
-    [UI_MENU_LOWEND_DUMP_KEY_DESC] = "Each press of this key in the game window dumps the next frame (images and the "
-                                   "frame's passes) to the dump folder, for a glitch caught while it is on screen. "
-                                   "Windows only.",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "How sharp FSR makes the picture. 0 turns it off.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "only with AMD FSR 1 or FSR 3.1",
@@ -503,11 +411,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Status: %s",
     [UI_MENU_MENU_LANG] = "Menu language", [UI_MENU_MENU_LANG_DESC] = "Language of this menu and the overlay.",
     [UI_MENU_MENU_LANG_AUTO] = "Automatic (from Windows)",
-    [UI_MENU_LOW_END_GPU] = "Low-end GPU mode (experimental)",
-    [UI_MENU_LOW_END_GPU_DESC] = "For older graphics cards and cards short of video memory. Runs the game's mesh shaders as compute shaders "
-                                 "where the card has none, keeps video memory within what the driver reports free, waits less for the GPU and "
-                                 "prepares frames on a thread of their own. Measured on a Radeon RX 580 only: it can show a dark or flickering "
-                                 "frame now and then, so leave it off on a newer card.",
     [UI_MENU_REPLAY_WORKERS] = "CPU helper threads (experimental)",
     [UI_MENU_REPLAY_WORKERS_DESC] = "Uses more of your CPU's cores to prepare each frame for the graphics card. Automatic "
                                     "picks the number for your CPU: half its cores less one, none on four cores or fewer "
@@ -1127,11 +1030,6 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Состояние: %s",
     [UI_MENU_MENU_LANG] = "Язык меню", [UI_MENU_MENU_LANG_DESC] = "Язык этого меню и индикатора.",
     [UI_MENU_MENU_LANG_AUTO] = "Автоматически (из Windows)",
-    [UI_MENU_LOW_END_GPU] = "Режим для слабых видеокарт (экспериментальный)",
-    [UI_MENU_LOW_END_GPU_DESC] = "Для старых видеокарт и карт с малым объёмом видеопамяти. Меш-шейдеры игры выполняются как вычислительные там, "
-                                 "где карта их не поддерживает, видеопамять удерживается в пределах свободного объёма по данным драйвера, игра "
-                                 "меньше ждёт видеокарту, а кадры готовятся в отдельном потоке. Проверено только на Radeon RX 580: изредка "
-                                 "возможен тёмный или мерцающий кадр, поэтому на новой карте оставьте выключенным.",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "Пока игра запущена, показывает «Играю в NX2navi» со временем игры в статусе "
                                  "Discord. Приложение выбирают discord_app_id и discord_image в nx2navi.ini.",
@@ -1559,11 +1457,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Estado: %s",
     [UI_MENU_MENU_LANG] = "Idioma do menu", [UI_MENU_MENU_LANG_DESC] = "Idioma deste menu e do indicador.",
     [UI_MENU_MENU_LANG_AUTO] = "Automático (do Windows)",
-    [UI_MENU_LOW_END_GPU] = "Modo para GPUs fracas (experimental)",
-    [UI_MENU_LOW_END_GPU_DESC] = "Para placas de vídeo antigas ou com pouca memória de vídeo. Executa os mesh shaders do jogo como compute "
-                                 "shaders onde a placa não os tem, mantém a memória de vídeo dentro do que o driver informa como livre, espera "
-                                 "menos pela GPU e prepara os quadros numa thread própria. Medido apenas numa Radeon RX 580: pode mostrar um "
-                                 "quadro escuro ou piscando de vez em quando, então deixe desligado numa placa mais nova.",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "Mostra \"Jogando NX2navi\" com o tempo de jogo no seu status do Discord "
                                  "enquanto o jogo roda. discord_app_id e discord_image no nx2navi.ini escolhem a "
@@ -2226,10 +2119,6 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MENU_LANG] = "菜单语言",
     [UI_MENU_MENU_LANG_DESC] = "本菜单和性能浮层的语言。",
     [UI_MENU_MENU_LANG_AUTO] = "自动（跟随 Windows）",
-    [UI_MENU_LOW_END_GPU] = "低端显卡模式（实验性）",
-    [UI_MENU_LOW_END_GPU_DESC] = "适用于较旧的显卡和显存不足的显卡。在显卡不支持网格着色器时以计算着色器运行游戏的网格着色器，"
-                                 "将显存占用控制在驱动报告的可用范围内，减少等待 GPU 的时间，并在独立线程上准备帧。"
-                                 "仅在 Radeon RX 580 上测试过：偶尔可能出现变暗或闪烁的画面，较新的显卡请保持关闭。",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "游戏运行时在 Discord 状态中显示“正在玩 NX2navi”及游戏时长。nx2navi.ini 中的 "
                                  "discord_app_id 和 discord_image 选择应用。",

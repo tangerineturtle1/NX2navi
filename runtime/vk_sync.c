@@ -1665,7 +1665,7 @@ int vk_sync_recorded_wait(uint64_t value, uint64_t timeout_ns, int (*gpu_wait)(u
         rt_log("vk: the wait after a frame's first submission also waits for %s (NX2NAVI_SUBMIT_FINISH_RESULTS=%d)",
                res_mode == 2 ? "every submission before it" : res_mode ? "the newest submission up to it that hands the "
                "CPU results at its completion (events, counter reports, write-backs)" : "nothing more", res_mode);
-        gpu = rt_knob("SUBMIT_FINISH_GPU", "1") != 0;   // 0 with low_end_gpu = 1
+        gpu = rt_knob("SUBMIT_FINISH_GPU", "1") != 0;   // the low-end GPU mode set 0 up to 0.10.1
         rt_log("vk: the wait after a frame's first submission ends %s (NX2NAVI_SUBMIT_FINISH_GPU=%d)",
                gpu ? "when the GPU has run it" : "when the replay has submitted it, or the GPU has run it where it reads guest "
                "memory itself", gpu);

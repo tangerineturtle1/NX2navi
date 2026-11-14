@@ -2,7 +2,7 @@
 content guard workflow runs it beside tools/check_content.py.
 
 It fails on:
-- a row or name after a // on a line of known[], metas[], sections[], DECK[] or LOWEND[]: it is not compiled, and a
+- a row or name after a // on a line of known[], metas[], sections[] or DECK[]: it is not compiled, and a
   hidden metas[] row ends every start with "FATAL: cfg: NX2NAVI_<X> has no row in the settings table" (this shipped
   in two test builds); a /* inside those tables, which this check does not read;
 - a name twice in known[], or two metas[] rows for one key in one #if branch (the first branch stands for the table,
@@ -32,7 +32,6 @@ TABLES = {   # declaration, what a row looks like on a line
     'metas[]': ('static const CfgMeta metas[]', r'\{\s*"(' + KEY + r')"'),
     'sections[]': ('sections[] = {', r'\{\s*"(' + KEY + r')"'),
     'DECK[]': ('DECK[] = {', r'\{\s*"(' + KEY + r')"'),
-    'LOWEND[]': ('LOWEND[] = {', r'\{\s*"(' + KEY + r')"'),
 }
 VALUE_FNS = ('cfg_value', 'cfg_int', 'cfg_bool', 'cfg_double')
 GUARD_FNS = ('cfg_get', 'cfg_is_set', 'cfg_meta')

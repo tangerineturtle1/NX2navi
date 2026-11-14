@@ -6358,7 +6358,7 @@ static int mesh_ring_entry(VkExec *ex, VkCommandBuffer cb, const p_draw_mesh_ind
     return 1;
 }
 
-// NX2NAVI_FOLIAGE (full, reduced, off; default full; the low-end GPU rows of the menu's Game tab): Ocarina draws its foliage with
+// NX2NAVI_FOLIAGE (full, reduced, off; default full; foliage in nx2navi.ini): Ocarina draws its foliage with
 // DrawMeshTasksIndirect, the instances its compute passes culled on the GPU. With a task stage: the small grass and moss
 // that carpet the ground; without one: ferns, leaves, clover and the other plants. Its other mesh draws (DrawMeshTasks
 // with a count: terrain, rocks, buildings, doors) are not foliage. reduced skips the indirect draws with a task stage,

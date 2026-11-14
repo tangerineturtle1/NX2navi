@@ -16,7 +16,8 @@
 // Laptop, 4 GiB) leaving that heap out sent every allocation past the reserve to system memory, more than 4096 of them,
 // and the process's commit with them: with 16 GiB of RAM the system's commit ran out, host memory imports failed and the
 // device was lost. Without another device-local heap with room the allocation is made as asked. The reserve
-// (NX2NAVI_VRAM_RESERVE_MB, 512 with low_end_gpu = 1, else 0, off) is room left for allocations VMA does not make, which can come at
+// (NX2NAVI_VRAM_RESERVE_MB; 0, off, by default; the low-end GPU mode set 512 up to 0.10.1) is room left for allocations
+// VMA does not make, which can come at
 // once: AMD's contexts are made when the upscaler or the frame generation setting changes. An allocation that finds
 // no room that way is made as asked, as before. Allocations from a VMA pool and those for one memory type alone (the
 // headroom's anchors, vk_headroom.c) are made as asked.

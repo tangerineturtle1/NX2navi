@@ -39,10 +39,11 @@ int main(void) {
     // ---- the mesh emulation acts only without mesh shaders, and then before the fallback
     expect(0, 0, "auto", "1", MESH_PATH_EMULATION, "no mesh shaders, mesh_emulation = 1");
     expect(0, 1, "1", "1", MESH_PATH_EMULATION, "no mesh shaders, both set");
-    expect(1, 1, "auto", "1", MESH_PATH_FALLBACK, "an RX 6000 card with mesh_emulation = 1 (low_end_gpu)");
+    expect(1, 1, "auto", "1", MESH_PATH_FALLBACK, "an RX 6000 card with mesh_emulation = 1");
     expect(1, 0, "auto", "1", MESH_PATH_NATIVE, "a card with mesh shaders and mesh_emulation = 1");
-    // ---- an NVIDIA card never takes the emulation, which ended the game inside its driver (GTX 10, low_end_gpu)
-    expect_nv(0, 0, 1, "auto", "1", MESH_PATH_FALLBACK, "a GTX 10 card with mesh_emulation = 1 (low_end_gpu)");
+    // ---- an NVIDIA card never takes the emulation, which ended the game inside its driver (GTX 10 cards in the
+    // low-end GPU mode of 0.10.1, which set mesh_emulation = 1)
+    expect_nv(0, 0, 1, "auto", "1", MESH_PATH_FALLBACK, "a GTX 10 card with mesh_emulation = 1");
     expect_nv(0, 0, 1, "1", "1", MESH_PATH_FALLBACK, "a GTX 10 card with both set");
     expect_nv(0, 0, 1, "0", "1", MESH_PATH_NONE, "a GTX 10 card with mesh_emulation = 1 and mesh_fallback = 0");
     expect_nv(0, 0, 1, "auto", "0", MESH_PATH_FALLBACK, "a GTX 10 card by default");

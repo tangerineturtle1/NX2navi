@@ -2932,18 +2932,26 @@ class MakeGameTest(Tmp):
             with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': 'Off'}):
                 self.assertFalse(self.mg.shader_carry(out))
 
-    def test_guest_opt_from_the_ini_only_with_the_low_end_mode_on(self):
-        """guest_opt_ini takes guest_opt from nx2navi.ini only while low_end_gpu is on as runtime/cfg.c lowend_of
-        reads it: 0, off, false and no in any case are off."""
+    def test_guest_opt_from_the_ini_counts_without_the_low_end_mode(self):
+        """guest_opt_ini takes guest_opt from nx2navi.ini by itself. Up to 0.10.1 it needed low_end_gpu on in the file;
+        that mode is gone, and a low_end_gpu line of any value changes nothing. The environment's value stays."""
         out = self.tmp / 'game'
         out.mkdir()
         env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_GUEST_OPT'}
-        for low, taken in (('1', True), ('yes', True), ('On', True), ('0', False), ('off', False), ('FALSE', False),
-                           ('no', False), ('0 ; note', False)):
-            (out / 'nx2navi.ini').write_text(f'guest_opt = 2\nlow_end_gpu = {low}\n')
+        for low in ('', 'low_end_gpu = 1\n', 'low_end_gpu = yes\n', 'low_end_gpu = 0\n', 'low_end_gpu = off\n',
+                    'low_end_gpu = 0 ; note\n'):
+            (out / 'nx2navi.ini').write_text('guest_opt = 2\n' + low)
             with mock.patch.dict(os.environ, env, clear=True):
                 self.mg.guest_opt_ini(out)
-                self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '2' if taken else None, low)
+                self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '2', low)
+        (out / 'nx2navi.ini').write_text('low_end_gpu = 1\n')
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertIsNone(os.environ.get('NX2NAVI_GUEST_OPT'))   # no guest_opt line: nothing is set
+        (out / 'nx2navi.ini').write_text('guest_opt = 2\n')
+        with mock.patch.dict(os.environ, dict(env, NX2NAVI_GUEST_OPT='1'), clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '1')   # the environment wins over the file
 
     def test_cache_from_before_carrying_names_its_translator(self):
         """Before a new translator goes beside the game, a shader cache with no identities.txt gets one naming the

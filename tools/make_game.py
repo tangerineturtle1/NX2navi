@@ -1632,13 +1632,12 @@ SWITCH_OFF = ('0', 'off', 'false', 'no')
 
 
 def guest_opt_ini(out):
-    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe (the low-end GPU rows of the menu's Game tab write it there)
-    when the environment does not set it: the next build of the game folder out takes it. Only while low_end_gpu is on
-    in the file too (not empty, 0, off, false or no, as runtime/cfg.c lowend_of reads it): the mode's settings count
-    only with the mode on (runtime/cfg.c LOWEND_ONLY)."""
+    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe when the environment does not set it: the next build of the
+    game folder out takes it. The line counts by itself. Up to 0.10.1 it counted only while low_end_gpu was on in the
+    file too; that mode is gone (runtime/cfg.c lowend_set) and its settings are read like any other."""
     if os.environ.get('NX2NAVI_GUEST_OPT', '').strip():
         return
-    found, low = '', False
+    found = ''
     try:
         for line in (Path(out) / 'nx2navi.ini').read_text(encoding='utf-8', errors='replace').splitlines():
             key, eq, value = line.partition('=')
@@ -1646,11 +1645,9 @@ def guest_opt_ini(out):
             value = value.split('#')[0].split(';')[0].strip().strip('"')
             if eq and key in ('guest_opt', 'nx2navi_guest_opt') and value:
                 found = value
-            if eq and key in ('low_end_gpu', 'nx2navi_low_end_gpu'):
-                low = value.lower() not in ('', *SWITCH_OFF)
     except OSError:
         pass
-    if found and low:
+    if found:
         os.environ['NX2NAVI_GUEST_OPT'] = found
 
 

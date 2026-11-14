@@ -26,7 +26,6 @@ int cfg_setenv(const char *name, const char *value);
 int cfg_from_env(const char *name);
 // 1 when the player set name (the environment or nx2navi.ini), 0 when cfg_get gives a device profile's default or NULL.
 int cfg_is_set(const char *name);
-int cfg_low_end_active(void);   // the low-end GPU mode was on when the game started (cfg.c LOWEND)
 // The keys of the file's lines that are no settings of this version, lower-case with ", " between them ("" when there
 // are none; a list too long to keep ends early), and how many there are. Such a line does nothing: the log says so at
 // start and the settings menu shows it (ui/menu.cpp), so that nobody takes one for the cause of what they see.

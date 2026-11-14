@@ -447,18 +447,25 @@
 # are what costs least to lose, and a draw that needs one later builds it again from the pipeline cache. 0: every
 # pipeline stays for the run, as before 0.10; tex_vram_pressure = 0 turns this off too. Read at start.
 # pipe_release = 1
-# Low-end GPU mode (experimental; also in the settings menu's Game tab). For older graphics cards, and ones short of
-# video memory: 1 turns on the settings written for them and measured on a Radeon RX 580, for every key below that
-# this file does not set itself. Mesh shaders run as compute where the card has none (mesh_emulation), video memory
-# stays within what the driver reports free (vram_heap_limit = auto, vram_reserve_mb = 512), large texture upload
-# batches go to the GPU early (upload_batch_mb = 256; every batch goes at 64 MiB of staging at the latest with or
-# without it, so only a value below 64 acts), game memory is copied for the GPU while a frame is recorded and
-# the game waits less for the GPU (mirror_stage = 1, submit_finish_gpu = 0), pools the game refills every frame stay
-# in system memory (mirror_hot = 25), and a texture read after another image was drawn over its memory gets memory of
-# its own (tex_clobber = 1). Frames prepared on a thread of their own (replay_async) stay off in this mode too, as they
-# can show a dark or flickering frame now and then; its row under the mode's switch turns them on. 0, the default: each of these stays as it was in 0.9.1, and none of these keys
-# is read. Read at start.
-# low_end_gpu = 0
+# The low-end GPU mode of 0.9.2 to 0.10.1 is gone: low_end_gpu = 1 in an older file does nothing, and the log says
+# so once. The settings it turned on are ordinary settings now, each off unless this file sets it, and none has a row
+# in the settings menu. Read at start.
+# mesh_emulation = 1 runs mesh shaders as compute where the card has none, in place of the mesh fallback (never on an
+# NVIDIA card). vram_heap_limit = auto and vram_reserve_mb = 512 keep video memory within what the driver reports
+# free. upload_batch_mb sends large texture upload batches to the GPU early (every batch goes at 64 MiB of staging at
+# the latest, so only a value below 64 acts). mirror_stage = 1 and submit_finish_gpu = 0 copy game memory for the GPU
+# while a frame is recorded and let the game wait less for the GPU. mirror_hot = 25 keeps pools the game refills every
+# frame in system memory. tex_clobber = 1 gives a texture read after another image was drawn over its memory memory
+# of its own. foliage = reduced draws no small grass or moss, off no foliage.
+# mesh_emulation = 0
+# vram_heap_limit = 0
+# vram_reserve_mb = 0
+# upload_batch_mb = 0
+# mirror_stage = 0
+# submit_finish_gpu = 1
+# mirror_hot = 0
+# tex_clobber = 0
+# foliage = full
 # Textures the game released that are kept as they are (1 to 16384); past this count only those that lose nothing
 # when dropped go. Default: one per 2 MB of the video memory budget, 2048 to 8192. Read at start.
 # tex_released_max = 4096

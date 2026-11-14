@@ -1417,7 +1417,8 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
     return calls;
 }
 
-// NX2NAVI_SNAP_WIDEN=<regions> (8 with low_end_gpu = 1, else 0, off): a texture check that has to query widens the query to up to this
+// NX2NAVI_SNAP_WIDEN=<regions> (default 0, off; the low-end GPU mode set 8 up to 0.10.1): a texture check that has to
+// query widens the query to up to this
 // many 2 MiB regions on each side, inside the import pool that holds the texture, so the textures of one pool are
 // snapped by one query a submission instead of one each. With freezing off (NX2NAVI_FREEZE_IDLE) an RX 580 in Hyrule
 // Field made about 1,130 texture queries a frame, about 6 MiB each on average incl. repeats, 9.4 ms with the pools'.
@@ -4337,7 +4338,8 @@ int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl || n_gpa_fli
 // and when its device address table writes reach guest memory as well (a twin: what they write is not recorded); so
 // does a range with a page that cannot be read without a fault (mem_copy_readable: a lazily armed range). The
 // whole-pool copy of a mirror's first use is larger than the limit and stays with the GPU.
-// Unset or 0 with NX2NAVI_MIRROR_STAGE=1 (what low_end_gpu = 1 sets): CAPTURE_STAGE_KB. A submission whose prologue copied
+// Unset or 0 with NX2NAVI_MIRROR_STAGE=1 (which the low-end GPU mode set up to 0.10.1): CAPTURE_STAGE_KB. A submission
+// whose prologue copied
 // everything this way reads nothing of guest memory late, so its submit wait ends once the replay has submitted it
 // (vk_sync_recorded_wait); one with a range left to the GPU-time copy, or a draw that reads a pool without a mirror,
 // is noted (vk_mem_note_live) and its submit wait is the GPU's. The first form of this (0.8.0) copied while the replay
@@ -5479,11 +5481,13 @@ VkCommandBuffer vk_upload_begin(void) {
     return open_b.cb;
 }
 
-// NX2NAVI_UPLOAD_BATCH_MB (256 with low_end_gpu = 1; 0, the default, = no limit of its own): once the open batch's
+// NX2NAVI_UPLOAD_BATCH_MB (0, the default, = no limit of its own; the low-end GPU mode set 256 up to 0.10.1): once the
+// open batch's
 // staging buffers hold that much, the outermost vk_upload_end submits it. It does so too once the batch's staging
 // reaches STG_FLUSH, so that an area load's staging stays inside the staging pool's blocks (the staging pool's
 // comment): 0 therefore means STG_FLUSH (64 MiB), not "never", and a value above STG_FLUSH changes nothing, the
-// low-end mode's 256 and the settings menu's 128 to 1024 included. A save load made thousands of textures between two replay submissions, and every one of them went into
+// 256 and the 128 to 1024 its menu row offered included. A save load made thousands of textures between two replay
+// submissions, and every one of them went into
 // one batch: about 1.5 GB of raw ASTC blocks plus the decoder's work in a single submission,
 // which AMD's 23.10 driver on an RX 580 refused with VK_ERROR_OUT_OF_DEVICE_MEMORY. Submitted early, a batch still
 // precedes the replay submission that uses its textures (the queue keeps order), and its staging is freed as it retires.

@@ -357,10 +357,11 @@ retry:
 // the next memory type that allows it (the other device-local heap first), for every allocation: textures, render
 // targets, VRAM mirrors, pools. The limit is each device-local heap's budget when the device is made (VK_EXT_memory_budget,
 // what other programs leave) less a margin for memory VMA does not see (swapchain, FidelityFX): a tenth, at least
-// 256 MiB. NX2NAVI_VRAM_HEAP_LIMIT: auto (with low_end_gpu = 1), 0 (no limits, the default), or a number of MiB for the largest device-local heap.
+// 256 MiB. NX2NAVI_VRAM_HEAP_LIMIT: auto, 0 (no limits, the default) or a number of MiB for the largest device-local
+// heap. The low-end GPU mode set auto up to 0.10.1.
 static int vram_heap_limits(VkDeviceSize *limit) {
     const char *e = cfg_get("NX2NAVI_VRAM_HEAP_LIMIT");
-    long mb = !e || !*e ? 0 : strcmp(e, "auto") ? atol(e) : -1;   // unset: no limits, as before (low_end_gpu sets auto)
+    long mb = !e || !*e ? 0 : strcmp(e, "auto") ? atol(e) : -1;   // unset: no limits
     if (!mb) return 0;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
@@ -632,8 +633,8 @@ static int create_device(void) {
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     {   // mesh_fallback: auto, 1 (on every device) or 0 (vk_mesh_path.h says when auto takes it, and why on AMD's driver
         // for RDNA 1 and 2). Without mesh shaders the mesh emulation (mesh_emulation = 1) draws them instead.
-        // has_mesh_shader keeps saying what the hardware has: the recorder thread (vk_rec.c) and the low-end card
-        // test (vk_low_end_card) go by it, not by how mesh programs are drawn.
+        // has_mesh_shader keeps saying what the hardware has: the recorder thread (vk_rec.c) goes by it, not by how
+        // mesh programs are drawn.
         const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION"), *why = "";
         int path = mesh_path_decide(g_vk.has_mesh_shader, vk_caps.amd_sc, g_vk.props.vendorID == 0x10de, mf, me, &why);
         g_vk.mesh_fallback = path == MESH_PATH_FALLBACK;
@@ -973,16 +974,6 @@ int probe_vkdevice(void) {
     return g_errors_total ? 1 : 0;
 }
 
-// The GPU has mesh shaders: the mesh emulation (NX2NAVI_MESH_EMULATION) does nothing there (the low-end GPU rows of the menu's Game tab).
+// The GPU has mesh shaders (vk_exec.c vk_exec_tail_begin: the early tail runs only on such a card).
 int vk_mesh_shader_native(void) { return g_vk.has_mesh_shader; }
 
-// The card the low-end GPU mode (cfg.c LOWEND) was written for: one without mesh shaders, or one whose driver reports
-// a video memory budget under 8 GiB. The menu offers the mode only there (ui/menu.cpp tab_game): on a GeForce RTX 5090
-// the mode's own-memory rule for overwritten textures moved the 1600x1600 sun shadow map and the scene depth to memory
-// of their own, and the ground's shadow was a dark patch with straight edges that turned with the camera.
-int vk_low_end_card(void) {
-    if (!g_vk.has_mesh_shader) return 1;
-    uint64_t used = 0, budget = 0;
-    int exact = 0;
-    return vk_mem_vram(&used, &budget, &exact) && budget && budget >> 20 < 8192;
-}

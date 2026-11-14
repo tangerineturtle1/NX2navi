@@ -20,12 +20,12 @@
 // left out of the picture until their compute passes are built, at their first sight in a run. mesh_fallback = 0
 // draws them natively again; 1 takes the fallback on every device.
 //
-// The mesh emulation is the older of the two ways for a card without mesh shaders, and the low-end GPU mode turns it on
-// (cfg.c LOWEND). On NVIDIA's cards without mesh shaders (GTX 10 and older) it ended the game inside the driver at the
-// first mesh draws of an area: an access violation at nvoglv64.dll+0x10cdffe on a GTX 1050 Ti and on a GTX 1070, both
-// on 0.10.1, and a Titan X (Pascal) report of the same mode. The GTX 1050 Ti ran on once mesh_emulation was set to 0,
-// through the fallback, with the rest of the low-end mode still on. So an NVIDIA card never takes the emulation: with
-// it asked for, the card is drawn for as if it were not.
+// The mesh emulation is the older of the two ways for a card without mesh shaders, and the low-end GPU mode turned it
+// on up to 0.10.1 (cfg.c lowend_set). On NVIDIA's cards without mesh shaders (GTX 10 and older) it ended the game
+// inside the driver at the first mesh draws of an area: an access violation at nvoglv64.dll+0x10cdffe on a GTX 1050 Ti
+// and on a GTX 1070, both on 0.10.1, and a Titan X (Pascal) report of the same mode. The GTX 1050 Ti ran on once
+// mesh_emulation was set to 0, through the fallback, with the rest of that mode still on. So an NVIDIA card never
+// takes the emulation: with it asked for, the card is drawn for as if it were not.
 #pragma once
 #include <string.h>
 

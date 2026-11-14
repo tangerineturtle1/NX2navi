@@ -919,10 +919,11 @@ A change to how nx2navi.ini and the environment are read (`runtime/cfg.c` `cfg_l
 `cfg_bool`, `check_value`) passes `python tests\cfg_parse_check.py`, which builds `cfg.c` with stand-ins for what it
 links with and loads scratch files: a comment after a value of a setting with a set of values is cut and logged once
 with its line, free text, a value in double quotes and the environment keep theirs; switches written as words read as
-0 or 1 through every reader, the low-end mode's switch (`lowend_of`, read apart from `cfg_get`) included; values
+0 or 1 through every reader; `low_end_gpu`, the switch of the low-end GPU mode that 0.10.2 removed, turns nothing on
+and is named once in the log (`lowend_set`), and the mode's keys are read by themselves; values
 outside their sets are logged with their line, at most 16 lines and a count; a full settings table logs one line at
 load and one for the menu. The launcher's reader (`launcher/gameini.py`) has the same comment lines in
-`tests\launcher_test.py` `PlayerIniTest`, and `tools/make_game.py`'s own reads of `shader_carry` and `low_end_gpu`
+`tests\launcher_test.py` `PlayerIniTest`, and `tools/make_game.py`'s own reads of `shader_carry` and `guest_opt`
 (`shader_carry`, `guest_opt_ini`) theirs in `MakeGameTest`. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter

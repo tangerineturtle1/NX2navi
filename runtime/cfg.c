@@ -113,7 +113,7 @@ static const char *const known[] = {
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
 static const struct { const char *key, *section; } sections[] = {
-    // the low-end GPU mode's rows in the menu's Game tab (ui/menu.cpp rows_low_end)
+    // the settings the low-end GPU mode had rows for up to 0.10.1 (lowend_set, below)
     {"TEX_RELEASED_MAX", "performance"}, {"MIRROR_HOT", "performance"}, {"FREEZE_IDLE", "performance"}, {"SUBMIT_FINISH_KINDS", "performance"}, {"FOLIAGE", "performance"},
     {"ZSTD_NATIVE", "performance"},
     {"VRAM_HEAP_LIMIT", "performance"}, {"VRAM_RESERVE_MB", "performance"}, {"UPLOAD_BATCH_MB", "performance"}, {"MESH_EMULATION", "performance"},
@@ -406,7 +406,7 @@ static const CfgMeta metas[] = {
     // it for the idle seconds; 0 keeps every shader's SPIR-V plain
     {"SHADER_COMPRESS", "1", "0|1", RESTART},
     {"SHADER_COMPRESS_IDLE_S", "30", "1..3600", RESTART},
-    // the low-end GPU mode's rows in the menu's Game tab (ui/menu.cpp rows_low_end)
+    // the settings the low-end GPU mode had rows for up to 0.10.1 (lowend_set, below): each is read by itself now
     {"TEX_RELEASED_MAX", "", NULL, RESTART},   // vk_texture.c released_max: "" by the video memory budget, else 1..16384
     {"MIRROR_HOT", "0", "0..1000", RESTART}, {"FREEZE_IDLE", "1800", "0..100000", RESTART},
     {"SUBMIT_FINISH_KINDS", "31", "0..31", RESTART},   // vk_sync.c res_mask
@@ -426,7 +426,8 @@ static const CfgMeta metas[] = {
     // vk_texture.c drop_aged: seconds a released texture is kept unused (vk_tex_release.h)
     {"TEX_RELEASED_HOLD", "180", "0..900", RESTART}, {"ASTC_BC", "", "0|1", RESTART}, {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
     {"TEX_CLOBBER", "0", "0|1", RESTART},
-    {"LOW_END_GPU", "0", "0|1", RESTART},   // LOWEND below
+    // the switch of the low-end GPU mode, which is gone: still a known key, and it does nothing (lowend_set, below)
+    {"LOW_END_GPU", "0", "0|1", RESTART},
     {"STG_ARENA", "1", "0|1", RESTART}, {"ASTC_GPU_DESWIZZLE", "1", "0|1", RESTART},
     {"ASTC_SCRATCH_KEEP", "1", "0|1", RESTART}, {"ASTC_ARENA", "1", "0|1", RESTART},   // vk_astc.c scratch_get, vk_texture.c astc_arena
     // render fixes
@@ -822,54 +823,19 @@ static int on_steam_deck(void) {
 
 static const char *raw_get(const char *name);
 
-// low_end_gpu = 1 in nx2navi.ini (NX2NAVI_LOW_END_GPU): defaults for the keys the player does not set, as the device
-// profile gives them. They turn on what was written for older graphics cards and ones short of video memory or bus
-// bandwidth, and measured on a Radeon RX 580: mesh shaders run as compute where the card has none (vk_pipeline.c
-// mesh_emu_on), a texture read after another image drew over its pool memory gets memory of its own (vk_texture.c
-// mark_clobbered), game memory is copied for the GPU while the replay records and the game's wait after a frame's
-// first submission ends once the replay has submitted it (vk_memory.c stage_on, vk_sync.c vk_sync_recorded_wait),
-// texture checks share their write-watch queries (vk_memory.c snap_widen_n), video memory stays within the heaps'
-// budgets (vk_device.c vram_heap_limits, vk_vma_budget.c), large upload batches go to the queue early (vk_memory.c
-// vk_upload_end) and pools the game refills every frame stay in system memory (vk_memory.c hot_check). Without the
-// key each of these keeps what 0.9.1 did. Asynchronous replay (vk_backend.c, NX2NAVI_REPLAY_ASYNC) is not among them:
-// it can show a dark or flickering frame now and then, so the mode leaves it off and its row under the mode's switch
-// turns it on for a player who wants it.
-static const struct { const char *key, *value; } LOWEND[] = {
-    {"MESH_EMULATION", "1"}, {"TEX_CLOBBER", "1"}, {"MIRROR_STAGE", "1"}, {"SUBMIT_FINISH_GPU", "0"}, {"SNAP_WIDEN", "8"},
-    {"VRAM_HEAP_LIMIT", "auto"}, {"VRAM_RESERVE_MB", "512"}, {"UPLOAD_BATCH_MB", "256"}, {"MIRROR_HOT", "25"},
-};
-// The keys that count only while the mode is on (LOWEND_ONLY): without it each reads as unset, whatever the settings
-// file or the environment says, so nothing of the mode acts unless a player turned it on. The menu shows their rows
-// only then (ui/menu.cpp rows_low_end). Keys the game had before the mode (replay_async, freeze_idle, zstd_native,
-// tex_released_max, astc_scratch_keep) are not among them.
-static const char *const LOWEND_ONLY[] = {
-    "MESH_EMULATION", "MESH_EMU_MB", "MESH_EMU_TASKS", "MESH_EMU_BATCH", "TEX_CLOBBER", "MIRROR_STAGE", "MIRROR_HOT",
-    "SUBMIT_FINISH_GPU", "SUBMIT_FINISH_RESULTS", "SUBMIT_FINISH_KINDS", "SNAP_WIDEN", "VRAM_HEAP_LIMIT",
-    "VRAM_RESERVE_MB", "UPLOAD_BATCH_MB", "FOLIAGE", "FLUSH_SKIP_CLEAN", "VEC_INDEX_FIX", "GUEST_OPT", "PASS_TIMES",
-    "DUMP_KEY", "LOG_TEX_NEW", "SVC_WAITS",
-};
-static int lowend_only(const char *key) {
-    for (size_t i = 0; i < sizeof LOWEND_ONLY / sizeof *LOWEND_ONLY; i++)
-        if (!strcasecmp(LOWEND_ONLY[i], key)) return 1;
-    return 0;
-}
-static int lowend = -1;
+// low_end_gpu (NX2NAVI_LOW_END_GPU) was the switch of the low-end GPU mode up to 0.10.1. With it on, nine keys got
+// other defaults (mesh shaders run as compute where the card has none, a texture read after another image drew over
+// its pool memory given memory of its own, game memory copied for the GPU while the replay records, video memory kept
+// within the heaps' budgets, large upload batches sent early, pools the game refills every frame kept in system
+// memory), and those keys and a dozen more were read only while it was on. The mode is gone. Its switch is still a
+// known key, so that an old file's line is no unknown one, and does nothing. Each of its keys is read like any other,
+// with the default of its row or of its reader: a value a player set by hand counts, and a file that sets none runs
+// the game as it runs for everyone else. cfg_init says so once while the switch is on.
 // Read through raw_get, which skips switch_word, so the words are taken here as cfg_bool takes them: "low_end_gpu =
-// off" is off for the mode as for the menu and cfg_get, and any value that is not 0 or one of the off words is on.
-static int lowend_of(void) {
-    int p = __atomic_load_n(&lowend, __ATOMIC_ACQUIRE);
-    if (p >= 0) return p;
+// off" is off, and any value that is not 0 or one of the off words is on.
+static int lowend_set(void) {
     const char *set = raw_get(PREFIX "LOW_END_GPU");
-    p = set && *set && switch_of(set) != 0;
-    __atomic_store_n(&lowend, p, __ATOMIC_RELEASE);
-    return p;
-}
-int cfg_low_end_active(void) { return lowend_of(); }
-static const char *lowend_value(const char *key) {
-    if (lowend_of())
-        for (size_t i = 0; i < sizeof LOWEND / sizeof *LOWEND; i++)
-            if (!strcasecmp(LOWEND[i].key, key)) return LOWEND[i].value;
-    return NULL;
+    return set && *set && switch_of(set) != 0;
 }
 
 static int profile_of(void) {
@@ -919,12 +885,11 @@ static const char *switch_word(const char *name, const char *v) {
 static const char *cfg_get_now(const char *name) {
     const char *v = raw_get(name);
     if (strncmp(name, PREFIX, PREFIX_LEN)) return v;
-    if (!lowend_of() && lowend_only(name + PREFIX_LEN)) return NULL;   // the mode is off: its settings are not read
     if (v) return switch_word(name, v);
     if (profile_of())
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
-    return lowend_value(name + PREFIX_LEN);
+    return NULL;
 }
 
 // Whether name's value comes from the player (the environment or nx2navi.ini), not a profile or the table.
@@ -1029,8 +994,6 @@ const char *cfg_default(const char *key) {
     if (profile_of())
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name)) return DECK[i].value;
-    const char *low = lowend_value(name);
-    if (low) return low;
     const CfgMeta *m = cfg_meta(key);
     return m ? m->def : NULL;
 }
@@ -1461,14 +1424,13 @@ void cfg_init(void) {
         if (e && *e) check_value(metas[i].key, e, 0);
     }
     check_end();
-    __atomic_store_n(&lowend, -1, __ATOMIC_RELEASE);   // asked before the file was read: decided again (lowend_of)
     if (profile_of())
         rt_log("cfg: device profile Steam Deck: defaults for the keys nx2navi.ini does not set (NX2NAVI_DEVICE_PROFILE=desktop "
                "turns it off)");
-    if (lowend_of())
-        rt_log("cfg: low_end_gpu = 1: the settings for older graphics cards are on for the keys nx2navi.ini does not set "
-               "(mesh shaders as compute, video memory budgets, staged uploads and the shorter wait for the GPU, frames "
-               "prepared on their own thread)");
+    if (lowend_set())
+        rt_log("cfg: low_end_gpu is on, and the low-end GPU mode was removed in 0.10.2: the line does nothing, and the game "
+               "runs as it does without it. The mode's single settings (mesh_emulation, tex_clobber, foliage, "
+               "vram_reserve_mb and the others) still count where nx2navi.ini or the environment sets them");
     start_values();
 }
 
