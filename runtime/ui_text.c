@@ -353,10 +353,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make light vibration stronger.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Also vibrates the triggers on Xbox controllers.",
-    [UI_MENU_RUMBLE_HD] = "HD vibration (Switch)",
-    [UI_MENU_RUMBLE_HD_DESC] = "Sends the game's detailed vibration to a Switch Pro Controller or Joy-Con as it is. "
-                               "The vibration strength still applies: its default is the game's own.",
-    [UI_MENU_RUMBLE_HD_NEEDS] = "Needs a Switch Pro Controller or Joy-Con",
+    [UI_MENU_RUMBLE_HD] = "HD vibration",
+    [UI_MENU_RUMBLE_HD_DESC] = "Sends the game's detailed vibration to a Switch Pro Controller or Joy-Con as it is, "
+                               "or plays it on a DualSense's haptics over USB. The vibration strength still applies: "
+                               "its default is the game's own.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Needs a Switch Pro Controller, Joy-Con or a DualSense on USB",
     [UI_MENU_PAD_LAYOUT] = "Button layout",
     [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A. Nintendo: by position, A right, B bottom, X top, Y "
                                 "left. Xbox and PlayStation: by label, A bottom, B right, X left, Y top (on a "

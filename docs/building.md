@@ -496,6 +496,12 @@ and end a sprint, ZL, the button kept from the game only during play (the bottom
 Link the player does not control, and the set switched off with the button off but never over a start that kept it
 off. No game files.
 
+A change to the DualSense haptics (`runtime/rumble_haptics.c`, the `HD_AUDIO` path of `runtime/input.c`) passes
+`python testsumble_haptics_check.py`, which builds `rumble_haptics.c` with the platform layer stubbed and SDL linked
+but no audio device opened: the Switch 2 amplitude curve, one side's target, the sines a target makes, the output
+ceiling, the glide from silence, the slot's peak hold of a one-update tick, a side at rest and a value the game stops
+renewing. No game files and no controller.
+
 A change to the text speed (`runtime/text_speed.c`, the set `text_speed` of `recomp/patches-v111.txt`, its call in
 `runtime/ov_input.c` `npad_states`) passes `python tests\text_speed_check.py`, which lifts the set's replacement words
 with `recomp/lifter.py` and runs them with `text_speed.c` against a stand-in message window and typewriter: the page

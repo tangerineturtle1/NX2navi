@@ -875,7 +875,7 @@
 # rumble_triggers = 0
 # HD rumble for a Switch Pro Controller, a Joy-Con or a pair of them: 1 sends the game's vibration to the controller as
 # the game makes it, each side's low and high band with its own frequency and amplitude, in place of two motor
-# strengths. rumble_strength still scales the amplitude (its default, 130, is exactly the game's; the controller's
+# strengths. A DualSense on USB plays it on its haptic actuators instead (over Bluetooth it keeps its motors). rumble_strength still scales the amplitude (its default, 130, is exactly the game's; the controller's
 # safe maximum is never passed) and rumble_curve does not apply. 0 (default), and every other gamepad: the motors, as before. Changes
 # while the game runs take effect at once. rumble_hd_ms is the shortest time between two rumble reports in
 # milliseconds (5 to 50, default 15): raise it if a controller on Bluetooth stutters or disconnects with HD rumble on.
