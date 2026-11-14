@@ -2131,11 +2131,55 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) *proc_mb = (float)(pmc.WorkingSetSize >> 20);
 }
 
+// The room in MiB the page files can still grow by. Windows reports as the commit limit the memory plus the page files'
+// current sizes, and grows a page file on demand up to its maximum: with page files that start small the limit reads
+// a little above the memory, and a machine whose memory is mostly in use shows a tenth of its commit free at best
+// while as much again as its memory is there for the asking. Each file's room is its maximum less its size
+// (SystemPageFileInformationEx), within the free space of its volume. Read at most once a second; 0 when the query
+// fails, which leaves the limit as Windows reports it.
+static double pagefile_room_mb(void) {
+    typedef struct {
+        ULONG next, pages, in_use, peak;   // sizes in 4 KiB pages
+        USHORT name_len, name_max;         // the name: a UNICODE_STRING, "\??\C:\pagefile.sys"
+        WCHAR *name;
+        ULONG min_pages, max_pages;
+    } PageFileEx;
+    typedef LONG(WINAPI * QuerySys)(ULONG, void *, ULONG, ULONG *);
+    static QuerySys query;
+    static volatile LONG64 at_ms = -1, room_kb;
+    LONG64 now = (LONG64)GetTickCount64(), last = InterlockedCompareExchange64(&at_ms, 0, 0);
+    if (last >= 0 && now - last < 1000) return (double)InterlockedCompareExchange64(&room_kb, 0, 0) / 1024.0;
+    InterlockedExchange64(&at_ms, now);
+    if (!query) query = (QuerySys)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    static __thread _Alignas(8) unsigned char buf[8192];
+    ULONG got = 0;
+    uint64_t room = 0;
+    if (query && query(144, buf, sizeof buf, &got) == 0 && got >= sizeof(PageFileEx)) {
+        for (ULONG off = 0; off + sizeof(PageFileEx) <= got;) {
+            const PageFileEx *f = (const PageFileEx *)(buf + off);
+            uint64_t grow = f->max_pages > f->pages ? (uint64_t)(f->max_pages - f->pages) * 4096 : 0;
+            WCHAR root[4] = L"C:\\";
+            ULARGE_INTEGER free_bytes = {0};
+            if (grow && f->name && f->name_len >= 6 * sizeof(WCHAR) && f->name[5] == L':') {
+                root[0] = f->name[4];
+                if (GetDiskFreeSpaceExW(root, &free_bytes, NULL, NULL) && free_bytes.QuadPart < grow) grow = free_bytes.QuadPart;
+            } else grow = 0;
+            room += grow;
+            if (!f->next) break;
+            off += f->next;
+        }
+    }
+    InterlockedExchange64(&room_kb, (LONG64)(room >> 10));
+    return (double)(room >> 10) / 1024.0;
+}
+
+// limit_mb: what the commit can reach, the limit Windows reports plus the room its page files can still grow by
+// (pagefile_room_mb).
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
     *proc_mb = *used_mb = *limit_mb = -1;
     MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
     if (GlobalMemoryStatusEx(&ms)) {
-        *limit_mb = (double)(ms.ullTotalPageFile >> 20);
+        *limit_mb = (double)(ms.ullTotalPageFile >> 20) + pagefile_room_mb();
         *used_mb = (double)((ms.ullTotalPageFile - ms.ullAvailPageFile) >> 20);
     }
     PROCESS_MEMORY_COUNTERS_EX pmc;
