@@ -189,6 +189,7 @@ enum {
     VK_GAP_CLEAR_TARGET, VK_GAP_UPSCALER, VK_GAP_WB_MERGE, VK_GAP_WB_COPY, VK_GAP_TWIN, VK_GAP_POOL_MARKS,
     VK_GAP_MESH_RING, VK_GAP_BC_BACK,
     VK_GAP_GROUP,   // a group of draws the replay workers recorded (vk_exec.c group_start): passes without marks
+    VK_GAP_MESH_FB,   // a mesh fallback draw's record fills and the copy of what it asked for (vk_exec_draw.c mfb_draw)
     VK_GAP_N
 };
 void vk_gpu_passes_part(VkCommandBuffer cb, int end);

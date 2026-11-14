@@ -6122,6 +6122,7 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     VkBuffer rec;
     int cmds;
     vk_exec_barrier(ex);   // ends the pass; the culling's record and the last draw's reads come before what follows
+    vk_gpu_gap_note(VK_GAP_MESH_FB, 64);   // the record's fills and its count's copy
     VkDeviceSize at = vk_meshfb_record(ex->cb, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts != NULL,
                                        verts, slot_words, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
@@ -6135,13 +6136,16 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     if (ts) {
         if (!mfb_dispatch(ex, c->cs_task, NVN_STAGE_TASK, rec, at)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
         vk_exec_barrier(ex);
+        VkPassMark *m = dispatch_mark(ex, NULL, 1, 1, 1);   // the scan: a dispatch of the runtime's own, no game shader
         vk_meshfb_scan(ex->cb, at, c->ti.payload_bytes / 4, c->ti.threads, slot_words, verts);
+        vk_pass_mark_end(ex->cb, m);
         cx->B.pipe[1] = VK_NULL_HANDLE;   // the scan bound its own
         ex->recorded += 4;
         vk_exec_barrier(ex);
     }
     if (!mfb_dispatch(ex, c->cs_mesh, NVN_STAGE_MESH, rec, at + 16)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
     vk_exec_barrier(ex);
+    vk_gpu_gap_note(VK_GAP_MESH_FB, 8);   // the copy of what the draw asked for, for the host's report
     vk_meshfb_note(ex->cb, at);
     ex->recorded++;
     vk_exec_barrier(ex);

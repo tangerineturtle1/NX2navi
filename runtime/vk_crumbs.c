@@ -212,7 +212,8 @@ static const char *const gp_kind_names[] = {
     "buffer copies", "buffer to texture copies", "texture to buffer copies", "texture copies", "buffer fills",
     "texture clears", "target clears", "the temporal upscaler", "write-back merges", "write-back copies",
     "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies",
-    "groups of draws the replay workers recorded, whose passes have no marks"};
+    "groups of draws the replay workers recorded, whose passes have no marks",
+    "mesh fallback records"};
 _Static_assert(sizeof gp_kind_names / sizeof gp_kind_names[0] == VK_GAP_N, "a name for every VK_GAP_* kind");
 static VkQueryPool gp_pool, gp_prims;   // gp_prims: mesh primitives generated per pass (with meshShaderQueries)
 static VkQueryPool gp_stats;            // fragment shader invocations per pass
