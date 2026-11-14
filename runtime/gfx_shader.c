@@ -3772,6 +3772,58 @@ static int drop_cmp(const void *x, const void *y) {
 }
 
 typedef struct {
+    PackDrop *v;
+    size_t n, cap;
+    int failed;
+} LooseCache;
+
+// Index loose files before pruning, so Wine need not search the directory case-insensitively for every
+// packed file that has no loose copy.
+static int loose_collect(const char *file, int type, uint64_t size, void *ctx) {
+    (void)size;
+    LooseCache *loose = ctx;
+    if (type == PLAT_FS_DIR || strlen(file) < 68) return 1;
+    size_t len = strlen(file + 64);
+    char ext[sizeof ".res.json"];
+    if (len >= sizeof ext) return 1;
+    memcpy(ext, file + 64, len + 1);
+#ifdef _WIN32
+    for (size_t i = 0; i < len; i++) ext[i] = (char)tolower((unsigned char)ext[i]);
+#endif
+    uint32_t kind;
+    if (!strcmp(ext, ".spv")) kind = PACK_SPV;
+    else if (!strcmp(ext, ".res.json")) kind = PACK_RES;
+    else if (!strcmp(ext, ".use")) kind = PACK_USE;
+    else return 1;
+    char hex[65];
+    uint8_t key[32];
+    memcpy(hex, file, 64), hex[64] = 0;
+    if (!hex32(hex, key)) return 1;
+#ifndef _WIN32
+    char canonical[65];
+    key_hex(key, canonical);
+    if (strcmp(hex, canonical)) return 1;
+#endif
+    if (loose->n == loose->cap) {
+        size_t cap = loose->cap ? loose->cap * 2 : 4096;
+        PackDrop *v = realloc(loose->v, cap * sizeof *v);
+        if (!v) return loose->failed = 1, 0;
+        loose->v = v, loose->cap = cap;
+    }
+    PackDrop *e = &loose->v[loose->n++];
+    e->kind = kind;
+    memcpy(e->name, key, sizeof e->name);
+    return 1;
+}
+
+static int loose_has(const LooseCache *loose, uint32_t kind, const uint8_t name[32]) {
+    if (!loose->n) return 0;
+    PackDrop e = {.kind = kind};
+    memcpy(e.name, name, sizeof e.name);
+    return bsearch(&e, loose->v, loose->n, sizeof *loose->v, drop_cmp) != NULL;
+}
+
+typedef struct {
     PackDrop *v;                                           // packed files to leave out of the pruned pack
     size_t n, cap;
     size_t deleted;                                        // loose files deleted
@@ -3779,14 +3831,16 @@ typedef struct {
 } Drops;
 
 // One file of a previous translator: the loose file is deleted, a packed one is listed for the pruned pack.
-static void drop_file(Drops *d, uint32_t kind, const uint8_t name[32]) {
-    char hex[65], p[PATH_CAP + 80];
-    key_hex(name, hex);
-    snprintf(p, sizeof p, "%s/%s%s", cache_dir, hex, kind == PACK_USE ? ".use" : kind == PACK_SPV ? ".spv" : ".res.json");
-    if (file_exists(p)) {
-        plat_file_delete(p);
-        if (file_exists(p)) d->left++;   // open in a reader: the next pass deletes it
-        else d->deleted++;
+static void drop_file(Drops *d, const LooseCache *loose, uint32_t kind, const uint8_t name[32]) {
+    if (loose->failed || loose_has(loose, kind, name)) {
+        char hex[65], p[PATH_CAP + 80];
+        key_hex(name, hex);
+        snprintf(p, sizeof p, "%s/%s%s", cache_dir, hex, kind == PACK_USE ? ".use" : kind == PACK_SPV ? ".spv" : ".res.json");
+        if (file_exists(p)) {
+            plat_file_delete(p);
+            if (file_exists(p)) d->left++;   // open in a reader: the next pass deletes it
+            else d->deleted++;
+        }
     }
     if (!pack_find(kind, name)) return;
     d->left++;
@@ -3803,7 +3857,7 @@ static void drop_file(Drops *d, uint32_t kind, const uint8_t name[32]) {
 // none of whose other inputs still needs it. The inputs it did not cover (refused, skipped, not reached) keep theirs,
 // so carry_find still serves them. Returns how many of j's entries remain (packed ones until the pruned pack is in
 // place); 0 drops j from identities.txt.
-static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d) {
+static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d, const LooseCache *loose) {
     Set64 keep = {0}, done = {0};
     size_t left0 = d->left, kept = 0;
     for (size_t i = 0; i < m; i++)
@@ -3815,10 +3869,10 @@ static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d) {
         if (!(it[i].has >> j & 1) || it[i].state != CI_COVERED) continue;
         uint8_t key[32], name[32];
         key_of_input_id(C.prev_eff[j], it[i].iid, key);
-        drop_file(d, PACK_SPV, key), drop_file(d, PACK_RES, key);
+        drop_file(d, loose, PACK_SPV, key), drop_file(d, loose, PACK_RES, key);
         if (!set_add(&done, hash8(it[i].h)) || set_has(&keep, hash8(it[i].h))) continue;
         use_name_id(C.prev_eff[j], it[i].h, name);
-        drop_file(d, PACK_USE, name);
+        drop_file(d, loose, PACK_USE, name);
     }
     free(keep.v), free(done.v);
     return kept + (d->left - left0);
@@ -3974,10 +4028,18 @@ static void carry_main(void *arg) {
     // whose use mask is known, and lookups try that before a previous translator's disk entry; the shaders already
     // served stay in memory as they are.
     Drops d = {0};
+    LooseCache loose = {0};
+    if (m && (plat_fs_list(cache_dir, loose_collect, &loose) != PLAT_FS_OK || loose.failed)) {
+        loose.failed = 1;
+        rt_log("gfx_shader: carry: cannot index loose cache files; checking each file separately");
+    } else if (loose.n) {
+        qsort(loose.v, loose.n, sizeof *loose.v, drop_cmp);
+    }
     uint8_t gone[IDS_MAX][32];
     int n_gone = 0;
     for (int j = 0; j < C.n_prev; j++)
-        if (!carry_prune_one(it, m, j, &d)) memcpy(gone[n_gone++], C.prev[j], 32);
+        if (!carry_prune_one(it, m, j, &d, &loose)) memcpy(gone[n_gone++], C.prev[j], 32);
+    free(loose.v);
     free(it);
     int repacked = d.n && carry_repack(&d);
     plat_mutex_lock(&ids_lock);
