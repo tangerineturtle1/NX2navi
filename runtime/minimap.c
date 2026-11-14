@@ -16,7 +16,7 @@
 // gameplay (the Pro interface never opens it) this file opens it in its small form as SeqOneShotOpenMapMenu does.
 // It does so only after the screen has stayed closed through REOPEN_POLLS polls in a row of gameplay, so a screen the
 // game closes on its way into a menu, a cutscene or a load (which stop Link's update) is not opened behind it.
-// game: the game decides, and only what this file changed is put back.
+// game: the game decides; the drawn byte this file held is handed back as 1.
 //
 // Settings (live): minimap_button (off, or down: the D-pad's down; the Controls tab's one row) switches between shown
 // and hidden, starting from what is on the screen, and saves the choice as minimap (game, shown or hidden; no row of
@@ -53,8 +53,7 @@ enum { MODE_GAME, MODE_SHOWN, MODE_HIDDEN };
 static _Atomic int polls = GAMEPLAY_POLLS;   // polls since Link's last movement update (none yet: not gameplay)
 static int latched;                          // the press now held began in gameplay: kept from the game
 static int last_held;
-static uint64_t drawn_screen;                // the screen whose drawn byte this file changed, or 0
-static uint8_t drawn_was;                    // ... and what it was before
+static uint64_t drawn_screen;                // the screen whose drawn byte this file holds, or 0
 static int closed_polls;                     // shown: gameplay polls in a row with the screen closed
 static int opened;                           // shown: this file opened the screen (log only)
 
@@ -103,13 +102,15 @@ static int screen_up(uint64_t s) {
 // The minimap is on the screen: up, in its small form and drawn.
 static int minimap_seen(uint64_t s) { return s && screen_up(s) && rd8(s + MAP_IS_MINI) && rd8(s + SCR_VISIBLE); }
 
+// The drawn byte while this file holds it. Handed back (the pause menu's map, or the game deciding again) it is 1, the
+// screen drawn: not the value found when this file first wrote it, which can be a 0 of a screen the game had not yet
+// shown or that the Pro interface left closed, and would leave the pause menu's map undrawn.
 static void set_drawn(uint64_t s, uint8_t v) {
-    if (rd8(s + SCR_VISIBLE) == v) return;
-    if (!drawn_screen) drawn_screen = s, drawn_was = rd8(s + SCR_VISIBLE);
-    wr8(s + SCR_VISIBLE, v);
+    drawn_screen = s;
+    if (rd8(s + SCR_VISIBLE) != v) wr8(s + SCR_VISIBLE, v);
 }
 static void restore_drawn(uint64_t s) {
-    if (drawn_screen && drawn_screen == s) wr8(s + SCR_VISIBLE, drawn_was);
+    if (drawn_screen && drawn_screen == s && !rd8(s + SCR_VISIBLE)) wr8(s + SCR_VISIBLE, 1);
     drawn_screen = 0;
 }
 

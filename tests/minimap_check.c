@@ -147,8 +147,8 @@ int main(void) {
     screen[MAP_IS_MINI] = 0, screen[SCR_VISIBLE] = 0;
     set_state(ST_CLOSED, 0);
     for (int i = 0; i < 100; i++) poll(0, 1);
-    assert(opens == 3 && !drawn());
-    screen[MAP_IS_MINI] = 1, screen[SCR_VISIBLE] = 1;   // the game's own map drawn again, back in the small form
+    assert(opens == 3 && drawn());   // the large form is drawn, never hidden
+    screen[MAP_IS_MINI] = 1;
 
     // the next press hides it (it is on the screen)
     for (int i = 0; i < REOPEN_POLLS; i++) poll(0, 1);
@@ -178,6 +178,33 @@ int main(void) {
     snprintf(button_v, sizeof button_v, "down");
     poll(0, 1);
     assert(set_on && !drawn());
+
+    // the pause menu's map after the minimap was hidden on Pro: the screen was undrawn and closed when the first press
+    // showed it, and that 0 is not what the large form gets back
+    snprintf(minimap_v, sizeof minimap_v, "game");
+    poll(0, 1);
+    screen[MAP_IS_MINI] = 1, screen[SCR_VISIBLE] = 0;
+    set_state(ST_CLOSED, 0);
+    poll(0, 1);
+    assert(poll(DOWN, 1) == 0 && !strcmp(minimap_v, "shown") && drawn());
+    poll(0, 1);
+    assert(poll(DOWN, 1) == 0 && !strcmp(minimap_v, "hidden") && !drawn());
+    poll(0, 1);
+    for (int i = 0; i < GAMEPLAY_POLLS + 1; i++) poll(0, 0);   // the pause menu
+    screen[MAP_IS_MINI] = 0;                                    // its map: the same screen, large
+    poll(0, 0);
+    assert(drawn());
+    screen[MAP_IS_MINI] = 1;                                    // back to the minimap: hidden again
+    poll(0, 1);
+    assert(!drawn());
+
+    // hidden from the start (saved), with the screen already undrawn: the large form is drawn all the same
+    screen[SCR_VISIBLE] = 0;
+    drawn_screen = 0;
+    poll(0, 1);
+    screen[MAP_IS_MINI] = 0;
+    poll(0, 0);
+    assert(drawn());
 
     puts("minimap_check: ok");
     free(img);
