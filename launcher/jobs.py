@@ -551,16 +551,24 @@ class UpdateDownloadJob(Job):
         self.title = f'Updating to {ver}'
         self.task = f'the update to {ver}'
 
+    def fetch(self, layout, prog):
+        """The release's app folder, downloaded and unpacked, and the download step's value (None: its time)."""
+        folder = updater.stage_app(layout, self.release, progress=prog, cancel=self.cancelled,
+                                   version=self.ctx.version, log=self.log)
+        return folder, None
+
+    def before_switch(self, layout):
+        """Just before app/current.txt names the release."""
+
     def run(self):
         layout = self.ctx.layout
         self.begin('download')
         prog = lambda d, t: self.progress('download', d / max(t, 1), f'{d / 1e6:.1f} of {t / 1e6:.1f} MB')  # noqa: E731
-        folder = updater.stage_app(layout, self.release, progress=prog, cancel=self.cancelled,
-                                   version=self.ctx.version, log=self.log)
+        folder, value = self.fetch(layout, prog)
         if updater.runtime_needed(layout, self.release):
             updater.stage_runtime(layout, self.release, progress=prog, cancel=self.cancelled,
                                   version=self.ctx.version, log=self.log)
-        self.finish('download')
+        self.finish('download', value)
         self.begin('verify')
         if not (folder / 'launcher' / 'start.pyw').is_file():
             raise updater.UpdateError(f'{folder} is incomplete')
@@ -568,8 +576,63 @@ class UpdateDownloadJob(Job):
         if layout.dev:   # a checkout runs from the repository: nothing to switch to
             self.after = 'staged'
             return
+        self.before_switch(layout)
         updater.switch_to(layout, self.ver)
         self.after = 'restart'
+
+
+class DowngradeJob(UpdateDownloadJob):
+    """Back to an older release the player picked (Settings > Downgrade, docs/launcher.md "Downgrading"): its
+    manifest from the feed, its app archive unless app/<version> still holds that version whole (most often the
+    version before the running one), the Python it needs, then the switch and the restart of an update, whose
+    rebuild runs in the older version (ContinueUpdateJob). Every newer version stays out until the player selects
+    Updates: the newest one the player leaves becomes settings['rolled_back'], which no launcher since background
+    updates began stages or installs by itself, and releases staged in the background are removed. A launcher older
+    than that never installs an update by itself."""
+
+    def __init__(self, ctx, listed, newest=''):
+        Job.__init__(self, ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders'],
+                     listed.version)
+        self.listed, self.ver, self.release = listed, listed.version, None
+        mine = versions.display(ctx.layout.version)
+        self.newest = newest if newest and versions.newer(newest, mine) else mine
+        self.title = f'Downgrading to {self.ver}'
+        self.task = f'the downgrade to {self.ver}'
+
+    def fetch(self, layout, prog):
+        self.release = self.listed.release(self.ctx.version)
+        if updater.installed_whole(layout, self.ver):
+            self.log(f'{self.ver} is still in app/{self.ver}: switching back to it without downloading it')
+            return layout.apps / self.ver, 'On This PC'
+        return UpdateDownloadJob.fetch(self, layout, prog)
+
+    def run(self):
+        if not versions.newer(self.ctx.layout.version, self.ver):
+            raise updater.UpdateError(f'{self.ver} is not older than the running version')
+        UpdateDownloadJob.run(self)
+
+    def before_switch(self, layout):
+        updater.drop_staged(layout)
+        self.ctx.settings['rolled_back'] = self.newest
+        self.ctx.settings.save()
+        self.log(f'downgrade: {self.newest} and newer stay out until Updates is selected')
+
+
+class HistoryJob(Job):
+    """The feed's releases for the Downgrade screen (feed.history)."""
+    kind = 'check'
+
+    def __init__(self, ctx):
+        super().__init__(ctx, [])
+        self.entries = []
+
+    def run(self):
+        s = self.ctx.settings
+        self.entries = feed.history(feed.load(self.ctx.layout, s), s.get('channel', 'stable'),
+                                    s.get('github_token', ''), self.ctx.version)
+
+    def overall(self):
+        return 0.0
 
 
 class ContinueUpdateJob(RebuildJob):

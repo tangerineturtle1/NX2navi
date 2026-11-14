@@ -11,6 +11,8 @@ The feed (app/<version>/feed.json, or the player's override in settings) is eith
     {"type": "github", "repo": "owner/name"}   the newest GitHub release (or pre-release, on the preview channel)
                                                   that has the manifest; a token reads a private repository
     {"type": "url", "url": "https://.../NX2navi-update.json"}   one manifest; its files sit beside it
+
+history() lists a GitHub feed's releases for a downgrade (Settings > Downgrade).
 """
 import json
 import re
@@ -103,7 +105,8 @@ def retry_text(headers, now=None):
             f'(in {minutes} minute{"" if minutes == 1 else "s"})')
 
 
-def _github(feed, channel, token, version):
+def _github_list(feed, token, version):
+    """The repository's releases as GitHub's API lists them (newest first) and the headers its files need."""
     api = feed.get('api', GITHUB_API).rstrip('/')
     headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
     if token:
@@ -118,26 +121,77 @@ def _github(feed, channel, token, version):
             when = retry_text(getattr(e, 'headers', None))
             raise FeedError(f'GitHub refused the request (rate limit); try again {when or "in an hour"}') from e
         raise FeedError(f'GitHub could not be reached: {e}') from e
+    return releases
+
+
+def _github_assets(r, token):
+    """(file name -> url, the headers those urls need) of a release that carries the manifest, or None."""
+    assets = {a['name']: a for a in r.get('assets', [])}
+    if MANIFEST not in assets:
+        return None
+    if token:   # a private repository's files come through the API with the token
+        return ({n: a['url'] for n, a in assets.items()},
+                {'Accept': 'application/octet-stream', 'Authorization': f'Bearer {token}'})
+    return {n: a['browser_download_url'] for n, a in assets.items()}, {}
+
+
+def _github_release(r, urls, asset_headers, version):
+    try:
+        m = _check_manifest(json.loads(net.get_bytes(urls[MANIFEST], asset_headers, version=version)),
+                            f'{r.get("tag_name")}/{MANIFEST}')
+    except (FeedError, ValueError, OSError) as e:
+        raise FeedError(f'{r.get("tag_name")}: {e}') from e
+    return Release(m, r.get('body') or '', r.get('html_url', ''), urls, asset_headers, bool(r.get('prerelease')))
+
+
+def _github(feed, channel, token, version):
     # The API lists the newest release first: the first one the channel takes that has a manifest is the answer.
-    for r in releases:
+    for r in _github_list(feed, token, version):
         if r.get('draft') or (r.get('prerelease') and channel != 'preview'):
             continue
-        assets = {a['name']: a for a in r.get('assets', [])}
-        if MANIFEST not in assets:
-            continue
-        if token:   # a private repository's files come through the API with the token
-            urls = {n: a['url'] for n, a in assets.items()}
-            asset_headers = {'Accept': 'application/octet-stream', 'Authorization': f'Bearer {token}'}
-        else:
-            urls = {n: a['browser_download_url'] for n, a in assets.items()}
-            asset_headers = {}
-        try:
-            m = _check_manifest(json.loads(net.get_bytes(urls[MANIFEST], asset_headers, version=version)),
-                                f'{r.get("tag_name")}/{MANIFEST}')
-        except (FeedError, ValueError, OSError) as e:
-            raise FeedError(f'{r.get("tag_name")}: {e}') from e
-        return Release(m, r.get('body') or '', r.get('html_url', ''), urls, asset_headers, bool(r.get('prerelease')))
+        found = _github_assets(r, token)
+        if found:
+            return _github_release(r, *found, version)
     return None
+
+
+class Listed:
+    """A release in the feed's list (history), read without its manifest: release() fetches that."""
+
+    def __init__(self, version, date, notes, prerelease, raw, urls, headers):
+        self.version, self.date, self.notes, self.prerelease = version, date, notes, prerelease
+        self._raw, self._urls, self._headers = raw, urls, headers
+
+    def release(self, version='dev'):
+        """The Release, with its manifest; FeedError when that names another version than the release's tag."""
+        rel = _github_release(self._raw, self._urls, self._headers, version)
+        if versions.display(rel.version) != self.version:
+            raise FeedError(f'the release {self.version} holds the manifest of {rel.version}')
+        return rel
+
+
+def history(feed, channel='stable', token='', version='dev'):
+    """The releases the feed offers on the channel that carry a manifest, newest first, as Listed (one request; no
+    manifest is read). A URL feed names one manifest and has no list: []."""
+    if feed.get('type') == 'url':
+        return []
+    if feed.get('type') != 'github':
+        raise FeedError(f'unknown feed type {feed.get("type")!r}')
+    out = []
+    for r in _github_list(feed, token, version):
+        if r.get('draft') or (r.get('prerelease') and channel != 'preview'):
+            continue
+        found = _github_assets(r, token)
+        ver = versions.display((r.get('tag_name') or '').lstrip('v'))
+        try:
+            versions.parse(ver)
+        except ValueError:
+            continue
+        if found:
+            out.append(Listed(ver, (r.get('published_at') or '')[:10], r.get('body') or '', bool(r.get('prerelease')),
+                              r, *found))
+    out.sort(key=lambda e: versions.parse(e.version), reverse=True)
+    return out
 
 
 def _url(feed, version):

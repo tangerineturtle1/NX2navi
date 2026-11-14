@@ -94,7 +94,8 @@ left and right to move it); customize (Color Scheme, with Custom Background Colo
 Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
 Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
-Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
+Build Cache, Update Channel, Downgrade, the folders, Open Logs Folder, Uninstall, Back); downgrade (the older
+releases, then Downgrade or Cancel); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
 
 Controls: the mouse (hover moves the cursor, a click selects); the keyboard (arrows, Enter or Space, Esc, F5 checks
@@ -321,6 +322,29 @@ broken version then stayed the current one. The game is never rebuilt while it
 runs. Keep Build Cache off deletes the lifted C and the objects (about 1.5 GB) after each build but keeps
 `build-cache/state.json`, so updates still rebuild without the dump (compiling everything).
 
+### Downgrading
+
+Settings > Downgrade goes back to an older release when a new one went wrong (`launcher/ui/app.py`
+`rows_downgrade`). The screen reads the feed's releases with one request (`feed.history`: the channel's releases
+that carry a manifest, newest first, without reading the manifests) and lists up to eight older than the running
+version, each with its date, or "On This PC" when `app/<version>` still holds it whole and was installed rather than
+staged (`updater.installed_whole`: most often the version before the running one). A URL feed names one manifest and
+lists nothing. Picking one asks first, then `jobs.DowngradeJob` runs the steps of an update:
+
+1. **Download**: the picked release's manifest (`feed.Listed.release`, refused when it names another version than the
+   release's tag), then its app archive, unless it is on this PC, and the Python it needs.
+2. **Verify** and the switch: releases staged in the background are removed (`updater.drop_staged`), `rolled_back`
+   in `data/launcher.json` gets the newest version the player knows of (the feed's newest, the last check's answer
+   or the running version), `app/previous.txt` the running version and `app/current.txt` the older one, and the
+   launcher restarts with `--continue-update`.
+3. The older version rebuilds the game in its own `jobs.ContinueUpdateJob`, as after an update.
+
+Newer versions then stay out until the player selects Updates, which updates as usual: every launcher since
+background updates began (0.6.1) neither stages nor installs the `rolled_back` version by itself, and the feed's
+newest release is the only one it ever offers; an older launcher never installs an update by itself. A release newer
+than that, published later, installs as usual. The game is never rebuilt while it runs: Downgrade asks to close it
+first.
+
 ## Sharing a save
 
 A bug report from a place in the game the developer has not reached yet is quickest to reproduce with the reporter's
@@ -546,7 +570,8 @@ repository keeps old package files, so a release keeps building with the compile
 `python tests/launcher_test.py` (Python 3.14): versions, settings, the toolchain resolver and installer against a
 local fake repository, resumed and checked downloads, the certificate checks against a local HTTPS server (its
 certificates made with the `openssl` command), the GitHub and URL feeds, staging, switching, rollback and
-pruning, unsafe archives, the background update (a release staged beside the running version without switching, the
+pruning, the downgrade (the feed's list, the older release switched to with newer ones held back, one still on this
+PC taken without a download), unsafe archives, the background update (a release staged beside the running version without switching, the
 `staged.json` marker, a staged release installed after a restart, no install while the game runs, the install once
 it exited, nothing by itself with Install Updates Automatically off, a failed staging tried again after the next
 check), the font decoding on a system font wrapped like the game's, the look (every colour scheme complete, the

@@ -239,6 +239,24 @@ def switch_to(layout, ver):
     write_text(layout.apps / 'current.txt', ver)
 
 
+def installed_whole(layout, ver):
+    """True when app/<ver> holds that version whole and was installed before rather than staged (most often the
+    version before the running one): a downgrade switches back to it without downloading it."""
+    folder = layout.apps / ver
+    return ((folder / 'launcher' / 'start.pyw').is_file() and versions.display(read_text(folder / 'VERSION')) == ver
+            and not (folder / STAGED).exists() and folder.resolve() != Path(layout.app).resolve())
+
+
+def drop_staged(layout):
+    """Remove every release staged in the background but not installed: a downgrade leaves them behind."""
+    keep = {current(layout), previous(layout)}
+    if layout.apps.is_dir():
+        for d in layout.apps.iterdir():
+            if (d.is_dir() and d.name not in keep and (d / STAGED).is_file()
+                    and d.resolve() != Path(layout.app).resolve()):
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def rollback(layout):
     """Back to previous.txt's version; False when there is none to go back to."""
     prev = previous(layout)

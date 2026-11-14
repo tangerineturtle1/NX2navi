@@ -969,6 +969,28 @@ class FeedTest(Tmp):
         self.assertTrue(any(h.get('Authorization') == 'Bearer secret' for _, h in srv.hits))
         self.assertEqual(feed.plain_notes('## Head\n- **One**\n* `Two`\n<!-- x -->'), ['Head', 'One', 'Two'])
 
+    def test_history_lists_the_releases_for_a_downgrade(self):
+        """feed.history: every release the channel takes that carries a manifest, newest first, from one request; a
+        release's manifest is read only when it is picked, and one naming another version than its tag is refused."""
+        srv = self.serve_github()
+        rels = [self.release(srv, 'v0.4.0-rc1', '0.4.0-rc1', pre=True), self.release(srv, 'v0.3.10', '0.3.10'),
+                self.release(srv, 'v0.3.12', '0.3.12', manifest=False), self.release(srv, 'v0.3.11', '0.3.11'),
+                dict(self.release(srv, 'nightly', '0.3.9'))]
+        rels[1]['published_at'] = '2026-11-02T10:00:00Z'
+        self.publish(rels)
+        f = {'type': 'github', 'repo': 'o/r', 'api': srv.url.rstrip('/')}
+        srv.hits.clear()
+        stable = feed.history(f, 'stable')
+        self.assertEqual([e.version for e in stable], ['0.3.11', '0.3.10'])   # sorted; no manifest, no version tag
+        self.assertEqual(len(srv.hits), 1)                                     # the list alone
+        self.assertEqual(stable[1].date, '2026-11-02')
+        self.assertEqual([e.version for e in feed.history(f, 'preview')], ['0.4.0-rc1', '0.3.11', '0.3.10'])
+        self.assertEqual(stable[0].release().version, '0.3.11')
+        wrong = feed.Listed('0.3.8', '', '', False, stable[0]._raw, stable[0]._urls, {})
+        with self.assertRaises(feed.FeedError):
+            wrong.release()
+        self.assertEqual(feed.history({'type': 'url', 'url': srv.url + 'x.json'}), [])
+
     def test_a_refused_check_says_when_to_try_again(self):
         """GitHub's answer to a request over the hourly allowance carries the time the allowance is whole again:
         the message names it, and the log gets one line for the failed check, not two tracebacks."""
@@ -1134,6 +1156,55 @@ class BackgroundUpdateTest(Tmp):
 
     def state(self):
         return updater.current(self.layout), updater.previous(self.layout), self.restarts
+
+    def listed(self, ver):
+        """ver as the Downgrade screen lists it: a GitHub release whose files are on the local server."""
+        self.publish(ver)
+        z = f'NX2navi-app-{ver}.zip'
+        urls = {feed.MANIFEST: self.srv.url + f'm-{ver}.json', z: self.srv.url + z}
+        return feed.Listed(ver, '', '', False, {'tag_name': f'v{ver}', 'body': ''}, urls, {})
+
+    def test_downgrade(self):
+        """Back to an older release: downloaded, switched to with the running version as previous, and the restart
+        of an update; the newest version left and every release staged in the background stay out until the player
+        selects Updates, also in a launcher that knows only rolled_back."""
+        ctx = self.context()
+        bg = self.background(ctx)
+        newer = self.publish('0.5.0')
+        self.assertEqual(self.stage(bg, newer), 'staged')
+        j = jobs.DowngradeJob(ctx, self.listed('0.3.0'), '0.5.0').run_inline()
+        self.assertEqual((j.result, j.after), ('ok', 'restart'), j.error)
+        self.assertEqual(self.state(), ('0.3.0', '0.4.0', []))
+        self.assertEqual(ctx.settings['rolled_back'], '0.5.0')
+        self.assertFalse((self.layout.apps / '0.5.0').exists())            # the staged release went
+        # the older launcher starting: nothing is staged or installed by itself
+        ctx2 = self.context()
+        self.assertEqual(ctx2.settings['rolled_back'], '0.5.0')
+        bg2 = self.background(ctx2)
+        self.assertIsNone(bg2.poll(newer))
+        self.assertIsNone(bg2.ready(newer))
+        self.assertEqual(bg2.install(self.game, newer), '')
+        self.assertEqual(self.restarts, [])
+
+    def test_downgrade_to_a_version_still_on_this_pc(self):
+        """The version before the running one is still in app/: going back to it downloads nothing; a newer version
+        than the running one is refused."""
+        prev = self.layout.apps / '0.3.5'
+        (prev / 'launcher').mkdir(parents=True)
+        (prev / 'launcher' / 'start.pyw').write_text('')
+        (prev / 'VERSION').write_text('0.3.5\n')
+        ctx = self.context()
+        listed = self.listed('0.3.5')
+        self.srv.hits.clear()
+        j = jobs.DowngradeJob(ctx, listed).run_inline()
+        self.assertEqual(j.result, 'ok', j.error)
+        self.assertEqual(j.step('download').value, 'On This PC')
+        self.assertFalse(any('NX2navi-app-0.3.5.zip' in path for path, _ in self.srv.hits))
+        self.assertEqual(updater.current(self.layout), '0.3.5')
+        self.assertEqual(ctx.settings['rolled_back'], '0.4.0')             # nothing newer known: the version left
+        j = jobs.DowngradeJob(self.context(), self.listed('0.6.0')).run_inline()
+        self.assertEqual(j.result, 'failed')
+        self.assertEqual(updater.current(self.layout), '0.3.5')
 
     def test_staging_leaves_the_running_version(self):
         """The release is unpacked beside the running version, its Python in its own folder rather than python.next
@@ -5418,7 +5489,7 @@ class WindowTest(Tmp):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('19 screens drawn', r.stdout)
+        self.assertIn('21 screens drawn', r.stdout)
 
 
 # ---------------------------------------------------------------- mods

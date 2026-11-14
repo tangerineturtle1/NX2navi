@@ -15,6 +15,8 @@ flat cells and the orange choices are canvas items. Screens:
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
     settings    the launcher's choices, the folders, the logs and Uninstall
+    downgrade   the older releases of the feed, to go back to one when a version went wrong
+    downgrade_confirm   what going back to the picked release does, then Downgrade or Cancel
     uninstall   what to remove, then Uninstall or Cancel
 
 Mouse, keyboard (arrows, Enter or Space, Esc, F5) and an XInput gamepad (d-pad or stick, A, B, Y) all move the cursor.
@@ -37,7 +39,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, mods, saves, steam, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, mods, saves, steam, updater, versions, winsys
 from ..context import Context
 from ..paths import long_path_problem
 from . import art, picture, sound
@@ -55,7 +57,8 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2, 'mods': 1, 'mod_order': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2, 'downgrade': 2, 'downgrade_confirm': 3}
+DOWNGRADE_SHOWN = 8   # older releases on the Downgrade screen
 MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
 ORDER_PAGE = 10   # ... of the Load Order screen
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
@@ -255,6 +258,9 @@ class App:
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
+        self.history = None        # the HistoryJob reading the feed's releases for the Downgrade screen
+        self.history_error = ''
+        self.downgrade_pick = None   # the feed.Listed picked on the Downgrade screen
         self.game_proc = None
         self.cursor_frames, self.cursor_k = [], 0
         self.last_second = 0
@@ -626,7 +632,8 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order',
+                           'downgrade', 'downgrade_confirm'):
             self.sounds.play('back')
         if self.screen == 'color':
             self.pick_done()
@@ -634,6 +641,10 @@ class App:
             self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
             self.show('settings')
+        elif self.screen == 'downgrade':
+            self.show('settings', self.settings_row('Downgrade'))
+        elif self.screen == 'downgrade_confirm':
+            self.show('downgrade')
         elif self.screen == 'saves':
             self.show('home', self.home_row('Saves'))
         elif self.screen == 'mods':
@@ -2018,6 +2029,9 @@ class App:
                         'Keep the translated code and compiled files (about 1.5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
             self.channel_row(),
+            Row('value', 'Downgrade', '', 'arrow', on=self.open_downgrade,
+                desc=('Go back to an older version of NX2navi when a new one went wrong. The game is rebuilt with '
+                      'it, and newer versions wait until you select Updates.',)),
             *([self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
             Row('divider'),
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
@@ -2035,6 +2049,103 @@ class App:
                       'game goes too.',)),
             Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
         ]
+
+    def settings_row(self, label):
+        """The index of the Settings screen's row with this label, for coming back to it."""
+        return next((i for i, r in enumerate(self.rows_settings()) if r.label == label), None)
+
+    # ---- downgrade (docs/launcher.md, "Downgrading")
+
+    def open_downgrade(self):
+        """The Downgrade screen, reading the feed's releases unless a reading is under way."""
+        if not (self.history and self.history.result is None):
+            self.history_error = ''
+            self.history = jobs.HistoryJob(self.ctx).start()
+        self.show('downgrade')
+
+    def history_done(self):
+        h = self.history
+        self.history_error = '' if h.result == 'ok' else (h.error or 'cancelled')
+        self.ctx.log(f'downgrade list: {len(h.entries)} releases' if h.result == 'ok' else
+                     f'downgrade list: {self.history_error}')
+        if self.screen == 'downgrade':
+            self.show('downgrade', self.focus)
+
+    def older_releases(self):
+        """The feed's releases older than the running version, newest first, at most DOWNGRADE_SHOWN."""
+        h = self.history
+        if not h or h.result != 'ok':
+            return []
+        mine = versions.display(self.layout.version)
+        return [e for e in h.entries if versions.newer(mine, e.version)][:DOWNGRADE_SHOWN]
+
+    def rows_downgrade(self):
+        mine = versions.display(self.layout.version)
+        back = Row('action', 'Back', on=lambda: self.show('settings', self.settings_row('Downgrade')), height=40,
+                   desc=('Back to Settings.',))
+        h = self.history
+        if h and h.result is None:
+            return [Row('value', 'Older Versions', 'Loading…', 'dim', on=lambda: None,
+                        desc=('Reading the list of released versions.',)), Row('divider'), back]
+        if self.history_error:
+            return [Row('value', 'Older Versions', 'Could not load', 'dim', on=self.open_downgrade,
+                        desc=(f'The list of versions could not be read: {self.history_error}',
+                              'Select this row to try again.')), Row('divider'), back]
+        older = self.older_releases()
+        if not older:
+            return [Row('value', 'Older Versions', 'None', 'dim', on=lambda: None,
+                        desc=(f'There is no released version older than {mine} to go back to.',)),
+                    Row('divider'), back]
+        rows = []
+        for e in older:
+            here = updater.installed_whole(self.layout, e.version)
+            value = 'On This PC' if here else (e.date or ('Preview' if e.prerelease else ''))
+            notes = feed.plain_notes(e.notes, 4)
+            text = (f'Go back from {mine} to {e.version}.'
+                    + (' It is still on this PC, so nothing needs downloading.' if here else ''))
+            rows.append(Row('value', f'Version {e.version}', value, 'arrow',
+                            on=lambda e=e: self.pick_downgrade(e),
+                            desc={'title': f'Version {e.version}', 'text': [text], 'divider': bool(notes),
+                                  'subtitle': "What's New in It" if notes else '', 'bullets': notes}))
+        return rows + [Row('divider'), back]
+
+    def pick_downgrade(self, entry):
+        self.downgrade_pick = entry
+        self.show('downgrade_confirm', 1)
+
+    def rows_downgrade_confirm(self):
+        e, mine = self.downgrade_pick, versions.display(self.layout.version)
+        if not e:
+            return [Row('action', 'Back', on=lambda: self.show('downgrade'), height=40, desc=('Back.',))]
+        text = (f'NX2navi goes back from {mine} to {e.version} and rebuilds the game with it. {UPDATE_TAKES} Your '
+                'saves stay as they are. Newer versions are not installed by themselves until you select Updates, '
+                'which brings NX2navi back up to date.')
+        return [
+            Row('value', 'Go Back To', f'Version {e.version}', 'normal', on=lambda: None,
+                desc={'title': f'Downgrade to {e.version}', 'text': [text]}),
+            Row('pair', actions=[('Downgrade', self.do_downgrade), ('Cancel', lambda: self.show('downgrade'))],
+                desc={'title': f'Downgrade to {e.version}', 'text': [text]}),
+        ]
+
+    def do_downgrade(self):
+        e = self.downgrade_pick
+        gd = self.settings.get('game_dir')
+        if not e:
+            return
+        if (self.game_proc and self.game_proc.poll() is None) or (gd and build.game_running(gd)):
+            self.message = 'Close the game first: going back rebuilds it.'
+            self.show('home', self.home_row('Play'))
+            return
+        if self.job and self.job.result is None:
+            return
+        # the newest version the player knows of stays out: the feed's newest, the last check's answer, the running one
+        newest = versions.display(self.layout.version)
+        for v in [x.version for x in (self.history.entries if self.history else [])] + (
+                [self.release.version] if self.release else []):
+            if versions.newer(v, newest):
+                newest = versions.display(v)
+        self.ctx.log(f'downgrade: from {versions.display(self.layout.version)} to {e.version}; {newest} stays out')
+        self.run_job(jobs.DowngradeJob(self.ctx, e, newest), 'home', back='downgrade')
 
     # ---- uninstall
 
@@ -2160,6 +2271,8 @@ class App:
             self.run_job(jobs.ContinueUpdateJob(self.ctx, j.game_dir, j.old, j.dump), self.job_return)
         elif isinstance(j, jobs.RebuildJob):
             self.run_job(jobs.RebuildJob(self.ctx, j.game_dir, j.dump), self.job_return)
+        elif isinstance(j, jobs.DowngradeJob):
+            self.run_job(jobs.DowngradeJob(self.ctx, j.listed, j.newest), self.job_return, self.job_back)
         elif isinstance(j, jobs.UpdateDownloadJob):
             self.run_job(jobs.UpdateDownloadJob(self.ctx, j.release), self.job_return)
 
@@ -2249,6 +2362,9 @@ class App:
             if self.check and self.check.result is not None and not getattr(self.check, 'seen', False):
                 self.check.seen = True
                 self.check_done()
+            if self.history and self.history.result is not None and not getattr(self.history, 'seen', False):
+                self.history.seen = True
+                self.history_done()
             ev = self.bg.poll(self.release, busy=bool(self.job and self.job.result is None))
             if ev:
                 self.background_event(ev)

@@ -239,6 +239,24 @@ def states(app):
     def mod_order():
         app.show('mod_order', 1)
 
+    def downgrade():   # the feed's list read: two older releases, the one before still on this PC
+        mine = versions.display(ctx.version)
+        try:
+            nums = versions.parse(mine)[0]
+            older = [f'{nums[0]}.{max(nums[1] - k, 0)}.0' for k in (1, 2)]
+        except ValueError:
+            older = ['0.2.0', '0.1.0']
+        h = jobs.HistoryJob(ctx)
+        h.entries = [feed.Listed(v, '2026-11-0' + str(2 - k), '- Fixes from that release.', False, {}, {}, {})
+                     for k, v in enumerate(older)]
+        h.result, h.seen = 'ok', True
+        app.history, app.history_error = h, ''
+        app.show('downgrade', 0)
+
+    def downgrade_confirm():
+        app.downgrade_pick = app.older_releases()[0] if app.older_releases() else None
+        app.show('downgrade_confirm', 1)
+
     def restore_game():
         s['game_dir'] = was_game
         app.show('home', 0)
@@ -249,7 +267,7 @@ def states(app):
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
             ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-custom-picker', custom_picker),
             ('16-first-scheme', restore_scheme), ('17-mods', mods_screen), ('18-mod-order', mod_order),
-            ('19-home-again', restore_game)]
+            ('19-downgrade', downgrade), ('20-downgrade-confirm', downgrade_confirm), ('21-home-again', restore_game)]
 
 
 def run(app, shots):
