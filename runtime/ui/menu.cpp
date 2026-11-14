@@ -515,7 +515,7 @@ static int fonts_up(float scale) {
         // what the title face shows in the CJK languages: the menu's title and tabs (Simplified Chinese menu text) and
         // the boot screen's title (the game's language)
         static const UiTextId titles[] = {UI_MENU_TITLE, UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                          UI_MENU_TAB_CONTROLS, UI_BOOT_TITLE};
+                                          UI_MENU_TAB_CONTROLS, UI_MENU_TAB_ADVANCED, UI_BOOT_TITLE};
         for (int i = 0; i < N; i++) {
             if (!data[i]) continue;
             ImFontGlyphRangesBuilder b;
@@ -582,8 +582,8 @@ extern "C" void menu_vk_release(void) {
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
-// Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
+// Ocarina of Time: the options this port has, and the Advanced tab
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_ADVANCED, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1793,8 +1793,144 @@ static void rows_low_end(void) {
 #endif
 }
 
-static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+// The confirmation of the Advanced tab's "Reset all settings to defaults", over the menu as restart_confirm's box is
+// (layout_menu calls it after that one, which clears g_modal): every key of the settings table, on every tab. Cancel
+// has the cursor first.
+static bool g_ask_reset;
+static void reset_confirm(float scale) {
+    if (g_ask_reset) g_ask_reset = false, ImGui::OpenPopup("##reset_confirm");
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0);
+    const bool open = ImGui::BeginPopupModal("##reset_confirm", nullptr,
+                                             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PopStyleVar();
+    if (!open) return;
+    g_modal = true;
+    const ImVec2 box = ImGui::GetWindowPos(), box_size = ImGui::GetWindowSize();
+    skin_panel(ImGui::GetWindowDrawList(), box, ImVec2(box.x + box_size.x, box.y + box_size.y), scale);
+    ImGui::TextUnformatted(menu_text(UI_MENU_RESET_CONFIRM));
+    ImGui::Spacing();
+    const char *yes = menu_text(UI_MENU_RESET_YES), *no = menu_text(UI_MENU_RESET_NO);
+    const ImGuiStyle &st = ImGui::GetStyle();
+    float bw = fmaxf(ImGui::CalcTextSize(yes).x, ImGui::CalcTextSize(no).x) + st.FramePadding.x * 4;
+    bool close = skin_widget_button(no, ImVec2(bw, 0), scale);
+    if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();
+    ImGui::SameLine(0, st.ItemSpacing.x + skin_cursor_reach(scale));
+    if (skin_widget_button(yes, ImVec2(bw, 0), scale)) {
+        const char *keys[256];
+        int n = 0;
+        for (const CfgMeta *m; n < 256 && (m = cfg_meta_at(n));) keys[n++] = m->key;
+        cfg_reset(keys, n);
+        opt_save_soon();
+        close = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+        close = true, menu_sound_play(MENU_SOUND_CANCEL);
+    if (close) {
+        ImGui::CloseCurrentPopup();
+        opt_focus_key("##reset");   // back on the row it came from
+    }
+    ImGui::EndPopup();
+}
+
+// A choice of thread counts for a setting whose unset value is automatic ("" first).
+static void row_threads(const char *key, UiTextId label, UiTextId desc) {
+    static const char *const values[] = {"", "1", "2", "4", "6", "8", "12", "16", "24", "32"};
+    const char *names[sizeof values / sizeof *values] = {menu_text(UI_MENU_AUTO), "1", "2", "4", "6", "8", "12", "16",
+                                                         "24", "32"};
+    opt_choice_list(key, label, values, names, sizeof values / sizeof *values, desc);
+}
+
+// The Advanced tab: rows for settings of nx2navi.ini's [performance] and [diagnostics] sections, grouped as the
+// sections' comments group them, and the log, system info and reset actions.
+static void tab_advanced(float scale) {
+    opt_begin("##advanced", scale);
+    opt_text(UI_MENU_ADV_WARNING, true);
+    static const UiTextId off_on[] = {UI_MENU_OFF, UI_MENU_ON};
+    static const UiTextId auto_off_on[] = {UI_MENU_AUTO, UI_MENU_OFF, UI_MENU_ON};
+
+    opt_group(UI_MENU_GROUP_CPU);
+    uint32_t l3_kb = 0;
+    uint64_t die = plat_cpu_cache_die(&l3_kb);
+    opt_choice("NX2NAVI_CACHE_DIE", UI_MENU_CACHE_DIE, off_on, 2, UI_MENU_CACHE_DIE_DESC,
+               die ? nullptr : menu_text(UI_MENU_CACHE_DIE_NOTE));
+    opt_choice("NX2NAVI_ONE_PER_CORE", UI_MENU_ONE_PER_CORE, off_on, 2, UI_MENU_ONE_PER_CORE_DESC);
+
+    opt_group(UI_MENU_GROUP_SCHED);
+    static const UiTextId preempt[] = {UI_MENU_PREEMPT_OFF, UI_MENU_PREEMPT_ON, UI_MENU_PREEMPT_INHERIT};
+    opt_choice("NX2NAVI_ASYNC_PREEMPT", UI_MENU_ASYNC_PREEMPT, preempt, 3, UI_MENU_ASYNC_PREEMPT_DESC);
+    opt_toggle("NX2NAVI_REPLAY_ASYNC", UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC);
+    opt_toggle("NX2NAVI_TIMER_1MS", UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC);
+
+    opt_group(UI_MENU_GROUP_SHADERS);
+    static const UiTextId wait[] = {UI_MENU_PIPE_WAIT_DEFAULT, UI_MENU_PIPE_WAIT_DRAW};
+    opt_choice("NX2NAVI_PIPE_WAIT", UI_MENU_PIPE_WAIT, wait, 2, UI_MENU_PIPE_WAIT_DESC);
+    static const UiTextId skip[] = {UI_MENU_PIPE_SKIP_STRICT, UI_MENU_PIPE_SKIP_ANY, UI_MENU_PIPE_SKIP_FULLSCREEN};
+    opt_choice("NX2NAVI_PIPE_SKIP", UI_MENU_PIPE_SKIP, skip, 3, UI_MENU_PIPE_SKIP_DESC);
+    opt_toggle("NX2NAVI_LIB_PREBUILD", UI_MENU_LIB_PREBUILD, UI_MENU_LIB_PREBUILD_DESC);
+    row_threads("NX2NAVI_LIB_PREBUILD_THREADS", UI_MENU_LIB_PREBUILD_THREADS, UI_MENU_LIB_PREBUILD_THREADS_DESC);
+    opt_toggle("NX2NAVI_PIPE_PREBUILD", UI_MENU_PIPE_PREBUILD, UI_MENU_PIPE_PREBUILD_DESC);
+    row_threads("NX2NAVI_PREWARM_XLATE", UI_MENU_PREWARM_XLATE, UI_MENU_PREWARM_XLATE_DESC);
+    opt_toggle("NX2NAVI_GPL", UI_MENU_GPL, UI_MENU_GPL_DESC);
+
+    opt_group(UI_MENU_GROUP_TEXMEM);
+    static const UiTextId astc[] = {UI_MENU_ASTC_AUTO, UI_MENU_ASTC_GPU, UI_MENU_ASTC_NATIVE, UI_MENU_ASTC_CPU};
+    opt_choice("NX2NAVI_ASTC", UI_MENU_ASTC, astc, 4, UI_MENU_ASTC_DESC);
+    static const UiTextId mem[] = {UI_MENU_MEMORY_AUTO, UI_MENU_MEMORY_IMPORT, UI_MENU_MEMORY_MIRROR,
+                                   UI_MENU_MEMORY_VERIFY};
+    opt_choice("NX2NAVI_MEMORY", UI_MENU_MEMORY, mem, 4, UI_MENU_MEMORY_DESC);
+    opt_toggle("NX2NAVI_TEX_ALIAS", UI_MENU_TEX_ALIAS, UI_MENU_TEX_ALIAS_DESC);
+    opt_slider("NX2NAVI_TEX_VRAM_PRESSURE", UI_MENU_TEX_VRAM_PRESSURE, 0, 100, UI_MENU_TEX_VRAM_PRESSURE_DESC, 5,
+               "%.0f %%");
+    opt_choice("NX2NAVI_ASTC_BC", UI_MENU_ASTC_BC, auto_off_on, 3, UI_MENU_ASTC_BC_DESC);
+
+    opt_group(UI_MENU_GROUP_FIXES);
+    opt_toggle("NX2NAVI_LOD_GUARD", UI_MENU_LOD_GUARD, UI_MENU_LOD_GUARD_DESC);
+    opt_toggle("NX2NAVI_FIX_C0", UI_MENU_FIX_C0, UI_MENU_FIX_C0_DESC);
+    opt_toggle("NX2NAVI_FIX_ZERO", UI_MENU_FIX_ZERO, UI_MENU_FIX_ZERO_DESC);
+    opt_toggle("NX2NAVI_BIND_SKIP", UI_MENU_BIND_SKIP, UI_MENU_BIND_SKIP_DESC);
+    opt_toggle("NX2NAVI_SHADER_MEMO", UI_MENU_SHADER_MEMO, UI_MENU_SHADER_MEMO_DESC);
+    opt_toggle("NX2NAVI_PIPE_MEMO", UI_MENU_PIPE_MEMO, UI_MENU_PIPE_MEMO_DESC);
+    opt_toggle("NX2NAVI_TEX_MEMO", UI_MENU_TEX_MEMO, UI_MENU_TEX_MEMO_DESC);
+    opt_toggle("NX2NAVI_DESC_TEMPLATE", UI_MENU_DESC_TEMPLATE, UI_MENU_DESC_TEMPLATE_DESC);
+    opt_toggle("NX2NAVI_PUSH_SKIP", UI_MENU_PUSH_SKIP, UI_MENU_PUSH_SKIP_DESC);
+    opt_slider("NX2NAVI_SPLIT_DRAWS", UI_MENU_SPLIT_DRAWS, 0, 1000, UI_MENU_SPLIT_DRAWS_DESC, 8, "%.0f");
+
+    opt_group(UI_MENU_GROUP_VULKAN);
+    opt_toggle("NX2NAVI_VK_VALIDATION", UI_MENU_VK_VALIDATION, UI_MENU_VK_VALIDATION_DESC);
+    opt_choice("NX2NAVI_VK_DYN_VERTEX", UI_MENU_VK_DYN_VERTEX, auto_off_on, 3, UI_MENU_VK_DYN_VERTEX_DESC);
+    opt_choice("NX2NAVI_VK_DYN_A2C", UI_MENU_VK_DYN_A2C, auto_off_on, 3, UI_MENU_VK_DYN_A2C_DESC);
+    opt_toggle("NX2NAVI_VK_SUBGROUP_PIN", UI_MENU_VK_SUBGROUP_PIN, UI_MENU_VK_SUBGROUP_PIN_DESC);
+
+    opt_group(UI_MENU_GROUP_DIAG);
+    {   // NX2NAVI_TRACE takes a list of channels; the row switches the frame timings (perf) alone
+        static const char *const values[] = {"", "perf"};
+        const char *names[] = {menu_text(UI_MENU_OFF), menu_text(UI_MENU_ON)};
+        opt_choice_list("NX2NAVI_TRACE", UI_MENU_TRACE, values, names, 2, UI_MENU_TRACE_DESC);
+    }
+    opt_toggle("NX2NAVI_FLIGHT", UI_MENU_FLIGHT, UI_MENU_FLIGHT_DESC);
+    opt_slider("NX2NAVI_FLIGHT_SPIKE_MS", UI_MENU_FLIGHT_SPIKE_MS, 20, 1000, UI_MENU_FLIGHT_SPIKE_MS_DESC, 10, "%.0f ms");
+    opt_choice("NX2NAVI_PASS_CRUMBS", UI_MENU_PASS_CRUMBS, auto_off_on, 3, UI_MENU_PASS_CRUMBS_DESC);
+    static bool log_failed, copied, copy_failed;
+    if (opt_button("##open_log", UI_MENU_OPEN_LOG, UI_MENU_OPEN_LOG_DESC,
+                   log_failed ? menu_text(UI_MENU_ACTION_FAILED) : "")) {
+        char dir[1024];
+        log_failed = !sysinfo_log_folder(dir, sizeof dir) || !plat_open_folder(dir);
+    }
+    const char *copy_value = copied ? menu_text(UI_MENU_COPY_INFO_DONE)
+                           : copy_failed ? menu_text(UI_MENU_ACTION_FAILED) : "";
+    if (opt_button("##copy_info", UI_MENU_COPY_INFO, UI_MENU_COPY_INFO_DESC, copy_value)) {
+        static char info[16384];
+        copied = sysinfo_text(info, sizeof info) > 0;
+        if (copied) ImGui::SetClipboardText(info);
+        copy_failed = !copied;
+    }
+    if (opt_button("##reset", UI_MENU_RESET, UI_MENU_RESET_DESC)) g_ask_reset = true;
+    opt_end();
+}
+
+static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND, UI_MENU_TAB_CONTROLS,
+                                              UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1915,6 +2051,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_ADVANCED: tab_advanced(scale); break;
             }
             ImGui::EndTabItem();
         }
@@ -1973,6 +2110,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SameLine(0, gap);
     if (skin_widget_button(quit, ImVec2(bw, 0), scale)) g_confirm_quit = true, ImGui::OpenPopup("##confirm");
     restart_confirm(scale);
+    reset_confirm(scale);
     menu_sounds_frame();
     bool was_modal = g_modal || binds_modal() || ImGui::GetIO().WantTextInput;
     if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))

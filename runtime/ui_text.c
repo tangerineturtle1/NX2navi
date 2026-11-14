@@ -745,6 +745,16 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MODS_EXEFS_ON] = "Code patches in use: %d files.",
     [UI_MENU_MODS_REPLACES_BUILTIN] = "Code patches in use: %d files. They replace the port's own patch %s, which "
                                       "stays off while this mod is on.",
+    [UI_MENU_GROUP_CPU] = "Processor",
+    [UI_MENU_CACHE_DIE] = "Run on the large-cache die",
+    [UI_MENU_CACHE_DIE_DESC] = "On a processor whose two dies have L3 caches of different sizes (AMD Ryzen X3D with "
+                               "3D V-Cache on one die), the game runs on the die with the larger cache, so its threads "
+                               "share one cache and never cross dies. Off leaves the placement to the system. No effect "
+                               "on other processors.",
+    [UI_MENU_CACHE_DIE_NOTE] = "no such die here",
+    [UI_MENU_ONE_PER_CORE] = "One thread per core",
+    [UI_MENU_ONE_PER_CORE_DESC] = "Uses one logical processor of each physical core, so two busy threads never share a "
+                                  "core.",
 };
 
 static const char *const text_ru[UI_TEXT_COUNT] = {
@@ -1304,6 +1314,16 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MODS_EXEFS_ON] = "Патчи кода в работе: файлов: %d.",
     [UI_MENU_MODS_REPLACES_BUILTIN] = "Патчи кода в работе: файлов: %d. Они заменяют собственный патч порта %s, "
                                       "который выключен, пока этот мод включён.",
+    [UI_MENU_GROUP_CPU] = "Процессор",
+    [UI_MENU_CACHE_DIE] = "Кристалл с большим кэшем",
+    [UI_MENU_CACHE_DIE_DESC] = "На процессоре, у двух кристаллов которого кэш L3 разного размера (AMD Ryzen X3D с 3D "
+                               "V-Cache на одном кристалле), игра работает на кристалле с большим кэшем: её потоки "
+                               "делят один кэш и не переходят между кристаллами. Выкл.: потоки размещает система. На "
+                               "других процессорах ничего не меняет.",
+    [UI_MENU_CACHE_DIE_NOTE] = "здесь такого нет",
+    [UI_MENU_ONE_PER_CORE] = "Один поток на ядро",
+    [UI_MENU_ONE_PER_CORE_DESC] = "Использует один логический процессор каждого физического ядра, чтобы два занятых "
+                                  "потока не делили ядро.",
 };
 
 static const char *const text_pt_br[UI_TEXT_COUNT] = {
@@ -1883,6 +1903,16 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_MODS_EXEFS_ON] = "Patches de código em uso: %d arquivos.",
     [UI_MENU_MODS_REPLACES_BUILTIN] = "Patches de código em uso: %d arquivos. Eles substituem o patch do próprio port "
                                       "%s, que fica desligado enquanto este mod está ligado.",
+    [UI_MENU_GROUP_CPU] = "Processador",
+    [UI_MENU_CACHE_DIE] = "Rodar no chip de cache maior",
+    [UI_MENU_CACHE_DIE_DESC] = "Num processador cujos dois chips têm caches L3 de tamanhos diferentes (AMD Ryzen X3D "
+                               "com 3D V-Cache num chip), o jogo roda no chip de cache maior: seus threads dividem um "
+                               "cache e não passam de um chip para o outro. Desligado deixa a distribuição com o "
+                               "sistema. Sem efeito em outros processadores.",
+    [UI_MENU_CACHE_DIE_NOTE] = "não há aqui",
+    [UI_MENU_ONE_PER_CORE] = "Um thread por núcleo",
+    [UI_MENU_ONE_PER_CORE_DESC] = "Usa um processador lógico de cada núcleo físico, para que dois threads ocupados nunca "
+                                  "dividam um núcleo.",
 };
 
 // Simplified Chinese: this row covers the software keyboard and the whole menu, so the menu and the overlay read Chinese
@@ -2542,6 +2572,14 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MODS_EXEFS_OTHER] = "它的代码补丁（exefs）是为其他游戏版本制作的。",
     [UI_MENU_MODS_EXEFS_ON] = "正在使用的代码补丁：%d 个文件。",
     [UI_MENU_MODS_REPLACES_BUILTIN] = "正在使用的代码补丁：%d 个文件。它们取代本移植自带的补丁 %s，此模组开启时该补丁保持关闭。",
+    [UI_MENU_GROUP_CPU] = "处理器",
+    [UI_MENU_CACHE_DIE] = "在大缓存芯片上运行",
+    [UI_MENU_CACHE_DIE_DESC] = "如果处理器的两个芯片的三级缓存大小不同（一个芯片带 3D V-Cache 的 AMD Ryzen X3D），"
+                               "游戏在缓存较大的芯片上运行，线程共用一个缓存，不跨芯片。关闭时由系统安排。"
+                               "对其他处理器无影响。",
+    [UI_MENU_CACHE_DIE_NOTE] = "本机没有",
+    [UI_MENU_ONE_PER_CORE] = "每核一个线程",
+    [UI_MENU_ONE_PER_CORE_DESC] = "每个物理核心只用一个逻辑处理器，两个繁忙线程不会共用一个核心。",
 };
 
 #define SWKBD_ONLY(name, ...) static const char *const name[UI_TEXT_COUNT] = {SWKBD(__VA_ARGS__)}
