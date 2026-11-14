@@ -391,10 +391,12 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   by their growth since play began and marks those that only climbed (`mem_growth.h`).
 - Released textures by age: the game releases a texture when what uses it leaves the view and takes it back when that
   returns; the cache keeps the released image so that the take-back finds it. In play the take-backs came within a
-  minute of the release or never, so a released texture goes once it has gone unused for a hold of three minutes, six
+  minute of the release or never, so a released texture goes once it has gone unused for a hold of one minute, two
   for content only the GPU made (`vk_texture.c` `drop_aged`, `vk_tex_release.h`, `tex_released_hold`). The size bound
-  (a quarter of the video memory budget) stays as the safety net for a burst of area changes, and young textures may
-  pass it, up to twice it, while the card and the system's commit have room. Times are wall seconds from a clock of
+  (a thirty-second of the video memory budget, 384 MiB to 1 GiB) is what the cache costs in video memory: the
+  allocator's blocks go back to the driver only when empty, so what the released textures hold at their fullest
+  stays in use for the session. Young textures may pass it, up to twice it, while the card and the system's commit
+  have room. Times are wall seconds from a clock of
   the presents, not present counts. What a switched-off upscaler or SMAA held is freed after it has gone unused for a
   while (`vk_dlaa.c` `idle_release`, `vk_fsr.c` `idle_note`, `vk_aa.c` `work_idle`). What DLSS or FSR lets go of at
   a change of size or mode (a network, an FSR context, a work image) goes once the GPU is past the last submission that

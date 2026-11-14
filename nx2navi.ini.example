@@ -416,14 +416,16 @@
 # left. In play the game took released textures back within a minute or not at all; one taken back after its drop is
 # made again and shows its stand-in for a frame. A texture whose content only the GPU made waits twice as long, and one
 # the GPU drew into since its last copy back to game memory stays. 0: released textures stay up to tex_released_mb for
-# the whole session (as before 0.10). Default: 180. Read at start.
-# tex_released_hold = 180
+# the whole session (as before 0.10). Default: 60 (180 until 0.10.2). Read at start.
+# tex_released_hold = 60
 # Megabytes the released textures may hold (0: no bound). Past it the oldest go even when young; while tex_released_hold
 # is on, young ones may stay past it, up to twice it, as long as video memory and the system's commit have room.
-# Default: a quarter of the video memory budget where the PC has an eighth of its memory to match, at least a
-# thirty-second of the PC's memory (512 to 2048), at most 8192. 1024 (the low of the 0.10 previews) holds less, but
-# textures the game takes back after their drop are made again and show their stand-in for a frame. Read at start.
-# tex_released_mb = 4096
+# What they hold at their fullest is video memory the game keeps for the rest of the session, so this is what the cache
+# costs. Default: a thirty-second of the video memory budget, at least 384 and at most 1024 (until 0.10.2 a quarter of
+# the budget, up to 8192: on a run through Hyrule Field that held 3.3 GB more video memory and saved one texture in
+# thirty from being loaded again). A larger value keeps more textures the game may take back, which are otherwise made
+# again and show their stand-in for a frame. Read at start.
+# tex_released_mb = 1024
 # Texture compaction (experimental). Video memory is taken in blocks (vma_block_mb), and a block goes back to the
 # driver only once everything in it is freed: after a long session the blocks hold textures scattered between holes,
 # and the game holds a gigabyte or two of video memory it does not use. 1: textures no shader sampled for ten seconds

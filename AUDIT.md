@@ -1163,8 +1163,9 @@ back.
 
 **Texture cache eviction.**
 
-- *Release overflow.* `sweep_released`: `RELEASED_MAX` 2048 entries, and `NX2NAVI_TEX_RELEASED_MB` (default RAM/32
-  clamped 512-2048 MiB, raised by budget/4 up to 8192).
+- *Release overflow.* `sweep_released`: `RELEASED_MAX` 2048 entries, and `NX2NAVI_TEX_RELEASED_MB` (default
+  budget/32 clamped 384-1024 MiB since 0.10.2, `vk_tex_release.h` `trl_cap_mb`; before it RAM/32 clamped 512-2048
+  MiB, raised by budget/4 up to 8192).
 - *Stale.* `drop_stale`: `STALE_FRAMES` 120 presents, `GPU_STALE_FRAMES` 1800.
 - *Overwritten.* `drop_overwritten`: `OVERWRITTEN_KEEP` 600.
 - *VRAM pressure.* `PRESSURE_STEP` 32 per check.

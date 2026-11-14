@@ -2579,11 +2579,10 @@ void vk_texture_pool_ctx(int on) { pool_ctx = on; }
 
 static int idle(const Tex *e, uint64_t now);
 
-// NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the installed memory, 512 MiB to 2 GiB, or more by the card's
-// budget, released_cap_bytes; 0 = no limit) bounds the own memory of the released entries. With the hold on (drop_aged,
-// the default) what they hold is what the last minutes released, and the bound is the safety net for a burst of area
-// changes within the hold; sweep_pressure lets young entries past it while the card and the system have room
-// (vk_tex_release.h trl_keep). Before the hold the bound was all that limited them: RELEASED_MAX alone kept 5-7 GiB of
+// NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the video memory budget, 384 MiB to 1 GiB, released_cap_bytes;
+// 0 = no limit) bounds the own memory of the released entries. With the hold on (drop_aged, the default) they hold
+// what the last minute released, up to the bound; sweep_pressure lets young entries past it while the card and the
+// system have room (vk_tex_release.h trl_keep). Before the hold the bound was all that limited them: RELEASED_MAX alone kept 5-7 GiB of
 // released render targets and decoded textures after an hour of play at a 2160p game resolution, device memory the
 // driver also charges to the system's commit (the process's private bytes reached 31 GiB). A sixteenth (1 to 4 GiB)
 // still let them hold 1.3 GiB on a 32 GB PC whose commit then ran out at an area load (device lost); only entries
@@ -2616,7 +2615,6 @@ static int idle(const Tex *e, uint64_t now);
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
-#define RELEASED_CAP_MAX_MB 8192
 static long long commit_free_mb = -2;   // -2: not read yet, -1: the default
 static long long proc_commit_mb;        // this process's bound in MB; 0 = none
 static int commit_low, commit_logs;     // commit_low: either of the two below at the last check
@@ -2633,29 +2631,19 @@ static uint64_t released_cap_bytes(void) {
         const char *by = "";   // which term set the bound, for the line below
         if (s && *s) mb = atoll(s);
         else {
-            float used, total, proc;
-            plat_mem_info(&used, &total, &proc);
-            mb = total > 0 ? (long long)(total / 32) : 1024;
-            mb = mb < 512 ? 512 : mb > 2048 ? 2048 : mb;
-            by = total > 0 ? ", a thirty-second of the installed memory (512 MiB to 2 GiB)"
-                           : ", the default without the installed memory's size";
-            // By the card too: a quarter of its budget where the PC has an eighth of its memory to match, up to
-            // RELEASED_CAP_MAX_MB. The game lets go of the textures of what leaves the view and takes them back when
-            // it returns; walking through a village the released ones passed 1 GiB within two or three minutes, and
-            // from then on each release dropped an older one that was decoded and encoded again on its way back,
-            // hundreds a second, on a card with 30 GiB free. The two pressure rules still come first: released
-            // entries go before anything else above NX2NAVI_TEX_VRAM_PRESSURE of the budget, and the bound falls to
-            // COMMIT_LOW_KEEP while the commit is low.
+            // By the card: a thirty-second of its budget, 384 MiB to 1 GiB (vk_tex_release.h trl_cap_mb, which has the
+            // run that set it). What the released textures hold at their fullest stays in use for the rest of the
+            // session, as free space inside the allocator's blocks once they are dropped, so the bound is the price of
+            // the cache; until 0.10.2 it was a quarter of the budget, up to 8 GiB. The two pressure rules still come
+            // first: released entries go before anything else above NX2NAVI_TEX_VRAM_PRESSURE of the budget, and the
+            // bound falls to COMMIT_LOW_KEEP while the commit is low.
             uint64_t vused = 0, vbudget = 0;
             int exact = 0;
-            if (vk_mem_vram(&vused, &vbudget, &exact) && total > 0) {
-                long long by_card = (long long)(vbudget >> 22), by_ram = (long long)(total / 8);   // a quarter, in MiB
-                long long more = by_card < by_ram ? by_card : by_ram;
-                const char *more_by = by_card <= by_ram ? ", a quarter of the video memory budget"
-                                                        : ", an eighth of the installed memory";
-                if (more > RELEASED_CAP_MAX_MB) more = RELEASED_CAP_MAX_MB, more_by = ", the largest the rule by the card gives";
-                if (more > mb) mb = more, by = more_by;
-            }
+            int known = vk_mem_vram(&vused, &vbudget, &exact) && vbudget;
+            mb = trl_cap_mb(known ? vbudget >> 20 : 0);
+            by = !known ? ", the default without the card's budget"
+               : mb == TRL_CAP_MAX_MB ? ", the most the rule by the card gives"
+               : mb == TRL_CAP_MIN_MB ? ", the least the rule by the card gives" : ", a thirty-second of the video memory budget";
         }
         released_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
         if (mb > 0) rt_log("vk: released textures keep at most %lld MiB of their own memory%s (NX2NAVI_TEX_RELEASED_MB)", mb,

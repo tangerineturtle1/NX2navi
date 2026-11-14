@@ -14,29 +14,50 @@
 // never taken back.
 //
 // So a released texture goes once it has gone unused for the hold (TRL_HOLD_S by default, NX2NAVI_TEX_RELEASED_HOLD),
-// three times the longest gap seen, whether or not the bound is reached: the cache then holds what the last few
-// minutes released, not what the bound allows, and it empties within minutes of the last area change. Unused counts
+// the longest gap seen, whether or not the bound is reached: the cache then holds what the last minute released, not
+// what the bound allows, and it empties within a minute or two of the last area change. Unused counts
 // from the release or from the last time a shader sampled the released image (a finalized slot may show it), whichever
 // is later. The hold is the same for a texture uploaded from the game's memory and for an ASTC one the GPU decodes:
 // either made again shows its stand-in for a frame, the decode only costs more of the render thread. A texture whose
 // content only the GPU made (a render target) cannot be made again at all, it comes back empty: it waits twice the
 // hold.
 //
-// The size bound (released_cap_bytes, a quarter of the video memory budget by default) stays as the safety net it was:
-// past it the oldest released textures go even when young. With the hold on, young ones past it are kept while the card
-// and the system have room (trl_room), up to TRL_ROOM_TIMES the bound: the old Balanced dropped 31 young ones in a
-// burst of area changes at its bound of 4 GiB on a card with 20 GiB free, and each was made again within a minute. The
-// hold empties that excess within minutes, so the room it takes is temporary; without the hold (tex_released_hold = 0) the
-// bound acts as before.
+// The size bound (trl_cap_mb: a thirty-second of the video memory budget, TRL_CAP_MIN_MB to TRL_CAP_MAX_MB) is what
+// decides how much video memory the cache costs: past it the oldest released textures go even when young, and with the
+// hold on, young ones past it are kept while the card and the system have room (trl_room), up to TRL_ROOM_TIMES the
+// bound. Until 0.10.2 the hold was 180 s and the bound a quarter of the budget (4 GiB on a 32 GiB card, 8 with room).
+// A run through Hyrule Field showed what that bought (2026-11-14, RTX 5090, 5120x2160 with DLSS Performance, about
+// three minutes of running; the game keeps 4.8 GiB of textures live there and lets go of and loads about 190 a
+// second): the released textures held 5.3 GiB on average and 6.4 at most, the video memory in use went from 11.1 to
+// 17.9 GiB, and of what they held the game took back 1,494 MiB within 2 to 10 s of the release, 171 MiB within 10 to
+// 60 s and 10 MiB later, beside 33,000 textures it loaded anew in that time. The memory does not come back when the
+// cache shrinks either: a block of the allocator goes back to the driver only when its last allocation went, so with
+// a hold of 20 s in the same run the released textures fell to 0.5 GiB while the free space inside the blocks rose to
+// 4.9 GiB, and the driver's figure stayed at 15.8. What the cache may hold at its fullest is therefore what the
+// session costs for good. With a bound of 1 GiB (2 with room) the same run held 13.4 GiB on average and 14.8 at most,
+// 3.3 GiB less, made 1,170 MiB of textures again over the run and kept its frame rate (78 against 75 fps, within what
+// two runs differ by).
 #pragma once
 #include <stdint.h>
 
 enum { TRL_STORAGE, TRL_GPU };   // content made again from the game's memory; content only the GPU made
 
-#define TRL_HOLD_S 180       // the default hold, in seconds
+#define TRL_HOLD_S 60        // the default hold, in seconds
 #define TRL_HOLD_MAX_S 900   // the longest hold the setting takes: twice it fits the clock below
 #define TRL_ROOM_TIMES 2     // with room, the released textures may hold this many times the bound
 #define TRL_ROOM_MARGIN 10   // room: the card at least this many points of its budget under the VRAM pressure
+#define TRL_CAP_SHARE 32     // the default bound: this share of the video memory budget,
+#define TRL_CAP_MIN_MB 384   // at least this much (the render targets a frame lets go of and takes back the next
+                             // frame come to about 70 MiB at 2560x1080; they are not dropped, but they count),
+#define TRL_CAP_MAX_MB 1024  // and at most this much
+#define TRL_CAP_UNKNOWN_MB 512   // without a budget (no VK_EXT_memory_budget and no heap size)
+
+// The default bound in MiB for a video memory budget in MiB (0: not known).
+static inline uint32_t trl_cap_mb(uint64_t budget_mb) {
+    if (!budget_mb) return TRL_CAP_UNKNOWN_MB;
+    uint64_t mb = budget_mb / TRL_CAP_SHARE;
+    return (uint32_t)(mb < TRL_CAP_MIN_MB ? TRL_CAP_MIN_MB : mb > TRL_CAP_MAX_MB ? TRL_CAP_MAX_MB : mb);
+}
 
 // The hold of a class, in seconds; 0: no hold.
 static inline uint32_t trl_hold(uint32_t hold_s, int cls) { return cls == TRL_GPU ? hold_s * 2 : hold_s; }
