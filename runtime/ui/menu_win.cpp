@@ -13,6 +13,7 @@
 extern "C" {
 #include "input.h"
 #include "input_win.h"
+#include "plugins.h"
 #include "ui/menu.h"
 }
 
@@ -46,6 +47,16 @@ static ImGuiKey key_of(WPARAM vk) {
 static unsigned g_held;
 
 extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
+    // The plugins see every key (plugin_api.h on_key; the virtual-key code is their key code). One that keeps a key
+    // takes it from the keys below, but never while the menu is open and never a system key (Alt+F4, F10).
+    if (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP) {
+        int down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
+        int kept = plugins_key((unsigned)w, down, down && (l & (1 << 30)));
+        if (kept && !menu_is_open() && (m == WM_KEYDOWN || m == WM_KEYUP)) {
+            *res = 0;
+            return 1;
+        }
+    }
     switch (m) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -84,6 +95,7 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
         if (c >= 0xdc00 && c < 0xe000) c = high ? 0x10000 + ((high - 0xd800) << 10) + (c - 0xdc00) : 0;
         high = 0;
         if (menu_is_open() && c >= 0x20 && c != 0x7f) menu_event_char(c);
+        else if (c >= 0x20 && c != 0x7f) plugins_text(c);   // a plugin's text box, while it has the input
         return 0;
     }
     case WM_MOUSEMOVE:

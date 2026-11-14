@@ -17,6 +17,7 @@ extern "C" {
 #include "platform/platform.h"
 }
 #include "menu_assets.h"
+#include "plugin_api.h"
 #include "ui/menu_art.h"
 #include "ui/menu_skin.h"
 
@@ -44,6 +45,7 @@ static struct Art {
 } g_art[MENU_ART_COUNT];
 static std::atomic<int> g_state;   // 0 not started, 1 decoding, 2 decoded, 3 nothing to show
 static VkSampler g_sampler;
+static VkSampler g_sampler_px;     // a plugin's pixel art (NX2_TEXTURE_PIXELS): the nearest texel when shown larger
 
 static void decode_all(void *) {
     size_t n = 0;
@@ -76,10 +78,19 @@ static void art_free(Art &a) {
 }
 
 // rgba (w x h) as a sampled image of up to max_levels levels, each halved from the one before, with its view and Dear
-// ImGui descriptor set in a; 1 when all of it is there, else 0 with nothing left allocated.
-static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t max_levels) {
+// ImGui descriptor set in a; 1 when all of it is there, else 0 with nothing left allocated. hard: sampled with
+// g_sampler_px.
+static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t max_levels, int hard = 0) {
     VkCtx *c = vk_ctx();
     if (!c || !rgba) return 0;
+    if (hard && !g_sampler_px) {
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_NEAREST;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(c->device, &si, nullptr, &g_sampler_px) != VK_SUCCESS) return 0;
+    }
     if (!g_sampler) {
         VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -174,7 +185,7 @@ static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint
         return art_free(a), 0;
     }
     int errs = menu_vk_errors();
-    a.ds = ImGui_ImplVulkan_AddTexture(g_sampler, a.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    a.ds = ImGui_ImplVulkan_AddTexture(hard ? g_sampler_px : g_sampler, a.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (menu_vk_errors() != errs) a.ds = VK_NULL_HANDLE;   // the descriptor set was not allocated (menu_vk_check logged it)
     if (!a.ds) return art_free(a), 0;
     return 1;
@@ -222,6 +233,108 @@ extern "C" int menu_art(MenuArt id, ImTextureID *tex, float *w, float *h) {
     return 1;
 }
 
+// ---- the plugins' pictures (plugin_api.h texture_create, texture_load, texture_free and Nx2Draw.image;
+// ui/plugin_draw.cpp makes the pixels and draws). A slot keeps the pixels a plugin gave, from any thread; the presenting
+// thread uploads them the first time an overlay callback draws the picture (plugin_tex_get), and again after the back
+// end started over. A picture given up after it was drawn is only marked: the presenting thread frees it before the
+// next overlay's callbacks, once the queue has finished the frames that drew with it (plugin_tex_sweep). With no
+// picture in use none of this runs but one load per overlay.
+static struct PTex {
+    Art a;            // a.rgba: the pixels, malloc'd, kept while the slot is in use
+    uint32_t flags;   // NX2_TEXTURE_*
+    uint32_t gen;     // counts the slot's uses: a handle is slot + 1 + gen * NX2_TEXTURES_MAX, so an old one finds nothing
+    int state;        // 0 free, 1 in use, 2 given up with objects on the GPU that wait for the sweep
+} g_ptex[NX2_TEXTURES_MAX];
+static PlatMutex g_ptex_lock;
+static std::atomic<int> g_ptex_dying;   // slots in state 2
+
+static PTex *ptex_of(int handle) {   // with g_ptex_lock held
+    if (handle <= 0) return nullptr;
+    PTex &t = g_ptex[(handle - 1) % NX2_TEXTURES_MAX];
+    return t.state == 1 && t.gen == (uint32_t)(handle - 1) / NX2_TEXTURES_MAX ? &t : nullptr;
+}
+
+// Takes the malloc'd pixels rgba (w x h) for a new picture; its handle, or 0 with rgba still the caller's when every
+// slot is in use. Any thread.
+extern "C" int plugin_tex_create(uint32_t w, uint32_t h, uint8_t *rgba, uint32_t flags) {
+    int handle = 0;
+    plat_mutex_lock(&g_ptex_lock);
+    for (int i = 0; i < NX2_TEXTURES_MAX && !handle; i++) {
+        PTex &t = g_ptex[i];
+        if (t.state) continue;
+        t.a = Art{};
+        t.a.rgba = rgba, t.a.w = w, t.a.h = h;
+        t.flags = flags;
+        t.gen = (t.gen + 1) & 0x3fffff;
+        t.state = 1;
+        handle = i + 1 + (int)t.gen * NX2_TEXTURES_MAX;
+    }
+    plat_mutex_unlock(&g_ptex_lock);
+    return handle;
+}
+
+extern "C" void plugin_tex_free(int handle) {   // any thread
+    plat_mutex_lock(&g_ptex_lock);
+    if (PTex *t = ptex_of(handle)) {
+        if (t->a.ds || t->a.img) {
+            t->state = 2;
+            g_ptex_dying.fetch_add(1);
+        } else {
+            free(t->a.rgba);
+            t->a = Art{};
+            t->state = 0;
+        }
+    }
+    plat_mutex_unlock(&g_ptex_lock);
+}
+
+extern "C" int plugin_tex_size(int handle, uint32_t wh[2]) {   // any thread
+    plat_mutex_lock(&g_ptex_lock);
+    PTex *t = ptex_of(handle);
+    if (t) wh[0] = t->a.w, wh[1] = t->a.h;
+    plat_mutex_unlock(&g_ptex_lock);
+    return t != nullptr;
+}
+
+// The picture for Dear ImGui, uploaded now when it is not on the GPU. The presenting thread, inside the overlay's frame.
+extern "C" int plugin_tex_get(int handle, ImTextureID *tex) {
+    int ok = 0;
+    plat_mutex_lock(&g_ptex_lock);
+    if (PTex *t = ptex_of(handle)) {
+        Art &a = t->a;
+        int hard = (t->flags & NX2_TEXTURE_PIXELS) != 0;
+        if (!a.ds && !a.failed && !upload_rgba(a, a.rgba, a.w, a.h, hard ? 1 : MAX_LEVELS, hard)) {
+            a.failed = 1;
+            rt_log("plugins: a picture of %ux%u could not be put on the GPU; it is not drawn", a.w, a.h);
+        }
+        if (a.ds) *tex = (ImTextureID)a.ds, ok = 1;
+    }
+    plat_mutex_unlock(&g_ptex_lock);
+    return ok;
+}
+
+// Frees the pictures given up since the last call. The presenting thread, before an overlay's callbacks: the frames
+// that drew with them were submitted, and the queue is waited for.
+extern "C" void plugin_tex_sweep(void) {
+    if (!g_ptex_dying.load(std::memory_order_relaxed)) return;
+    VkCtx *c = vk_ctx();
+    plat_mutex_lock(&g_ptex_lock);
+    if (c) {
+        vk_queue_lock();
+        vkQueueWaitIdle(c->gfx_queue);
+        vk_queue_unlock();
+    }
+    for (PTex &t : g_ptex) {
+        if (t.state != 2) continue;
+        art_free(t.a);
+        free(t.a.rgba);
+        t.a = Art{};
+        t.state = 0;
+    }
+    g_ptex_dying.store(0);
+    plat_mutex_unlock(&g_ptex_lock);
+}
+
 extern "C" void menu_art_release(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
@@ -229,6 +342,19 @@ extern "C" void menu_art_release(void) {
         art_free(a);
         a.failed = 0;   // uploaded again at the next use
     }
+    plat_mutex_lock(&g_ptex_lock);
+    for (PTex &t : g_ptex) {   // the plugins' pictures too: their pixels stay, for the next draw
+        art_free(t.a);
+        t.a.failed = 0;
+        if (t.state == 2) {
+            free(t.a.rgba);
+            t.a = Art{};
+            t.state = 0;
+        }
+    }
+    g_ptex_dying.store(0);
+    plat_mutex_unlock(&g_ptex_lock);
+    if (g_sampler_px) vkDestroySampler(c->device, g_sampler_px, nullptr), g_sampler_px = VK_NULL_HANDLE;
     art_free(g_font);   // the menu makes its atlas again after the back end starts again (fonts_up)
     ImGui::GetIO().Fonts->SetTexID(0);
     if (g_sampler) vkDestroySampler(c->device, g_sampler, nullptr), g_sampler = VK_NULL_HANDLE;

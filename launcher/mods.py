@@ -592,3 +592,35 @@ def add(game_dir, src, log=None):
         log(f'mods: added {src} as {target.name}')
     return target
 
+
+
+# ---------------------------------------------------------------- the launcher's own layer
+
+# Everything above is the mods folder as the game reads it. What a mod brings for the launcher (its mod.json: a
+# launcher add-on, libraries for the game's process, variables; single-file .nx2mod mods) is launcher/modext.py, which
+# builds on this module. Two things of it show here, so that every user of this module sees one kind of mod:
+# - scan returns each mod with its mod.json read (modext.Mod, a Mod with more fields), and leaves out the folder
+#   earlier launchers kept installed .nx2mod files in;
+# - the names modext.FROM_MODS lists (start_game, install_archive, pack, Host, load_plugins ...) are found in this
+#   module too, where they were before modext.py.
+
+_scan_folder = scan
+
+
+def scan(game_dir, details=True, log=None):
+    """The mods of the mods folder in the game's load order, as the scan above gives them, each with its mod.json read
+    (launcher/modext.py extend); [] without a game folder. A function in details' place is the log of the earlier
+    scan(game_dir, log): it means details, and nothing is logged."""
+    from . import modext
+    if callable(details):
+        details, log = True, details
+    if not game_dir:
+        return []
+    return [modext.extend(m) for m in _scan_folder(game_dir, details) if m.name != modext.LEGACY]
+
+
+def __getattr__(name):
+    from . import modext
+    if name in modext.FROM_MODS:
+        return getattr(modext, name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

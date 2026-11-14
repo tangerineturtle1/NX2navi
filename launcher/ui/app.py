@@ -8,7 +8,12 @@ The window is one Tk canvas at 1000 x 640 logical pixels, scaled to the display.
 flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
-    home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
+    home        Play, Updates, the rows the mods' launcher add-ons put there, the game folder, Saves, Mods, Rebuild
+                the Game, Customize Launcher, Settings
+    mods        Open Mods Folder, Add a Mod (a file or a folder), Reload Mods, one switch per mod in the mods folder,
+                Load Order (launcher/mods.py, and launcher/modext.py for what a mod's mod.json brings)
+    mod_order   each mod with its place in the load order
+    mod         a menu of a mod's launcher add-on (ModApi.show_menu), one per level of a stack
     customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
     color       the Custom scheme's colour picker: a colour square, a hue bar and the hex code
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
@@ -32,12 +37,13 @@ import random
 import shutil
 import sys
 import time
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, mods, saves, steam, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, modext, mods, saves, steam, steamlib, versions, winsys
 from ..context import Context
 from ..paths import long_path_problem
 from . import art, picture, sound
@@ -55,9 +61,11 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2, 'mods': 1, 'mod_order': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2, 'mod': 2}
 MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
 ORDER_PAGE = 10   # ... of the Load Order screen
+MOD_TRUST = ('Mods with a launcher add-on or game code run with your rights on this PC: install only mods you '
+             'trust.')
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
 # the hue bar (x0, y0, x1, y1)
 PICKER_BOX = (614, 100, 336, 452)
@@ -256,6 +264,10 @@ class App:
         self.dump_search = None
         self.uninstall_game = False
         self.game_proc = None
+        self.mod_apis = []       # the launcher add-ons that registered (load_mods)
+        self.mod_stack = []      # the add-ons' open menus: (api, title, rows), the one shown last
+        self.plugin_problems = {}   # mod name -> why its add-on failed at the last load_mods
+        self.play_extra = None   # (env, dlls) of the Play that waits for the build of the mods' code
         self.cursor_frames, self.cursor_k = [], 0
         self.last_second = 0
         self.gamepad = winsys.Gamepad()
@@ -626,9 +638,11 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order', 'mod'):
             self.sounds.play('back')
-        if self.screen == 'color':
+        if self.screen == 'mod':
+            self.mod_back()
+        elif self.screen == 'color':
             self.pick_done()
         elif self.screen == 'settings':
             self.show('home', self.home_row('Settings'))
@@ -765,6 +779,8 @@ class App:
             shutil.rmtree(old, ignore_errors=True)
         if gd or self.settings.get('dump'):
             self.fonts_from_game(gd, self.settings.get('dump'))
+        if gd and not a.selftest:   # the selftest draws made-up mods instead of the player's
+            self.load_mods()
         if a.uninstall:
             self.show('uninstall')
         elif a.continue_update is not None and not a.rolled_back:
@@ -1032,10 +1048,12 @@ class App:
             play_desc += (f'NX2navi {staged["version"]} is downloaded and installs after you quit the game.',)
         if self.message:
             play_desc = (self.message,) + play_desc
+        added = self.mod_home_rows()
         return [
             Row('value', 'Play', play_value, big=True, icon='play', on=self.play, desc=play_desc),
             upd,
             Row('divider'),
+            *([*added, Row('divider')] if added else []),
             Row('value', 'Game Folder', gd, on=lambda: self.open(gd),
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
                       'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
@@ -1593,6 +1611,10 @@ class App:
         if waiting:
             desc += (f'{", ".join(waiting)} changes the game\'s code: Play first builds the game again with it, which '
                      'takes a few minutes.',)
+        bad = sum(1 for m in found if m.problems or self.plugin_problems.get(m.name))
+        if bad:
+            desc += (f'{bad} of them {"has" if bad == 1 else "have"} a problem with what '
+                     f'{"it brings" if bad == 1 else "they bring"} for the launcher: the Mods screen says which.',)
         return Row('value', 'Mods', 'Build Waiting' if waiting else f'{on} On' if found else 'None',
                    'orange_arrow' if waiting else 'arrow', on=lambda: self.show('mods'), desc=desc)
 
@@ -1614,17 +1636,23 @@ class App:
                             'own and moves a mod\'s files to where the game looks for them.',
                             'To remove a mod, delete its folder and its archive, or switch it off here.')),
             Row('value', 'Add a Mod', 'Choose a File', 'arrow', on=lambda: self.add_mod(folder=False),
-                desc=msg + ('Choose a mod you downloaded, a .zip, .7z or .rar file: it is unpacked into the mods '
-                            'folder, ready for the game\'s next start.',)),
+                desc={'text': list(msg) + [
+                    'Choose a mod you downloaded, a .zip, .7z, .rar or .nx2mod file: it is unpacked into the mods '
+                    'folder, ready for the game\'s next start.',
+                    'A .nx2mod file is a mod made for NX2navi: it replaces the mod of its name, whose settings '
+                    'stay.'], 'note': MOD_TRUST}),
             Row('value', 'Add a Mod Folder', 'Choose a Folder', 'arrow', on=lambda: self.add_mod(folder=True),
                 desc=msg + ('Choose the folder of a mod (one with a romfs, exefs or cheats folder in it, or an '
                             'atmosphere folder): it is copied into the mods folder.',)),
+            Row('value', 'Reload Mods', '', 'arrow', on=self.reload_mods,
+                desc=msg + ('Read the mods folder again, after you changed it yourself, and load the mods\' launcher '
+                            'add-ons anew.',)),
         ]
         if found:
             rows.append(Row('divider'))
         for m in found[self.mods_page * MODS_PAGE:(self.mods_page + 1) * MODS_PAGE]:
             label = fit(self.f['label'], m.name, self.X(LABEL_W - 30))
-            if m.usable:
+            if m.usable or m.extras:   # what it brings for the launcher is switched too, whatever the game takes
                 rows.append(Row('toggle', label, on=lambda v, m=m: self.switch_mod(m, v), get=lambda m=m: m.enabled,
                                 desc=lambda m=m: self.mod_desc(m, over)))
             else:
@@ -1649,8 +1677,14 @@ class App:
 
     def mod_desc(self, m, over):
         lines = [self.mods_message] if self.mods_message else []
+        lines.append(m.field('description'))
+        lines.append(' · '.join(x for x in (f'Version {m.field("version")}' if m.field('version') else '',
+                                            f'by {m.field("author")}' if m.field('author') else '') if x))
+        if m.title != m.name:
+            lines.append(f'Folder: {m.name}')
         if not m.usable:
             lines.append(m.problem)
+        lines += [f'Problem: {p}' for p in [*m.problems, *self.plugin_problems.get(m.name, [])]]
         what = []
         if m.files:
             what.append(f'replaces {len(m.files):,} of the game\'s files' if len(m.files) > 1 else
@@ -1659,6 +1693,12 @@ class App:
             what.append(f'patches the game\'s code ({m.patches} patch file{"s" if m.patches > 1 else ""})')
         if m.cheat_file:
             what.append('brings cheats, which the Cheats tab of the game\'s menu switches on and off')
+        if m.plugin:
+            what.append('adds to this launcher (a launcher add-on)')
+        if m.dlls:
+            what.append('loads code of its own into the game (DLL)')
+        if m.env:
+            what.append('sets variables for the game')
         if what:
             lines.append('It ' + (', '.join(what[:-1]) + ' and ' + what[-1] if len(what) > 1 else what[0]) + '.')
         if m.name == mods.STAND_INS:
@@ -1674,8 +1714,12 @@ class App:
             lines.append('Its code is not in the game yet: Play first builds the game again with it, which takes a '
                          'few minutes.')
         if m.usable:
-            lines.append('On: the game loads it at its next start. Off: it stays in the mods folder, unused.')
-        return {'title': m.name, 'text': lines}
+            lines.append('On: the game loads it at its next start. Off: it stays in the mods folder, unused.'
+                         + (' Its launcher add-on comes and goes at once.' if m.plugin else ''))
+        desc = {'title': m.title, 'text': [t for t in lines if t]}
+        if m.extras or m.problems:   # code of the mod's own runs in the launcher or the game
+            desc['note'] = MOD_TRUST
+        return desc
 
     def game_busy(self, gd):
         return bool((self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)))
@@ -1692,6 +1736,10 @@ class App:
             return
         m.enabled, self.mods_message = bool(on), ''
         self.ctx.log(f'mods: {m.name} {"on" if on else "off"}')
+        if m.plugin:   # its launcher add-on comes or goes at once
+            focus = self.focus
+            self.load_mods(unpack=False)
+            self.show('mods', focus)
 
     def open_mods(self):
         gd = self.settings.get('game_dir')
@@ -1718,15 +1766,22 @@ class App:
             else:
                 src = filedialog.askopenfilename(parent=self.root, title='Choose the mod',
                                                  initialdir=str(Path.home() / 'Downloads'),
-                                                 filetypes=[('Mod', '*.zip *.7z *.rar'), ('All files', '*.*')])
+                                                 filetypes=[('Mod', '*.zip *.7z *.rar *.nx2mod'),
+                                                            ('All files', '*.*')])
             if not src:
                 return
+            if self.game_busy(gd) and modext.replaces(gd, src):
+                self.mods_message = 'Quit the game first: this file replaces a mod the game may be using.'
+                self.show('mods', self.focus)
+                return
             try:
-                target = mods.add(gd, src, log=self.ctx.log)
+                target = modext.add(gd, src, log=self.ctx.log)   # a single-file mod, or mods.add
             except (mods.ModError, OSError) as e:
                 self.mods_message = f'{Path(src).name} was not added: {e}.'
             else:
                 added = next((m for m in self.mod_list(gd) if m.name == target.name), None)
+                if added and (added.plugin or self.addon_of(added.name)):   # a new add-on, or a replaced one
+                    self.load_mods(unpack=False)
                 self.mods_message = f'Added {target.name}.' + (f' {added.problem}' if added and not added.usable else
                                                               ' It is on: the game loads it at its next start.')
         self.show('mods', self.focus)
@@ -1773,10 +1828,10 @@ class App:
         self.show('mod_order', at % ORDER_PAGE)
 
     def mods_before_play(self, gd):
-        """Put the mods folder in order (mods.prepare) and say whether the game must be built again for a mod's code
-        first: the mods that wait for it, [] when none do."""
+        """Put the mods folder in order (modext.prepare: the single-file mods, then mods.prepare) and say whether the
+        game must be built again for a mod's code first: the mods that wait for it, [] when none do."""
         try:
-            for line in mods.prepare(gd, log=self.ctx.log):
+            for line in modext.prepare(gd, log=self.ctx.log):
                 self.mods_message = line
                 if 'was not unpacked' in line:   # on the home screen too, when the launcher comes back
                     self.message = line
@@ -1864,20 +1919,25 @@ class App:
         if self.screen == 'home':
             self.show('home', self.focus)
 
-    def play(self, built=False):
-        """built: the build for the mods' code (ModsRebuildJob) just ended, so the game starts without asking again."""
+    def play(self, built=False, env=None, dlls=None):
+        """Start the game with what the enabled mods add (launcher/modext.py start_game) and env and dlls on top (a
+        launcher add-on's api.play). True when it started, and when it starts after the build of a mod's code that
+        begins here. built: that build (ModsRebuildJob) just ended, so the game starts without asking again, with the
+        env and dlls of the Play that began it."""
+        if built and self.play_extra:
+            env, dlls = self.play_extra
+        self.play_extra = None
         gd = self.settings.get('game_dir')
-        exe = Path(gd) / 'ocarina.exe'
-        if not exe.is_file():
+        exe = Path(gd or '.') / 'ocarina.exe'
+        if not gd or not exe.is_file():
             self.message = 'The game is not built yet.'
             self.render()
-            return
-        if self.game_proc and self.game_proc.poll() is None:
-            return
-        if saves.game_running(gd):   # a copy this launcher did not start (another launcher, a shortcut, a test run)
+            return False
+        if (self.game_proc and self.game_proc.poll() is None) or saves.game_running(gd):
+            # also a copy this launcher did not start (another launcher, a shortcut, a test run)
             self.message = 'The game is already running.'
             self.render()
-            return
+            return False
         waiting = [] if built else self.mods_before_play(gd)
         if waiting and waiting != self.mods_failed:
             # a mod's code cheats or ExeFS patches the game was not built with: built in first (tools/make_game.py
@@ -1886,22 +1946,31 @@ class App:
             self.ctx.log(f'play: the game is built again first for the code of {", ".join(waiting)}')
             job = jobs.ModsRebuildJob(self.ctx, gd)
             job.waiting = waiting
+            self.mod_stack = []   # the build's screen takes the place of an add-on's menu (api.play)
             self.run_job(job, 'home')
             self.message = f'Building the game with the code of {", ".join(waiting)}; it starts after.'
-            return
+            self.play_extra = (env, dlls)
+            return True
         if waiting:
             self.ctx.log(f'play: without the code of {", ".join(waiting)}, whose build did not finish')
+        # Steam's library file beside the game, for a mod that uses Steam through the plugin interface (plugin_steam.c)
+        steamlib.ensure(gd, self.ctx.layout.app / 'bin', log=self.ctx.log)
         try:
-            self.game_proc = winsys.start_game(exe)
+            self.game_proc = modext.start_game(gd, exe, env, dlls, self.ctx.log)
         except OSError as e:
             self.message = f'The game could not start: {e}'
             self.render()
-            return
+            return False
         self.ctx.log(f'play: {exe}')
+        failed = getattr(self.game_proc, 'dll_errors', None) or []
+        if failed:
+            self.message = (f'Game code of a mod did not load, so the game runs without it: {"; ".join(failed)}. '
+                            'The launcher\'s log has the details.')
         self.sounds.play('select')
         if self.settings.get('hide_while_playing'):
             self.root.withdraw()
         self.root.after(1000, self.watch_game)
+        return True
 
     def watch_game(self):
         # The game's own Restart ends the process started here and starts another (gfx_present.c gfx_window_closed)
@@ -1927,9 +1996,11 @@ class App:
                 self.ctx.log(f'the game ended with code {text}')
                 self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
             note_exit_in_log(self.game_dir(), text)
+        self.mod_game_ended(code)
         if self.install_staged('the game exited'):
             return
-        self.show('home', self.focus)
+        # back on a mod's menu when the game was started from one (api.play)
+        self.show(self.screen if self.screen in ('mod', 'mods') else 'home', self.focus)
 
     def open(self, path):
         try:
@@ -1999,6 +2070,182 @@ class App:
         gd = self.settings.get('game_dir')
         self.run_job(jobs.RebuildJob(self.ctx, gd, self.settings.get('dump')), 'home')
 
+    # ---- what the mods bring for the launcher (launcher/modext.py; docs/mods-launcher.md)
+
+    def load_mods(self, unpack=True):
+        """Load the enabled mods' launcher add-ons anew (the old ones are unloaded first). An add-on that fails is
+        logged and shown as its mod's problem. unpack: the single-file mods lying in the mods folder are unpacked
+        first (modext.unpack_single), unless the game runs."""
+        gd = self.settings.get('game_dir')
+        modext.unload_plugins(self.mod_apis, self)
+        self.mod_apis, self.mod_stack, self.plugin_problems = [], [], {}
+        try:
+            if gd and Path(gd).is_dir():
+                if unpack and not self.game_busy(gd):
+                    for line in modext.unpack_single(gd, log=self.ctx.log):
+                        self.mods_message = line
+                found = mods.scan(gd, details=False)
+                self.mod_apis = modext.load_plugins(found, self)
+                self.plugin_problems = {m.name: [p for p in m.problems if p.startswith('Its launcher add-on')]
+                                        for m in found}
+        except Exception:   # a mods folder in a state nobody foresaw: the launcher goes on without add-ons
+            self.ctx.log(f'mods: {traceback.format_exc()}')
+            self.mod_apis = []
+        if self.screen == 'mod':
+            self.show('home')
+
+    def addon_of(self, name):
+        return next((api for api in self.mod_apis if api.name == name), None)
+
+    def reload_mods(self):
+        gd = self.settings.get('game_dir')
+        self.mods_message = ''
+        self.load_mods()
+        n, k = len(self.mod_list(gd, details=False)), len(self.mod_apis)
+        self.mods_message = (f'Mods read again: {n} mod{"" if n == 1 else "s"}, {k} launcher add-on'
+                             f'{"" if k == 1 else "s"}.' + (f' {self.mods_message}' if self.mods_message else ''))
+        self.show('mods', self.focus)
+
+    # the launcher add-ons' rows and menus
+
+    def mod_value(self, api, v, default=''):
+        """v, or what it returns when it is a function; an add-on that raises shows '?' and is logged."""
+        if not callable(v):
+            return v if v is not None else default
+        try:
+            r = v()
+            return r if r is not None else default
+        except Exception:
+            self.ctx.log(f'mod {api.name}: {traceback.format_exc()}')
+            return '?'
+
+    def mod_call(self, api, fn, *args):
+        """Call an add-on's function; an exception is logged and shown, never passed on. The screen is drawn
+        again afterwards, as the add-on's values may have changed."""
+        screen = self.screen
+        try:
+            if fn:
+                fn(*args)
+        except Exception as e:
+            self.ctx.log(f'mod {api.name}: {traceback.format_exc()}')
+            self.message = f'{api.name}: {type(e).__name__}: {e}'
+        if self.screen == screen:
+            self.mod_refresh()
+
+    def mod_row(self, api, spec, title=None):
+        """The window's row for a RowSpec; title: the menu's, shown in the description box (None on home)."""
+        def desc():
+            text = str(self.mod_value(api, spec.desc))
+            if title is None:
+                return tuple(t for t in (self.message, text) if t)
+            return {'title': title, 'text': [text] if text else []}
+        k = spec.kind
+        if k == 'divider':
+            return Row('divider')
+        if k == 'action':
+            return Row('action', spec.label, on=lambda: self.mod_call(api, spec.on), height=40, desc=desc)
+        if k == 'toggle':
+            return Row('toggle', spec.label, get=lambda: bool(self.mod_value(api, spec.get, False)),
+                       on=lambda v: self.mod_call(api, spec.set, bool(v)), desc=desc)
+        if k == 'text':
+            shown = str(self.mod_value(api, spec.get))
+            if spec.secret:   # not even its length shows
+                shown = '••••••••' if shown else ''
+
+            def ask():
+                cur = '' if spec.secret else str(self.mod_value(api, spec.get))
+                new = self.mod_ask_text(spec.label, spec.prompt or spec.label, cur, spec.secret)
+                if new is not None:
+                    self.mod_call(api, spec.set, new)
+            return Row('value', spec.label, shown, 'arrow', on=ask, desc=desc)
+        return Row('value', spec.label, str(self.mod_value(api, spec.value)), 'arrow' if spec.on else 'normal',
+                   on=(lambda: self.mod_call(api, spec.on)) if spec.on else None, desc=desc)
+
+    def mod_home_rows(self):
+        return [self.mod_row(api, spec) for api in self.mod_apis for spec in api.home_rows]
+
+    def rows_mod(self):
+        if not self.mod_stack:
+            return [Row('action', 'Back', on=self.mod_back, height=40, desc=('Back to the main menu.',))]
+        api, title, make = self.mod_stack[-1]
+        specs = self.mod_value(api, make, [])
+        if not isinstance(specs, (list, tuple)):
+            specs = []
+        rows = []
+        for spec in specs:
+            if isinstance(spec, modext.RowSpec):
+                rows.append(self.mod_row(api, spec, title))
+        return rows + [Row('action', 'Back', on=self.mod_back, height=40,
+                           desc={'title': title, 'text': ['Back to the menu before.' if len(self.mod_stack) > 1
+                                                          else 'Back to the main menu.']})]
+
+    # what a ModApi asks of the window (launcher/modext.py Host)
+
+    def mod_game_dir(self):
+        return self.settings.get('game_dir') or ''
+
+    def mod_log(self, text):
+        self.ctx.log(text)
+
+    def mod_refresh(self):
+        if not modext.in_tk_thread():   # Tk is drawn from its own thread only
+            self.root.after(0, self.mod_refresh)
+            return
+        if self.screen == 'mod' and not self.mod_stack:
+            self.show('home')
+        elif self.screen in ('home', 'mods', 'mod'):
+            self.show(self.screen, self.focus)
+
+    def mod_show_menu(self, api, title, rows):
+        if self.screen != 'mod':   # menus left open under another screen (a build's) are gone
+            self.mod_stack = []
+        self.mod_stack.append((api, title, rows))
+        self.show('mod')
+
+    def mod_back(self):
+        if self.mod_stack:
+            self.mod_stack.pop()
+        if self.mod_stack:
+            self.show('mod')
+        else:
+            self.show('home')
+
+    def mod_home(self):
+        self.mod_stack = []
+        self.show('home')
+
+    def mod_message(self, text):
+        self.message = text or ''
+        self.mod_refresh()
+
+    def mod_ask_text(self, title, prompt, initial='', secret=False):
+        from tkinter import simpledialog
+        kw = {'show': '•'} if secret else {}
+        try:
+            return simpledialog.askstring(title, prompt, initialvalue=initial, parent=self.root, **kw)
+        except tk.TclError as e:
+            self.ctx.log(f'mods: the text box could not open: {e}')
+            return None
+
+    def mod_play(self, env, dlls):
+        return self.play(env=env, dlls=dlls)
+
+    def mod_game_running(self):
+        return self.game_busy(self.settings.get('game_dir'))
+
+    def mod_open(self, path):
+        self.open(path)
+
+    def mod_game_ended(self, code):
+        """Tell the add-ons that asked (api.on_game_exit) how the game ended."""
+        for api in self.mod_apis:
+            for cb in list(api.exit_callbacks):
+                try:
+                    cb(code)
+                except Exception as e:
+                    self.ctx.log(f'mod {api.name}: {traceback.format_exc()}')
+                    self.message = f'{api.name}: {type(e).__name__}: {e}'
+
     # ---- settings
 
     def rows_settings(self):
@@ -2023,6 +2270,10 @@ class App:
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
                 desc=('Open the game folder: saves in profile, the game\'s settings in nx2navi.ini, its logs in '
                       'logs.',)),
+            Row('value', 'Mods Folder', str(mods.mods_dir(gd)) if gd else 'Not chosen',
+                on=lambda: gd and self.open_mods(),
+                desc=('Open the mods folder, one folder per mod. Mods on the main menu switches them on and off, '
+                      'sets their order and adds a mod from a file or a folder.',)),
             Row('value', 'Game Dump', Path(dump).name if dump else 'Not chosen', on=self.choose_dump,
                 desc=(f'The dump the game was built from: {dump}.' if dump else 'No dump chosen yet.',
                       'Select this row to choose another .nup file.')),
@@ -2221,10 +2472,19 @@ class App:
                 self.check_now()
         elif j.result == 'cancelled':
             self.mods_failed = getattr(j, 'waiting', self.mods_failed)
+            self.play_gave_up(j)
             self.show(self.job_back)
         else:
             self.mods_failed = getattr(j, 'waiting', self.mods_failed)
+            self.play_gave_up(j)
             self.show('job')
+
+    def play_gave_up(self, j):
+        """The build before a Play (ModsRebuildJob) did not finish, so the game does not start: an add-on that
+        asked for it (api.play) is told through its on_game_exit, with None for the exit code."""
+        extra, self.play_extra = self.play_extra, None
+        if j.after == 'play' and extra and (extra[0] or extra[1]):
+            self.mod_game_ended(None)
 
     def drop_build_cache(self):
         """Keep Build Cache off: delete the lifted C and the objects (about 1.5 GB) but keep state.json, which an
@@ -2589,7 +2849,9 @@ class App:
                 return
         if isinstance(d, tuple):
             d = {'text': [t for t in d if t]}
-        elif self.message and self.screen in ('first_run', 'settings', 'uninstall'):
+            if self.message and self.screen in ('mods', 'mod'):   # api.message on a mod's menu
+                d['text'] = [self.message] + d['text']
+        elif self.message and self.screen in ('first_run', 'settings', 'uninstall', 'mods', 'mod'):
             d = dict(d)
             d['text'] = [self.message] + list(d.get('text', []))
         c, X = self.canvas, self.X
@@ -2738,7 +3000,7 @@ def play_only(ctx):
         ctx.log('play from Steam: the game is already running')
         return 0
     try:
-        for line in mods.prepare(gd, log=ctx.log):
+        for line in modext.prepare(gd, log=ctx.log):
             pass
         waiting = mods.code_waiting(gd) if build.can_rebuild(gd) else []
     except OSError as e:
@@ -2747,8 +3009,9 @@ def play_only(ctx):
     if waiting:   # the window builds the mods' code in, then starts the game (App.start with --play)
         ctx.log(f'play from Steam: the game is built again first for the code of {", ".join(waiting)}')
         return None
+    steamlib.ensure(gd, ctx.layout.app / 'bin', log=ctx.log)   # Steam's library file, for a mod that uses Steam
     try:
-        proc = winsys.start_game(exe)
+        proc = modext.start_game(gd, exe, log=ctx.log)   # the mods' variables and game code, as Play adds them
     except OSError as e:
         ctx.log(f'play from Steam: {exe}: {e}')
         return None

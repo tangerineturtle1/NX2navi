@@ -85,3 +85,13 @@ const char *fs_save_import_done(void);                     // the backup of the 
 // (empty when nothing is saved yet: nothing to copy), 0 when it could not be made (logged). Slow (the whole save): not
 // on the game's thread.
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap);
+// For the plugin interface's description of the game: the profile folder as the game was given it, and the folder of
+// the committed save, <profile>/save/<account>, which is "" until the game's first use of its storage has named it.
+const char *fs_profile_dir(void);
+const char *fs_save_dir(void);
+// plugin_api.h set_save_dir: the saves are kept under folder from now on (NULL or "": under the profile again), with the
+// game's save mount on a working copy of the save there. 1 when done; 0 with *why (a constant text) when it is refused:
+// save data open, written and not committed or being committed, the game closing, the folder held by another game.
+// fs_save_dir_gen counts the changes, for a reader that keeps a copy of fs_save_dir.
+int fs_save_dir_set(const char *folder, const char **why);
+int fs_save_dir_gen(void);

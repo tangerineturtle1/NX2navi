@@ -355,7 +355,7 @@ void res_init(void) {
     rt_patch_switch(output, R.ow != BASE_W || R.oh != BASE_H);
     rt_patch_switch(scene, scene_on);
     R.on = 1;
-    if (R.live) g_fnprof = 1;   // until the game sets its render size: res_fn_hit, or res_present gives up
+    if (R.live) rt_fn_want(RT_FN_ALL, 1);   // until the game sets its render size: res_fn_hit, or res_present gives up
     // Another shape than 16:9 (more than 1% off): the camera takes the output's ratio (recomp/patches-v121.txt and
     // patches-v143.txt, set aspect), so a 21:9 output shows more of the world at the sides instead of a stretched 16:9 view. The HUD's layouts
     // for that shape come from romfs-patches-<w>x<h> (romfs.c overlay_init, tools/make_romfs_patches.py --aspect).
@@ -445,7 +445,7 @@ static volatile int size_pending;  // the page holds a size the game has not set
 void res_fn_hit(uint64_t addr, uint64_t x0) {
     if (addr != SET_RENDER_SIZE) return;
     renderer = x0;
-    g_fnprof = 0;
+    rt_fn_want(RT_FN_ALL, 0);
     rt_log("resolution: renderer at %#llx; the scene size can change while the game runs", (unsigned long long)x0);
 }
 
@@ -453,8 +453,8 @@ void res_present(Cpu *c) {
     // The hook runs on every guest function entry while it waits: should the game set its render size before
     // res_init or never, it stops after 1800 presents (half a minute at 60 fps) and modes change at the next start.
     static unsigned waited;
-    if (g_fnprof && !renderer && ++waited == 1800) {
-        g_fnprof = 0;
+    if ((g_fnprof & RT_FN_ALL) && !renderer && ++waited == 1800) {
+        rt_fn_want(RT_FN_ALL, 0);
         rt_log("resolution: the game's render size setup was not seen; DLSS modes change at the next start");
     }
     if (!size_pending || !renderer) return;

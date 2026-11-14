@@ -410,6 +410,38 @@ static int lazy_protect_locked(uint64_t x, uint64_t e, void *ctx) {
     return 1;
 }
 
+// Test (NX2NAVI_WB_LAZY_RACE=<n>, or <n>,old; environment only): the race the flag's place in mem_lazy_arm closes, made
+// on purpose. At every n-th arm, between the moment the pages lose their access and the moment the segment is in the
+// list, another thread reads the first byte of the range, and the arm waits 2 ms with frz_lock held so that the read's
+// fault is under way: the fault must find the region's flag set, wait for the lock and be answered as a fault on an
+// armed page. "old" puts the flag's store back after the segment (the order before the fix), with which the same read
+// ends the process with an access violation: the test's own proof that it sees the race. The report line counts the
+// reads made and the reads that came back.
+static int lz_race_every = -1, lz_race_old;
+static uint64_t lz_race_made, lz_race_back;
+static void lazy_race_read(void *arg) {
+    volatile uint8_t v = *(volatile const uint8_t *)arg;
+    (void)v;
+    uint64_t n = __atomic_add_fetch(&lz_race_back, 1, __ATOMIC_RELAXED);
+    if (!(n & (n - 1)))   // the 1st, 2nd, 4th, 8th ...
+        rt_log("mem: lazy write-back race test: read %llu inside an arm's window came back (of %llu made)",
+               (unsigned long long)n, (unsigned long long)__atomic_load_n(&lz_race_made, __ATOMIC_RELAXED));
+}
+static void lazy_race_locked(uint64_t x) {   // frz_lock held, [x, ...) just made inaccessible
+    if (lz_race_every < 0) {
+        char e[32] = "";
+        lz_race_every = plat_getenv("NX2NAVI_WB_LAZY_RACE", e, sizeof e) ? atoi(e) : 0;
+        lz_race_old = strstr(e, ",old") != NULL;
+        if (lz_race_every > 0)
+            rt_log("mem: lazy write-back race test: a read inside every %d. arm's window%s", lz_race_every,
+                   lz_race_old ? ", with the region's flag set after the segment (the order before the fix)" : "");
+    }
+    if (lz_race_every <= 0 || lz_arm_calls % (uint64_t)lz_race_every) return;
+    if (!plat_thread_spawn(lazy_race_read, (void *)(uintptr_t)x, "lazy race", 0)) return;
+    lz_race_made++;
+    plat_sleep_ms(2);
+}
+
 // Arms the whole pages of [a, a + n), which the back end has just written back from the buffer h0 into h1 at offset
 // off: they fault on their next access. Returns the bytes armed now. Not in a frozen, probed, held or thaw-held region.
 uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx) {
@@ -449,8 +481,22 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
                 }
         }
         int no = frz[r] ? LZ_NO_FROZEN : prb[r] ? LZ_NO_PAGES : lz_hot[r] && (int32_t)(lz_hot[r] - now) > 0 ? LZ_NO_HOT :
-                 thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS ? LZ_NO_THAW :
-                 !lazy_protect_locked(x, e, ctx) ? LZ_NO_PAGES : -1;
+                 thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS ? LZ_NO_THAW : -1;
+        if (no < 0) {
+            // The region's flag is set before the pages lose their access, not after the segment is in the list: a
+            // thread of the game that touches one of the pages in between faults, and lazy_fault looks at the flag
+            // without the lock. With the flag still 0 it took the fault for one nobody answers (the region's first
+            // segment: the game stopped on its own read of a buffer the write-back had just armed). With it set the
+            // fault waits for frz_lock, which is held until the segment is in the list, and finds the segment; when
+            // the arm is refused the pages have their access back by then and the access runs again (access_fault,
+            // thaw_fault: the page's state). The flag goes back to what it was in that case.
+            uint8_t was = lzr[r];
+            if (!lz_race_old) __atomic_store_n(&lzr[r], 1, __ATOMIC_SEQ_CST);
+            if (!lazy_protect_locked(x, e, ctx)) {
+                __atomic_store_n(&lzr[r], was, __ATOMIC_RELEASE);
+                no = LZ_NO_PAGES;
+            } else lazy_race_locked(x);
+        }
         if (no >= 0) {
             lz_no[no] += e - x;
             continue;
@@ -610,6 +656,8 @@ void mem_lazy_window(int open) {
 }
 
 static int lazy_fault(uint64_t a, int write) {
+    // The flag is read without the lock: mem_lazy_arm sets it before it takes the access from a page, so a fault on an
+    // armed page always finds it set, and a fault that has nothing to do with the write-back takes no lock here.
     if (a >= RT_ADDRESS_LIMIT || !__atomic_load_n(&lzr[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE)) return 0;
     uint32_t me = plat_thread_id();
     for (int tries = 0;; tries++) {
@@ -694,6 +742,10 @@ void mem_lazy_note(char *out, size_t n) {
 
 // One log line since the last one; skipped: the bytes the back end left in the mirror since then.
 void mem_lazy_report(uint64_t frame, uint64_t skipped) {
+    if (lz_race_every > 0)
+        rt_log("mem: lazy write-back race test at frame %llu: %llu reads made inside an arm's window, %llu came back",
+               (unsigned long long)frame, (unsigned long long)__atomic_load_n(&lz_race_made, __ATOMIC_RELAXED),
+               (unsigned long long)__atomic_load_n(&lz_race_back, __ATOMIC_RELAXED));
     static int64_t async_said = -1;
     int64_t an = __atomic_load_n(&frz_async_n, __ATOMIC_RELAXED), af = __atomic_load_n(&frz_protect_fails, __ATOMIC_RELAXED);
     if ((rt_trace & RT_TRACE_PERF) && an != async_said) {
@@ -1592,6 +1644,27 @@ int mem_read_hold(uint64_t a, uint64_t n) {
 }
 
 void mem_read_release(void) { plat_mutex_unlock_shared(&lock); }
+
+// For the plugin interface's direct access (plugins.c span_ok): the region around a when it is memory the guest's own
+// code reads (write: and writes) with plain loads and stores: the heap, mapped pages of the alias region, a mapped
+// stack, a module's code, constants and data as their pages' permissions allow. Every page of such a region is either
+// committed with that access or brought to it by this file's fault hooks when it is touched (a page the lazy heap left
+// reserved, a frozen region, a page armed for a lazy write-back), whatever code of the process touches it, so a plain
+// copy cannot fault there for good while the mapping stays. The kernel region is left out (not every page of it is
+// committed), and so is everything query_locked reports without knowing what backs it. 1 with the region in
+// [*lo, *hi) and the mapping generation the answer was taken at: it holds until mem_map_gen changes.
+int mem_guest_span(uint64_t a, int write, uint64_t *lo, uint64_t *hi, uint32_t *gen) {
+    RtMemoryInfo r;
+    plat_mutex_lock_shared(&lock);
+    query_locked(a, &r);
+    int module = a < RT_ADDRESS_LIMIT && module_index(a) >= 0;
+    *gen = map_gen;
+    plat_mutex_unlock_shared(&lock);
+    int known = r.state == ST_NORMAL || r.state == ST_STACK || (module && (r.state == ST_CODE || r.state == ST_CODEDATA));
+    if (!known || !(r.perm & PERM_R) || (write && (r.perm & PERM_RW) != PERM_RW) || a - r.base >= r.size) return 0;
+    *lo = r.base, *hi = r.base + r.size;
+    return 1;
+}
 
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
     plat_mutex_lock_shared(&lock);

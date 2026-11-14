@@ -14,6 +14,7 @@
 //                       primary flag and DPI; needs no game files
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-mods      the mods folder scan, order and switches (mods.c); needs no game files
+//     --probe-plugins   the plugin interface (plugins.c): its table, callbacks, memory calls and refusals; no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
 //     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    host probes
 //     --probe-discord  the Rich Presence IPC exchange; skips without a Discord client; no game files
@@ -50,6 +51,7 @@
 #include "logq.h"
 #include "prof.h"
 #include "platform/platform.h"
+#include "plugins.h"
 #include "sha256.h"
 
 #define MAX_MODULES 16
@@ -221,8 +223,23 @@ static RtConfig cfg;
 const RtConfig *rt_config(void) { return &cfg; }
 
 // ---- runtime services the generated code calls (cpu.h)
-volatile int g_fnprof = 0;   // resolution.c switches it on until the game sets its render size (res_fn_hit)
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)lr, res_fn_hit(addr, x0); }
+// The function-entry hook of the lifted code (cpu.h FN_ENTER). g_fnprof holds who wants it: resolution.c every
+// function, until the game sets its render size (res_fn_hit); plugins.c the functions its hooks mark in rt_fn_filter.
+volatile int g_fnprof = 0;
+uint8_t rt_fn_filter[RT_FN_FILTER];
+
+void rt_fn_want(int bit, int on) {
+    if (on) __atomic_or_fetch((int *)&g_fnprof, bit, __ATOMIC_SEQ_CST);
+    else __atomic_and_fetch((int *)&g_fnprof, ~bit, __ATOMIC_SEQ_CST);
+}
+
+__attribute__((weak)) int plugins_fn_enter(Cpu *c, uint64_t addr) { (void)c, (void)addr; return 0; }   // plugins.c
+
+int fnprof_hit(uint64_t addr, Cpu *c) {
+    int want = g_fnprof;
+    if (want & RT_FN_ALL) res_fn_hit(addr, c->x[0]);
+    return (want & RT_FN_HOOKS) && rt_fn_filter[RT_FN_SLOT(addr)] && plugins_fn_enter(c, addr);
+}
 
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
     char at[128], lr[128];
@@ -597,7 +614,7 @@ static int probe_crash_exit(void) {
 
 static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
-                    "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
+                    "--probe-cfg | --probe-dpi | --probe-mods | --probe-plugins | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-meshfb | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-crash-exit | --probe-discord | "
                     "--prepare-shaders | --warm-shaders | --prepare-pipelines | --probe-prewarm | --probe-buildgate | --probe-ffx-cache | --probe-memneed | --probe-devlost | --boot |--seconds S [--shot PNG]]\n", argv0);
@@ -746,6 +763,7 @@ static int main_run(int argc, char **argv) {
     if (!strcmp(mode, "--probe-dpi")) return probe_dpi();   // the Win32 DPI awareness of nx2navi.manifest
 #endif
     if (!strcmp(mode, "--probe-mods")) return probe_mods();
+    if (!strcmp(mode, "--probe-plugins")) return probe_plugins();
     if (!strcmp(mode, "--probe-discord")) return probe_discord();
     if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
     if (!strcmp(mode, "--probe-ipc")) return probe_ipc();

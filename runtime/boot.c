@@ -24,6 +24,7 @@
 #include "mods.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "plugins.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -324,6 +325,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
+    plugins_exit();    // plugins.c: the plugins' exit callbacks
     input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value before the exit
     fs_save_flush();
     vk_pipeline_prewarm_marker_clear();   // an orderly end, not a driver crash in the boot's builds (vk_pipeline.c pm_skipped)
@@ -422,6 +424,8 @@ void rt_boot(void) {
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);
     ipc_applet_event_init();
     hostfn_seal();
+    plugins_start();   // plugins.c: the mods' libraries and their nx2navi_plugin_init, with the modules in memory and
+                       // the dispatch table built, before any guest code runs
     uint64_t held = plat_now_ms();
     // The guest waits for all of the prewarm (boot_wait): a warm start is ready in about half a second; a cold one (a new
     // translator, GPU or driver) translated 2,987 shaders in about 11 s and then builds the recorded pipelines, with the

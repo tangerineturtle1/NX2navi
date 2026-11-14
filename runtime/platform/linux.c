@@ -2097,6 +2097,13 @@ int plat_open_folder(const char *path) {
 void *plat_lib_open(const char *name) { return dlopen(name, RTLD_NOW | RTLD_LOCAL); }
 void *plat_lib_sym(void *lib, const char *name) { return lib ? dlsym(lib, name) : NULL; }
 
+// Opening the loaded library once more with RTLD_NODELETE marks it: a later dlclose leaves it mapped.
+int plat_lib_pin(const void *addr) {
+    Dl_info d;
+    if (!dladdr(addr, &d) || !d.dli_fname) return 0;
+    return dlopen(d.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE) != NULL;
+}
+
 // ---- machine load: /proc/stat and /proc/self/stat for the CPU, hwmon for the temperature, the amdgpu sysfs files of
 // the render device for the GPU.
 

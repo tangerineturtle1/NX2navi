@@ -53,6 +53,7 @@ extern "C" {
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "plugins.h"
 #include "save_share.h"
 #include "sprint.h"
 #include "sysinfo.h"
@@ -369,7 +370,8 @@ static int vk_up(const MenuTarget *t) {
     ii.Device = t->device;
     ii.QueueFamily = t->queue_family;
     ii.Queue = t->queue;
-    ii.DescriptorPoolSize = 32;   // the art's sets, and two font atlases while one replaces the other
+    // the art's sets, two font atlases while one replaces the other, and the plugins' pictures (ui/menu_art.cpp)
+    ii.DescriptorPoolSize = 32 + NX2_TEXTURES_MAX;
     ii.CheckVkResultFn = menu_vk_check;
     ii.MinImageCount = 2;
     ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than gfx_present.c's 2 frames in flight
@@ -456,9 +458,77 @@ static void game_fonts_read(void) {
            g_title_font_data ? "CetraDisplayPro" : "not found");
 }
 
+// ---- the plugins' fonts (plugin_api.h font_load, font_free; ui/plugin_draw.cpp reads the files and draws). A slot
+// keeps a font file's bytes and the size it was asked for at 1080 lines; fonts_up puts every slot's font into the atlas
+// at that size times the scale, after the menu's own, so a font loaded at any time and from any thread only marks the
+// atlas as stale (g_pfont_dirty) and the presenting thread makes it again before its next frame (fonts_for). The lock
+// is held by fonts_up for all its length: it also keeps font_usable, whose parser reports through one flag, to one
+// thread at a time.
+static struct PFont {
+    uint8_t *data;    // the file, malloc'd; NULL: the slot is free
+    size_t n;
+    float px;         // the size asked for: at scale 1, or with exact in the window's pixels
+    int exact;        // NX2_FONT_EXACT
+    ImFont *font;     // in the atlas as it is now; NULL until the atlas was made with it, or when it was left out
+    uint32_t gen;     // counts the slot's uses: a handle is slot + 1 + gen * NX2_FONTS_MAX
+} g_pfont[NX2_FONTS_MAX];
+static PlatMutex g_pfont_lock;
+static std::atomic<int> g_pfont_dirty;
+
+static PFont *pfont_of(int handle) {   // with g_pfont_lock held
+    if (handle <= 0) return nullptr;
+    PFont &s = g_pfont[(handle - 1) % NX2_FONTS_MAX];
+    return s.data && s.gen == (uint32_t)(handle - 1) / NX2_FONTS_MAX ? &s : nullptr;
+}
+
+// Takes the malloc'd font file data (freed here when refused); its handle, or 0 with *why saying what was wrong.
+int plugin_font_add(uint8_t *data, size_t n, float px, int exact, const char **why) {
+    int handle = 0;
+    plat_mutex_lock(&g_pfont_lock);
+    if (!font_usable(data, n)) {
+        *why = "it is not a TrueType or OpenType font the runtime can read";
+    } else {
+        *why = "every font slot is in use";
+        for (int i = 0; i < NX2_FONTS_MAX && !handle; i++) {
+            PFont &s = g_pfont[i];
+            if (s.data) continue;
+            s.data = data, s.n = n, s.px = px, s.exact = exact, s.font = nullptr;
+            s.gen = (s.gen + 1) & 0x3ffffff;
+            handle = i + 1 + (int)s.gen * NX2_FONTS_MAX;
+        }
+    }
+    plat_mutex_unlock(&g_pfont_lock);
+    if (handle) g_pfont_dirty.store(1, std::memory_order_release);
+    else free(data);
+    return handle;
+}
+
+void plugin_font_remove(int handle) {
+    plat_mutex_lock(&g_pfont_lock);
+    if (PFont *s = pfont_of(handle)) {   // its letters stay in the atlas until that is made again; nothing finds them
+        free(s->data);
+        s->data = nullptr, s->font = nullptr;
+    }
+    plat_mutex_unlock(&g_pfont_lock);
+}
+
+// The font of a handle as the atlas holds it, NULL when it is not in the atlas (yet); *px gets the size its letters
+// are to have at the overlay scale `scale`, 0 for a handle that is no font's. The presenting thread.
+ImFont *plugin_font_get(int handle, float scale, float *px) {
+    plat_mutex_lock(&g_pfont_lock);
+    PFont *s = pfont_of(handle);
+    ImFont *f = s ? s->font : nullptr;
+    *px = !s ? 0 : s->exact ? s->px : s->px * scale;
+    plat_mutex_unlock(&g_pfont_lock);
+    return f;
+}
+
 static int fonts_up(float scale) {
     enum { N = sizeof kCjk / sizeof *kCjk };
     ImFontAtlas *fa = ImGui::GetIO().Fonts;
+    plat_mutex_lock(&g_pfont_lock);
+    g_pfont_dirty.store(0, std::memory_order_release);
+    for (PFont &s : g_pfont) s.font = nullptr;
     fa->Clear();
     game_fonts_read();
     g_title_font = nullptr;
@@ -527,6 +597,24 @@ static int fonts_up(float scale) {
             fa->AddFontFromMemoryTTF(data[i], (int)sizes[i], 31.0f * scale, &mc, title_ranges[i].Data);
         }
     }
+    // The plugins' fonts, each a font of its own after the menu's. About 560 letters a font, each taking about 0.45 of
+    // its size squared in the atlas: fonts past 24 million pixels in all are left out (their text is drawn with the
+    // menu's font), so that the atlas stays a size every GPU takes.
+    double atlas_px = 0;
+    int plugin_fonts = 0;
+    for (PFont &s : g_pfont) {
+        if (!s.data) continue;
+        float px = s.exact ? s.px : s.px * scale;
+        atlas_px += (double)px * px * 0.45 * 560;
+        if (atlas_px > 24e6) {
+            rt_log("plugins: a font of %.0f px is left out of the atlas: the plugins' fonts are too large together", px);
+            continue;
+        }
+        ImFontConfig pc;
+        pc.FontDataOwnedByAtlas = false;
+        s.font = fa->AddFontFromMemoryTTF(s.data, (int)s.n, px, &pc, kRanges);
+        plugin_fonts++;
+    }
     skin_atlas_add(fa);    // the boxes' grain tile (ui/menu_skin.cpp), drawn into the atlas once it is built
     skin_atlas_fill(fa);   // builds the atlas, which the upload below then takes as it is
     unsigned char *px = nullptr;
@@ -541,7 +629,10 @@ static int fonts_up(float scale) {
     fa->ClearInputData();   // the glyphs are in the texture: the font files and the pixels are not needed again
     fa->ClearTexData();
     for (uint8_t *d : data) free(d);
-    rt_log("menu: font atlas at %.1f px, language names from %d of %d system fonts", 26.0f * scale, merged, (int)N);
+    if (!ok) for (PFont &s : g_pfont) s.font = nullptr;
+    plat_mutex_unlock(&g_pfont_lock);
+    rt_log("menu: font atlas at %.1f px, %dx%d, language names from %d of %d system fonts, %d plugin fonts", 26.0f * scale,
+           aw, ah, merged, (int)N, plugin_fonts);
     g_font_scale = ok ? scale : 0;
     return ok;
 }
@@ -556,7 +647,8 @@ static int fonts_for(float scale, uint64_t now) {
     ImGuiIO &io = ImGui::GetIO();
     if (g_font_scale == scale) {
         io.FontGlobalScale = 1;
-        return 1;
+        // a plugin loaded a font since the atlas was made (plugin_font_add): made again now, with it
+        return g_pfont_dirty.load(std::memory_order_acquire) ? fonts_up(scale) : 1;
     }
     if (scale != g_scale_seen) g_scale_seen = scale, g_scale_seen_ns = now;
     if (g_font_scale > 0 && now - g_scale_seen_ns < 250000000ull) {
@@ -2193,7 +2285,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !capture_shows) {
+        } else if (!g_perf_mode && !capture_shows && !plugins_overlay_wanted()) {
             return 0;
         }
     }
@@ -2257,6 +2349,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     } else if (open) {
         layout_menu(t->width, t->height, scale);
     }
+    plugins_overlay_imgui((float)t->width, (float)t->height, scale, open);   // the plugins' drawing, under all of ours
     perf_draw(t, scale);
     capture_note(t, scale);
     ImGui::Render();
@@ -2285,7 +2378,9 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
 // and on Windows the input method attached to the game window, until the menu opened again.
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     int r = overlay_frame(frame, t, shot);
-    menu_text_input_follow(g_ctx_ok && g_open.load(std::memory_order_relaxed) && ImGui::GetIO().WantTextInput);
+    // ... or a plugin's own text box has the input (plugin_api.h capture_input)
+    menu_text_input_follow((g_ctx_ok && g_open.load(std::memory_order_relaxed) && ImGui::GetIO().WantTextInput) ||
+                           plugins_capturing());
     return r;
 }
 

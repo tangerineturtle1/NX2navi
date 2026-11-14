@@ -219,28 +219,26 @@ def states(app):
     was_game = s.get('game_dir')
 
     def mods_screen():   # a game folder of made-up mods, removed when the selftest closes
-        import atexit
-        import shutil
-        import tempfile
-        game = Path(tempfile.mkdtemp(prefix='nx2navi-selftest-'))
-        atexit.register(shutil.rmtree, game, True)
-        for name, files in (('HD Textures', 40), ('Better Menus', 12), ('Classic Music', 3)):
-            for k in range(files):
-                f = game / 'mods' / name / 'romfs' / ('UI' if k < 6 else name.split()[0]) / f'file{k}.bin'
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_bytes(b'0')
-        (game / 'mods' / 'Old Plugin' / 'exefs').mkdir(parents=True)
-        (game / 'mods' / 'Old Plugin' / 'exefs' / 'subsdk9').write_bytes(b'0')
-        (game / 'nx2navi.ini').write_text('[mods]\nmods_disabled = Classic Music\n', encoding='utf-8')
-        s['game_dir'] = str(game)
-        app.mods_page, app.mods_message = 0, ''
+        s['game_dir'] = str(made_up_mods())
+        app.mods_page, app.mods_message, app.message = 0, '', ''
+        app.load_mods()   # the made-up mods' launcher add-ons
         app.show('mods', next(i for i, r in enumerate(app.rows_mods()) if r.label == 'HD Textures'))
 
     def mod_order():
         app.show('mod_order', 1)
 
+    def mod_home():
+        app.show('home', next(i for i, r in enumerate(app.rows_home()) if r.label == 'Speedrun Timer'))
+
+    def mod_menu():
+        app.rows[app.focus].on()
+
     def restore_game():
+        app.mod_home()
         s['game_dir'] = was_game
+        from .. import modext
+        modext.unload_plugins(app.mod_apis, app)   # the player's own mods are not loaded in the selftest
+        app.mod_apis, app.plugin_problems = [], {}
         app.show('home', 0)
 
     return [('1-first-run', first_run), ('2-installing', installing), ('3-home', home),
@@ -249,7 +247,61 @@ def states(app):
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
             ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-custom-picker', custom_picker),
             ('16-first-scheme', restore_scheme), ('17-mods', mods_screen), ('18-mod-order', mod_order),
-            ('19-home-again', restore_game)]
+            ('19-mod-home', mod_home), ('20-mod-menu', mod_menu), ('21-home-again', restore_game)]
+
+
+PLUGIN = '''
+def register(api):
+    s = {'splits': True, 'name': 'Link'}
+
+    def menu():
+        return [api.toggle('Show Splits', lambda: s['splits'], lambda v: s.update(splits=v),
+                           desc='Show the split times over the game.'),
+                api.text('Runner Name', lambda: s['name'], lambda v: s.update(name=v), prompt='Your name:'),
+                api.text('Board Password', lambda: 'hunter22', lambda v: None, secret=True),
+                api.value('Best Time', lambda: '1:42:07'),
+                api.divider(),
+                api.action('Play with Timer', lambda: None, desc='Start the game with the timer.')]
+    api.add_home_row('Speedrun Timer', value=lambda: 'Best 1:42:07', desc='The timer, its splits and your times.',
+                     on=lambda: api.show_menu('Speedrun Timer', menu))
+'''
+
+
+def made_up_mods():
+    """A game folder holding only made-up mods, removed when the selftest ends: three that replace game files (one
+    off, two sharing files), one the game cannot use, and four with a mod.json (a launcher add-on, game code that is
+    off, an add-on that fails, a broken mod.json)."""
+    import atexit
+    import json
+    import shutil
+    import tempfile
+    game = Path(tempfile.mkdtemp(prefix='nx2navi-selftest-'))
+    atexit.register(shutil.rmtree, game, True)
+    m = game / 'mods'
+
+    def mod(name, manifest=None, files=()):
+        (m / name).mkdir(parents=True, exist_ok=True)
+        if manifest is not None:
+            (m / name / 'mod.json').write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+        for f, text in files:
+            (m / name / f).parent.mkdir(parents=True, exist_ok=True)
+            (m / name / f).write_text(text)
+    for name, files in (('HD Textures', 40), ('Better Menus', 12), ('Classic Music', 3)):
+        mod(name, files=[(f'romfs/{"UI" if k < 6 else name.split()[0]}/file{k}.bin', '0') for k in range(files)])
+    mod('HD Textures', {'name': 'HD Textures', 'version': '2.1', 'author': 'Saria',
+                        'description': 'Sharper textures for Hyrule Field and Kakariko.'})
+    mod('Old Plugin', files=[('exefs/subsdk9', '0')])
+    mod('Speedrun Timer', {'name': 'Speedrun Timer', 'version': '0.4', 'author': 'Sheik',
+                           'description': 'A timer with splits, set up from the launcher.',
+                           'launcher': 'launcher_plugin.py'}, [('launcher_plugin.py', PLUGIN)])
+    mod('Online Play', {'name': 'Online Play', 'version': '0.1', 'author': 'Navi', 'description': 'Play together.',
+                        'launcher': 'plugin.py', 'dlls': ['bin/online.dll']},
+        [('plugin.py', 'def register(api):\n    pass\n'), ('bin/online.dll', '')])
+    mod('Lantern', {'launcher': 'lantern.py'},
+        [('lantern.py', 'def register(api):\n    raise ValueError("no lamp")\n')])
+    mod('Old Shaders', '{"name": "Old Shaders",', [('romfs/x', '')])
+    (game / 'nx2navi.ini').write_text('[mods]\nmods_disabled = Classic Music|Online Play\n', encoding='utf-8')
+    return game
 
 
 def run(app, shots):

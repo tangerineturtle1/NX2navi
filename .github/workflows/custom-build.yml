@@ -1,0 +1,169 @@
+# The custom launcher release of this fork (tools/make_launcher.py, docs/launcher.md "Releases" and "Custom build"),
+# built on a Windows runner: the setup program, the app and runtime zips and the update manifest, with feed.json naming
+# this repository, so launchers installed from it update from this fork and not from upstream. It holds the launcher
+# and the build kit only, never game files: players build the game from their own dump, as with every release.
+# NVIDIA DLSS stays out unless the run asks for it; FSR, DLSS Frame Generation and the button art always stay out.
+#
+# It runs only when asked: Actions > Custom build > Run workflow (optionally a version suffix, a release), or a pushed
+# tag custom-v<version> (git tag custom-v0.9.0-custom.1 && git push origin custom-v0.9.0-custom.1), which always makes a
+# release. Never on a schedule, never on a branch push. The release is a draft pre-release: launchers see nothing until
+# it is published by hand, and a pre-release only on the Preview channel.
+name: Custom build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: 'Appended to VERSION as a pre-release part, e.g. custom.1 gives 0.9.0-custom.1 (empty: VERSION as it is)'
+        required: false
+        default: ''
+      publish:
+        description: 'Also create a draft pre-release with the four release files'
+        type: boolean
+        default: false
+      dlss:
+        description: "Put NVIDIA DLSS in (make_launcher.py downloads the pinned nvngx_dlss.dll from NVIDIA's DLSS repository; docs/launcher.md, Releases)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'custom-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-build-${{ github.ref }}
+  cancel-in-progress: false   # never cut a run that may be creating a release
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and tag
+        id: version
+        # The inputs reach the script through the environment only. The version must be one launcher/versions.py
+        # parses; a suffix makes a pre-release version, which sorts before the plain VERSION and compares as text.
+        env:
+          SUFFIX: ${{ inputs.version_suffix }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            ver="${GITHUB_REF_NAME#custom-v}"
+            tag="$GITHUB_REF_NAME"
+          else
+            ver="$(tr -d ' \r\n' < VERSION)${SUFFIX:+-$SUFFIX}"
+            tag="custom-v$ver"
+          fi
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$ver' is not a release version (digits and dots, optionally -suffix of letters, digits, dots, dashes)"
+            exit 1
+          fi
+          echo "version $ver, tag $tag, release: $PUBLISH"
+          { echo "version=$ver"; echo "tag=$tag"; echo "publish=$PUBLISH"; } >> "$GITHUB_OUTPUT"
+
+      - name: Shader compilers and clang (MSYS2 UCRT64)
+        # tools/build_shaders.py compiles the runtime's own shaders into runtime/<name>_spv.h with glslc, spirv-as and
+        # spirv-val from C:\msys64\ucrt64\bin; tests/plugins_check.py compiles with clang from there. release: false
+        # uses the runner's own MSYS2 in C:\msys64, the folder those scripts look in. The launcher's native programs and
+        # the prebuilt runtime use the MSYS2 packages make_launcher.py downloads itself, not these.
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          release: false
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-clang
+
+      - uses: actions/setup-dotnet@v4   # the shader translator (tools/build_xlate.py: NativeAOT, with the image's MSVC)
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Content check
+        run: uv run --no-project --python 3.12 tools/check_content.py
+
+      - name: Runtime shaders
+        run: |
+          /c/msys64/ucrt64/bin/glslc.exe --version
+          /c/msys64/ucrt64/bin/spirv-val.exe --version
+          uv run --no-project --python 3.14 tools/build_shaders.py
+
+      - name: Launcher tests
+        # With the packages of the release's bundled Python. Tests that need what the runner lacks (a POSIX compiler
+        # script, cc, a display elsewhere than Windows, the openssl command) skip themselves.
+        run: uv run --no-project --python 3.14 --with-requirements tools/requirements-launcher.txt tests/launcher_test.py
+
+      - name: Plugin interface check
+        # Without a game executable: the header alone in C99, C11 and C++17, the recorded layout and the example
+        # plugin. Skipped while the plugin interface is not in this commit.
+        run: |
+          if [ -f tests/plugins_check.py ] && [ -f runtime/plugin_api.h ]; then
+            uv run --no-project --python 3.14 tests/plugins_check.py
+          else
+            echo "no plugin interface in this commit: skipped"
+          fi
+
+      - name: Shader translator
+        run: uv run --no-project --python 3.12 tools/build_xlate.py
+
+      - name: Launcher release
+        env:
+          VER: ${{ steps.version.outputs.version }}
+          DLSS: ${{ github.event_name == 'workflow_dispatch' && inputs.dlss }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          printf 'NX2navi %s, custom build of %s at %s.\n' "$VER" "$GITHUB_REPOSITORY" "${GITHUB_SHA:0:7}" > "$notes"
+          dlss=(--no-dlss); [ "$DLSS" = true ] && dlss=()
+          uv run --no-project --python 3.14 --with numpy tools/make_launcher.py --xlate build/xlate "${dlss[@]}" \
+            --feed "$GITHUB_REPOSITORY" --version "$VER" --notes "$notes"
+          cp "$notes" build/launcher-release/notes.md
+          cd build/launcher-release
+          sha256sum NX2navi-Setup-*.exe NX2navi-app-*.zip NX2navi-runtime-*.zip NX2navi-update.json | tee SHA256SUMS.txt
+          cat NX2navi/app/*/feed.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nx2navi-launcher-${{ steps.version.outputs.version }}
+          path: build/launcher-release/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # gh release create
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VER: ${{ needs.build.outputs.version }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nx2navi-launcher-${{ needs.build.outputs.version }}
+          path: release
+      - name: Draft pre-release
+        # The four files a launcher reads (launcher/feed.py) and their checksums. A dispatched run creates the tag on
+        # the built commit when the draft is published; a tag push names its own commit.
+        run: |
+          cd release
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease \
+            --title "NX2navi $VER (custom)" --notes-file notes.md \
+            NX2navi-Setup-"$VER".exe NX2navi-app-"$VER".zip NX2navi-runtime-*.zip NX2navi-update.json SHA256SUMS.txt

@@ -497,6 +497,9 @@ int plat_open_folder(const char *path);                   // shows the folder in
 // in the system directories only. NULL when missing.
 void *plat_lib_open(const char *name);
 void *plat_lib_sym(void *lib, const char *name);
+// Keeps the library that holds the code address addr loaded until the process ends, whoever closes it later (a
+// plugin whose callbacks the runtime holds, plugins.c). 1 when it is pinned.
+int plat_lib_pin(const void *addr);
 
 // ---- machine load for the performance overlay (perfmon.c's sampling thread; each call can take milliseconds). A number
 // the system does not give is -1.

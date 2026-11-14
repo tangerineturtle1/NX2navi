@@ -44,6 +44,12 @@ void input_block(int on);
 // The in-game menu (ui/menu.h): input_menu(1) when it opens (input_poll reports nothing, the cursor is released), (0) when
 // it closes (nothing until every button and stick direction is released). Independent of input_block.
 void input_menu(int open);
+// A plugin's text box (plugin_api.h capture_input): input_plugin(1) while it has the input, (0) when it gives it back;
+// as input_menu, with a flag of its own.
+void input_plugin(int on);
+// The buttons the gamepad alone held at the last input_poll (B_* bits; the left stick past half way as its direction's
+// bit), without the keys bound to them: plugins.c tells a key's press from the pad's with it. 0 without a gamepad.
+uint64_t input_pad_bits(void);
 // The gamepad alone, for the menu: Switch button bits and the left stick (up +y). 0 without a connected gamepad.
 // Minus+Plus combo and the neutral pad while the menu is open (input_map.c, window-system free): *held is the caller's memory
 // of the combo, sticks are lx, ly, rx, ry. Returns 1 in the poll where the combo goes down (toggle the menu once).
