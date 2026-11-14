@@ -449,6 +449,10 @@ void vk_mem_lazy_part_end(void);   // lazy write-back: a part ends (before its p
 void vk_mem_lazy_handed(void);
 void vk_mem_lazy_decide(void);     // once the driver is known (after vk_caps_driver): on or off, with one log line
 void vk_mem_fatal_note(char *out, size_t n);   // the memory mode and the lazy write-back's state, for a fatal error's line
+uint64_t vk_sync_rec_fence(void);   // replay thread: the timeline value of the submission being recorded
+// vk_sync.c: submits what vk_queue_submit holds back when it is needed for the timeline to reach value
+void vk_sync_release_held(uint64_t value);
+void vk_mem_merge_cpu_wait(uint64_t value);   // NX2NAVI_MERGE_CPU: the lists up to value are stored
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
@@ -944,6 +948,9 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
 // The same for a side effect the game's CPU reads (an occlusion count, a counter report, an event value): run before
 // the others, and by the wait after a frame's first submission itself (vk_sync.c "the executed timeline").
 void vk_completion_add_result(uint64_t fence, void (*fn)(void *), void *arg);
+// As vk_completion_add, but before every vk_completion_add callback of the values reached (in their own order): the
+// merge lists the CPU stores into guest memory (NX2NAVI_MERGE_CPU), which the GPU events of the same value come after.
+void vk_completion_add_first(uint64_t fence, void (*fn)(void *), void *arg);
 // gfx_vulkan_backend (vk_backend.c): presents go to a present thread and run after the submissions made before them.
 void rdoc_init(void);                     // runtime/rdoc.c: NX2NAVI_RDOC debug capture; before vkCreateInstance
 int rdoc_active(void);

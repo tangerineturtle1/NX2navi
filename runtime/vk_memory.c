@@ -28,6 +28,9 @@
 #include "vk_gpa.h"
 #include "wb_lazy_choice.h"
 #include "wb_merge_spv.h"
+#include "wb_diffcopy_spv.h"
+#include "wb_listcopy_spv.h"
+#include "wb_mergelist_spv.h"
 #include "platform/platform.h"
 
 // Timestamps for the tracking cost, in ns; qpc_ms converts.
@@ -85,6 +88,8 @@ typedef struct PoolRec {
     uint8_t twin;                      // MS_ON: the table's writes reach guest memory too (twin_wanted); 0: the mirror only
     uint32_t vd_wrote_sub, vd_use_sub; // verify mode: the last submission that bound it written / used its mirror
     uint64_t vd_wrote_n;               // verify mode: written bindings of it so far
+    struct WbSpan { uint64_t lo, hi, fence; } *cws;   // replay: the byte ranges of its merges the CPU stores
+    int ncws, ccws;                                   // (NX2NAVI_MERGE_CPU) and their values, until done
     uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
     FlushRange fl[FLUSH_RANGES + 1];   // flush_lock: nvnMemoryPoolFlushMappedRange pages not copied yet (flush_add)
@@ -120,6 +125,8 @@ typedef struct PoolRec {
 } PoolRec;
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
+static void cpu_span_add(PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence);   // NX2NAVI_MERGE_CPU
+static uint64_t cpu_span_wait(const PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence);
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
@@ -608,6 +615,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
+    free(r->cws);
     free(r->pt);
     free(r);
 }
@@ -2463,6 +2471,7 @@ typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
     uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes;
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
+    uint64_t diff_bytes, diff_dispatches;                               // write-back by difference (NX2NAVI_WB_DIFF)
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
     uint64_t flush_skipped;   // flush ranges not copied: the write watch covers them
     uint64_t cap_bytes, cap_ranges, cap_left, cap_t;   // mirror_capture: copied by the CPU, left to the GPU copy, its time
@@ -3239,7 +3248,16 @@ static uint64_t merge_max(void) {
     }
     return m;
 }
-typedef struct { PoolRec *r; uint64_t off, size, soff; int chunk; } SnapRange;
+// NX2NAVI_WB_DIFF=1 (default), 0, ab: the written ranges over DIFF_MIN, up to DIFF_MAX, go back by difference
+// (shaders/wb_diffcopy.comp) instead of by the merge: snapshotted like the merge's, then the whole 64-byte lines the
+// GPU changed are copied and the rest is left alone. The merge writes word by word, and word-sized writes into host
+// memory cost the memory controller a read-modify-write each. In Kokiri Forest the compute programs bind whole
+// pools of 6-15 MiB as writable, 46 MiB a frame, of which 3-4 % of the words change: by difference 5.4 % of the
+// 46 MiB is copied, in whole lines.
+#define DIFF_MIN (4ull << 20)
+#define DIFF_MAX MERGE_SPAN
+#define DIFF_WORDS (65535u * 256u)   // the words, with each range's alignment padding, one difference dispatch covers
+typedef struct { PoolRec *r; uint64_t off, size, soff; int chunk, diff; } SnapRange;
 typedef struct { VkBuffer buf; VmaAllocation alloc; uint64_t size, used; int host; } SnapChunk;
 typedef struct { int n; SnapChunk c[]; } SnapFree;   // a submission's chunks and range lists, pooled at its fence
 static SnapRange *snl;              // replay: this submission's merged ranges; [0, snl_copied) have their snapshot copy
@@ -3272,14 +3290,63 @@ static PlatMutex snap_pool_lock = PLAT_MUTEX_INIT;
 static SnapChunk snap_pool[SNAP_POOL_N];
 static int nsnap_pool;
 static uint64_t snap_pool_bytes;
+enum { CHUNK_LIST = 1, CHUNK_MARKS = 2, CHUNK_MLIST = 3, CHUNK_MCOPY = 4 };   // SnapChunk.host (chunk_new)
+// The merge lists' chunks (NX2NAVI_MERGE_CPU: one in device memory and its copy in host memory a submission, each
+// twice its merge ranges' bytes) stay outside that bound, up to SNAP_POOL_LISTS of them: when the snapshots of the
+// frames in flight had filled the pool while a list was out, the list's two chunks were destroyed at every fence and
+// made again for the next frame, 12-15 ms a frame in place of 8.
+#define SNAP_POOL_LISTS 4
+static int nsnap_lists;
+static int chunk_is_mlist(int host) { return host == CHUNK_MLIST || host == CHUNK_MCOPY; }
 static int merge_on = -1;
 static struct {
-    int tried, ok;
+    int tried, ok, dok;
     PFN_vkCmdPushDescriptorSetKHR push;
-    VkDescriptorSetLayout dsl;
-    VkPipelineLayout layout;
-    VkPipeline pipe;
+    VkDescriptorSetLayout dsl, ddsl;
+    VkPipelineLayout layout, dlayout;
+    VkPipeline pipe, dpipe;   // the merge, the difference copy
+    // NX2NAVI_MERGE_CPU: the merge into a list (shaders/wb_mergelist.comp), its copy to host memory
+    // (shaders/wb_listcopy.comp), and the timeline merge_apply signals with a submission's value once it stored its list
+    int ltried, lok;
+    VkDescriptorSetLayout ldsl, cdsl;
+    VkPipelineLayout llayout, clayout;
+    VkPipeline lpipe, cpipe;
+    VkSemaphore asem;
+    uint64_t asem_val;   // completion thread: the value signalled last
 } WM;
+
+// A compute pipeline over nb storage buffers (push descriptors) with pc bytes of push constants.
+static int comp_pipe(VkCtx *c, const uint32_t *code, size_t size, int nb, uint32_t pc, VkDescriptorSetLayout *dsl,
+                     VkPipelineLayout *layout, VkPipeline *pipe) {
+    VkDescriptorSetLayoutBinding b[8];
+    for (int i = 0; i < nb; i++)
+        b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                              .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = (uint32_t)nb, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, pc};
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = code};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, dsl) != VK_SUCCESS) return 0;
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    if (vkCreatePipelineLayout(c->device, &li, NULL, layout) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS)
+        return 0;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = *layout};
+    VkResult res = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, pipe);
+    vkDestroyShaderModule(c->device, m, NULL);
+    return res == VK_SUCCESS;
+}
+
+// The difference copy's pipeline (shaders/wb_diffcopy.comp): the merge's bindings.
+static int diff_init(VkCtx *c) {
+    return comp_pipe(c, wb_diffcopy_spv, sizeof wb_diffcopy_spv, 4, 8, &WM.ddsl, &WM.dlayout, &WM.dpipe);
+}
 
 static int merge_init(VkCtx *c) {
     WM.tried = 1;
@@ -3308,6 +3375,7 @@ static int merge_init(VkCtx *c) {
     VkResult res = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &WM.pipe);
     vkDestroyShaderModule(c->device, m, NULL);
     if (res != VK_SUCCESS) goto fail;
+    if (!(WM.dok = diff_init(c))) rt_log("mem: the write-back by difference could not be created: large ranges stay copies");
     return WM.ok = 1;
 fail:
     rt_log("mem: write-back merge off: its pipeline could not be created");
@@ -3324,10 +3392,203 @@ static int merging(void) {
     return WM.ok;
 }
 
+// The write-back by difference and the merge through the CPU write guest memory directly: not with shadow storage,
+// whose bytes reach guest memory in the submission's shadow_wb_cb, nor with the lazy write-back, whose fetch copies
+// the mirror over a range at any time.
+static int wb_lazy(void);
+static int wb_direct(void) { return !shadow_on && !wb_lazy(); }
+
+static int wb_diff(void) {   // NX2NAVI_WB_DIFF; after merging(), which makes the pipeline
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("WB_DIFF", "1");
+        if (mode != 1) rt_log("mem: written ranges up to %llu MiB go back by difference%s (NX2NAVI_WB_DIFF)",
+                              (unsigned long long)(DIFF_MAX >> 20), mode == 2 ? " in the B blocks" : " never");
+    }
+    return RT_KNOB_ON(mode) && WM.dok && wb_direct();
+}
+
+// NX2NAVI_MERGE_CPU=1 (default), 0, ab: a submission's merge goes back through the CPU. shaders/wb_mergelist.comp
+// compares as wb_merge.comp, but puts each changed word (its place among the submission's list words, its value) into
+// a list in device-local memory; shaders/wb_listcopy.comp copies the list to host memory in whole lines, and the
+// completion thread stores the words into guest memory (merge_apply) before the submission's value counts as done and
+// before its other callbacks, the GPU events among them (vk_completion_add_first). wb_merge.comp's 4-byte writes into
+// host memory cost the memory controller a read-modify-write of their line each: in Kokiri Forest 0.9-1.0 ms of
+// GPU a frame for 0.6 MiB of words, in the frame's third submission, which its last and longest waits for. In the
+// order the GPU's writes had:
+// - a prologue's copies from guest memory and a later submission's GPU write-backs into bytes a list still has to
+//   store wait for it (the replay thread waits: apply_wait, on WM.asem, which merge_apply signals), since a list
+//   stored after them would put older words over theirs;
+// - the lists are stored in submission order, and the list has room for every word of its ranges.
+// The CPU's stores set the write-watch bits of their pages, so those pages go up again at their next use (the
+// uploads 1.2 to 3.0 MiB a frame there). Only a submission with at least NX2NAVI_MERGE_CPU_MIN KiB of merge
+// ranges (default 256) and at most MERGE_CPU_MAX uses a list; the others merge on the GPU.
+// NX2NAVI_MERGE_CPU_CHECK=1: the GPU merges as without it and the CPU compares the list with what the GPU wrote (the
+// cpu merge line counts the words that differ: a CPU write meanwhile, or a fault).
+// Measured there: one list a frame of 165,000-170,000 words, stored in 0.31-0.41 ms; the check run found them all
+// equal to the GPU's merge but 121 words the game zeroed as it exited. The GPU time 6.80 to 5.72 and 6.95 to 5.80 ms a
+// frame in two A/Bs (the merge 1.12 to 0.17 ms).
+#define MERGE_CPU_MAX (32ull << 20)   // the list has room for every word of the ranges, twice their bytes
+static int merge_cpu_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("MERGE_CPU", "1");
+        if (mode != 1) rt_log("mem: merges go back through the CPU %s (NX2NAVI_MERGE_CPU)", mode == 2 ? "in the B blocks" : "never");
+    }
+    return mode;
+}
+
+static uint64_t merge_cpu_min(void) {   // bytes
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *s = cfg_get("NX2NAVI_MERGE_CPU_MIN");
+        v = s && *s ? strtoll(s, NULL, 0) : 256;
+        if (v < 0) v = 0;
+    }
+    return (uint64_t)v << 10;
+}
+
+static int merge_cpu_check(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = cfg_get("NX2NAVI_MERGE_CPU_CHECK");
+        v = s && *s == '1';
+        if (v) rt_log("mem: NX2NAVI_MERGE_CPU_CHECK: the GPU merges, the CPU compares the lists");
+    }
+    return v;
+}
+
+static int list_init(VkCtx *c) {
+    WM.ltried = 1;
+    VkSemaphoreTypeCreateInfo ti = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+    VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
+    if (!comp_pipe(c, wb_mergelist_spv, sizeof wb_mergelist_spv, 5, 20, &WM.ldsl, &WM.llayout, &WM.lpipe) ||
+        !comp_pipe(c, wb_listcopy_spv, sizeof wb_listcopy_spv, 2, 4, &WM.cdsl, &WM.clayout, &WM.cpipe) ||
+        vkCreateSemaphore(c->device, &si, NULL, &WM.asem) != VK_SUCCESS) {
+        rt_log("mem: NX2NAVI_MERGE_CPU: the merge list's pipelines could not be created: merges stay on the GPU");
+        return 0;
+    }
+    return WM.lok = 1;
+}
+
+// A submission whose merge ranges come to merge_bytes goes through a list (decided once, at its write-back).
+static int merge_cpu(uint64_t merge_bytes) {
+    int m = merge_cpu_mode();
+    if (!m || !merge_bytes || merge_bytes < merge_cpu_min() || merge_bytes > MERGE_CPU_MAX || !RT_KNOB_ON(m) || !WM.ok ||
+        !wb_direct())
+        return 0;
+    if (!WM.ltried) list_init(vk_ctx());
+    return WM.lok;
+}
+
+// NX2NAVI_MERGE_CPU statistics (any thread): lists stored, their words, the CPU time; the replay thread's waits for a
+// list ([0] a write-back, [1] a prologue's copies, [2] the executed wait) and their time; words past the room,
+// without a range, different from the GPU's (NX2NAVI_MERGE_CPU_CHECK)
+static volatile int64_t mc_lists, mc_words, mc_ns, mc_waits[3], mc_wait_ns[3], mc_over, mc_bad, mc_diff;
+
+typedef struct { uint32_t first, words; uint64_t host; } MergeSpan;   // list places [first, first + words): from host
+typedef struct {
+    uint64_t fence;
+    const uint8_t *map;    // the host copy: the count, 12 bytes, then (place, word) pairs
+    VmaAllocation alloc;
+    uint32_t cap;
+    int n, check;
+    MergeSpan t[];         // by first
+} MergeJob;
+
+static void merge_apply(void *arg) {   // completion thread, before the other callbacks of its value
+    MergeJob *j = arg;
+    uint64_t t0 = qpc();
+    VkCtx *c = vk_ctx();
+    vmaInvalidateAllocation(c->vma, j->alloc, 0, 16);
+    uint32_t n = *(const volatile uint32_t *)j->map;
+    if (n > j->cap) plat_add64(&mc_over, (int64_t)(n - j->cap)), n = j->cap;
+    if (n) vmaInvalidateAllocation(c->vma, j->alloc, 16, (uint64_t)n * 8);
+    const uint32_t *e = (const uint32_t *)(j->map + 16);
+    int k = 0;
+    int64_t bad = 0, diff = 0;
+    static volatile int32_t logged;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t g = e[2 * i], v = e[2 * i + 1];
+        if (g - j->t[k].first >= j->t[k].words) {   // not in the last word's range
+            int lo = 0, hi = j->n;
+            while (hi - lo > 1) {
+                int m = (lo + hi) >> 1;
+                if (j->t[m].first <= g) lo = m;
+                else hi = m;
+            }
+            k = lo;
+            if (g - j->t[k].first >= j->t[k].words) { bad++; continue; }
+        }
+        uint32_t *p = (uint32_t *)(uintptr_t)(j->t[k].host + 4ull * (g - j->t[k].first));
+        if (!j->check) *p = v;
+        else if (*p != v) {
+            diff++;
+            if (plat_inc32(&logged) <= 8)
+                rt_log("mem: NX2NAVI_MERGE_CPU_CHECK: %#llx holds %#x, the list %#x (value %llu)",
+                       (unsigned long long)(uintptr_t)p, *p, v, (unsigned long long)j->fence);
+        }
+    }
+    if (j->fence > WM.asem_val) {   // in check mode too: the comparison is where the store would be
+        VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = WM.asem, .value = j->fence};
+        VkResult r = vkSignalSemaphore(c->device, &si);
+        if (r != VK_SUCCESS) {
+            vk_device_lost_check(r, "the signal of the merge lists' timeline");
+            rt_fatal("vk: vkSignalSemaphore of the merge lists' timeline failed (%d)", (int)r);
+        }
+        WM.asem_val = j->fence;
+    }
+    uint64_t dt = qpc() - t0;
+    plat_inc64(&mc_lists);
+    plat_add64(&mc_words, (int64_t)n);
+    plat_add64(&mc_ns, (int64_t)dt);
+    if (bad) plat_add64(&mc_bad, bad);
+    if (diff) plat_add64(&mc_diff, diff);
+    free(j);
+}
+
+// The values of the newest submissions with a list to store, in value order: the replay thread adds them, any waiter
+// looks for the newest at or below the value it waits for (vk_mem_merge_cpu_wait).
+#define MC_RING 64
+static uint64_t mc_ring[MC_RING], mc_n;   // mc_n: atomic, lists so far
+
+// Returns once the lists up to submission value v are stored (0: at once); the replay thread, or a waiter. why: mc_waits' index.
+static void apply_wait(uint64_t v, int why) {
+    if (!v || v <= vk_sync_fence_done()) return;
+    uint64_t t0 = qpc();
+    vk_sync_release_held(v);   // a submission held for batching (vk_sync.c) goes to the queue now
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &WM.asem,
+                              .pValues = &v};
+    VkResult r = vkWaitSemaphores(vk_ctx()->device, &wi, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "the wait for the merge lists' timeline");
+        rt_fatal("vk: vkWaitSemaphores on the merge lists' timeline failed (%d; device lost?)", (int)r);
+    }
+    plat_inc64(&mc_waits[why]);
+    plat_add64(&mc_wait_ns[why], (int64_t)(qpc() - t0));
+}
+
+// The wait for a submission's own commands (vk_sync_exec_wait) leaves out the completion thread, and with it the
+// lists of the submissions before: the GPU's merges of those are through by then, in queue order, and the game goes
+// on to rewrite what they wrote. A list stored after that put the last frame's words over the game's (white frames
+// while the camera turns). So that wait ends once the lists up to its value are stored too, before the results the
+// game reads (vk_sync.c results_run), which come after the write-backs before them as with the GPU's merge. Any thread.
+void vk_mem_merge_cpu_wait(uint64_t value) {
+    uint64_t n = __atomic_load_n(&mc_n, __ATOMIC_ACQUIRE);
+    for (uint64_t i = n; i > 0 && i + MC_RING > n; i--) {
+        uint64_t v = __atomic_load_n(&mc_ring[(i - 1) % MC_RING], __ATOMIC_RELAXED);
+        if (v <= value) {
+            apply_wait(v, 2);
+            return;
+        }
+    }
+}
+
 // A chunk of at least size bytes in chunks[]: the smallest fitting one of the pool, else a new buffer; -1 when the
 // allocation fails. host: 0 device memory (snapshots), CHUNK_LIST host memory the CPU writes (range lists),
-// CHUNK_MARKS host memory the CPU reads back (the merge's page marks, shadow_wb_cb).
-enum { CHUNK_LIST = 1, CHUNK_MARKS = 2 };
+// CHUNK_MARKS host memory the CPU reads back (the merge's page marks, shadow_wb_cb), CHUNK_MLIST device memory (a merge
+// list, NX2NAVI_MERGE_CPU), CHUNK_MCOPY its copy in host memory the CPU reads.
 static int chunk_new(uint64_t size, int host) {
     uint64_t want = host ? SNAP_LIST_MIN : SNAP_CHUNK;
     while (want < size) want <<= 1;
@@ -3341,7 +3602,8 @@ static int chunk_new(uint64_t size, int host) {
     if (best >= 0) {
         *ch = snap_pool[best];
         snap_pool[best] = snap_pool[--nsnap_pool];
-        snap_pool_bytes -= ch->size;
+        if (chunk_is_mlist(host)) nsnap_lists--;
+        else snap_pool_bytes -= ch->size;
     }
     plat_mutex_unlock(&snap_pool_lock);
     if (best < 0) {
@@ -3349,10 +3611,11 @@ static int chunk_new(uint64_t size, int host) {
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT,   // the source of mirror_capture's copies
                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        VmaAllocationCreateInfo ai = {.usage = host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                      .flags = host == CHUNK_MARKS ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                                                         VMA_ALLOCATION_CREATE_MAPPED_BIT
-                                             : host ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+        int dev = !host || host == CHUNK_MLIST, rd = host == CHUNK_MARKS || host == CHUNK_MCOPY;
+        VmaAllocationCreateInfo ai = {.usage = dev ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = rd ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                                        VMA_ALLOCATION_CREATE_MAPPED_BIT
+                                             : !dev ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                                           VMA_ALLOCATION_CREATE_MAPPED_BIT : 0};
         if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &ch->buf, &ch->alloc, NULL) != VK_SUCCESS) return -1;
         ch->size = want, ch->host = host;
@@ -3363,7 +3626,7 @@ static int chunk_new(uint64_t size, int host) {
 }
 
 // Record time: room in a snapshot chunk for [off, off+size) of r's mirror, once per submission. 0: plain copy instead.
-static int snap_add(PoolRec *r, uint64_t off, uint64_t size) {
+static int snap_add(PoolRec *r, uint64_t off, uint64_t size, int diff) {
     for (int i = nsnl; i-- > 0;)
         if (snl[i].r == r && snl[i].off == off && snl[i].size == size) return 1;
     int k = -1;
@@ -3371,7 +3634,7 @@ static int snap_add(PoolRec *r, uint64_t off, uint64_t size) {
         if (chunks[i].used != UINT64_MAX && chunks[i].size - chunks[i].used >= size) { k = i; break; }
     if (k < 0 && (k = chunk_new(size > SNAP_CHUNK ? size : SNAP_CHUNK, 0)) < 0) return 0;
     if (nsnl == csnl) grow((void **)&snl, &csnl, sizeof *snl);
-    snl[nsnl++] = (SnapRange){r, off, size, chunks[k].used, k};
+    snl[nsnl++] = (SnapRange){r, off, size, chunks[k].used, k, diff};
     chunks[k].used += (size + 15) & ~15ull;
     return 1;
 }
@@ -3386,8 +3649,9 @@ static void snap_copies(VkCommandBuffer cb) {
     snl_copied = nsnl;
 }
 
-static int snap_cmp(const void *x, const void *y) {
+static int snap_cmp(const void *x, const void *y) {   // the merges first, then the differences
     const SnapRange *a = x, *b = y;
+    if (a->diff != b->diff) return a->diff - b->diff;
     if (a->r != b->r) return (uintptr_t)a->r < (uintptr_t)b->r ? -1 : 1;
     if (a->chunk != b->chunk) return a->chunk < b->chunk ? -1 : 1;
     return a->off < b->off ? -1 : a->off > b->off;
@@ -3412,6 +3676,64 @@ static void merge_dispatch(VkCommandBuffer cb, const SnapRange *s, int n, uint64
     uint32_t pc[4] = {(uint32_t)n, total, (uint32_t)(base & (SB_PAGE - 1)), marks >= 0};
     vkCmdPushConstants(cb, WM.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (total + 63) / 64, 1, 1);
+}
+
+// One merge dispatch into the submission's list lbuf (shaders/wb_mergelist.comp, NX2NAVI_MERGE_CPU), as
+// merge_dispatch; gbase: the list place of its first word, cap: the list's room.
+static void list_dispatch(VkCommandBuffer cb, const SnapRange *s, int n, uint64_t base, uint64_t span, int list,
+                          uint64_t list_off, uint32_t total, VkBuffer lbuf, uint64_t lsize, uint32_t gbase, uint32_t cap,
+                          int check) {
+    VkDescriptorBufferInfo bi[5] = {{s->r->mbuf, base, span}, {chunks[s->chunk].buf, 0, chunks[s->chunk].size},
+                                    {s->r->buf, base, span}, {chunks[list].buf, list_off, (uint64_t)n * 16},
+                                    {lbuf, 0, lsize}};
+    VkWriteDescriptorSet w[5];
+    for (int i = 0; i < 5; i++)
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                      .pBufferInfo = &bi[i]};
+    rec_push(WM.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, WM.llayout, 0, 5, w);   // in call order (vk_rec.h)
+    uint32_t pc[5] = {(uint32_t)n, total, gbase, cap, (uint32_t)check};
+    vkCmdPushConstants(cb, WM.llayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (total + 63) / 64, 1, 1);
+}
+
+// One difference dispatch (shaders/wb_diffcopy.comp), as merge_dispatch.
+static void diff_dispatch(VkCommandBuffer cb, const SnapRange *s, int n, uint64_t base, uint64_t span, int list,
+                          uint64_t list_off, uint32_t total) {
+    VkDescriptorBufferInfo bi[4] = {{s->r->mbuf, base, span}, {chunks[s->chunk].buf, 0, chunks[s->chunk].size},
+                                    {s->r->buf, base, span}, {chunks[list].buf, list_off, (uint64_t)n * 16}};
+    VkWriteDescriptorSet w[4];
+    for (int i = 0; i < 4; i++)
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                      .pBufferInfo = &bi[i]};
+    rec_push(WM.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, WM.dlayout, 0, 4, w);   // in call order (vk_rec.h)
+    uint32_t pc[2] = {(uint32_t)n, total};
+    vkCmdPushConstants(cb, WM.dlayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (total + 255) / 256, 1, 1);
+}
+
+// A difference range's first invocation: the first at or after total whose place within 32 matches the range's first
+// word x, so that the shader's clusters of 16 invocations cover whole 64-byte lines of the 128-byte aligned binding.
+static uint64_t diff_first(uint64_t total, uint64_t x) { return total + ((x - total) & 31); }
+
+// The ranges s[i..j) one merge or difference dispatch covers (s sorted by snap_cmp): one kind, pool and chunk, within
+// MERGE_SPAN and MERGE_WORDS (a difference: DIFF_WORDS, its span from a 128-byte boundary). Returns j; *base, *end: the
+// span, *total: its invocations.
+static int merge_group(const SnapRange *s, int i, int n, uint64_t align, uint64_t *base, uint64_t *end, uint32_t *total) {
+    int diff = s[i].diff;
+    if (diff && align < 128) align = 128;
+    uint64_t b = s[i].off & ~(align - 1), e = s[i].off + s[i].size;
+    uint64_t tot = 0;
+    int j = i;
+    for (; j < n && s[j].r == s[i].r && s[j].chunk == s[i].chunk && s[j].diff == s[i].diff; j++) {
+        uint64_t f = s[j].off + s[j].size > e ? s[j].off + s[j].size : e;
+        uint64_t t = (diff ? diff_first(tot, (s[j].off - b) / 4) : tot) + s[j].size / 4;
+        if (j > i && (f - b > MERGE_SPAN || t > (diff ? DIFF_WORDS : MERGE_WORDS))) break;
+        e = f, tot = t;
+    }
+    *base = b, *end = e, *total = (uint32_t)tot;
+    return j;
 }
 
 // ---- shadow storage: the GPU's writes into VRAM mirrors back into guest memory
@@ -3489,10 +3811,11 @@ static void swb_job(uint64_t fence) {
     vk_completion_add(fence, shadow_wb_cb, j);
 }
 
-// vk_mem_mirror_end: the merge dispatches of this submission's ranges. Returns the commands recorded; 0 with nsnl
-// left as it was when the range list cannot be allocated (the caller copies them plainly). With shadow storage each
-// dispatch also marks the pages it changed, for swb_job.
-static int wb_merge_record(VkCommandBuffer cb) {
+// vk_mem_mirror_end: the merge and difference dispatches of this submission's ranges. Returns the commands recorded; 0
+// with nsnl left as it was when the range list cannot be allocated (the caller copies them plainly). With shadow
+// storage each dispatch also marks the pages it changed, for swb_job. fence: the submission's value; *listed: 1 when
+// its merges went into a list the CPU stores at the fence (NX2NAVI_MERGE_CPU).
+static int wb_merge_record(VkCommandBuffer cb, uint64_t fence, int *listed) {
     VkCtx *c = vk_ctx();
     uint64_t align = c->props.limits.minStorageBufferOffsetAlignment;
     if (align < 16) align = 16;
@@ -3501,21 +3824,18 @@ static int wb_merge_record(VkCommandBuffer cb) {
     if (!s || !gr) rt_fatal("vk: out of memory");
     memcpy(s, snl, sizeof *s * (size_t)nsnl);
     qsort(s, (size_t)nsnl, sizeof *s, snap_cmp);
-    // the dispatches: ranges of one pool and snapshot chunk, within MERGE_SPAN bytes and MERGE_WORDS words
+    *listed = 0;
+    // the dispatches: ranges of one kind, pool and snapshot chunk, within MERGE_SPAN bytes and MERGE_WORDS words
     int ng = 0;
     uint64_t nmarks = 0;   // bytes of page marks, each dispatch's at an aligned offset
+    uint64_t mwords = 0;   // the words of the merges
     for (int i = 0; i < nsnl;) {
-        uint64_t base = s[i].off & ~(align - 1), end = s[i].off + s[i].size;
-        uint32_t total = 0;
-        int j = i;
-        for (; j < nsnl && s[j].r == s[i].r && s[j].chunk == s[i].chunk; j++) {
-            uint64_t e = s[j].off + s[j].size > end ? s[j].off + s[j].size : end;
-            if (j > i && (e - base > MERGE_SPAN || total + s[j].size / 4 > MERGE_WORDS)) break;
-            end = e;
-            total += (uint32_t)(s[j].size / 4);
-        }
+        uint64_t base, end;
+        uint32_t total;
+        int j = merge_group(s, i, nsnl, align, &base, &end, &total);
         gr[ng++] = (struct MGroup){i, j, base, end, total};
         nmarks += (((base & (SB_PAGE - 1)) + end - base + SB_PAGE - 1) / SB_PAGE * 4 + align - 1) & ~(align - 1);
+        if (!s[i].diff) mwords += total;
         i = j;
     }
     // the range lists: at most one 16-byte entry per range, each dispatch's list at an aligned offset
@@ -3539,34 +3859,98 @@ static int wb_merge_record(VkCommandBuffer cb) {
     VmaAllocationInfo li;
     vmaGetAllocationInfo(c->vma, chunks[list].alloc, &li);
     uint32_t *lm = li.pMappedData;
+    // NX2NAVI_MERGE_CPU: the merges into a list in device memory (ml), copied to host memory (mh) for merge_apply; room
+    // for every word of the ranges, so none is written by the GPU past it
+    uint64_t lsize = 0;
+    int ml = -1, mh = -1, check = 0;
+    MergeJob *job = NULL;
+    if (mwords && mwords < 0x7fffffffull && merge_cpu(mwords * 4)) {
+        lsize = (16 + mwords * 8 + 15) & ~15ull;
+        if ((ml = chunk_new(lsize, CHUNK_MLIST)) >= 0) chunks[ml].used = UINT64_MAX;
+        if (ml >= 0 && (mh = chunk_new(lsize, CHUNK_MCOPY)) >= 0) chunks[mh].used = UINT64_MAX;
+        if (mh >= 0 && (job = malloc(sizeof *job + sizeof(MergeSpan) * (size_t)nsnl))) {
+            VmaAllocationInfo hi;
+            vmaGetAllocationInfo(c->vma, chunks[mh].alloc, &hi);
+            check = merge_cpu_check();
+            *job = (MergeJob){.fence = fence, .map = hi.pMappedData, .alloc = chunks[mh].alloc, .cap = (uint32_t)mwords,
+                              .check = check};
+            vkCmdFillBuffer(cb, chunks[ml].buf, 0, 16, 0);
+            mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+    }
     uint64_t lo = 0, mo = 0;
-    int rec = 0;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, WM.pipe);
+    int rec = 0, nt = 0;
+    int bound = -1;
+    uint32_t gbase = 0;
     for (int k = 0; k < ng; k++) {
         const struct MGroup *d = &gr[k];
+        int diff = s[d->i].diff;
+        int kind = diff ? 1 : job ? 2 : 0;   // a difference, a merge into the list, a merge
+        if (bound != kind)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, kind == 1 ? WM.dpipe : kind == 2 ? WM.lpipe : WM.pipe),
+                bound = kind;
         lo = (lo + align - 1) & ~(align - 1);
         uint64_t l0 = lo;
         uint32_t first = 0;   // the range's first invocation
         for (int j = d->i; j < d->j; j++) {
-            uint32_t *q = lm + lo / 4;
-            q[0] = (uint32_t)((s[j].off - d->base) / 4), q[1] = (uint32_t)(s[j].soff / 4), q[2] = (uint32_t)(s[j].size / 4);
+            uint32_t *q = lm + lo / 4, x = (uint32_t)((s[j].off - d->base) / 4);
+            if (diff) first = (uint32_t)diff_first(first, x);
+            q[0] = x, q[1] = (uint32_t)(s[j].soff / 4), q[2] = (uint32_t)(s[j].size / 4);
             q[3] = first;
+            if (kind == 2) {
+                job->t[nt++] = (MergeSpan){gbase + first, (uint32_t)(s[j].size / 4), s[j].r->import_lo + s[j].off};
+                if (!check) cpu_span_add(s[j].r, s[j].off, s[j].off + s[j].size, fence);
+            }
             first += (uint32_t)(s[j].size / 4);
             lo += 16;
-            mrep.merge_bytes += s[j].size;
+            if (diff) mrep.diff_bytes += s[j].size;
+            else mrep.merge_bytes += s[j].size;
         }
-        merge_dispatch(cb, s + d->i, d->j - d->i, d->base, d->end - d->base, list, l0, d->total, marks, mo);
-        if (shadow_on) {
-            uint64_t ga = s[d->i].r->import_lo + d->base;
-            if (marks >= 0) swl_add(ga, d->end - d->base, (uint32_t)(mo / 4));
-            else
-                for (int j = d->i; j < d->j; j++) swl_add(s[j].r->import_lo + s[j].off, s[j].size, SWB_ALL);
+        if (kind == 1) {
+            diff_dispatch(cb, s + d->i, d->j - d->i, d->base, d->end - d->base, list, l0, d->total);
+            mrep.diff_dispatches++;
+        } else if (kind == 2) {
+            list_dispatch(cb, s + d->i, d->j - d->i, d->base, d->end - d->base, list, l0, d->total, chunks[ml].buf, lsize,
+                          gbase, job->cap, check);
+            gbase += d->total;
+            mrep.merge_dispatches++;
+        } else {
+            merge_dispatch(cb, s + d->i, d->j - d->i, d->base, d->end - d->base, list, l0, d->total, marks, mo);
+            if (shadow_on) {
+                uint64_t ga = s[d->i].r->import_lo + d->base;
+                if (marks >= 0) swl_add(ga, d->end - d->base, (uint32_t)(mo / 4));
+                else
+                    for (int j = d->i; j < d->j; j++) swl_add(s[j].r->import_lo + s[j].off, s[j].size, SWB_ALL);
+            }
+            mrep.merge_dispatches++;
         }
         mo += (((d->base & (SB_PAGE - 1)) + d->end - d->base + SB_PAGE - 1) / SB_PAGE * 4 + align - 1) & ~(align - 1);
-        mrep.merge_dispatches++;
         rec += 3;
     }
     vmaFlushAllocation(c->vma, chunks[list].alloc, 0, VK_WHOLE_SIZE);
+    if (job) {   // the list to host memory in whole lines, for merge_apply at the fence
+        job->n = nt;
+        mbarrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, WM.cpipe);
+        VkDescriptorBufferInfo bi[2] = {{chunks[ml].buf, 0, lsize}, {chunks[mh].buf, 0, lsize}};
+        VkWriteDescriptorSet w[2];
+        for (int i = 0; i < 2; i++)
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
+                                          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                          .pBufferInfo = &bi[i]};
+        rec_push(WM.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, WM.clayout, 0, 2, w);
+        uint32_t cap = job->cap;
+        vkCmdPushConstants(cb, WM.clayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof cap, &cap);
+        uint64_t groups = (1 + (mwords + 1) / 2 + 255) / 256;   // 16 bytes an invocation, at most 256 groups
+        vkCmdDispatch(cb, (uint32_t)(groups < 256 ? groups : 256), 1, 1);
+        rec += 7;
+        vk_completion_add_first(fence, merge_apply, job);
+        *listed = !check;
+        __atomic_store_n(&mc_ring[mc_n % MC_RING], fence, __ATOMIC_RELAXED);
+        __atomic_store_n(&mc_n, mc_n + 1, __ATOMIC_RELEASE);
+    }
     for (int i = 0; i < nsnl; i++) snl[i].r->wb_sub = msub;
     free(s), free(gr);
     return rec;
@@ -3577,9 +3961,12 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
     plat_mutex_lock(&snap_pool_lock);
     for (int i = 0; i < f->n; i++) {
         SnapChunk *ch = &f->c[i];
-        if (nsnap_pool == SNAP_POOL_N || snap_pool_bytes + ch->size > snap_pool_cap()) continue;
+        int ml = chunk_is_mlist(ch->host);
+        if (nsnap_pool == SNAP_POOL_N || (ml ? nsnap_lists == SNAP_POOL_LISTS : snap_pool_bytes + ch->size > snap_pool_cap()))
+            continue;
         snap_pool[nsnap_pool++] = *ch;
-        snap_pool_bytes += ch->size;
+        if (ml) nsnap_lists++;
+        else snap_pool_bytes += ch->size;
         ch->buf = VK_NULL_HANDLE;
     }
     plat_mutex_unlock(&snap_pool_lock);
@@ -3797,9 +4184,13 @@ static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader) {
     r->hot_bytes += size;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
     uint64_t o = 0;
-    if (shader && !(sp->offset & 3) && !(size & 3) && size <= merge_max() && merging())
-        for (uint64_t n; o < size; o += n)
-            if (!snap_add(r, sp->offset + o, n = size - o < MERGE_PIECE ? size - o : MERGE_PIECE)) break;
+    if (shader && !(sp->offset & 3) && !(size & 3) && merging()) {
+        if (size > DIFF_MIN && size <= DIFF_MAX && wb_diff()) {   // whole, by difference
+            if (snap_add(r, sp->offset, size, 1)) o = size;
+        } else if (size <= merge_max())
+            for (uint64_t n; o < size; o += n)
+                if (!snap_add(r, sp->offset + o, n = size - o < MERGE_PIECE ? size - o : MERGE_PIECE, 0)) break;
+    }
     r->st_merge += o;
     if (o == size) return;
     r->st_wb += size - o;
@@ -4069,6 +4460,45 @@ void vk_mem_mirror_begin(void) {
     slow_mem_call("mirror begin (its queries and freezes)", 0, ww_bytes - b0, q, qpc() - t0);
 }
 
+// A pool's spans in value order: those done go; one that overlaps or touches the last of its value joins it, and past
+// SPAN_MAX a value's spans become one (more bytes wait than need to, none fewer).
+#define SPAN_MAX 64
+static void span_add(struct WbSpan **v, int *n, int *cap, uint64_t lo, uint64_t hi, uint64_t fence) {
+    if (*n && (*v)[0].fence <= vk_sync_fence_done()) {
+        uint64_t done = vk_sync_fence_done();
+        int k = 0;
+        for (int i = 0; i < *n; i++)
+            if ((*v)[i].fence > done) (*v)[k++] = (*v)[i];
+        *n = k;
+    }
+    struct WbSpan *l = *n ? &(*v)[*n - 1] : NULL;
+    if (l && l->fence == fence && ((lo <= l->hi && hi >= l->lo) || *n >= SPAN_MAX)) {
+        if (lo < l->lo) l->lo = lo;
+        if (hi > l->hi) l->hi = hi;
+        return;
+    }
+    if (*n == *cap) grow((void **)v, cap, sizeof **v);
+    (*v)[(*n)++] = (struct WbSpan){lo, hi, fence};
+}
+
+// The newest value of a span over [lo, hi) before `fence`.
+static uint64_t span_wait(const struct WbSpan *v, int n, uint64_t lo, uint64_t hi, uint64_t fence) {
+    uint64_t w = 0;
+    for (int i = 0; i < n; i++)
+        if (v[i].fence < fence && v[i].fence > w && v[i].lo < hi && lo < v[i].hi) w = v[i].fence;
+    return w;
+}
+
+// NX2NAVI_MERGE_CPU: the bytes a submission's list stores (merge_apply), until done.
+static void cpu_span_add(PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence) {
+    span_add(&r->cws, &r->ncws, &r->ccws, lo, hi, fence);
+}
+
+// The newest list before `fence` that stores into [lo, hi) of r; done or not (the caller compares).
+static uint64_t cpu_span_wait(const PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence) {
+    return r->ncws ? span_wait(r->cws, r->ncws, lo, hi, fence) : 0;
+}
+
 int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl || n_gpa_flip; }
 
 // NX2NAVI_MIRROR_CAPTURE_KB: the pages the CPU wrote since a VRAM mirror's last sync are copied out of guest memory by
@@ -4199,6 +4629,12 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     if (!npend && snl_copied == nsnl && !n_gpa_flip) return;
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (npend && merge_cpu_mode()) {   // after the merge lists still to be stored there (NX2NAVI_MERGE_CPU)
+        uint64_t aw = 0, f = vk_sync_rec_fence(), w;
+        for (int i = 0; i < npend; i++)
+            if ((w = cpu_span_wait(pend[i].r, pend[i].off, pend[i].off + pend[i].size, f)) > aw) aw = w;
+        apply_wait(aw, 1);
+    }
     mirror_capture(cb);
     if (npend) vk_mem_note_live();   // left to the GPU-time copy: the GPU reads guest memory late
     copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
@@ -4320,13 +4756,14 @@ int vk_mem_mirror_wb_pending(void) { return vk_mirror_on && (nsnl || nwbl); }
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    int listed = 0;
     lazy_part_check();   // before the merges are recorded: what the last part skipped and has to write back after all
     if (nsnl) {
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         vk_gpu_gap_note(VK_GAP_WB_MERGE, 0);
-        int m = wb_merge_record(cb);
+        int m = wb_merge_record(cb, fence, &listed);
         if (!m) {   // no range list: copy them plainly
             for (int i = 0; i < nsnl; i++) range_add(&wbl, &nwbl, &cwbl, snl[i].r, snl[i].off, snl[i].size);
         }
@@ -4335,6 +4772,15 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    }
+    if (merge_cpu_mode()) {   // this submission's GPU write-backs land after the lists still to be stored there
+        uint64_t hw = 0, w;
+        for (int i = 0; i < nsnl; i++)
+            if ((snl[i].diff || !listed) && (w = cpu_span_wait(snl[i].r, snl[i].off, snl[i].off + snl[i].size, fence)) > hw)
+                hw = w;
+        for (int i = 0; i < nwbl; i++)
+            if ((w = cpu_span_wait(wbl[i].r, wbl[i].off, wbl[i].off + wbl[i].size, fence)) > hw) hw = w;
+        apply_wait(hw, 0);
     }
     if (shadow_on && (nswl || nwbl)) swb_job(fence);   // before snap_free takes back the marks' chunk
     if (nchunks) {   // the last part's prologue still records snapshot copies into them; back to the pool at the fence
@@ -4457,15 +4903,16 @@ static void mirror_log(uint64_t frame) {
     vk_gpa_report();
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
-           "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, merge %.3f MiB in %.1f dispatches "
-           "(snapshots %.3f MiB, new buffers %.2f), flush calls %.1f (%.3f MiB), queries "
+           "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, merge %.3f MiB in %.1f dispatches, by "
+           "difference %.3f MiB in %.1f (snapshots %.3f MiB, new buffers %.2f), flush calls %.1f (%.3f MiB), queries "
            "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f); so far "
            "evicted %lld (%.1f MiB), budget refusals asked again %lld, made without a twin %lld (%.1f MiB)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, a.merge_bytes / f / M,
-           a.merge_dispatches / f, a.snap_bytes / f / M, a.snap_allocs / f, fc / f, fb / f / M,
+           a.merge_dispatches / f, a.diff_bytes / f / M, a.diff_dispatches / f, a.snap_bytes / f / M, a.snap_allocs / f,
+           fc / f, fb / f / M,
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, (long long)m_evicted_n, m_evicted_bytes / M, (long long)m_retries,
            (long long)m_untwinned_n, m_untwinned_bytes / M, ver);
@@ -4485,6 +4932,18 @@ static void mirror_log(uint64_t frame) {
     if (n_gpa_late)
         rt_log("mem: mirror frame %llu: the device address table took up %llu mirrors in queue order, after their first "
                "copy, so far (NX2NAVI_GPA_LATE)", (unsigned long long)frame, (unsigned long long)n_gpa_late);
+    if (merge_cpu_mode()) {
+        int64_t nl = plat_xchg64(&mc_lists, 0), nw = plat_xchg64(&mc_words, 0), ns = plat_xchg64(&mc_ns, 0), wn[3], wt[3];
+        for (int i = 0; i < 3; i++) wn[i] = plat_xchg64(&mc_waits[i], 0), wt[i] = plat_xchg64(&mc_wait_ns[i], 0);
+        int64_t ov = plat_xchg64(&mc_over, 0), bad = plat_xchg64(&mc_bad, 0), dif = plat_xchg64(&mc_diff, 0);
+        rt_log("mem: mirror frame %llu: merges through the CPU per frame (NX2NAVI_MERGE_CPU): %.2f lists, %.0f words "
+               "stored in %.3f ms (%.3f a list); the replay waited for a list %.3f times for a write-back (%.3f ms), %.3f "
+               "for a prologue (%.3f ms), %.3f for an executed wait (%.3f ms); words past the room %lld, without a "
+               "range %lld, "
+               "different from the GPU's (check) %lld", (unsigned long long)frame, nl / f, nw / f, ns / f / 1e6,
+               nl ? ns / 1e6 / nl : 0.0, wn[0] / f, wt[0] / f / 1e6, wn[1] / f, wt[1] / f / 1e6, wn[2] / f,
+               wt[2] / f / 1e6, (long long)ov, (long long)bad, (long long)dif);
+    }
 }
 
 // After vram_log: every heap's usage as the driver reports it (VK_EXT_memory_budget) beside VMA's share of it, VMA by
@@ -5999,7 +6458,7 @@ void vk_mem_shutdown(void) {
     swl_marks = -1;
     plat_mutex_lock(&snap_pool_lock);
     for (int i = 0; i < nsnap_pool; i++) vmaDestroyBuffer(c->vma, snap_pool[i].buf, snap_pool[i].alloc);
-    nsnap_pool = 0, snap_pool_bytes = 0;
+    nsnap_pool = 0, snap_pool_bytes = 0, nsnap_lists = 0;
     plat_mutex_unlock(&snap_pool_lock);
     plat_mutex_lock(&shadow_lock);
     nstouch = nstab = 0, s_sb_pages = 0;   // shadows too (their base copies went with their records)

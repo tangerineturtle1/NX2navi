@@ -84,6 +84,8 @@ static Pending *rqueue;
 static int rqhead, rqn, rqcap;
 static PlatMutex res_lock = PLAT_MUTEX_INIT;   // the runner; taken before st_lock
 static void results_run(uint64_t upto);
+static Pending *fqueue;           // vk_completion_add_first: run before the callbacks of their value (merge lists)
+static int fqhead, fqn, fqcap;
 
 // ---- submit batching
 // Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
@@ -352,6 +354,10 @@ static void hold_release(uint64_t value, int aged, int try_only) {
     vk_sync_flush_held();
     vk_queue_unlock();
 }
+
+// The replay thread is about to wait for what submission `value` leaves (vk_memory.c apply_wait, NX2NAVI_MERGE_CPU): a
+// held submission that signals it goes to the queue now, or the wait would last out the hold.
+void vk_sync_release_held(uint64_t value) { hold_release(value, 0, 0); }
 
 // ---- GPU time (NX2NAVI_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
 // ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
@@ -855,7 +861,8 @@ static void completion_main(void *arg) {
     __atomic_store_n(&cb_tid, plat_thread_id(), __ATOMIC_RELEASE);
     plat_mutex_lock(&st_lock);
     for (;;) {
-        while (!stop && done == issued && !(qn && queue[qhead].fence <= done) && !(rqn && rqueue[rqhead].fence <= done))
+        while (!stop && done == issued && !(qn && queue[qhead].fence <= done) && !(rqn && rqueue[rqhead].fence <= done) &&
+               !(fqn && fqueue[fqhead].fence <= done))
             plat_cond_wait(&cv_work, &st_lock);
         if (stop) break;
         uint64_t reached = done;
@@ -893,6 +900,15 @@ static void completion_main(void *arg) {
         // work that never finished: frees of what the GPU may still hold, records handed out again, counter reports.
         // done stays where it is, the waiters stay asleep, and the thread that saw the loss ends the process.
         if (vk_device_is_lost()) break;
+        // the merge lists first (NX2NAVI_MERGE_CPU): the results the game reads come after the write-backs before
+        // them, as with the GPU's merge
+        while (fqn && fqueue[fqhead].fence <= reached && !vk_device_is_lost()) {
+            Pending p = fqueue[fqhead++];
+            fqn--;
+            plat_mutex_unlock(&st_lock);
+            p.fn(p.arg);
+            plat_mutex_lock(&st_lock);
+        }
         plat_mutex_unlock(&st_lock);
         results_run(reached);   // what the game reads first; a waiter after its submit may have run them already
         plat_mutex_lock(&st_lock);
@@ -1212,6 +1228,9 @@ VkCommandBuffer vk_sync_worker_begin(int w) {
 }
 
 void vk_sync_worker_end(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }
+
+uint64_t vk_sync_rec_fence(void) { return cur_fence; }
+
 static VkCommandBuffer split_part(int exec);
 
 // ---- the early tail (vk_exec.c "the early tail"). The replay cut the part where the tail began (vk_sync_cut), so the
@@ -1437,6 +1456,16 @@ static void pending_push(Pending **q, int *head, int *n, int *cap, Pending p) {
     (*q)[*head + (*n)++] = p;
 }
 
+// As vk_completion_add, in a queue the completion thread runs first: the merge lists the CPU stores into guest memory
+// (NX2NAVI_MERGE_CPU), which the results and the other callbacks of the same value come after. From the replay thread
+// alone, in value order.
+void vk_completion_add_first(uint64_t fence, void (*fn)(void *), void *arg) {
+    plat_mutex_lock(&st_lock);
+    pending_push(&fqueue, &fqhead, &fqn, &fqcap, (Pending){fence, fn, arg});
+    if (fence <= done) plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
+}
+
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
     plat_mutex_lock(&st_lock);
     pending_push(&queue, &qhead, &qn, &qcap, (Pending){fence, fn, arg});
@@ -1625,6 +1654,8 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     }
     // The results the game reads, of this submission and of those before it, which the GPU ran first: here, not when
     // the completion thread gets to them behind the other side effects of the last frame's submissions.
+    // The merge lists the CPU stores (NX2NAVI_MERGE_CPU) up to the value asked for, as the GPU's merges are by now.
+    if (r == VK_SUCCESS) vk_mem_merge_cpu_wait(asked);
     if (r == VK_SUCCESS && wb_results) results_run(value);
     perf_end(PERF_FENCE, p0);
     perf_gpu_wait(p0);
@@ -1680,7 +1711,7 @@ void vk_sync_shutdown(void) {
         plat_thread_join(completion_thread);
         completion_thread = NULL;
         plat_mutex_lock(&st_lock);
-        qhead = qn = rqhead = rqn = 0;   // callbacks of values never submitted
+        qhead = qn = rqhead = rqn = fqhead = fqn = 0;   // callbacks of values never submitted
         plat_mutex_unlock(&st_lock);
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
