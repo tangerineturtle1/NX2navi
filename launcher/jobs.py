@@ -509,23 +509,35 @@ class RebuildJob(Job):
         super().__init__(ctx, ['tools_update', 'lift', 'compile_changed', 'swap', 'shaders', *prompt_rows(ctx), 'scan'])
         self.game_dir, self.dump = str(game_dir), dump
 
+    def rebuild_arguments(self) -> list[str]:
+        layout = self.ctx.layout
+        if build.can_rebuild(self.game_dir):
+            return build.rebuild_args(layout, self.game_dir, self.retune)
+        if self.dump:
+            return build.install_args(layout, self.dump, self.game_dir)
+        raise build.BuildError('the game folder has no earlier build: install the game again')
+
     def run(self):
         self.ensure_tools('tools_update')
-        layout = self.ctx.layout
         if build.game_running(self.game_dir):
             raise build.BuildError('the game is running: close it and try again')
-        if build.can_rebuild(self.game_dir):
-            args = build.rebuild_args(layout, self.game_dir, self.retune)
-        elif self.dump:
-            args = build.install_args(layout, self.dump, self.game_dir)
-        else:
-            raise build.BuildError('the game folder has no earlier build: install the game again')
+        args = self.rebuild_arguments()
         self.make_game(args, {'lift': 'lift', 'compile': 'compile_changed', 'shaders': 'shaders', 'prompts': 'prompts', 'scan': 'scan'},
                        link_step='swap')
         for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
             if self.step(sid) and self.step(sid).state == PENDING:
                 self.skip(sid)
         self.note_scan(self.game_dir)
+
+
+class CleanRebuildJob(RebuildJob):
+    title = 'Rebuilding from Scratch'
+    task = 'a clean rebuild of the game'
+
+    def rebuild_arguments(self) -> list[str]:
+        if not build.can_rebuild(self.game_dir):
+            raise build.BuildError('the game folder has no unpacked game files: install the game first')
+        return [*super().rebuild_arguments(), '--clean']
 
 
 class ModsRebuildJob(RebuildJob):

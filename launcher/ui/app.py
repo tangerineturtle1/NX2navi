@@ -55,7 +55,7 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2, 'mods': 1, 'mod_order': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2, 'clean_rebuild': 1}
 MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
 ORDER_PAGE = 10   # ... of the Load Order screen
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
@@ -626,7 +626,7 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order', 'clean_rebuild'):
             self.sounds.play('back')
         if self.screen == 'color':
             self.pick_done()
@@ -634,6 +634,8 @@ class App:
             self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
             self.show('settings')
+        elif self.screen == 'clean_rebuild':
+            self.show('home', self.home_row('Clean Rebuild'))
         elif self.screen == 'saves':
             self.show('home', self.home_row('Saves'))
         elif self.screen == 'mods':
@@ -1044,6 +1046,8 @@ class App:
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
                       'after changing build tools, or if the game stopped starting.',)),
+            *([Row('value', 'Clean Rebuild', '', 'arrow', on=lambda: self.show('clean_rebuild'),
+                   desc=('Compile from scratch and prepare shaders again.',))] if build.can_rebuild(gd) else []),
             Row('value', 'Customize Launcher', art.THEMES[art.theme]['label'], 'arrow',
                 on=lambda: self.show('customize'),
                 desc=('Colour scheme, background picture, animations and sounds.',)),
@@ -1999,6 +2003,14 @@ class App:
         gd = self.settings.get('game_dir')
         self.run_job(jobs.RebuildJob(self.ctx, gd, self.settings.get('dump')), 'home')
 
+    def rows_clean_rebuild(self) -> list[Row]:
+        return [Row('pair', actions=[('Clean Rebuild', self.start_clean_rebuild), ('Cancel', self.back)],
+                    desc=('This clears the generated code, compiled files and local shader caches. It can take '
+                          'as long as the first build. Your saves, settings, controller bindings and mods are kept.',))]
+
+    def start_clean_rebuild(self) -> None:
+        self.run_job(jobs.CleanRebuildJob(self.ctx, self.settings.get('game_dir')), 'home')
+
     # ---- settings
 
     def rows_settings(self):
@@ -2158,6 +2170,8 @@ class App:
             self.run_job(jobs.InstallJob(self.ctx, j.dump, j.game_dir), self.job_return, self.job_back)
         elif isinstance(j, jobs.ContinueUpdateJob):
             self.run_job(jobs.ContinueUpdateJob(self.ctx, j.game_dir, j.old, j.dump), self.job_return)
+        elif isinstance(j, jobs.CleanRebuildJob):
+            self.run_job(jobs.CleanRebuildJob(self.ctx, j.game_dir), self.job_return)
         elif isinstance(j, jobs.RebuildJob):
             self.run_job(jobs.RebuildJob(self.ctx, j.game_dir, j.dump), self.job_return)
         elif isinstance(j, jobs.UpdateDownloadJob):
