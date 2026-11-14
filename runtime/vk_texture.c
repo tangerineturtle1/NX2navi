@@ -522,9 +522,20 @@ static void tex_init(void *p) {
 // that took it (perf_lock_hold); lock is not inlined so that its return address names that code.
 static uint64_t hold_t0;
 static void *hold_site;
+// While the replay workers record (vk_exec_shared) up to nine threads take the lock for a few microseconds at each
+// draw's lookups. The OS lock spins only briefly before its waiter sleeps, and a sleeping waiter woke tens of
+// microseconds after the lock was free: in Hyrule Field the workers spent about a third of their recording asleep here
+// (bind_resources, shader_for). So a waiter then spins up to TEX_SPINS pauses for the lock to come free first.
+#define TEX_SPINS 2048
 __attribute__((noinline)) static void lock(void) {
     if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) plat_once(&tex_once, tex_init, NULL);
-    plat_rmutex_lock_at(&tex_lock, __builtin_return_address(0));
+    int got = 0;
+    if (__atomic_load_n(&tex_lock.owner, __ATOMIC_RELAXED) != plat_thread_id() && vk_exec_shared())
+        for (int i = 0; i < TEX_SPINS && !got; i++) {
+            if (!__atomic_load_n(&tex_lock.owner, __ATOMIC_RELAXED)) got = plat_rmutex_trylock(&tex_lock);
+            if (!got) plat_pause();
+        }
+    if (!got) plat_rmutex_lock_at(&tex_lock, __builtin_return_address(0));
     if (tex_lock.depth == 1 && perf_lock_holds_on()) hold_t0 = plat_now_ns(), hold_site = __builtin_return_address(0);
 }
 static void unlock(void) {
@@ -7179,6 +7190,7 @@ static struct {
     CompOld old[RES_OLD_N];              // the old images of moved textures, until they can go (res_old_sweep)
     int nold;
     uint64_t frame, frame_b;             // the presented frame of the moves counted in frame_b
+    uint64_t scan_frame;                 // the presented frame the texture table was last walked in
     uint64_t used, budget, used_frame;   // the driver's figure at used_frame, give or take what moved since
     uint64_t *out_blk;                   // this frame's blocks to empty (sorted device memory handles)
     int nout_blk, waiting;               // waiting: sampled textures left in system memory for want of room
@@ -7381,6 +7393,10 @@ static void residency_step(void) {
             RS.host_used = RS.host_used > got ? RS.host_used - got : 0;
         }
     }
+    // The walks below go over every texture: once a presented frame, not at each of its few dozen submissions, where
+    // they cost the submitting threads about 0.7 ms a frame in Hyrule Field.
+    if (RS.scan_frame == now) return;
+    RS.scan_frame = now;
     uint64_t target = RS.budget - RES_MARGIN;
     // back first: into holes, then into new memory while the figure allows it
     int waiting = 0;
