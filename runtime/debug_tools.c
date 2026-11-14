@@ -1183,8 +1183,26 @@ void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *
 // <tick>:next <mode> <value>;<tick>:setfirst <value>;<tick>:holdfirst <value>;<tick>:show [<hash hex>];
 // <tick>:warp <area> [<start position>];<tick>:event <name>;<tick>:text <game data text's name>;
 // <tick>:freecam <0|1> <sticks 0|1> <speed>;<tick>:camavoid <0|1>;<tick>:camgo <dx> <dy> <dz> [<yaw> <pitch>];
-// <tick>:camreset;<tick>:campos":
+// <tick>:camfly <dx> <dy> <dz> <yaw> <pitch> <ticks>;<tick>:camreset;<tick>:campos":
 // the menu's requests without the menu, for test runs. Ticks count the game's pad reads from the player's first appearance.
+// camfly moves the free camera as camgo does, in equal steps over that many ticks: a flight across an area for a run
+// that measures what the moving view costs (video memory, frame time) without a route Link can get stuck on. A camfly
+// that comes while another runs takes over from where the camera is.
+static struct {
+    double d[3];              // per tick
+    float yaw, pitch;         // per tick
+    uint64_t left;            // ticks to go
+} fly;
+
+static void fly_tick(void) {
+    if (!fly.left) return;
+    for (int i = 0; i < 3; i++) fc.pos[i] += fly.d[i];
+    fc.yaw += fly.yaw, fc.pitch += fly.pitch;
+    fc.pitch = fc.pitch > 1.5f ? 1.5f : fc.pitch < -1.5f ? -1.5f : fc.pitch;
+    if (!--fly.left) rt_log("debug: camfly done: free camera at %.1f %.1f %.1f, yaw %.3f, pitch %.3f", fc.pos[0], fc.pos[1],
+                            fc.pos[2], fc.yaw, fc.pitch);
+}
+
 static void test_script(uint64_t tick) {
     static char buf[2048];
     static const char *next;
@@ -1224,6 +1242,14 @@ static void test_script(uint64_t tick) {
             if (sscanf(colon + 7, "%lf %lf %lf %f %f", &d[0], &d[1], &d[2], &yaw, &pitch) >= 3) {
                 for (int i = 0; i < 3; i++) fc.pos[i] += d[i];
                 fc.yaw += yaw, fc.pitch += pitch;
+            }
+        } else if (!strncmp(colon + 1, "camfly ", 7)) {     // camfly <dx> <dy> <dz> <yaw> <pitch> <ticks>
+            double d[3] = {0, 0, 0};
+            float yaw = 0, pitch = 0;
+            unsigned long long n = 0;
+            if (sscanf(colon + 8, "%lf %lf %lf %f %f %llu", &d[0], &d[1], &d[2], &yaw, &pitch, &n) == 6 && n > 0 && n <= 1000000) {
+                for (int i = 0; i < 3; i++) fly.d[i] = d[i] / (double)n;
+                fly.yaw = yaw / (float)n, fly.pitch = pitch / (float)n, fly.left = n;
             }
         } else if (!strncmp(colon + 1, "route ", 6)) {   // route <x> <z> [<x> <z> ...]: points in metres
             const char *q = colon + 7;
@@ -1319,6 +1345,7 @@ void dbg_tick(Cpu *c) {
     if (!dbg_supported() || (!tick && !player())) return;
     tick++;
     test_script(tick);
+    fly_tick();
     bugcap_replay_tick(tick);   // a replay of a bug capture: the teleport, the walk and the camera (bugcap.c)
     warp_tick(c, tick);
     static Req todo[Q_MAX];
