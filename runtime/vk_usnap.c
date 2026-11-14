@@ -79,6 +79,8 @@ typedef struct Taken {
     Reg *reg;
     int nreg, n;
     uint64_t first, total, refused, ns;   // first, n: the submission's first handle and handle count
+    uint64_t *h;                          // open: the handles, for the copy still to take (vk_usnap_take_later)
+    int open;
 } Taken;
 static Taken *tq_head, *tq_tail;
 static PlatMutex tq_lock = PLAT_MUTEX_INIT;
@@ -308,14 +310,9 @@ static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total, int
 // NX2NAVI_REPLAY_ASYNC, the submitting thread before the submission is queued for the replay: the uniform ranges it
 // binds are copied now, while they hold what the game submitted. vk_usnap_begin takes the copy over when the replay
 // reaches the submission, and leaves out there what GPU writes in flight touch (the replay knows them only then).
-void vk_usnap_take(const uint64_t *handles, int n) {
-    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;
-    if (n <= 0 || !RT_KNOB_ON(U.mode - 1)) return;
+static void taken_fill(Taken *t, const uint64_t *handles, int n, int owners) {
     uint64_t t0 = kern_now_ns();
-    Taken *t = calloc(1, sizeof *t);
-    if (!t) rt_fatal("vk_usnap: out of memory");
-    t->n = n, t->first = handles[0];
-    if (motion_owner_enabled()) {
+    if (owners && motion_owner_enabled()) {
         t->owners = malloc(sizeof *t->owners);
         if (t->owners) motion_owner_capture(t->owners);
     }
@@ -342,6 +339,9 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     plat_mutex_unlock(&gather_lock);
     if (t->nreg && (t->arena = arena_get(t->total))) copy_regions(t->arena, t->reg, t->nreg, t->total, 0);
     t->ns = kern_now_ns() - t0;
+}
+
+static void taken_queue(Taken *t) {
     plat_mutex_lock(&tq_lock);
     if (tq_tail) tq_tail->next = t;
     else tq_head = t;
@@ -349,11 +349,49 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     plat_mutex_unlock(&tq_lock);
 }
 
+void vk_usnap_take(const uint64_t *handles, int n) {
+    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;
+    if (n <= 0 || !RT_KNOB_ON(U.mode - 1)) return;
+    Taken *t = calloc(1, sizeof *t);
+    if (!t) rt_fatal("vk_usnap: out of memory");
+    t->n = n, t->first = handles[0];
+    taken_fill(t, handles, n, 1);
+    taken_queue(t);
+}
+
+// A submission that waits for the CPU's signal for the frame, queued before that signal (vk_backend.c replay_gate): the
+// game is still writing the uniform blocks it binds. On the console the GPU reads them once the signal let the queue
+// start, so the copy is taken at the signal (vk_usnap_take_open, on the signalling thread), or when the replay reaches
+// the submission without it (adopt). A copy from the submit call held, in a few frames a minute while walking in Kokiri
+// Forest, blocks the game had not written yet: the frame came out with the scene's sunlight missing.
+void vk_usnap_take_later(const uint64_t *handles, int n) {
+    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;
+    if (n <= 0 || !RT_KNOB_ON(U.mode - 1)) return;
+    Taken *t = calloc(1, sizeof *t);
+    if (!t || !(t->h = malloc(sizeof *t->h * (size_t)n))) rt_fatal("vk_usnap: out of memory");
+    memcpy(t->h, handles, sizeof *t->h * (size_t)n);
+    t->n = n, t->first = handles[0], t->open = 1;
+    taken_queue(t);
+}
+
+void vk_usnap_take_open(void) {
+    plat_mutex_lock(&tq_lock);   // held over the copies: adopt waits for the one it is about to take over
+    for (Taken *t = tq_head; t; t = t->next)
+        if (t->open) taken_fill(t, t->h, t->n, 1), t->open = 0;
+    plat_mutex_unlock(&tq_lock);
+}
+
 static void taken_free(Taken *t) {
     if (t->arena) arena_done(t->arena);
     free(t->owners);
     free(t->reg);
+    free(t->h);
     free(t);
+}
+
+static void reg_put(uint64_t lo, uint64_t hi, uint64_t off, uint64_t dropped) {
+    if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
+    U.reg[U.nreg++] = (Reg){lo, hi, off, dropped};
 }
 
 // The copy vk_usnap_take made for this submission becomes the replay's. 0: none was taken.
@@ -370,14 +408,33 @@ static int adopt(const uint64_t *handles, int n) {
     if (!tq_head) tq_tail = NULL;
     plat_mutex_unlock(&tq_lock);
     if (!t) return 0;
+    // the replay went on without the CPU's signal: no motion owners, which would be this moment's (vk_usnap_begin)
+    if (t->open) taken_fill(t, handles, n, 0), t->open = 0;
     U.refused += t->refused;
     if (t->arena) {
         wr_prune();
-        while (U.creg < t->nreg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
-        memcpy(U.reg, t->reg, (size_t)t->nreg * sizeof *U.reg);
-        U.nreg = t->nreg;
-        for (int i = 0; i < U.nreg; i++)   // a GPU write in flight: the mirror holds those bytes, not guest memory
-            if (wr_hits(U.reg[i].lo, U.reg[i].hi)) U.reg[i].dropped = 1, U.inflight++;
+        // A GPU write in flight: the mirror holds those bytes, not guest memory. Only the written bytes leave the copy
+        // (reg_put): a merged region holds many blocks, and dropped whole, its other blocks were read from live memory
+        // when the replay got to them, up to a frame after the submit call, with what the game had written there since.
+        U.nreg = 0;
+        for (int i = 0; i < t->nreg; i++) {
+            const Reg r = t->reg[i];
+            uint64_t at = r.lo;
+            int a = 0, b = U.nwr, hit = 0;
+            while (a < b) {
+                int k = (a + b) / 2;
+                if (U.wr[k].hi <= r.lo) a = k + 1;
+                else b = k;
+            }
+            for (; a < U.nwr && U.wr[a].lo < r.hi; a++) {
+                uint64_t lo = U.wr[a].lo > r.lo ? U.wr[a].lo : r.lo, hi = U.wr[a].hi < r.hi ? U.wr[a].hi : r.hi;
+                if (lo > at) reg_put(at, lo, r.off + (at - r.lo), 0);
+                reg_put(lo, hi, r.off + (lo - r.lo), 1);
+                at = hi, hit = 1;
+            }
+            if (at < r.hi) reg_put(at, r.hi, r.off + (at - r.lo), 0);
+            U.inflight += (uint64_t)hit;
+        }
         U.arena = t->arena, t->arena = NULL;
         U.on = 1;
         U.owners = t->owners, t->owners = NULL;
@@ -391,6 +448,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
     free(U.owners), U.owners = NULL;
     U.on = 0, U.fence = fence, U.gen++;
+    if (n <= 0) return;   // a submission without commands of its own binds nothing; held work has its own copies
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
         U.off_subs++;
@@ -479,6 +537,45 @@ static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders w
 // The replay workers (vk_exec.c NX2NAVI_REPLAY_PIPE) record a group's draws while the submitting thread goes on past
 // it: a drop holds from its place in the stream on (vk_exec_epoch), so a chunk does not see the drops of ops after its
 // group, and the submitting thread sees every one.
+
+// A snapshot set aside with its submission (vk_usnap_detach). While the submission's held part runs, the snapshot is
+// the current one and this holds the running submission's (vk_usnap_swap).
+typedef struct Held { int on; Arena *arena; MotionOwnerSnapshot *owners; Reg *reg; int nreg, creg; } Held;
+static Held **held;
+static int nheld, cheld;
+
+// [addr, addr+n) leaves the regions from epoch ep on: only the written bytes, the rest of a merged region stays as of
+// the submit call (adopt). While replay workers may look the regions up (shared), the list is not reshaped and the
+// whole region goes from ep on, as the workers' epochs need.
+static void drop_in(Reg **preg, int *pnreg, int *pcreg, uint64_t addr, uint64_t n, uint64_t ep, int shared) {
+    Reg *reg = *preg;
+    int nreg = *pnreg, i = 0, top = nreg;
+    while (i < top) {
+        int m = (i + top) / 2;
+        if (reg[m].hi <= addr) i = m + 1;
+        else top = m;
+    }
+    for (; i < nreg && reg[i].lo < addr + n; i++) {
+        const Reg r = reg[i];
+        if (r.dropped && r.dropped <= ep) continue;
+        if (!r.dropped) U.drops++;
+        __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+        if (shared) {
+            reg[i].dropped = ep;
+            continue;
+        }
+        uint64_t lo = addr > r.lo ? addr : r.lo, hi = addr + n < r.hi ? addr + n : r.hi;
+        int extra = (lo > r.lo) + (hi < r.hi), j = i;
+        while (nreg + extra > *pcreg) reg = *preg = grow(reg, pcreg, sizeof *reg);
+        if (extra) memmove(reg + i + 1 + extra, reg + i + 1, (size_t)(nreg - i - 1) * sizeof *reg);
+        if (lo > r.lo) reg[j++] = (Reg){r.lo, lo, r.off, r.dropped};
+        reg[j++] = (Reg){lo, hi, r.off + (lo - r.lo), ep};
+        if (hi < r.hi) reg[j++] = (Reg){hi, r.hi, r.off + (hi - r.lo), r.dropped};
+        nreg += extra, i = j - 1;
+    }
+    *pnreg = nreg;
+}
+
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
     uint64_t ep = vk_exec_epoch(1);
@@ -486,13 +583,49 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ep};
-    if (U.on)
-        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-            if (!U.reg[i].dropped || ep < U.reg[i].dropped) {
-                if (!U.reg[i].dropped) U.drops++;
-                U.reg[i].dropped = ep, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
-            }
+    if (U.on) drop_in(&U.reg, &U.nreg, &U.creg, addr, n, ep, lk);
+    // a held submission goes on after this write (the write is what it waited for): its copy loses the bytes too; no
+    // worker reads a held copy while it is set aside
+    for (int k = 0; k < nheld; k++)
+        if (held[k]->on) drop_in(&held[k]->reg, &held[k]->nreg, &held[k]->creg, addr, n, ep, 0);
     if (lk) plat_mutex_unlock(&drop_lock);
+}
+
+// Event order with the replay on its own thread (vk_exec.c evo_resume): a submission that stops at a wait keeps the
+// copy taken at its submit call. vk_usnap_detach sets the current snapshot aside for it (the next submission starts
+// without one), vk_usnap_swap exchanges it with the current one around the walk of its held part, and
+// vk_usnap_release frees it once that part is through, its arena at the fence of the submission it finished in.
+void *vk_usnap_detach(void) {
+    Held *s = calloc(1, sizeof *s);
+    if (!s) rt_fatal("vk_usnap: out of memory");
+    *s = (Held){U.on, U.arena, U.owners, U.reg, U.nreg, U.creg};
+    U.on = 0, U.arena = NULL, U.owners = NULL, U.reg = NULL, U.nreg = U.creg = 0, U.gen++;
+    if (nheld == cheld) {
+        cheld = cheld ? cheld * 2 : 16;
+        if (!(held = realloc(held, sizeof *held * (size_t)cheld))) rt_fatal("vk_usnap: out of memory");
+    }
+    held[nheld++] = s;
+    return s;
+}
+
+void vk_usnap_swap(void *p) {
+    Held *s = p, t;
+    if (!s) return;
+    t = *s;
+    *s = (Held){U.on, U.arena, U.owners, U.reg, U.nreg, U.creg};
+    U.on = t.on, U.arena = t.arena, U.owners = t.owners, U.reg = t.reg, U.nreg = t.nreg, U.creg = t.creg, U.gen++;
+}
+
+void vk_usnap_release(void *p, uint64_t fence) {
+    Held *s = p;
+    if (!s) return;
+    for (int k = 0; k < nheld; k++)
+        if (held[k] == s) {
+            held[k] = held[--nheld];
+            break;
+        }
+    if (s->arena) vk_completion_add(fence, arena_done, s->arena);
+    free(s->owners), free(s->reg), free(s);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

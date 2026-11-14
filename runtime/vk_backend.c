@@ -364,6 +364,8 @@ typedef struct {
     uint64_t *h;
     const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
     RegItem *regs;      // RI_REGS: n registrations the item owns, in the order the game made them
+    uintptr_t q;   // RI_SUBMIT: the game's queue (gfx_submit_queue on the submitting thread)
+    uint64_t value0;   // RI_PRESENT with the event order: the value of the submission held work goes on in before it
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -374,6 +376,7 @@ static const char *const dr_name[DR_N] = {
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
+
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
@@ -382,6 +385,98 @@ static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr
 // NX2NAVI_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
 // although no submission recorded a write to the texture in between, differing with the queue idle at the first read.
 static uint64_t ck_reads, ck_diff, ck_diff_unexplained, ck_diff_idle;
+
+// ---- the CPU's signal for the frame (vk_exec_xfer.c "events the CPU signals")
+// The main queue's submission waits for an event the game signals from the CPU once it has written what the frame
+// reads, and the worker queues' submissions wait for events the main queue signals after that wait. The game queues
+// them before its signal, and the replay keeps the submission order: the uniform copy taken at the submit call and
+// the mirror sync at the start of the recording (vk_exec_record) could both hold data the game was still writing,
+// single frames with the scene's sunlight missing or the scene black. So for a submission with a wait, queued while
+// an event the CPU signals has not had its signal for the frame, the uniform copy is taken at that signal
+// (vk_usnap_take_later, gfx_event_signalling), and the replay waits here for the signal before it records the
+// submission. It goes on at once when a game thread waits for work the replay has not submitted (a drain, a full
+// queue, the frame bound, a fence of a submission not submitted yet), since the game may not signal before that wait
+// ends, and after GATE_NS at the latest; the copy is then taken as the recording starts. After a wait that ran out
+// nothing is held until the CPU signals again. NX2NAVI_EVENT_GATE=0: copies at the submit call and no wait, as before.
+#define GATE_NS 50000000ull
+#define GATE_FENCE DR_N         // a blocker's cause: a DR_ value, or a fence wait
+static int32_t g_waiting;       // atomic: replay_gate waits on rcv
+static int32_t g_blockers;      // atomic: game threads waiting for work the replay has not submitted
+static int32_t g_block_why;     // atomic: the cause of the latest of them
+static int32_t g_stuck;         // atomic: a wait ran out and the CPU has not signalled since
+static int32_t g_taking;        // atomic: gfx_event_signalling is between the signal and the end of the copies it takes
+static uint64_t r_value_done;   // atomic: the timeline value of the last item the replay handed on
+static uint64_t g_held, g_escaped[DR_N + 1], g_timed_out, g_ns;   // under rl: over the run (replay_log)
+
+static int gate_on(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("EVENT_GATE", "1");
+    return on;
+}
+
+// The submit call: this submission's uniform copy waits for the CPU's signal, and replay_gate will hold it.
+static int gate_later(const uint64_t *h, int n) {
+    return n > 0 && gate_on() && !__atomic_load_n(&g_stuck, __ATOMIC_RELAXED) && vk_exec_waits(h, n) &&
+           vk_exec_event_cpu_pending();
+}
+
+// A game thread begins (why: its cause) or ends (why < 0) a wait for the replay; _locked: with rl held.
+static void gate_blocked_locked(int why) {
+    if (why >= 0) __atomic_store_n(&g_block_why, why, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_blockers, why >= 0 ? 1 : -1, __ATOMIC_SEQ_CST);
+    if (why >= 0) plat_cond_broadcast(&rcv);
+}
+static void gate_blocked(int why) {
+    if (why >= 0) __atomic_store_n(&g_block_why, why, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_blockers, why >= 0 ? 1 : -1, __ATOMIC_SEQ_CST);
+    if (why >= 0 && __atomic_load_n(&g_waiting, __ATOMIC_SEQ_CST)) {
+        plat_mutex_lock(&rl);
+        plat_cond_broadcast(&rcv);
+        plat_mutex_unlock(&rl);
+    }
+}
+
+// The back end's fence waits: one for a value the replay has not handed on yet is a wait for the replay.
+static int be_fence_wait(uint64_t value, uint64_t timeout_ns) {
+    if (!timeout_ns || !vk_replay_async() || value <= __atomic_load_n(&r_value_done, __ATOMIC_ACQUIRE)) {
+        int r = vk_sync_fence_wait(value, timeout_ns);
+        return r;
+    }
+    gate_blocked(GATE_FENCE);
+    int ok = vk_sync_fence_wait(value, timeout_ns);
+    gate_blocked(-1);
+    return ok;
+}
+
+// Replay thread, before it records a submission.
+static void replay_gate(const uint64_t *h, int n) {
+    // The signal alone is not enough: the signalling thread takes the held submissions' copies right after it
+    // (gfx_event_signalling), and a recording that began between the two read uniform data of a frame the game was
+    // already rewriting (single frames with all lit geometry black, when this thread reached the gate in that window).
+    if (!n || !gate_on() || __atomic_load_n(&g_stuck, __ATOMIC_RELAXED) ||
+        (!vk_exec_event_cpu_pending() && !__atomic_load_n(&g_taking, __ATOMIC_SEQ_CST)) || !vk_exec_waits(h, n))
+        return;
+    uint64_t t0 = kern_now_ns(), now = t0;
+    int why = 0;   // the signal came; 1 a game thread waits for the replay; 2 GATE_NS passed
+    plat_mutex_lock(&rl);
+    __atomic_store_n(&g_waiting, 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (__atomic_load_n(&g_blockers, __ATOMIC_SEQ_CST)) { why = 1; break; }
+        if (!vk_exec_event_cpu_pending() && !__atomic_load_n(&g_taking, __ATOMIC_SEQ_CST)) break;
+        if ((now = kern_now_ns()) - t0 >= GATE_NS) { why = 2; break; }
+        plat_cond_wait_ns(&rcv, &rl, GATE_NS - (now - t0));
+    }
+    __atomic_store_n(&g_waiting, 0, __ATOMIC_SEQ_CST);
+    g_held++, g_timed_out += why == 2, g_ns += kern_now_ns() - t0;
+    if (why == 1) g_escaped[__atomic_load_n(&g_block_why, __ATOMIC_RELAXED)]++;
+    if (why == 2) __atomic_store_n(&g_stuck, 1, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&rl);
+    vk_exec_evt('G', NULL, (uint32_t)why);
+    static int logged;
+    if (why == 2 && logged++ < 4)
+        rt_log("vk: a submission waited %llu ms for the CPU's signal for the frame and went on without it",
+               (unsigned long long)(GATE_NS / 1000000));
+}
 
 int vk_replay_async(void) {
     static int on = -1;
@@ -399,7 +494,7 @@ int vk_replay_async(void) {
 
 // With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
 static int vk_be_gpu_wait(uint64_t value, uint64_t timeout_ns) {
-    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
+    return vk_replay_async() ? be_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
 }
 // The submit wait (nvn_api_core.c NX2NAVI_SUBMIT_FINISH): the GPU's only where the submission reads guest memory on the
 // GPU (vk_sync_recorded_wait).
@@ -410,10 +505,22 @@ static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
 
-// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
+// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals"). The game has written what
+// the frame reads by now: a submission replay_gate holds may go on.
 void gfx_event_signalling(const void *value, uint32_t to) {
-    vk_exec_event_cpu(value);
+    int gate = vk_replay_async() && gate_on();
+    if (gate) __atomic_store_n(&g_taking, 1, __ATOMIC_SEQ_CST);   // replay_gate holds until the copies are taken
+    vk_exec_event_cpu(value, to);
     vk_exec_evt('c', value, to);
+    if (!gate) return;
+    __atomic_store_n(&g_stuck, 0, __ATOMIC_RELAXED);
+    if (!vk_exec_event_cpu_pending()) vk_usnap_take_open();
+    __atomic_store_n(&g_taking, 0, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_waiting, __ATOMIC_SEQ_CST)) {
+        plat_mutex_lock(&rl);
+        plat_cond_broadcast(&rcv);
+        plat_mutex_unlock(&rl);
+    }
 }
 
 // The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
@@ -494,7 +601,9 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
     // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
     // submission's value is the one the game's fence stands for.
-    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
+    // Not with the replay on its own thread: every queued item has its value (vk_sync_reserve), so the held part goes
+    // on in the next queued submission.
+    if (n && !gfx_replay_async() && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
@@ -519,7 +628,10 @@ static void replay_main(void *arg) {
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
             vk_sub_in_frame = sub_idx++;
+            replay_gate(it.h, it.n);
+            gfx_submit_queue = it.q;   // the game's queue, for the event order (vk_exec.c vk_exec_record)
             uint64_t f = submit_sync(it.h, it.n);
+            gfx_submit_queue = 0;
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
                          (unsigned long long)it.value);
@@ -534,10 +646,29 @@ static void replay_main(void *arg) {
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
+            vk_exec_evt_frame(frame);
+            // What the frame's submissions left held goes on before the picture is taken: the game's main queue waits
+            // for a CPU signal that may come after its last submit call, and nothing else would replay it before the
+            // next frame's first submission. The value was queued with the present (replay_enqueue).
+            if (it.value0) {
+                vk_exec_flush_held = 1;
+                uint64_t f = submit_sync(NULL, 0);
+                vk_exec_flush_held = 0;
+                if (f != it.value0)
+                    rt_fatal("vk: the submission before a present signalled %llu, queued as %llu", (unsigned long long)f,
+                             (unsigned long long)it.value0);
+            }
             vk_lowlat_submitted(frame);
+            static uint64_t held_presents, held_logged;
+            if (vk_exec_held() && (++held_presents <= 8 || held_presents >= held_logged * 2)) {
+                held_logged = held_presents;
+                rt_log("vk: frame %llu is presented with %d held submissions still waiting for their signal (%llu such "
+                       "presents so far)", (unsigned long long)frame, vk_exec_held(), (unsigned long long)held_presents);
+            }
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
             sub_idx = 0;
         }
+        if (it.value) __atomic_store_n(&r_value_done, it.value, __ATOMIC_RELEASE);
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else if (it.kind != RI_REGS) r_presents_done++;
@@ -580,8 +711,10 @@ static void rq_room(int room) {
     while (rq_n > RQ_CAP - room) {
         uint64_t p0 = perf_begin();
         dr_calls[DR_FULL]++, dr_tcalls[DR_FULL]++;
+        gate_blocked_locked(DR_FULL);   // before the core is given up: a submission replay_gate holds goes on at once
         int away = core_away_unlocked();
         while (rq_n > RQ_CAP - room) plat_cond_wait(&rcv, &rl);
+        gate_blocked_locked(-1);
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
@@ -606,6 +739,7 @@ static uint64_t replay_enqueue(ReplayItem *it) {
     plat_mutex_lock(&rl);
     rq_room(2);   // the item, and the registrations made before it
     regs_queue_locked();
+    if (it->kind == RI_PRESENT && vk_exec_event_order()) it->value0 = vk_sync_reserve();
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
@@ -625,8 +759,10 @@ static void replay_drain(int why) {
     }
     if (rq_n || r_busy) {
         uint64_t p0 = perf_begin();
+        gate_blocked_locked(why);
         int away = core_away_unlocked();
         while (rq_n || r_busy) plat_cond_wait(&rcv, &rl);
+        gate_blocked_locked(-1);
         wait_counted(why, p0);
         core_back_unlocked(&away);
     }
@@ -647,6 +783,15 @@ static void replay_log(uint64_t frame, int total) {
         k += snprintf(buf + k, sizeof buf - (size_t)k, "; check (run): %llu reads, %llu differ, %llu without a recorded write, %llu with the queue idle",
                       (unsigned long long)ck_reads, (unsigned long long)ck_diff, (unsigned long long)ck_diff_unexplained,
                       (unsigned long long)ck_diff_idle);
+    if (g_held && k < (int)sizeof buf - 200) {
+        k += snprintf(buf + k, sizeof buf - (size_t)k, "%s submissions held for the CPU's signal (run): %llu, %.1f ms, "
+                      "%llu timed out; let go for a game thread waiting:", k ? ";" : "", (unsigned long long)g_held,
+                      g_ns / 1e6, (unsigned long long)g_timed_out);
+        for (int i = 0; i <= DR_N && k < (int)sizeof buf - 48; i++)
+            if (g_escaped[i])
+                k += snprintf(buf + k, sizeof buf - (size_t)k, " %s %llu", i < DR_N ? dr_name[i] : "fence",
+                              (unsigned long long)g_escaped[i]);
+    }
     memset(dr_calls, 0, sizeof dr_calls);
     memset(dr_waits, 0, sizeof dr_waits);
     memset(dr_ns, 0, sizeof dr_ns);
@@ -695,7 +840,9 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     dr_calls[DR_FRAME]++, dr_tcalls[DR_FRAME]++;
     if (r_presents_done < r_presents_queued) {
         uint64_t p0 = perf_begin();
+        gate_blocked_locked(DR_FRAME);
         while (r_presents_done < r_presents_queued) plat_cond_wait(&rcv, &rl);
+        gate_blocked_locked(-1);
         wait_counted(DR_FRAME, p0);
     }
     r_presents_queued++;
@@ -779,14 +926,17 @@ static uint64_t vk_be_submit(const uint64_t *handles, int n) {
         return submit_sync(handles, n);
     }
     vk_sync_start();
-    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
+    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count(), .q = gfx_submit_queue};
     if (n > 0) {
         it.h = malloc(sizeof *it.h * (size_t)n);
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
         memcpy(it.h, handles, sizeof *it.h * (size_t)n);
     }
-    vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
-    return replay_enqueue(&it);
+    int later = gate_later(handles, n);
+    if (later) vk_usnap_take_later(handles, n);   // the game is still writing them (replay_gate)
+    else vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
+    uint64_t v = replay_enqueue(&it);
+    return v;
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
 static int replay_check(void) {
@@ -818,7 +968,7 @@ static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     plat_mutex_unlock(&rl);
     if (f && vk_sync_fence_done() < f) {
         uint64_t t0 = kern_now_ns();
-        vk_sync_fence_wait(f, UINT64_MAX);   // counts as a fence wait in perf
+        be_fence_wait(f, UINT64_MAX);   // counts as a fence wait in perf
         uint64_t d = kern_now_ns() - t0;
         plat_mutex_lock(&rl);
         dr_waits[DR_READ_TEXELS]++, dr_twaits[DR_READ_TEXELS]++;
@@ -878,7 +1028,7 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
         if (f && vk_sync_fence_done() < f) {
             uint64_t t0 = kern_now_ns();
             NVN_BLOCKING();
-            vk_sync_fence_wait(f, UINT64_MAX);
+            be_fence_wait(f, UINT64_MAX);
             uint64_t d = kern_now_ns() - t0;
             plat_mutex_lock(&rl);
             dr_waits[DR_GUEST_READ]++, dr_twaits[DR_GUEST_READ]++;
@@ -934,7 +1084,7 @@ const GfxBackend gfx_vulkan_backend = {
     .texture_release = vk_be_texture_release,
     .program_release = vk_be_program_release,
     .submit = vk_be_submit,
-    .fence_wait = vk_sync_fence_wait,
+    .fence_wait = be_fence_wait,
     .exec_wait = vk_be_exec_wait,
     .game_wait = vk_sync_game_wait,
     .fence_done = vk_sync_fence_done,

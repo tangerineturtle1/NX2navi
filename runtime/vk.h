@@ -392,11 +392,16 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 // NX2NAVI_REPLAY_ASYNC: the submitting thread takes the copy before it queues the submission; vk_usnap_begin on the
 // replay thread then uses it.
 void vk_usnap_take(const uint64_t *handles, int n);
+void vk_usnap_take_later(const uint64_t *handles, int n);   // ... or queues the copy for the CPU's signal for the frame
+void vk_usnap_take_open(void);                              // any thread, at that signal: the queued copies are taken
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy of [addr, addr+n) as of the submit, NULL: none
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
+void *vk_usnap_detach(void);                      // event order on the replay thread: a held submission's copy,
+void vk_usnap_swap(void *held);                   // set aside, current while its held part runs,
+void vk_usnap_release(void *held, uint64_t fence);   // and freed after it
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 // [addr, addr+n) into dst: 1 from this submission's copy, 2 from guest memory where the copy lacks it but the bytes are
 // ones the CPU writes (an imported pool) and no GPU write in flight touches them, 0 neither (dst untouched).

@@ -1274,6 +1274,7 @@ typedef struct Cont {
     uint64_t since;         // vk_exec_submit_seq when it stopped
     int has_st;             // st holds the queue's state (else the running state carries over, as for any submission)
     uint8_t *st;
+    void *us;               // replay on its own thread: the uniform copy taken at its submit call (vk_usnap_detach)
 } Cont;
 static struct { uintptr_t q; Cont *head, *tail; } evq[EVO_QUEUES];
 static int evo_on = -1, evo_in;     // knob; inside a continuation
@@ -1281,6 +1282,7 @@ static uintptr_t evo_queue;         // queue of the stream being walked (0: it c
 static int evo_pending;             // continuations held
 static uint64_t evo_held, evo_resumed, evo_forced, evo_switches;   // since the last perf line
 int vk_exec_held(void) { return evo_pending; }
+int vk_exec_flush_held;             // replay thread: the submission being made is the one before a present (vk_backend.c)
 #define ST_LO offsetof(VkExec, rt)
 #define ST_HI offsetof(VkExec, views)
 
@@ -1327,7 +1329,7 @@ void vk_exec_evt(char what, const void *event, uint32_t value) {
         for (e = 0; e < ET.nev && ET.ev[e] != event; e++) {}
         if (e == ET.nev && ET.nev < 64) ET.ev[ET.nev++] = event;
     }
-    if (what == 's' || what == 'c') snprintf(t, sizeof t, value < 16 ? "%c%d=%u " : "%c%d=n ", what, e, value);
+    if (what == 's' || what == 'c' || what == 'G') snprintf(t, sizeof t, value < 16 ? "%c%d=%u " : "%c%d=n ", what, e, value);
     else if (what == '|') snprintf(t, sizeof t, "|%d.%u ", e, value);
     else if (event) snprintf(t, sizeof t, "%c%d ", what, e);
     else snprintf(t, sizeof t, "%c ", what);
@@ -1366,13 +1368,15 @@ static int evo_enabled(void) {
     if (evo_on < 0) {
         const char *e = cfg_get("NX2NAVI_EVENT_ORDER");
         evo_on = !(e && !strcmp(e, "0"));
-        if (evo_on && gfx_replay_async()) {
+        if (evo_on && gfx_replay_async() && !rt_knob("EVENT_ORDER_ASYNC", "1")) {
             evo_on = 0;
-            rt_log("vk: event order across queues off: the replay runs on its own thread (NX2NAVI_REPLAY_ASYNC)");
+            rt_log("vk: event order across queues off: the replay runs on its own thread (NX2NAVI_EVENT_ORDER_ASYNC=0)");
         } else rt_log("vk: event order across queues %s (NX2NAVI_EVENT_ORDER)", evo_on ? "on" : "off");
     }
     return evo_on;
 }
+
+int vk_exec_event_order(void) { return evo_enabled(); }
 
 static int evq_slot(uintptr_t q) {
     int free_i = -1;
@@ -1564,7 +1568,10 @@ static void evo_resume(VkExec *ex) {
             for (;;) {
                 evo_resumed++;
                 vk_exec_evt('r', (const void *)evq[s].q, 0);
-                if (cont_walk(ex, c)) {   // waits again: the queue's state stays with it
+                vk_usnap_swap(c->us);   // its own uniform copy while it runs
+                int waits = cont_walk(ex, c);
+                vk_usnap_swap(c->us);
+                if (waits) {   // waits again: the queue's state stays with it
                     vk_exec_evt('w', NULL, 0);
                     vk_exec_pass_end(ex);
                     if (!c->st && !(c->st = malloc(ST_HI - ST_LO))) rt_fatal("vk: out of memory (queue state)");
@@ -1576,6 +1583,7 @@ static void evo_resume(VkExec *ex) {
                 if (!evq[s].head) evq[s].tail = NULL;
                 evo_pending--;
                 vk_exec_evt('d', NULL, 0);
+                vk_usnap_release(c->us, ex->fence);
                 cont_free(c);
                 c = evq[s].head;
                 if (!c) break;
@@ -2685,10 +2693,15 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     if (evo && slot < 0) evo = 0;
     vk_exec_evt('|', (const void *)gfx_submit_queue, (uint32_t)n);
     vk_exec_event_sync(1);   // before the mirror sync and the uniform copy: a CPU signal after this point came after them
-    int synced = n || (evo_pending && held_sync() && vk_exec_held_ready());   // held_sync
+    // The replay on its own thread: held work goes on only in the replay thread's submissions (the game's, and the
+    // one it makes before a present, vk_exec_flush_held), never in the present thread's empty one (the replay thread
+    // may be at work between its submissions), and every submission keeps the uniform copy of its own submit call
+    // (Cont.us).
+    int async = gfx_replay_async(), resume = n || !async || vk_exec_flush_held;
+    int synced = n || (resume && evo_pending && held_sync() && vk_exec_held_ready());   // held_sync
     if (synced) {
         vk_mem_mirror_begin();
-        if (evo_pending) {   // the uniform snapshot covers what held submissions bind too: they may go on here
+        if (evo_pending && !async) {   // the uniform snapshot covers what held submissions bind too: they may go on here
             int tot = n;
             for (int s = 0; s < EVO_QUEUES; s++)
                 for (Cont *c = evq[s].head; c; c = c->next) tot += c->n;
@@ -2704,9 +2717,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     for (int i = 0; i < n; i++)
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
-    if (evo_pending) evo_resume(ex);   // signals the CPU gave since, and holds past CONT_MAX
+    if (evo_pending && resume) evo_resume(ex);   // signals the CPU gave since, and holds past CONT_MAX
     if (evo && evq[slot].head) {   // the queue waits: this submission lines up behind it
-        if (n) cont_push(slot, cont_new(handles, n, 0, NULL)), evo_held++, vk_exec_evt('p', NULL, 0);
+        if (n) {
+            Cont *c = cont_new(handles, n, 0, NULL);
+            if (async) c->us = vk_usnap_detach();
+            cont_push(slot, c), evo_held++, vk_exec_evt('p', NULL, 0);
+        }
     } else {
         evo_queue = evo ? gfx_submit_queue : 0;
         AH.handles = handles, AH.n = n, AH.live = 1;
@@ -2714,7 +2731,9 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
             AH.i = i;
             const op_hdr *stop = walk(ex, nvn_op_first(handles[i]), 0);
             if (!stop) continue;
-            cont_push(slot, cont_new(handles, n, i, stop));   // the rest of this submission waits for its signal
+            Cont *c = cont_new(handles, n, i, stop);   // the rest of this submission waits for its signal
+            if (async) c->us = vk_usnap_detach();
+            cont_push(slot, c);
             evo_held++;
             vk_exec_evt('h', NULL, 0);
             break;

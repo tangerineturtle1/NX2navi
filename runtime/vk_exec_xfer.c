@@ -794,9 +794,22 @@ static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
 // stops the submission like any wait reached before its signal, and vk_backend.c submit_sync lets it go on at once
 // in a submission of its own, whose copies are taken after the signal.
 // NX2NAVI_EVENT_AT_SYNC=0: the value in memory when the walk reaches the wait, as before.
+// With the replay on its own thread none of this holds a submission back: the replay follows the submission order and
+// the walk does not stop at a wait. The worker queues' submission waits for events the main queue signals after its
+// wait for the CPU, and both its uniform copy (vk_usnap_take, at the submit call) and its mirror sync could come
+// before the CPU signal. vk_backend.c replay_gate holds a submission with a wait until the signal, and its uniform
+// copy is taken at the signal (vk_exec_event_cpu_pending, vk_exec_waits).
 #define CPU_EV 16
 #define CPU_EV_HIST 8
-static struct { const void *val; uint64_t seq[CPU_EV_HIST]; uint32_t before[CPU_EV_HIST]; unsigned n; } cpu_ev[CPU_EV];
+// to: the value the latest nvnEventSignal wrote; wmode, wvalue: the latest wait the replay tested on the event (waited)
+static struct {
+    const void *val;
+    uint64_t seq[CPU_EV_HIST];
+    uint32_t before[CPU_EV_HIST];
+    unsigned n;
+    uint32_t to, wmode, wvalue;
+    int waited;
+} cpu_ev[CPU_EV];
 static int cpu_ev_n;                             // cpu_ev_lock
 static uint64_t cpu_ev_seq;                      // cpu_ev_lock: nvnEventSignal calls so far
 static uint64_t ev_sync_seq = UINT64_MAX;        // cpu_ev_lock: cpu_ev_seq at the recording's start; UINT64_MAX outside one
@@ -809,15 +822,16 @@ int vk_exec_event_at_sync(void) {
     return on;
 }
 
-void vk_exec_event_cpu(const void *event) {
+void vk_exec_event_cpu(const void *event, uint32_t to) {
     plat_mutex_lock(&cpu_ev_lock);
     int i = 0;
     while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
-    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0;
+    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0, cpu_ev[i].waited = 0;
     cpu_ev_seq++;
     if (i < cpu_ev_n) {
         unsigned k = cpu_ev[i].n++ % CPU_EV_HIST;
         cpu_ev[i].seq[k] = cpu_ev_seq, cpu_ev[i].before[k] = __atomic_load_n((const volatile uint32_t *)event, __ATOMIC_ACQUIRE);
+        cpu_ev[i].to = to;
     }
     plat_mutex_unlock(&cpu_ev_lock);
 }
@@ -836,6 +850,35 @@ int vk_exec_event_cpu_known(const void *event) {
 int vk_exec_event_holds_now(const void *payload) {
     const p_wait_event *p = payload;
     return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+}
+
+// The replay tested a wait: on an event the CPU signals, it is the wait the CPU's next signal is for.
+static void cpu_ev_waited(const p_wait_event *p) {
+    plat_mutex_lock(&cpu_ev_lock);
+    for (int i = 0; i < cpu_ev_n; i++)
+        if (cpu_ev[i].val == (const void *)p->val) {
+            cpu_ev[i].wmode = p->mode, cpu_ev[i].wvalue = p->value, cpu_ev[i].waited = 1;
+            break;
+        }
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+int vk_exec_event_cpu_pending(void) {
+    int pending = 0;
+    plat_mutex_lock(&cpu_ev_lock);
+    for (int i = 0; i < cpu_ev_n && !pending; i++)
+        pending = cpu_ev[i].waited && !ev_holds(cpu_ev[i].to, cpu_ev[i].wmode, cpu_ev[i].wvalue) &&
+                  !ev_holds(__atomic_load_n((const volatile uint32_t *)cpu_ev[i].val, __ATOMIC_ACQUIRE), cpu_ev[i].wmode,
+                            cpu_ev[i].wvalue);
+    plat_mutex_unlock(&cpu_ev_lock);
+    return pending;
+}
+
+int vk_exec_waits(const uint64_t *handles, int n) {
+    for (int i = 0; i < n; i++)
+        for (const op_hdr *h = nvn_op_first(handles[i]); h->op != OP_END; h = nvn_op_next(h))
+            if (h->op == OP_WAIT_EVENT) return 1;
+    return 0;
 }
 
 void vk_exec_event_sync(int begin) {
@@ -892,6 +935,7 @@ int vk_exec_signalled;
 int vk_exec_wait_event(const void *payload) {
     const p_wait_event *p = payload;
     ev_waits++;
+    cpu_ev_waited(p);
     uint32_t mem;
     const uint32_t *seen;
     int late;
