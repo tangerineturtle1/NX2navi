@@ -5871,10 +5871,13 @@ static void mesh_shading_rate(VkExec *ex) {
 //   mesh dispatch            the mesh module, with the mesh stage's bindings
 //   draw                     one instance per mesh workgroup, with the generated vertex stage and the program's
 //                            fragment stage, the instance count from the record
-// Every step reads what the one before wrote, so a full barrier stands between them, and the dispatches cannot be
-// recorded inside a pass: each such draw ends the open pass, and the next draw begins it again. The buffers are
-// reused by every draw (vk_mesh_fb.c), which the barrier before a draw's first dispatch makes safe: the previous
-// draw's vertex stage has read them by then.
+// Every step reads what the one before wrote, and the dispatches cannot be recorded inside a pass: each such draw ends
+// the open pass with a full barrier (what the game wrote before, its culling, and the last draw's reads of the
+// buffers come first), and the next draw begins it again. Between the steps stand barriers of the stages and accesses
+// each one orders (mfb_barrier): the fills and copies before the dispatches that read the record as indirect
+// arguments, the task dispatch before the scan, the scan before the mesh dispatch, and the mesh dispatch before
+// everything after it, the draw first. The buffers are reused by every draw (vk_mesh_fb.c), which the full barrier
+// before a draw's first step makes safe: the previous draw's vertex stage has read them by then.
 //
 // The modules of a program are made once, on a thread of their own, with their compute pipelines (a mesh program of
 // the game is up to 900,000 SPIR-V words, and its pipeline compiles for as long as the mesh pipeline it replaces):
@@ -6050,6 +6053,15 @@ static const GfxShader *mfb_vs_get(const MfbCs *e, const GfxShader *fs) {
     rt_fatal("vk: mesh fallback: more than %d vertex stages", MFB_TAB);
 }
 
+static void me_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da);
+// A barrier between two steps of a fallback draw: the stages and accesses of the step before (src) and of the steps
+// after that read or write what it wrote (dst). me_barrier adds the generic memory bits, which AMD's Polaris driver
+// needs to act on storage accesses. It is not a full barrier and leaves the replay's barrier state alone.
+static void mfb_barrier(VkExec *ex, VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da) {
+    me_barrier(ex->cb, ss, sa, ds, da);
+    ex->recorded++;
+}
+
 // One of the draw's compute dispatches: module cs with the bindings of NVN stage `stage`, its group counts read from
 // the record at `at`. 0 when its pipeline is not there.
 static int mfb_dispatch(VkExec *ex, const GfxShader *cs, int stage, VkBuffer rec, VkDeviceSize at) {
@@ -6121,34 +6133,50 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     if (count > most) count = most;   // a count the GPU wrote is cut on the GPU, below
     VkBuffer rec;
     int cmds;
+    const VkPipelineStageFlags2 st_cs = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, st_ind = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                                st_tr = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    const VkAccessFlags2 a_sr = VK_ACCESS_2_SHADER_STORAGE_READ_BIT, a_sw = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         a_ind = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    int dirty = ex->bar_dirty;   // the full barrier below orders what came before; the steps after it need no more
     vk_exec_barrier(ex);   // ends the pass; the culling's record and the last draw's reads come before what follows
     vk_gpu_gap_note(VK_GAP_MESH_FB, 64);   // the record's fills and its count's copy
     VkDeviceSize at = vk_meshfb_record(ex->cb, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts != NULL,
                                        verts, slot_words, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
-    vk_exec_barrier(ex);
+    // the record: the dispatches' indirect arguments, the clamp's and the scan's words, and without a task stage the
+    // copy of the note
+    mfb_barrier(ex, st_tr, VK_ACCESS_2_TRANSFER_WRITE_BIT, st_ind | st_cs | st_tr,
+                a_ind | a_sr | a_sw | VK_ACCESS_2_TRANSFER_READ_BIT);
     if (ind) {   // to what the buffers hold, before a dispatch reads it (meshfb_clamp.comp)
         vk_meshfb_clamp(ex->cb, at, ts ? c->ti.payload_bytes / 4 : 0);
         cx->B.pipe[1] = VK_NULL_HANDLE;   // the clamp bound its own
         ex->recorded += 4;
-        vk_exec_barrier(ex);
+        // the cut counts: the dispatches' indirect arguments, the scan's words and the note's copy
+        mfb_barrier(ex, st_cs, a_sw, st_ind | st_cs | st_tr, a_ind | a_sr | a_sw | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     if (ts) {
         if (!mfb_dispatch(ex, c->cs_task, NVN_STAGE_TASK, rec, at)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
-        vk_exec_barrier(ex);
+        mfb_barrier(ex, st_cs, a_sw, st_cs, a_sr | a_sw);   // the payloads, before the scan reads them
         VkPassMark *m = dispatch_mark(ex, NULL, 1, 1, 1);   // the scan: a dispatch of the runtime's own, no game shader
         vk_meshfb_scan(ex->cb, at, c->ti.payload_bytes / 4, c->ti.threads, slot_words, verts);
         vk_pass_mark_end(ex->cb, m);
         cx->B.pipe[1] = VK_NULL_HANDLE;   // the scan bound its own
         ex->recorded += 4;
-        vk_exec_barrier(ex);
+        // the list and the record's counts: the mesh dispatch's arguments and list entries, and the note's copy
+        mfb_barrier(ex, st_cs, a_sw, st_ind | st_cs | st_tr, a_ind | a_sr | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
-    if (!mfb_dispatch(ex, c->cs_mesh, NVN_STAGE_MESH, rec, at + 16)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
-    vk_exec_barrier(ex);
+    // what the draw asked for: words the fills or the scan wrote, which the barrier above ordered for the copy
     vk_gpu_gap_note(VK_GAP_MESH_FB, 8);   // the copy of what the draw asked for, for the host's report
     vk_meshfb_note(ex->cb, at);
     ex->recorded++;
-    vk_exec_barrier(ex);
+    if (!mfb_dispatch(ex, c->cs_mesh, NVN_STAGE_MESH, rec, at + 16)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
+    // the mesh buffer, the record and the note before everything after them: the draw's indirect arguments and vertex
+    // stage, and the pass the draw begins. Since the full barrier above only these compute and transfer steps ran, so
+    // this one orders all that a full barrier here would: it counts as one (barrier_at), and the pass's begin needs
+    // none of its own, as after the full barrier that stood here before 2026-11-14.
+    mfb_barrier(ex, st_cs | st_tr, a_sw | VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    ex->barrier_at = ex->recorded, ex->bar_dirty = dirty;
     cx->c0_binst = 0;
     cx->mfb_cur_vs = vs;
     int prim = c->mi.ipp == 1 ? NVN_DRAW_PRIMITIVE_POINTS : c->mi.ipp == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
