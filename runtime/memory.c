@@ -854,15 +854,44 @@ static void thaw_wait_locked(uint64_t a, uint64_t n) {
 // it; a kernel read or write of a buffer (mem_thaw, mem_kernel_access) and a pointer check (mem_host_readable)
 // commit their range first, as the kernel and VirtualQuery do not fault. On Linux pages are committed on first touch
 // already.
-// frz_lock held exclusively. Commits the reserved pages of [a, a + n) inside the heap; returns the bytes committed. A
-// page another path committed is left alone: committing it again would make a read-only or inaccessible page (a
-// freeze, a probe, an armed lazy write-back) read-write behind their backs. The regions it commits into are thawed
-// first, as for any mapping change, so that no frozen region holds a read-write page.
+// The heap's 64 KiB chunks that hold no reserved page any more, one bit each, set and cleared under frz_lock and read
+// without it (hl_committed). mem_kernel_access and mem_thaw are asked about buffers committed long ago thousands of
+// times a frame (motion_owner.c reads the game's objects a pointer at a time, a file read names its buffer), and each
+// call took frz_lock and asked the system for the pages' state: on 0.10.1 Hyrule Field ran at 12.7 fps with the lazy
+// heap on, the replay 78 ms a frame with 14 ms of it in its ops and 7.1 s of 33 waiting behind motion_owner_forget.
+// A SetHeapSize that shrinks the heap clears the chunks it gives back (mem_set_heap_size).
+#define HL_CHUNK 0x10000ull
+static uint64_t hl_map[HEAP_CAP / HL_CHUNK / 64];
+
+static void hl_mark(uint64_t lo, uint64_t hi, int on) {   // frz_lock held: heap offsets [lo, hi), multiples of HL_CHUNK
+    for (uint64_t c = lo / HL_CHUNK; c < hi / HL_CHUNK; c++) {
+        if (on) __atomic_fetch_or(&hl_map[c >> 6], 1ull << (c & 63), __ATOMIC_RELEASE);
+        else __atomic_fetch_and(&hl_map[c >> 6], ~(1ull << (c & 63)), __ATOMIC_RELEASE);
+    }
+}
+
+// Whether the part of [a, a + n) inside the heap lies in chunks marked committed; true when none of it is in the heap.
+static int hl_committed(uint64_t a, uint64_t n) {
+    uint64_t base = L.heap.base, top = base + __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE);
+    uint64_t end = a + n < a ? UINT64_MAX : a + n, lo = a > base ? a : base, hi = end < top ? end : top;
+    if (lo >= hi) return 1;
+    for (uint64_t c = (lo - base) / HL_CHUNK, c1 = (hi - 1 - base) / HL_CHUNK; c <= c1; c++)
+        if (!(__atomic_load_n(&hl_map[c >> 6], __ATOMIC_ACQUIRE) >> (c & 63) & 1)) return 0;
+    return 1;
+}
+
+// frz_lock held exclusively. Commits the reserved pages of the 64 KiB chunks [a, a + n) reaches inside the heap and
+// marks those chunks (hl_map); returns the bytes committed. A page another path committed is left alone: committing
+// it again would make a read-only or inaccessible page (a freeze, a probe, an armed lazy write-back) read-write
+// behind their backs. The regions it commits into are thawed first, as for any mapping change, so that no frozen
+// region holds a read-write page.
 static uint64_t heap_lazy_commit_locked(uint64_t a, uint64_t n) {
     uint64_t lo = a > L.heap.base ? a : L.heap.base, top = L.heap.base + __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE);
     uint64_t end = a + n < a ? UINT64_MAX : a + n, hi = end < top ? end : top, got = 0;
     if (lo >= hi) return 0;
-    lo &= ~(PAGE - 1), hi = align_up(hi, PAGE);
+    // whole chunks: the heap's size is a multiple of 2 MiB (mem_set_heap_size), so hi stays inside the heap
+    lo = L.heap.base + ((lo - L.heap.base) & ~(HL_CHUNK - 1));
+    hi = L.heap.base + align_up(hi - L.heap.base, HL_CHUNK);
     int thawed = 0;
     for (uint64_t x = lo, y; x < hi; x = y) {
         if (plat_mem_state(x, hi, &y) != PLAT_MEM_RESERVED) continue;
@@ -872,13 +901,15 @@ static uint64_t heap_lazy_commit_locked(uint64_t a, uint64_t n) {
                      "used up", (unsigned long long)x, (unsigned long long)(y - x));
         got += y - x;
     }
+    hl_mark(lo - L.heap.base, hi - L.heap.base, 1);
     heap_lazy_bytes += got;
     return got;
 }
 
-// Commits the heap pages of [a, a + n) that the lazy heap left reserved; nothing when it is off.
+// Commits the heap pages of [a, a + n) that the lazy heap left reserved; nothing when it is off, and nothing but a
+// look at hl_map when they were committed before or the range is outside the heap.
 void mem_kernel_access(uint64_t a, uint64_t n) {
-    if (!heap_lazy || !n) return;
+    if (!heap_lazy || !n || hl_committed(a, n)) return;
     plat_mutex_lock(&frz_lock);
     heap_lazy_commit_locked(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -920,8 +951,9 @@ static int heap_lazy_fault(uint64_t a) {
 
 void mem_thaw(uint64_t a, uint64_t n) {
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
-    if (heap_lazy || !frz_async || !n || a >= RT_ADDRESS_LIMIT) {
-        if (heap_lazy) {
+    int lazy = heap_lazy && n && !hl_committed(a, n);   // pages to commit: the lazy heap's only case for the hold
+    if (lazy || !frz_async || !n || a >= RT_ADDRESS_LIMIT) {
+        if (lazy) {
             thaw_wait_locked(a, n);   // it commits pages: a mapping change
             heap_lazy_commit_locked(a, n);   // the kernel's write would fail on a reserved page as well
         }
@@ -1323,6 +1355,11 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     uint64_t was = heap_size;
     if (size > was && !heap_lazy) commit(L.heap.base + was, size - was, "heap");
     __atomic_store_n(&heap_size, size, __ATOMIC_RELEASE);   // before a shrink: no first-use commit past the new end
+    if (size < was && heap_lazy) {   // a first-use commit that saw the old end marked its chunks before this hold
+        plat_mutex_lock(&frz_lock);
+        hl_mark(size, was, 0);
+        plat_mutex_unlock(&frz_lock);
+    }
     if (size < was) decommit(L.heap.base + size, was - size, "heap");   // reserved pages in the range are fine
     uint64_t moved = size > was ? size - was : was - size;
     __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
