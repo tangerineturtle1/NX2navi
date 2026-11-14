@@ -134,6 +134,7 @@ struct RowView {
     const char *note;    // under the value instead of the "default" mark; NULL for none
     float col;           // the width of the widest value the row can show (value_width); 0: this value's
     bool end_l, end_r;   // the value is the first / last one: that arrow is drawn faint and does nothing
+    const char *subtitle = nullptr;   // under the label, before any status note
 };
 
 // The width of the widest of n values at the current font size: a stepper's left arrow stands that far from the right
@@ -356,6 +357,15 @@ static int row_text(const char *key, const char *label, const char *desc, const 
                      : off                               ? menu_text(UI_MENU_SET_BY_ENV)
                      : m && !m->live && cfg_pending(key) ? menu_text(UI_MENU_AFTER_RESTART)
                                                          : NULL;
+    char both[UI_DESC_BYTES];
+    if (v.subtitle) {
+        if (note) {
+            snprintf(both, sizeof both, "%s — %s", v.subtitle, note);
+            note = both;
+        } else {
+            note = v.subtitle;
+        }
+    }
     ImVec4 note_clip(p.x, p.y, note_right, p.y + h);
     if (note)
         dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : SKIN_TEXT_DIM, note, NULL, 0,
@@ -409,11 +419,12 @@ static float on_off_width(void) {
     return value_width(names, 2);
 }
 
-bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted) {
+bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted, const char *subtitle) {
     const char *d = cfg_default(key);
     bool set = cfg_bool(key) != 0, def = d && *d && strcmp(d, "0") != 0;
     bool on = set != inverted;   // what the row shows
     RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, true, NULL, on_off_width()};
+    v.subtitle = subtitle;
     if (!row(key, label, desc, v)) return false;   // any step flips it
     apply(key, set ? "0" : "1");
     return true;

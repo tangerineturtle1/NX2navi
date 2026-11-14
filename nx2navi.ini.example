@@ -434,9 +434,12 @@
 # the game waits less for the GPU (mirror_stage = 1, submit_finish_gpu = 0), pools the game refills every frame stay
 # in system memory (mirror_hot = 25), and a texture read after another image was drawn over its memory gets memory of
 # its own (tex_clobber = 1). Frames prepared on a thread of their own (replay_async) stay off in this mode too, as they
-# can show a dark or flickering frame now and then; its row under the mode's switch turns them on. 0, the default: each of these stays as it was in 0.9.1, and none of these keys
-# is read. Read at start.
+# can show a dark or flickering frame now and then; its row under the mode's switch turns them on. 0, the default:
+# these settings stay as they were in 0.9.1 unless tex_clobber is set explicitly. Read at start.
 # low_end_gpu = 0
+# 1: give a texture its own memory if it is read after another image overwrote it. This can help with fog corruption
+# on other graphics cards too. It may use more video memory. 0: keep the images in pool memory. Read at start.
+# tex_clobber = 0
 # Textures the game released that are kept as they are (1 to 16384); past this count only those that lose nothing
 # when dropped go. Default: one per 2 MB of the video memory budget, 2048 to 8192. Read at start.
 # tex_released_max = 4096

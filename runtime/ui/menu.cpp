@@ -1329,6 +1329,8 @@ static void tab_screen(float scale) {
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("NX2NAVI_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
     opt_group(UI_MENU_GRAPHICS);
+    opt_toggle("NX2NAVI_TEX_CLOBBER", UI_MENU_TEX_CLOBBER, UI_MENU_TEX_CLOBBER_DESC, false,
+               menu_text(UI_MENU_TEX_CLOBBER_NOTE));
     // The game resolution needs the output and scene patch sets (resolution.c res_adjustable): Ocarina's build has
     // none and always draws its own size, so the row would change nothing
     if (res_adjustable()) row_output_res();
@@ -1775,7 +1777,6 @@ static void rows_low_end(void) {
     opt_slider("NX2NAVI_MESH_EMU_TASKS", UI_MENU_LOWEND_MESH_TASKS, 4096, 65536, UI_MENU_LOWEND_MESH_TASKS_DESC, 4096, "%.0f");
     if (native) opt_disable_next(UI_MENU_LOWEND_MESH_NATIVE);
     opt_toggle("NX2NAVI_MESH_EMU_BATCH", UI_MENU_LOWEND_MESH_BATCH, UI_MENU_LOWEND_MESH_BATCH_DESC);   // vk_exec_draw.c
-    opt_toggle("NX2NAVI_TEX_CLOBBER", UI_MENU_LOWEND_CLOBBER, UI_MENU_LOWEND_CLOBBER_DESC);
     static const UiTextId vec[] = {UI_MENU_OFF, UI_MENU_LOWEND_VEC_AUTO, UI_MENU_ON};   // gfx_shader.c patch_vec_index
     opt_choice("NX2NAVI_VEC_INDEX_FIX", UI_MENU_LOWEND_VEC_INDEX, vec, 3, UI_MENU_LOWEND_VEC_INDEX_DESC);
     opt_group(UI_MENU_LOWEND_BUILD);
