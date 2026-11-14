@@ -14,6 +14,7 @@
 #include <SDL3/SDL.h>
 
 #include "cfg.h"
+#include "gyro_mouse.h"
 #include "host.h"
 #include "input.h"
 #include "input_hd_pair.h"
@@ -1467,13 +1468,73 @@ void input_motion_axes(const float a[3], const float g[3], double acc[3], double
     gyro[2] = g[1];
 }
 
+// Every sensor report, not only the newest: SDL_UpdateGamepads (the pad thread) reads all the reports that came in since
+// its last update and sends a sensor event for each report and sensor, with the controller's own timestamp. The event
+// filter keeps the motion gamepad's gyro readings, each with the newest accelerometer reading, in a ring the motion
+// thread empties every 4 ms, and drops every sensor event, so nothing piles up in SDL's queue (which nothing reads on
+// Windows). A controller whose reports come faster than the motion thread, or out of step with it, loses none of them
+// and counts none twice. Until the motion gamepad has sent one, the motion thread reads the newest sample as before.
+#define SENSOR_RING 64   // 64 ms at 1000 Hz: far more than one 4 ms tick gathers
+typedef struct { float a[3], g[3]; uint64_t t; } SensorSample;
+static PlatMutex sensor_lock = PLAT_MUTEX_INIT;   // guards the fields below
+static SensorSample sensor_ring[SENSOR_RING];
+static unsigned sensor_head, sensor_count;
+static SDL_JoystickID sensor_events_pad;   // the gamepad whose readings are kept
+static float sensor_acc[3];
+static int sensor_have_acc, sensor_events_seen;
+
+static bool SDLCALL sensor_filter(void *userdata, SDL_Event *e) {
+    (void)userdata;
+    if (e->type != SDL_EVENT_GAMEPAD_SENSOR_UPDATE) return true;
+    const SDL_GamepadSensorEvent *s = &e->gsensor;
+    plat_mutex_lock(&sensor_lock);
+    if (s->which == sensor_events_pad) {
+        sensor_events_seen = 1;
+        if (s->sensor == SDL_SENSOR_ACCEL) {
+            memcpy(sensor_acc, s->data, sizeof sensor_acc);
+            sensor_have_acc = 1;
+        } else if (s->sensor == SDL_SENSOR_GYRO && sensor_have_acc) {
+            SensorSample *p;
+            if (sensor_count == SENSOR_RING) p = &sensor_ring[sensor_head], sensor_head = (sensor_head + 1) % SENSOR_RING;
+            else p = &sensor_ring[(sensor_head + sensor_count++) % SENSOR_RING];
+            memcpy(p->a, sensor_acc, sizeof p->a);
+            memcpy(p->g, s->data, sizeof p->g);
+            p->t = s->sensor_timestamp ? s->sensor_timestamp : s->timestamp;
+        }
+    }
+    plat_mutex_unlock(&sensor_lock);
+    return false;
+}
+
+// Inside sdl_enter: the motion gamepad changed to id (0 none); its readings start a new ring.
+static void sensor_events_use(SDL_JoystickID id) {
+    static int installed;
+    if (!installed) {
+        installed = 1;
+        SDL_SetEventFilter(sensor_filter, NULL);
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, true);
+    }
+    plat_mutex_lock(&sensor_lock);
+    sensor_events_pad = id, sensor_head = sensor_count = 0, sensor_have_acc = 0, sensor_events_seen = 0;
+    plat_mutex_unlock(&sensor_lock);
+}
+
+// The readings gathered since the last call, oldest first; -1 while the motion gamepad has sent none (read the newest).
+static int sensor_events_take(SensorSample *out) {
+    plat_mutex_lock(&sensor_lock);
+    int n = sensor_events_seen ? (int)sensor_count : -1;
+    for (int i = 0; i < n; i++) out[i] = sensor_ring[(sensor_head + i) % SENSOR_RING];
+    sensor_head = sensor_count = 0;
+    plat_mutex_unlock(&sensor_lock);
+    return n;
+}
+
 // Under lock: (re)enable the sensors when the open gamepad changed; 1 if it has both and they are on.
 static int sensors_ready(void) {
     SDL_JoystickID id = SDL_GetGamepadID(pad);
     if (id == sensor_pad) return sensor_ok;
     sensor_pad = id;
-    // Nothing drains the SDL event queue: no event per sample (the data still updates, SDL_SendJoystickSensor)
-    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, false);
+    sensor_events_use(id);
     sensor_ok =SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) &&
                 SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true) &&
                 SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
@@ -1496,26 +1557,78 @@ int input_motion_enabled(void) {
     return on;
 }
 
-// 250 Hz: the gamepads update (reports read, rumble expiry) and the newest gyro and accelerometer sample goes into the
-// fusion. Without a gamepad with sensors, or with motion off (NX2NAVI_MOTION=0, live), nothing is fed and the six-axis
-// sensor reads at rest.
+// Every 4 ms: the gamepads update (reports read, rumble expiry) and every gyro and accelerometer reading since the last
+// tick goes into the fusion and the player space gyro, each with its own time (sensor_filter). Without a gamepad with
+// sensors, or with motion off (NX2NAVI_MOTION=0, live), nothing is fed and the six-axis sensor reads at rest.
 static void motion_main(void *arg) {
     (void)arg;
+    uint64_t last_t = 0;      // the controller's time of the last reading fed (0: none, the next one turns nothing)
+    uint64_t last_wall = 0;   // the same by the wall clock, for the newest-reading fallback
     for (;;) {
         plat_wait_ns(4000000);
-        float a[3], g[3];
-        int have = 0;
+        SensorSample got[SENSOR_RING];
+        int n = 0, touched = 0, events = 0;
         plat_mutex_lock(&lock);
         if (pad && sdl_enter()) {   // no sample while SDL finds devices again
-            have = SDL_GamepadConnected(pad) && sensors_ready() &&
-                   SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, a, 3) && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
+            if (SDL_GamepadConnected(pad) && sensors_ready()) {
+                n = sensor_events_take(got);
+                events = n >= 0;
+                if (!events) {   // no sensor event yet: the newest reading, timed by the wall clock
+                    n = SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, got[0].a, 3) &&
+                        SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, got[0].g, 3);
+                    got[0].t = 0;
+                }
+            }
+            // A finger on the touchpad (DualSense, DualShock 4) holds the player space gyro (gyro_mouse.c).
+            if (n > 0 && SDL_GetNumGamepadTouchpads(pad) > 0) {
+                int fingers = SDL_GetNumGamepadTouchpadFingers(pad, 0);
+                for (int i = 0; i < fingers && !touched; i++) {
+                    bool down = false;
+                    if (SDL_GetGamepadTouchpadFinger(pad, 0, i, &down, NULL, NULL, NULL) && down) touched = 1;
+                }
+            }
             sdl_leave();
         }
         plat_mutex_unlock(&lock);
-        if (!have || !input_motion_enabled()) continue;
-        double acc[3], gyro[3];
-        input_motion_axes(a, g, acc, gyro);
-        motion_feed(motion_global(), acc, gyro, kern_now_ns());
+        if (!input_motion_enabled()) {
+            last_t = last_wall = 0;
+            continue;
+        }
+        if (n <= 0) continue;   // no new reading this tick (or no gamepad): the next one measures from the last
+        uint64_t kern = kern_now_ns(), wall = plat_now_ns();
+        {   // once: which readings are fed, and how many a second
+            static uint64_t from, count;
+            static int logged;
+            if (!logged) {
+                if (!from) from = wall;
+                count += (uint64_t)n;
+                if (wall - from >= 2000000000ull) {
+                    logged = 1;
+                    rt_log("input: motion feeds %s, %.0f a second", events ? "every sensor report" : "the newest reading each 4 ms",
+                           count / ((wall - from) / 1e9));
+                }
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            double acc[3], gyro[3], dt;
+            input_motion_axes(got[i].a, got[i].g, acc, gyro);
+            uint64_t back = 0;   // how long before the newest reading this one was taken
+            if (events) {
+                dt = last_t && got[i].t > last_t ? (double)(got[i].t - last_t) / 1e9 : 0;
+                last_t = got[i].t;
+                if (got[n - 1].t > got[i].t) back = got[n - 1].t - got[i].t;
+            } else {
+                dt = last_wall && wall > last_wall ? (double)(wall - last_wall) / 1e9 : 0;
+                last_t = 0;
+            }
+            motion_feed(motion_global(), acc, gyro, kern > back ? kern - back : kern);
+            if (gyro_mouse_on()) {   // player space gyro: the camera's turn (gyro_mouse.c)
+                double up[3];
+                motion_up(motion_global(), up);
+                gyro_mouse_feed(acc, gyro, up, touched, dt);
+            }
+        }
+        last_wall = wall;
     }
 }
 

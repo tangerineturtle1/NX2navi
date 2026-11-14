@@ -143,6 +143,12 @@ int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now) {
     return n;
 }
 
+void motion_up(MotionFusion *m, double up[3]) {
+    plat_mutex_lock_shared(&m->lock);
+    for (int j = 0; j < 3; j++) up[j] = m->R[2][j];   // the reference's up axis in controller coordinates
+    plat_mutex_unlock_shared(&m->lock);
+}
+
 void motion_restart(MotionFusion *m) {
     plat_mutex_lock(&m->lock);
     m->restart = 1;

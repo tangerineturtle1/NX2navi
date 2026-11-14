@@ -496,6 +496,13 @@ and end a sprint, ZL, the button kept from the game only during play (the bottom
 Link the player does not control, and the set switched off with the button off but never over a start that kept it
 off. No game files.
 
+A change to player space gyro (`runtime/gyro_mouse.c`, its feed in `runtime/input.c` `motion_main` and its turn in
+`runtime/mouse_direct.c` `camera_input_oot`) passes `python tests\gyro_mouse_check.py`, which builds `gyro_mouse.c` with
+the rest of the runtime stubbed: the yaw of a turn about the vertical with the controller flat, upright and between,
+the yaw a sideways roll adds, pitch, the sensitivity, the bias a still controller loses (and a real turn does not
+teach), the dead zone and tightening alone and together, the touchpad hold, the turn made while nothing takes it dropped, and the settings that gate it. No game
+files.
+
 A change to the text speed (`runtime/text_speed.c`, the set `text_speed` of `recomp/patches-v111.txt`, its call in
 `runtime/ov_input.c` `npad_states`) passes `python tests\text_speed_check.py`, which lifts the set's replacement words
 with `recomp/lifter.py` and runs them with `text_speed.c` against a stand-in message window and typewriter: the page

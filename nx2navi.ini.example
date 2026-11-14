@@ -861,6 +861,23 @@
 # Gamepad motion controls (0 = off) and vibration (0 = off).
 # motion = 1
 # rumble = 1
+# Motion style: game (Original, the default: the game's own gyro aiming) or player (Custom: the gyro turns the camera
+# like a mouse). gyro_space with player: player (the default, player space: the same however the controller is held),
+# world (the turn about the real vertical), yaw (local: a flat controller turned like a dial), roll (local: tilted like
+# a wheel), yaw_roll (local: both) or laser (a pointer: aims where the controller points, no dead zone or tightening). gyro_sens_x and gyro_sens_y: degrees the camera turns left or
+# right, and up or down, for each degree the controller turns with player, 0.1 to 10. gyro_scope with player: always
+# (the default) or aim (only while the game aims an item, where its own gyro aiming would be on). gyro_deadzone with
+# player: turns slower than this many degrees a second are dropped (0 to 10, 0 = none). gyro_tighten with player, after
+# the dead zone: turns slower than this many degrees a second are slowed in proportion (0 to 10, default 1.5, 0 = none). gyro_touch_hold with player:
+# 1 (the default) stops the turn while a finger rests on the touchpad (DualSense, DualShock 4), to re-centre.
+# gyro_mode = game
+# gyro_scope = always
+# gyro_space = player
+# gyro_sens_x = 2
+# gyro_sens_y = 2
+# gyro_deadzone = 0
+# gyro_tighten = 1.5
+# gyro_touch_hold = 1
 # Sprint button (game 1.1.1): Link sprints without rolling first. off (the default), l3 (the left stick's click, which
 # has no other use) or b (the game's B button, the bottom one of the Nintendo layout: it sprints only while Link moves
 # and puts the weapon away as usual otherwise; with the game's Swap Jump Controls B is the jump, so use l3). sprint_mode: toggle (press to sprint and again to stop; the sprint
