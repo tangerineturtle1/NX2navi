@@ -148,7 +148,7 @@ int main(void) {
     set_state(ST_CLOSED, 0);
     for (int i = 0; i < 100; i++) poll(0, 1);
     assert(opens == 3 && !drawn());
-    screen[MAP_IS_MINI] = 1;
+    screen[MAP_IS_MINI] = 1, screen[SCR_VISIBLE] = 1;   // the game's own map drawn again, back in the small form
 
     // the next press hides it (it is on the screen)
     for (int i = 0; i < REOPEN_POLLS; i++) poll(0, 1);
@@ -156,7 +156,7 @@ int main(void) {
     assert(poll(DOWN, 1) == 0 && !strcmp(minimap_v, "hidden") && !drawn());
     poll(0, 1);
 
-    // set from the menu before the interface exists: applied once it does
+    // set in nx2navi.ini before the interface exists: applied once it does
     snprintf(minimap_v, sizeof minimap_v, "shown");
     ui_ready = 0;
     poll(0, 1);
@@ -164,12 +164,20 @@ int main(void) {
     poll(0, 1);
     assert(drawn());
 
-    // button off: the set stops, presses reach the game, the setting still holds
+    // button off: the whole of it is off. The set stops, presses reach the game, the minimap is the game's again
+    // (drawn as the game had it) and nothing is opened, while the saved choice stays for when the button is back
+    snprintf(minimap_v, sizeof minimap_v, "hidden");
+    poll(0, 1);
+    assert(!drawn());
     snprintf(button_v, sizeof button_v, "off");
-    assert(poll(DOWN, 1) == DOWN && !set_on && drawn() && !strcmp(minimap_v, "shown"));
+    assert(poll(DOWN, 1) == DOWN && !set_on && drawn() && !strcmp(minimap_v, "hidden"));
+    set_state(ST_CLOSED, 0);
+    opens = finds = 0;
+    for (int i = 0; i < 100; i++) poll(0, 1);
+    assert(opens == 0 && finds == 0);
     snprintf(button_v, sizeof button_v, "down");
     poll(0, 1);
-    assert(set_on);
+    assert(set_on && !drawn());
 
     puts("minimap_check: ok");
     free(img);

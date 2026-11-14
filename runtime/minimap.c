@@ -18,8 +18,9 @@
 // game closes on its way into a menu, a cutscene or a load (which stop Link's update) is not opened behind it.
 // game: the game decides, and only what this file changed is put back.
 //
-// Settings (live): minimap (game, shown or hidden); minimap_button (off, or down: the D-pad's down) switches between
-// shown and hidden, starting from what is on the screen, and saves it. The press counts only during gameplay, while
+// Settings (live): minimap_button (off, or down: the D-pad's down; the Controls tab's one row) switches between shown
+// and hidden, starting from what is on the screen, and saves the choice as minimap (game, shown or hidden; no row of
+// its own, game until the first press). With the button off the game decides, whatever minimap holds. The press counts only during gameplay, while
 // Link's movement update runs (the set's site at the top of main+0x4aaa80 calls minimap_link); during gameplay it is
 // kept from the game until it is released, so it does not also do what the game gives it.
 #include <stdatomic.h>
@@ -119,7 +120,7 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
 
     int n = atomic_load(&polls), gameplay = n < GAMEPLAY_POLLS;
     if (n <= GAMEPLAY_POLLS) atomic_store(&polls, n + 1);
-    int mode = setting_mode();
+    int mode = button ? setting_mode() : MODE_GAME;   // the button off turns the whole of it off
     uint64_t s = 0;
     int looked = 0;
 
@@ -139,7 +140,8 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
     // Nothing is looked up while the game decides and nothing of this file is left on the screen.
     if (mode == MODE_GAME && !drawn_screen) return;
     if (!looked) s = map_screen(c);
-    if (drawn_screen && drawn_screen != s) drawn_screen = 0;   // the screen is gone or another
+    if (drawn_screen && s && drawn_screen != s) drawn_screen = 0;   // another screen: nothing of ours is on it
+
     if (!s) return;
     int mini = rd8(s + MAP_IS_MINI) != 0;
     if (mode == MODE_GAME || !mini) {   // the game's, or the pause menu's map: as the game left it

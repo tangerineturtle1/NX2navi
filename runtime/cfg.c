@@ -274,7 +274,7 @@ static const CfgMeta metas[] = {
     // sprint.c: the sprint button (b the game's B, l3 the left stick's click) and toggle or hold; the Controls tab's
     // Sprint rows (1.1.1)
     {"SPRINT_BUTTON", "off", "off|b|l3", LIVE}, {"SPRINT_MODE", "toggle", "toggle|hold", LIVE},
-    // minimap.c: the minimap as the interface option has it, shown or hidden, and the button that switches it during gameplay (1.1.1)
+    // minimap.c: the button that shows or hides the minimap during gameplay, and the choice it saves (no row) (1.1.1)
     {"MINIMAP", "game", "game|shown|hidden", LIVE}, {"MINIMAP_BUTTON", "off", "off|down", LIVE},
     {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "nintendo", "auto|nintendo|xbox|playstation", LIVE},
