@@ -1735,7 +1735,7 @@ class MakeGameTest(Tmp):
             layout.parent.mkdir(exist_ok=True)
             layout.write_text('[]')
 
-        def compile_(out, cache, msys, jobs, romfs_job, update):
+        def compile_(out, cache, msys, jobs, romfs_job, update, *, guest_opt=1):
             ran.append('compile')
             self.assertTrue(layout.is_file())
 
@@ -1769,7 +1769,7 @@ class MakeGameTest(Tmp):
         def lift(out, cache):
             seen['lift_beside_romfs'] = not (out / 'romfs' / 'index.json').exists()
 
-        def compile_(out, cache, msys, jobs, romfs_job=None, update=False):
+        def compile_(out, cache, msys, jobs, romfs_job=None, update=False, *, guest_opt=1):
             seen['job'] = romfs_job is not None
             romfs_job.join()
             seen['image_after_join'] = (out / 'romfs' / 'romfs.bin').is_file()
@@ -1789,7 +1789,7 @@ class MakeGameTest(Tmp):
             (cache / 'lift').mkdir(exist_ok=True)
             (cache / 'lift' / 'layout.json').write_text('[]')   # the lifted code is there (make_game.py lift_gone)
 
-        def compile_(out, cache, msys, jobs, romfs_job=None, update=False):
+        def compile_(out, cache, msys, jobs, romfs_job=None, update=False, *, guest_opt=1):
             calls.append('compile')
             if romfs_job:
                 romfs_job.join()
@@ -2051,7 +2051,7 @@ class MakeGameTest(Tmp):
             time.sleep(0.1)
             ran.append('lift')
 
-        def compile_(out, cache, msys, jobs, romfs_job=None, update=False):
+        def compile_(out, cache, msys, jobs, romfs_job=None, update=False, *, guest_opt=1):
             ran.append('compile')
         self.assertEqual(self.main_with(romfs, lift, compile_), 1)
         self.assertEqual(ran, ['lift'])
@@ -2356,7 +2356,7 @@ class MakeGameTest(Tmp):
         made_up_game(self.out)
         seen = []
 
-        def compile_(out, cache, msys, jobs, romfs_job=None, update=False):
+        def compile_(out, cache, msys, jobs, romfs_job=None, update=False, *, guest_opt=1):
             seen.append(jobs)
             self.mg.fail('stop here')
         with mock.patch.object(self.mg, 'default_jobs', lambda: (3, 'stubbed')):
@@ -3205,6 +3205,47 @@ class MakeGameTest(Tmp):
         del state['steps']['romfs']   # the lift reads nothing of the RomFS step: it does not follow it
         self.assertEqual(mg.steps_to_run(state, ident, self.out, 'compile'), ['romfs', 'compile'])
         self.assertEqual(mg.steps_to_run({'steps': {}}, ident, self.out, 'romfs'), ['exefs', 'romfs'])
+
+    def test_rebuild_takes_the_guest_opt_setting(self):
+        mg = self.mg
+        made_up_game(self.out)
+        state_path = self.out / 'build-cache' / 'state.json'
+        state = json.loads(state_path.read_text())
+        layout = state_path.parent / 'lift' / 'layout.json'
+        layout.parent.mkdir()
+        layout.write_text('[]')
+        ini = self.out / 'nx2navi.ini'
+        compiled: list[str] = []
+
+        def compile_(out, cache, msys, jobs, romfs_job, update, *, guest_opt: int = 1) -> None:
+            cmd = mg.runtime_cmd('clang', 'clang++', [], guest_opt=guest_opt)
+            compiled.append(cmd(Path('chunk.c'), Path('main_chunk.o'))[3])
+
+        with mock.patch.dict(os.environ, {'NX2NAVI_GUEST_OPT': '', 'NX2NAVI_PGO': 'off'}), \
+                mock.patch.object(mg, 'step_shaders', lambda out: self.fail('the shaders are already prepared')):
+            state['steps'] = {s: mg.step_key(s, state['input'], self.out) for s in state['steps']}
+            state_path.write_text(json.dumps(state))
+
+            def rebuild() -> None:
+                code, log = self.main_rebuild(lambda *a: self.fail('the lift is already current'), compile_,
+                                              '--pgo', 'off', '--until', 'shaders')
+                self.assertEqual(code, 0, log)
+
+            ini.write_text('low_end_gpu = 1\nguest_opt = 2\n')
+            rebuild()
+            self.assertEqual(compiled, ['-O2'])
+            rebuild()
+            self.assertEqual(compiled, ['-O2'])
+            os.environ['NX2NAVI_GUEST_OPT'] = '1'
+            rebuild()
+            self.assertEqual(compiled, ['-O2', '-O1'])
+            ini.write_text('low_end_gpu = 0\nguest_opt = 2\n')
+            os.environ.pop('NX2NAVI_GUEST_OPT')
+            rebuild()
+            self.assertEqual(compiled, ['-O2', '-O1'])
+            os.environ['NX2NAVI_GUEST_OPT'] = '2'
+            rebuild()
+            self.assertEqual(compiled, ['-O2', '-O1', '-O2'])
 
     def test_the_build_tools_are_tried_before_the_long_steps(self):
         """On Windows a build whose compile step will run first compiles and links an empty program with the
