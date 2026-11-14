@@ -94,6 +94,9 @@ void plugin_game_ui_for_probe(void) {
 
 const PluginGameUi *plugin_game_ui(void) {
     if (__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return found;
+    // Before the dispatch table is built (hostfn_seal) no function is found, and a library the launcher put into the
+    // process can ask that early through the exported interface: no answer yet, and nothing remembered.
+    if (!rt_dispatch_lookup(RT_RET_HOST)) return NULL;
     const char *id = mods_main_build_id();
     uint64_t base = main_base();
     const PluginGameUi *g = NULL;
