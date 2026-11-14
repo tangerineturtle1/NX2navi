@@ -514,8 +514,9 @@ static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 // - HD_PAIR, a left and a right Joy-Con that SDL presents as one gamepad: SDL refuses the call for that gamepad, so the
 //   reports go to the two HID devices directly (input_hd_pair.c).
 // - HD_AUDIO, a DualSense (or DualSense Edge) on USB: its two haptic actuators play the game's values as sound on the
-//   third and fourth channels of the controller's audio device (rumble_haptics.c), opened at the first value the game
-//   sends with the setting on, and tried again every 2 s while it is not listed yet. Over Bluetooth it has no audio device and keeps its motors.
+//   third and fourth channels of the controller's audio device (rumble_haptics.c), opened on a thread of its own when
+//   the gamepad becomes the primary with the setting on (or when the setting is turned on), and tried again every 2 s
+//   while it is not listed yet. Over Bluetooth it has no audio device and keeps its motors.
 // Every other gamepad keeps the motors' path, the Switch 2 controllers too (other product ids, another protocol).
 // The game's thread only posts its newest values (input_rumble_hd). A thread of its own writes the reports (hd_main):
 // every HD_TICK_NS while there is something to write it asks rumble_hd_due, which spaces the reports, keeps only the
@@ -539,9 +540,12 @@ static int hd_ended;                  // input_rumble_hd_stop ran: nothing is wr
 static int hd_first_logged;           // under lock: the primary's first report was logged (hd_wrote)
 static volatile int32_t hd_thread;    // 0 not started, 1 running, -1 it could not be started (set under hd_lock)
 static volatile int32_t hd_audio;     // any thread: the primary is HD_AUDIO
-static volatile int32_t hd_audio_open;   // 0 to be tried, 1 open, -1 it did not open (tried again after HD_AUDIO_RETRY_NS)
+static volatile int32_t hd_audio_open;   // 0 to be tried, 2 opening, 1 open, -1 it did not open (tried again after
+                                         // HD_AUDIO_RETRY_NS)
 static uint64_t hd_audio_failed_at;      // when it last did not open
-static int hd_audio_logged;              // its first failure was logged (once per primary)
+static volatile int32_t hd_audio_logged; // its first failure was logged (once per primary)
+static volatile int32_t hd_audio_gen;    // a new primary: an open still running for the last one is undone
+static volatile int32_t hd_audio_stop_motors;   // the device opened: the motors get one stop (input_rumble)
 // Windows lists the DualSense's audio device a second or two after its gamepad: a device that did not open is tried
 // again after this long, the gamepad keeping its motors meanwhile.
 #define HD_AUDIO_RETRY_NS 2000000000ull
@@ -588,7 +592,7 @@ static int hd_probe(SDL_Gamepad *p, int *one, char *how, size_t cap) {
             snprintf(how, cap, "a DualSense over Bluetooth: its haptic actuators take sound over USB only");
             return HD_NONE;
         }
-        snprintf(how, cap, "a DualSense on USB, through its haptic actuators (opened at the first vibration)");
+        snprintf(how, cap, "a DualSense on USB, through its haptic actuators");
         return HD_AUDIO;
     }
     if (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR) {
@@ -619,6 +623,35 @@ static int hd_probe(SDL_Gamepad *p, int *one, char *how, size_t cap) {
     return HD_SDL;
 }
 
+// The DualSense's audio device is opened on a thread of its own, as soon as the gamepad becomes the primary with the
+// setting on, and never on the game's thread: Windows can take a while to open it. Once open, the motors are stopped
+// once (input_rumble), so the controller leaves rumble emulation and its actuators play the sound alone.
+static void hd_audio_opener(void *arg) {
+    int32_t gen = (int32_t)(intptr_t)arg;
+    char why[256];
+    int ok = haptics_open(why, sizeof why);
+    if (gen != __atomic_load_n(&hd_audio_gen, __ATOMIC_ACQUIRE)) {   // the gamepad left meanwhile
+        if (ok) haptics_close();
+        return;
+    }
+    if (!ok) __atomic_store_n(&hd_audio_failed_at, plat_now_ns(), __ATOMIC_RELAXED);
+    if (ok || !plat_xchg32(&hd_audio_logged, 1))
+        rt_log("input: HD rumble on the DualSense: %s%s", ok ? "" : "not available yet (tried again every 2 s): ", why);
+    if (ok) __atomic_store_n(&hd_audio_stop_motors, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd_audio_open, ok ? 1 : -1, __ATOMIC_RELEASE);
+}
+
+// Starts an open when none is open or running. Any thread.
+static void hd_audio_try(void) {
+    int32_t idle = 0;
+    if (!__atomic_compare_exchange_n(&hd_audio_open, &idle, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
+    void *gen = (void *)(intptr_t)__atomic_load_n(&hd_audio_gen, __ATOMIC_ACQUIRE);
+    if (!plat_thread_spawn(hd_audio_opener, gen, "haptics", 0)) {
+        __atomic_store_n(&hd_audio_failed_at, plat_now_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&hd_audio_open, -1, __ATOMIC_RELEASE);
+    }
+}
+
 // Under lock, and under sdl_lock when connected is set: the primary stops being the primary (another gamepad takes
 // over, or it went away). A controller the HD path left vibrating gets the neutral value, and what was written to it
 // does not count for the next primary.
@@ -637,10 +670,11 @@ static void hd_pad_leave(int connected) {
         rumble_hd_report(rumble_hd_neutral, 0, r, sizeof r);
         SDL_SendGamepadEffect(pad, r, sizeof r);
     }
+    __atomic_add_fetch(&hd_audio_gen, 1, __ATOMIC_ACQ_REL);
     if (pad_hd == HD_AUDIO) haptics_close();
     __atomic_store_n(&hd_audio, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&hd_audio_open, 0, __ATOMIC_RELAXED);
-    hd_audio_logged = 0;
+    __atomic_store_n(&hd_audio_logged, 0, __ATOMIC_RELAXED);
     pad_hd = HD_NONE, sdl_rumbling = 0, hd_first_logged = 0;
     __atomic_store_n(&hd_shown, 0, __ATOMIC_RELAXED);
 }
@@ -730,18 +764,9 @@ void input_rumble_hd(const RumbleHdValue v[2], const int live[2], float strength
     int32_t shown = __atomic_load_n(&hd_shown, __ATOMIC_RELAXED);
     if (!shown) return;
     if (__atomic_load_n(&hd_audio, __ATOMIC_RELAXED)) {   // a DualSense on USB (rumble_haptics.c)
-        int32_t open = __atomic_load_n(&hd_audio_open, __ATOMIC_RELAXED);
-        if (!open) {
-            char why[256];
-            open = haptics_open(why, sizeof why) ? 1 : -1;
-            if (open < 0) __atomic_store_n(&hd_audio_failed_at, plat_now_ns(), __ATOMIC_RELAXED);
-            __atomic_store_n(&hd_audio_open, open, __ATOMIC_RELAXED);
-            if (open > 0 || !hd_audio_logged)
-                rt_log("input: HD rumble on the DualSense: %s%s", open > 0 ? "" : "not available yet (tried again every 2 s): ",
-                       why);
-            hd_audio_logged = 1;
-        }
-        if (open > 0) haptics_post(v, live, strength);
+        int32_t open = __atomic_load_n(&hd_audio_open, __ATOMIC_ACQUIRE);
+        if (!open) hd_audio_try();   // the setting was turned on, or a retry is due
+        if (open == 1) haptics_post(v, live, strength);
         return;
     }
     uint8_t d[RUMBLE_HD_DATA];
@@ -823,6 +848,7 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
     int one;
     pad_hd = hd_probe(pad, &one, how, sizeof how);
     __atomic_store_n(&hd_audio, pad_hd == HD_AUDIO, __ATOMIC_RELAXED);
+    if (pad_hd == HD_AUDIO && hd_setting()) hd_audio_try();   // open it now, before the first vibration
     __atomic_store_n(&hd_shown, pad_hd == HD_NONE ? 0 : 1 + one, __ATOMIC_RELAXED);
     rt_log("input: HD rumble %s for this gamepad: %s (rumble_hd = %s)", pad_hd == HD_NONE ? "not available" : "available",
            how, cfg_value("NX2NAVI_RUMBLE_HD"));
@@ -1481,8 +1507,8 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     if (state == 1 && pad && pad_rumble && plat_mutex_trylock(&sdl_lock)) {   // one skipped while SDL updates
         if (pad_hd != HD_NONE && input_rumble_hd_on()) {
             // HD rumble has this gamepad (hd_tick): its motors are stopped once and get nothing more, so the reports
-            // with the game's values are the only rumble it is sent
-            if (sdl_rumbling) SDL_RumbleGamepad(pad, 0, 0, 0);
+            // with the game's values are the only rumble it is sent (a DualSense also once its audio device opened)
+            if (plat_xchg32(&hd_audio_stop_motors, 0) | sdl_rumbling) SDL_RumbleGamepad(pad, 0, 0, 0);
             sdl_rumbling = 0;
             ok = 1;
         } else {

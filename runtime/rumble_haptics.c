@@ -196,6 +196,7 @@ int haptics_open(char *why, size_t cap) {
     } else {
         SDL_AudioSpec spec = {SDL_AUDIO_F32, CHANNELS, RATE};
         memset(voices, 0, sizeof voices);
+        for (int k = 0; k < 2; k++) voices[k].freq[0] = 160, voices[k].freq[1] = 320;   // the bands' rest frequencies
         memset(slot, 0, sizeof slot);
         slot_left = 0;
         since_onset[0] = since_onset[1] = -1;
