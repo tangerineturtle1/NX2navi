@@ -617,11 +617,15 @@ static VkImageAspectFlags aspect_of(const TexVkFormat *f) {
 
 // Binds img into the pool memory behind its GPU address (physical pools, virtual pools through the page table) when
 // the memory type, alignment and contiguous size allow; 0 otherwise.
-// A depth / stencil image that needs more bytes than its NVN storage (guest_size) is not bound: AMD's RDNA2 driver
-// (26.10.1) puts the depth compression metadata after the depth data, and above 1080p that tail lies over the next
-// texture of the game's heap; each depth write then scrambled it (garbage band at the top, pink glow, blocks in the
-// grass, a blue checkered scene in the menu). Colour images keep their place: the RX 9070 also sizes some of them
-// above their storage, and nothing there showed that the GPU writes the excess.
+// An image that needs more bytes than its NVN storage (guest_size) is not bound (pool_fits): the device's layout puts
+// texels or metadata in the excess, which lies over the next texture of the game's heap, so a draw into either one
+// scrambles the other. Depth: AMD's RDNA2 driver (26.10.1) puts the depth compression metadata after the depth data,
+// and above 1080p each depth write scrambled the next texture (garbage band at the top, pink glow, blocks in the
+// grass, a blue checkered scene in the menu). Colour: on an RX 6800 XT (26.10.1) the local exposure grid of 1.1.1's
+// tonemap (32x24x64 rg16f, 3D) is laid out larger than its storage, and the light target the tonemap draws into
+// starts 0x200 bytes after that storage; the draw overwrote the grid's top slices while it sampled them, the grid
+// then gave the brightest pixels a gain of 2^-50, and lanterns and daylight turned to flickering black patches.
+// NX2NAVI_TEX_OVERSIZE_ALIAS=1 binds such colour images as before (depth images stay out).
 static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no block-compressed format
     return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
            (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
@@ -851,7 +855,20 @@ static int from_storage(const Tex *e) { return e->pub.mirrored || e->sfill == 1 
 
 // Whether an image with these requirements can lie in the pool memory at e's address (*sp: that memory).
 static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, uint64_t guest_size, VkMemSpan *sp) {
-    if ((e->f.depth || e->f.stencil) && req->size > guest_size) return 0;
+    static int oversize_alias = -1;   // NX2NAVI_TEX_OVERSIZE_ALIAS (see bind_pool_memory)
+    static volatile int32_t n_oversize;
+    if (oversize_alias < 0) oversize_alias = rt_knob("TEX_OVERSIZE_ALIAS", "0") != 0;
+    if (req->size > guest_size) {
+        int ds = e->f.depth || e->f.stencil;
+        if (ds || !oversize_alias) {
+            if (!ds)
+                log_limited(&n_oversize, "texture %#llx (%ux%ux%u, type %u, vk format %u) needs %llu bytes, its "
+                            "storage %llu: memory of its own, so the excess lies over no other texture",
+                            (unsigned long long)e->pub.addr, e->ik.w, e->ik.h, e->ik.d, e->ik.type, e->ik.format,
+                            (unsigned long long)req->size, (unsigned long long)guest_size);
+            return 0;
+        }
+    }
     if (!req->size) return 0;   // an image the device could not lay out (image_size)
     if (!vk_mem_lookup(e->pub.addr, req->size, sp) || !sp->alloc || sp->alloc_offset % req->alignment) return 0;
     VmaAllocationInfo info;
