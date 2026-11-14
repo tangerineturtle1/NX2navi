@@ -129,13 +129,45 @@ def follow_functions():
     return '\n'.join(out)
 
 
+# The playback staff's note gate (set ostaff): after the read of the melody's note signal (main+0x3297b50, 0 or 1 in
+# w0) at main+0x3292c84 and main+0x3292ed4, the set keeps the signal on the page (+776, through x9 = the page) and
+# clears w0 when the signal was already set the update before. Site words: the first keeps its ldr w3 ahead of the
+# gate, the second its tbz behind it.
+STAFF_GATE = [0xb943092a, 0xb9030920, 0x0a2a0000]   # ldr w10, [x9, #0x308]; str w0, [x9, #0x308]; bic w0, w0, w10
+STAFF_SITES = ((0x3292c84, 0xb94286c3, [0xb94286c3, ('page', 9)] + STAFF_GATE),
+               (0x3292ed4, 0x36000b80, [('page', 9)] + STAFF_GATE + [0x36000b80]))
+
+
+def check_staff():
+    """Each staff gate is the set ostaff's adrp to the page in x9 and the three words of the gate, over the game's."""
+    table = load(ROOT / 'recomp/patches-v111.txt', [('main', 0x7000000000, PAGE)])
+    names = {i: t[0] for i, t in enumerate(table.sets)}
+    bad = 0
+    for site, original, words in STAFF_SITES:
+        alts = {names[k]: (w, have) for k, w, have in table.sites['main'].get(site, [])}
+        if alts != {'ostaff': (words, original)}:
+            print(f'FAIL: the staff gate at main+{site:#x} is {alts}')
+            bad += 1
+    return bad
+
+
+def staff_functions():
+    lift = Lifter(0, simd='c')
+    body = []
+    for k, w in enumerate(STAFF_GATE):
+        insn = lift.lift(w, 0x7000000000 + STAFF_SITES[0][0] + 4 * k)
+        assert insn.kind == 'op', (hex(w), insn.kind)
+        body.append('    ' + insn.code)
+    return 'void staff_ostaff(Cpu *c) {\n' + '\n'.join(body) + '\n}\n'
+
+
 def main():
     work = ROOT / 'build' / 'test' / 'frame_step'
     work.mkdir(parents=True, exist_ok=True)
     (work / 'layout.h').write_text(LAYOUT)
     exe = work / ('frame_step_check.exe' if os.name == 'nt' else 'frame_step_check')
     solver = work / 'solver_sites.c'
-    solver.write_text(solver_functions() + '\n' + follow_functions())
+    solver.write_text(solver_functions() + '\n' + follow_functions() + '\n' + staff_functions())
     env = dict(os.environ)
     if os.name == 'nt' and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
@@ -143,7 +175,7 @@ def main():
                            '-I', str(ROOT / 'runtime'), '-I', str(work),
                            str(ROOT / 'tests' / 'frame_step_check.c'), str(solver), '-o', str(exe), '-lm'], env=env)
     rc = subprocess.run([str(exe)], env=env).returncode
-    return subprocess.run([str(exe), 'mean'], env=env).returncode or rc or check_sites() + check_follow()
+    return subprocess.run([str(exe), 'mean'], env=env).returncode or rc or check_sites() + check_follow() + check_staff()
 
 
 if __name__ == '__main__':

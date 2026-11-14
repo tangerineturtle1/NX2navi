@@ -168,6 +168,25 @@ set osound NX2NAVI_SOUND_STEPS 1
 site osound main 41531c 910083fd 910083fd 952a2efd   # add x29, sp, #0x20 -> add x29, sp, #0x20; bl page+0xf10
 site osound main 415334 bd401100 bd401100 952a2ef3   # ldr s0, [x8, #0x10] -> ldr s0, [x8, #0x10]; bl page+0xf00
 
+# The staff of a song the game plays back: when Link has played a song (or when a song is shown to him), the ocarina
+# manager (its update main+0x17bad0, state +0x230 = 5 at main+0x3292b04, 6 at main+0x3292dd4) plays the melody's sound
+# ("ScoreExampleMelody_" and the song's name, started by main+0x335b730, whose handle the manager keeps at +0x20) and
+# moves the staff to the next note (+0x284, the index into the melody's notes) on each update the sound's note signal
+# reads as set (main+0x3297b50: the handle is live and the word it points to, +0x94 of the melody player
+# [[main+0x4c80728]], is not 0), at most one note an update. At 60 fps the signal is set for exactly one update a note.
+# Above it, it was now and then set for two updates in a row, and the staff took two notes for one sound and stayed a
+# note ahead of the melody (at 73 fps: the index went from 2 to 3 and to 4 in two updates 14 ms apart, where the other
+# notes came 40 updates apart). Why the signal stays set over two updates above 60 fps was not traced. The set lets
+# only an update whose signal was clear the update before move the staff: both reads keep the signal (0 or 1, a cset)
+# on the patch page (+776) and clear w0 when the word there was already set. At 60 fps and below that is every note
+# the game moves on; a note signal set on the first update of a playback after one that ended with it set is the one
+# it would lose, and the melody's first note comes about 45 updates after the sound starts. With the set, nine
+# playbacks at 73 fps moved the staff one note a note, in step with the melody. x9 and x10 are written
+# again or reach only calls and returns before they are read, and no word reads or writes the flags.
+set ostaff NX2NAVI_SONG_STAFF 1
+site ostaff main 3292c84 b94286c3 b94286c3 @page:x9 b943092a b9030920 0a2a0000   # ldr w3, [x22, #0x284] -> the same; adrp x9, page; ldr w10, [x9, #0x308]; str w0, [x9, #0x308]; bic w0, w0, w10
+site ostaff main 3292ed4 36000b80 @page:x9 b943092a b9030920 0a2a0000 36000b80   # tbz w0, #0, 0x3293044 -> adrp x9, page; ldr w10, [x9, #0x308]; str w0, [x9, #0x308]; bic w0, w0, w10; the tbz
+
 # Movie-synchronised event timelines: the movie layer advances its counter at +760 on each draw of a ready
 # picture. main+0x3b3ec10 reads that counter for the event dispatcher, so rendering a picture twice also
 # advances voices and overlays twice. Both ready paths reach these sites only after main+0x3b5ce80 checks

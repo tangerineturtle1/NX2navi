@@ -172,6 +172,17 @@ static int follow_cut(void (*fn)(Cpu *), float inverse) {
     return !FLAG_Z(&c) && FLAG_N(&c) == FLAG_V(&c);   // gt
 }
 
+// The playback staff's note gate (set ostaff): w0 in is the melody's note signal of this update, w0 out whether the
+// staff moves on; the last signal stays on the page (+776) between calls.
+void staff_ostaff(Cpu *c);
+static int staff_gate(int signal) {
+    Cpu c;
+    memset(&c, 0, sizeof c);
+    c.x[0] = (uint64_t)signal, c.x[9] = (uint64_t)(uintptr_t)page;
+    staff_ostaff(&c);
+    return (int)c.x[0];
+}
+
 int main(int argc, char **argv) {
     int mean = argc > 1 && !strcmp(argv[1], "mean");
     if (mean) steady = "0";
@@ -430,6 +441,15 @@ int main(int argc, char **argv) {
             CHECK(follow_cut(follow_game, 60.0f / frames) == (hz[r] > 100), "%d fps: the game's own words %s", hz[r],
                   hz[r] > 100 ? "do not cut" : "cut");
         }
+    }
+    // The playback staff (set ostaff): a note signal set over several updates in a row moves the staff once, a signal
+    // set for one update (every note at 60 fps) moves it as the game does, and a clear signal never does.
+    {
+        const int in[] = {0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 0}, out[] = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0};
+        memset(page + 776, 0, 4);
+        for (int i = 0; i < (int)(sizeof in / sizeof in[0]); i++)
+            CHECK(staff_gate(in[i]) == out[i], "update %d: a note signal %d moves the staff %s", i, in[i],
+                  out[i] ? "on" : "not");
     }
     printf("frame_step_check: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;

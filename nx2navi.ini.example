@@ -58,6 +58,10 @@
 # held after an area unloaded until new sounds and then the music went silent. 1 runs the sound system 60 times a
 # second with whole frames while the frame rate is above 60; 0 is the game's own step. Read at start.
 # sound_steps = 1
+# When the game plays back a song (after Link plays it, or when one is taught), its staff moves a note for each note of
+# the melody's sound. Above 60 fps the sound's note signal now and then lasted two frames, and the staff took two notes
+# for one sound and ran a note ahead. 1 moves the staff only when the signal comes on; 0 is the game's own. Read at start.
+# song_staff = 1
 # Above 100 fps the game kept only a tenth of a moving floor's speed for whoever stood on it, so Link was left behind
 # on moving platforms (the Deku Tree's floating one). 1 makes the floor carry him as at 60 fps at any frame rate; 0 is
 # the game's own cut. Read at start; needs game code generated with this release.
