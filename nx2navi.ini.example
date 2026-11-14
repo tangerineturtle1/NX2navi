@@ -8,8 +8,8 @@
 # it changes and keeps every other line as it is.
 
 [frame rate]
-# Frame rate limit: 30, 40, 45, 60, 90, 120, 144, any whole rate from 30 to 240, display (the refresh rate of the
-# window's monitor, at most 240) or unlimited (as fast as the PC goes, at most 240 frames of the game a second). A
+# Frame rate limit: any whole rate from 30 to 240 (the settings menu's slider: left and right step one, held they
+# step ten, and past 240 come the next two), display (the refresh rate of the window's monitor, at most 240) or unlimited (as fast as the PC goes, at most 240 frames of the game a second). A
 # higher rate gives 240: far above it the game's own code fails (its quick menu crashed at 700 fps). Above 60
 # is experimental and needs realtime = 1. Changes while the game runs take effect at once.
 # With mailbox or fifo presentation (vk_present, the default) a frame reaches the screen at a vertical blank, so a limit

@@ -835,34 +835,29 @@ static void row_game_lang(void) {
     opt_choice_list("NX2NAVI_LANG", UI_MENU_GAME_LANG, vals, names, n + 1, UI_MENU_GAME_LANG_DESC, cur);
 }
 
-// The frame limit (frame_rate.c): unset, the older fps60 = 0 still means 30. The monitor choice shows the rate it gives.
-// The note says when RivaTuner Statistics Server does the limiting (rtss_limit.c), cannot change its profile, or let the
-// game run past its limit.
+// The frame limit (frame_rate.c): any whole rate from 30 to 240 on a slider (left and right step one, held they step
+// ten), then the monitor's rate and, where the game steps by the clock, unlimited. Unset, the older fps60 = 0 still
+// means 30. The monitor stop shows the rate it gives. The note says when RivaTuner Statistics Server does the limiting
+// (rtss_limit.c), cannot change its profile, or let the game run past its limit.
 static void row_fps_limit() {
-    // 40 and 45: the Steam Deck's screen runs at 40 to 60 Hz (the OLED to 90); 40 divides 40 and 120 Hz evenly
-    // 165 and 240: common gaming monitors; unlimited only where the game steps by the clock (frame_rate.c)
-    static const char *const vals[] = {"30", "40", "45", "60", "90", "120", "144", "165", "240", "display", "unlimited"};
-    static const UiTextId ids[] = {UI_MENU_FPS_30,  UI_MENU_FPS_40,  UI_MENU_FPS_45,  UI_MENU_FPS_60,
-                                   UI_MENU_FPS_90,  UI_MENU_FPS_120, UI_MENU_FPS_144, UI_MENU_FPS_144,
-                                   UI_MENU_FPS_144, UI_MENU_FPS_DISPLAY, UI_MENU_FPS_UNLIMITED};
-    int n = frame_free_running() ? 11 : 10;
-    const char *names[11];
-    for (int i = 0; i < n; i++) names[i] = menu_text(ids[i]);
-    names[7] = "165 FPS", names[8] = "240 FPS";
+    static const char *const stop_values[] = {"display", "unlimited"};
+    const char *stop_names[2] = {menu_text(UI_MENU_FPS_DISPLAY), menu_text(UI_MENU_FPS_UNLIMITED)};
+    int stops = frame_free_running() ? 2 : 1;
     static char display[64];
     double hz = gfx_window_refresh_hz();
     if (hz > 0) {
         snprintf(display, sizeof display, menu_text(UI_MENU_FPS_DISPLAY_HZ), hz);
-        names[9] = display;
+        stop_names[0] = display;
     }
     const char *set = cfg_get("NX2NAVI_FPS_LIMIT"), *old = cfg_get("NX2NAVI_FPS60");
-    int cur = (!set || !*set) && old && !strcmp(old, "0") ? 0 : -1;
+    const char *cur = (!set || !*set) && old && !strcmp(old, "0") ? "30" : nullptr;
     int rtss = rtss_limit_state();
     const char *note = rtss == 1   ? menu_text(UI_MENU_FPS_RTSS)
                        : rtss == 2 ? menu_text(UI_MENU_FPS_RTSS_READONLY)
                        : rtss == 3 ? menu_text(UI_MENU_FPS_RTSS_IGNORED)
                                    : nullptr;
-    opt_choice_list("NX2NAVI_FPS_LIMIT", UI_MENU_FPS_LIMIT, vals, names, n, UI_MENU_FPS_LIMIT_DESC, cur, note);
+    opt_slider_stops("NX2NAVI_FPS_LIMIT", UI_MENU_FPS_LIMIT, 30, 240, UI_MENU_FPS_LIMIT_DESC, "%d FPS", stop_values,
+                     stop_names, stops, cur, note);
 }
 
 // "in use: ..." under the VSync row when the swapchain does other than the row says: VSync when it is off and the driver
