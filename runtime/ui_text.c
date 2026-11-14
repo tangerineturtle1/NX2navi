@@ -112,9 +112,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                    "lose nothing when dropped go. Fewer leaves more video memory for the rest; more "
                                    "saves making them again; too few lets some blink black for a moment. Auto: one per 2 MB "
                                    "of the video memory budget, 2048 to 8192.",
-    [UI_MENU_LOWEND_CLOBBER] = "Fix overwritten textures",
-    [UI_MENU_LOWEND_CLOBBER_DESC] = "A texture the game reads after another image was drawn over its memory gets memory of "
-                                  "its own. Fixes the teal splotches in Kokiri Forest's fog.",
+    [UI_MENU_TEX_CLOBBER] = "Fix overwritten textures",
+    [UI_MENU_TEX_CLOBBER_DESC] = "Keeps textures intact when the game draws another image over the same memory. "
+                               "This fixes green squares in fog and can use more video memory.",
+    [UI_MENU_TEX_CLOBBER_NOTE] = "* Remove green sprite bug",
     [UI_MENU_LOWEND_MIRROR_HOT] = "Pools copied every frame stay in system memory",
     [UI_MENU_LOWEND_MIRROR_HOT_DESC] = "A game memory pool whose copies to and from video memory each frame reach this "
                                      "percentage of its size is read by the GPU from system memory instead, if the "
