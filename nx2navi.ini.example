@@ -868,6 +868,13 @@
 # Sprint rows set both; changes take effect at once.
 # sprint_button = off
 # sprint_mode = toggle
+# Minimap button (game 1.1.1): minimap_button = down makes the D-pad's down show or hide the minimap during gameplay,
+# whatever the In-Game Interface option does with it (Normal shows it, Pro does not); the rest of the interface and the
+# pause menu's map stay as they are. In menus and cutscenes the button keeps its role, and during gameplay the game
+# does not get it. The button saves its choice as minimap (game, shown or hidden); off (the default) leaves the minimap
+# to the game whatever minimap holds. The Controls tab's Minimap button row sets minimap_button.
+# minimap = game
+# minimap_button = off
 # Rumble strength in percent (0 to 300; 0 = off) and the exponent on the amplitude (0.2 to 1.5; lower = weak pulses
 # stronger, 1 = linear). rumble_triggers = 1 also drives the impulse triggers of an Xbox pad.
 # rumble_strength = 130

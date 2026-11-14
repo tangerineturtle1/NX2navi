@@ -347,6 +347,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                  "and ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs. "
                                  "Hold: Link sprints while the button is held.",
     [UI_MENU_SPRINT_TOGGLE] = "Toggle", [UI_MENU_SPRINT_HOLD] = "Hold",
+    [UI_MENU_MINIMAP_BUTTON] = "Minimap button",
+    [UI_MENU_MINIMAP_BUTTON_DESC] = "A button that shows or hides the minimap during gameplay, whatever the In-Game "
+                                    "Interface option does with it: Pro can have a minimap and Normal can go without, "
+                                    "and the rest of the interface stays. The choice is kept. In menus and cutscenes "
+                                    "the button does what the game gives it. Off: the minimap as the game has it.",
+    [UI_MENU_MINIMAP_OFF] = "Off", [UI_MENU_MINIMAP_DOWN] = "D-pad down",
     [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
     [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the vibration is.",
     [UI_MENU_RUMBLE_CURVE] = "Vibration curve",

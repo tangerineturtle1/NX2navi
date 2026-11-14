@@ -18,6 +18,7 @@
 #include "input.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "minimap.h"
 #include "sprint.h"
 #include "text_speed.h"
 
@@ -104,6 +105,7 @@ static void npad_states(Cpu *c, uint32_t want) {
     dbg_tick(c);   // the debug menu's changes to the game, between two of its frames (debug_tools.c)
     if (live) dbg_pad(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);   // its free camera takes the sticks while it flies
     if (live) sprint_pad(&s.buttons);   // the sprint button's presses, kept from the game during gameplay (sprint.c)
+    minimap_pad(c, live ? &s.buttons : NULL);   // the minimap button, and the minimap hidden or shown (minimap.c)
     if (live) text_speed_poll();   // the text_speed setting onto the patch page (text_speed.c)
     *out = s;
     ret_x(c, 1);

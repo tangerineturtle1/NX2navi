@@ -341,6 +341,14 @@ set sprint NX2NAVI_SPRINT_BUTTON_PATCH 1
 site sprint main 4ae798 f940014a f940014a 9527c9ea   # ldr x10, [x10] -> ldr x10, [x10]; bl page+0xf40
 site sprint main c07f3c 39400108 39400108 950a63fd   # ldrb w8, [x8] -> ldrb w8, [x8]; bl page+0xf30
 
+# Minimap button (runtime/minimap.c). Its press counts only during gameplay: while Link's movement update
+# (main+0x4aaa80) runs, which a menu, a cutscene or a load stops. The site keeps the update's load of the actor's +0x18
+# at main+0x4aaabc, before any of its early exits, and calls the page's +0xef0 (minimap_link), which notes that the
+# update ran when x0 is Link. x30 is the function's own, saved by its prologue and restored from its frame; the host
+# function reads only x0 and writes no register. The set runs only while a minimap button is chosen.
+set minimap NX2NAVI_MINIMAP_BUTTON_PATCH 1
+site minimap main 4aaabc f9400c15 f9400c15 9527d90d   # ldr x21, [x0, #0x18] -> ldr x21, [x0, #0x18]; bl page+0xef0
+
 # Text speed (runtime/text_speed.c). The message window (its update main+0x774b00) shows its text through a typewriter
 # object at window +0x2b0 (its step main+0xafe140): each frame the step adds speed (+0x4c) times the frame's step (s0)
 # to a reveal position (+0x60) and shows every character whose extent that position passed. The message's tags (group 1,
