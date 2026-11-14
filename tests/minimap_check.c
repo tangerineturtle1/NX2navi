@@ -14,7 +14,7 @@ const int rt_game_version = 111;
 #include "minimap.c"
 
 static char minimap_v[16] = "game", button_v[16] = "down";
-static int saves, opens;
+static int saves, opens, closes;
 const char *cfg_value(const char *key) {
     if (!strcmp(key, "NX2NAVI_MINIMAP")) return minimap_v;
     if (!strcmp(key, "NX2NAVI_MINIMAP_BUTTON")) return button_v;
@@ -37,8 +37,10 @@ void rt_register_host(uint64_t addr, GuestFn fn) {
 }
 
 #define OPEN_FN 0x7777000ull
+#define CLOSE_FN 0x7778000ull
 static uint8_t screen[0x2400] __attribute__((aligned(8)));
-static uint64_t mgr[16], link_actor[4], finds;
+static uint64_t mgr[16], link_actor[4], finds, event_mgr[16];
+static void set_event(int on) { event_mgr[0x68 / 8] = on ? 1 : 0; }
 static int ui_ready = 1;
 uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     va_list ap;
@@ -48,6 +50,11 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     if (fn == OPEN_FN) {   // the screen's open: raises the request; the stand-in screen is open at the next poll
         assert(a == (uintptr_t)screen && b == 3 && screen[MAP_IS_MINI] == 1);
         opens++, screen[SCR_REQUEST] = 3;
+        return 0;
+    }
+    if (fn == CLOSE_FN) {   // the screen's close: the stand-in screen is closed at the next poll
+        assert(a == (uintptr_t)screen && (int64_t)b == -4);
+        closes++, screen[SCR_REQUEST] = (uint8_t)(int8_t)-4;
         return 0;
     }
     assert(fn == test_main_base + SCREEN_FIND && n == 2 && a == (uintptr_t)mgr && b == MAP_SCREEN_HASH);
@@ -63,6 +70,7 @@ static uint64_t poll(uint64_t buttons, int gameplay) {
     if (gameplay && set_on) c.x[0] = (uintptr_t)link_actor, link_fn(&c);
     minimap_pad(&c, &buttons);
     if (screen[SCR_REQUEST] == 3) set_state(ST_OPEN, 0);   // the manager takes the request
+    if ((int8_t)screen[SCR_REQUEST] == -4) set_state(ST_CLOSED, 0);
     return buttons;
 }
 static int drawn(void) { return screen[SCR_VISIBLE]; }
@@ -79,6 +87,9 @@ int main(void) {
     uint64_t vt = test_main_base + MAP_SCREEN_VTABLE, open_fn = OPEN_FN;
     memcpy(screen, &vt, 8);
     memcpy(img + MAP_SCREEN_VTABLE + VT_OPEN, &open_fn, 8);
+    uint64_t close_fn = CLOSE_FN, event_ptr = (uintptr_t)event_mgr;
+    memcpy(img + MAP_SCREEN_VTABLE + VT_CLOSE, &close_fn, 8);
+    memcpy(img + EVENT_MGR, &(uint64_t){(uintptr_t)&event_ptr}, 8);
     link_actor[0] = test_main_base + LINK_VTABLE;
 
     // Normal: the game shows the minimap; with minimap = game nothing is looked up
@@ -205,6 +216,37 @@ int main(void) {
     screen[MAP_IS_MINI] = 0;
     poll(0, 0);
     assert(drawn());
+
+    // an event (a conversation: Link's update goes on) with the minimap this file opened on Pro: closed at once, never
+    // opened during it, a press is the game's; after it the minimap comes back once REOPEN_POLLS polls have passed
+    snprintf(minimap_v, sizeof minimap_v, "shown");
+    screen[MAP_IS_MINI] = 1;
+    set_state(ST_CLOSED, 0);
+    opens = closes = 0;
+    for (int i = 0; i < REOPEN_POLLS; i++) poll(0, 1);
+    assert(opens == 1 && screen[SCR_STATE] == ST_OPEN);
+    set_event(1);
+    poll(0, 1);
+    assert(closes == 1 && screen[SCR_STATE] == ST_CLOSED);
+    for (int i = 0; i < 300; i++) poll(0, 1);
+    assert(opens == 1 && closes == 1);
+    assert(poll(DOWN, 1) == DOWN && !strcmp(minimap_v, "shown"));   // the conversation's: no switch
+    poll(0, 1);
+    set_event(0);
+    for (int i = 0; i < REOPEN_POLLS - 1; i++) poll(0, 1);
+    assert(opens == 1);
+    poll(0, 1);
+    assert(opens == 2 && screen[SCR_STATE] == ST_OPEN);
+    // the game's own minimap (Normal) in an event is left to the game: it closes it itself
+    set_state(ST_CLOSED, 0);
+    poll(0, 1);   // seen closed: no longer this file's
+    set_state(ST_OPEN, 0);
+    poll(0, 1);   // opened by the game (Normal) before this file would
+    assert(opens == 2);
+    set_event(1);
+    for (int i = 0; i < 50; i++) poll(0, 1);
+    set_event(0);
+    assert(closes == 1);
 
     puts("minimap_check: ok");
     free(img);

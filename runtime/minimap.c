@@ -14,15 +14,20 @@
 // and nothing that waits for it sees a difference; the pause menu's map (+0x2350 = 0) is never touched.
 // shown: the drawn byte is 1 while the screen is the minimap, and when the game leaves the screen closed during
 // gameplay (the Pro interface never opens it) this file opens it in its small form as SeqOneShotOpenMapMenu does.
-// It does so only after the screen has stayed closed through REOPEN_POLLS polls in a row of gameplay, so a screen the
-// game closes on its way into a menu, a cutscene or a load (which stop Link's update) is not opened behind it.
+// It does so only after the screen has stayed closed through REOPEN_POLLS polls in a row of gameplay without an event,
+// so a screen the game closes on its way into a menu, a cutscene or a load (which stop Link's update) is not opened
+// behind it. An event (a cutscene or a conversation, during which Link's update can go on) is running while the event
+// manager **[main+0x4c7e090] has its +0x68, what SeqQueryIsEventRunning answers (main+0xbcc100 with 0): then the screen
+// is never opened, and one this file opened is closed (vtable +0x30 with -4), as the game closes its interface for an
+// event; the Pro interface, which never opened it, would leave it.
 // game: the game decides; the drawn byte this file held is handed back as 1.
 //
 // Settings (live): minimap_button (off, or down: the D-pad's down; the Controls tab's one row) switches between shown
 // and hidden, starting from what is on the screen, and saves the choice as minimap (game, shown or hidden; no row of
-// its own, game until the first press). With the button off the game decides, whatever minimap holds. The press counts only during gameplay, while
-// Link's movement update runs (the set's site at the top of main+0x4aaa80 calls minimap_link); during gameplay it is
-// kept from the game until it is released, so it does not also do what the game gives it.
+// its own, game until the first press). With the button off the game decides, whatever minimap holds. The press
+// counts only during gameplay: while Link's movement update runs (the set's site at the top of main+0x4aaa80 calls
+// minimap_link) and no event does. Then it is kept from the game until it is released, so it does not also do what
+// the game gives it.
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -37,6 +42,7 @@
 #endif
 
 #define SCREEN_MGR 0x4c7e098ull        // main offset: the pointer to eui's screen manager pointer
+#define EVENT_MGR 0x4c7e090ull         // ... and to the event manager pointer
 #define SCREEN_FIND 0xb25cd0ull        // (manager, hash): the screen of that name, cast to its class, or 0
 #define MAP_SCREEN_HASH 0xc3332ad4u    // MurmurHash3 of "MapMenu_00"
 #define MAP_SCREEN_VTABLE 0x4be8300ull
@@ -55,9 +61,15 @@ static int latched;                          // the press now held began in game
 static int last_held;
 static uint64_t drawn_screen;                // the screen whose drawn byte this file holds, or 0
 static int closed_polls;                     // shown: gameplay polls in a row with the screen closed
-static int opened;                           // shown: this file opened the screen (log only)
+static int opened;                           // shown: times this file opened the screen (log only)
+static uint64_t ours;                        // shown: the screen this file opened, until it is seen closed
 
 static uint64_t rd64(uint64_t a) { return a ? *(const uint64_t *)(uintptr_t)a : 0; }
+// An event (a cutscene, a conversation) is running: SeqQueryIsEventRunning's answer
+static int event_running(void) {
+    uint64_t m = rd64(rd64(MOD_MAIN_BASE + EVENT_MGR));
+    return m && rd64(m + 0x68);
+}
 static uint8_t rd8(uint64_t a) { return *(const volatile uint8_t *)(uintptr_t)a; }
 static void wr8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
 
@@ -119,7 +131,7 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
     int avail = minimap_available(), button = avail && setting_button();
     if (avail && rt_patch_enabled(minimap_set()) != button) rt_patch_switch(minimap_set(), button);
 
-    int n = atomic_load(&polls), gameplay = n < GAMEPLAY_POLLS;
+    int n = atomic_load(&polls), event = event_running(), gameplay = n < GAMEPLAY_POLLS && !event;
     if (n <= GAMEPLAY_POLLS) atomic_store(&polls, n + 1);
     int mode = button ? setting_mode() : MODE_GAME;   // the button off turns the whole of it off
     uint64_t s = 0;
@@ -157,7 +169,16 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
     }
     // shown
     set_drawn(s, 1);
-    if (screen_up(s) || !gameplay) {
+    if (screen_up(s)) {
+        closed_polls = 0;
+        if (event && ours == s) {   // an event the Pro interface would leave it on for
+            rt_call(c, rd64(rd64(s) + VT_CLOSE), 2, s, (uint64_t)(int64_t)-4);
+            ours = 0;
+        }
+        return;
+    }
+    ours = 0;
+    if (!gameplay) {
         closed_polls = 0;
         return;
     }
@@ -169,6 +190,7 @@ void minimap_pad(Cpu *c, uint64_t *buttons) {
     wr8(s + MAP_IS_MINI, 1);
     wr8(s + MAP_IS_DIRECT, 0);
     rt_call(c, rd64(rd64(s) + VT_OPEN), 2, s, (uint64_t)3);
+    ours = s;
     if (opened++ < 20) rt_log("minimap: opened the minimap the game left closed (state %d)", rd8(s + SCR_STATE));
 }
 
