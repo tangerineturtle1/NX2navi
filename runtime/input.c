@@ -515,7 +515,7 @@ static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 //   reports go to the two HID devices directly (input_hd_pair.c).
 // - HD_AUDIO, a DualSense (or DualSense Edge) on USB: its two haptic actuators play the game's values as sound on the
 //   third and fourth channels of the controller's audio device (rumble_haptics.c), opened at the first value the game
-//   sends with the setting on. Over Bluetooth it has no audio device and keeps its motors.
+//   sends with the setting on, and tried again every 2 s while it is not listed yet. Over Bluetooth it has no audio device and keeps its motors.
 // Every other gamepad keeps the motors' path, the Switch 2 controllers too (other product ids, another protocol).
 // The game's thread only posts its newest values (input_rumble_hd). A thread of its own writes the reports (hd_main):
 // every HD_TICK_NS while there is something to write it asks rumble_hd_due, which spaces the reports, keeps only the
@@ -539,7 +539,12 @@ static int hd_ended;                  // input_rumble_hd_stop ran: nothing is wr
 static int hd_first_logged;           // under lock: the primary's first report was logged (hd_wrote)
 static volatile int32_t hd_thread;    // 0 not started, 1 running, -1 it could not be started (set under hd_lock)
 static volatile int32_t hd_audio;     // any thread: the primary is HD_AUDIO
-static volatile int32_t hd_audio_open;   // 0 not tried for this primary, 1 open, -1 it did not open (logged)
+static volatile int32_t hd_audio_open;   // 0 to be tried, 1 open, -1 it did not open (tried again after HD_AUDIO_RETRY_NS)
+static uint64_t hd_audio_failed_at;      // when it last did not open
+static int hd_audio_logged;              // its first failure was logged (once per primary)
+// Windows lists the DualSense's audio device a second or two after its gamepad: a device that did not open is tried
+// again after this long, the gamepad keeping its motors meanwhile.
+#define HD_AUDIO_RETRY_NS 2000000000ull
 
 // NX2NAVI_RUMBLE_HD is on and rumble is not off altogether (NX2NAVI_RUMBLE=0); live (cfg_version). Any thread.
 static int hd_setting(void) {
@@ -635,6 +640,7 @@ static void hd_pad_leave(int connected) {
     if (pad_hd == HD_AUDIO) haptics_close();
     __atomic_store_n(&hd_audio, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&hd_audio_open, 0, __ATOMIC_RELAXED);
+    hd_audio_logged = 0;
     pad_hd = HD_NONE, sdl_rumbling = 0, hd_first_logged = 0;
     __atomic_store_n(&hd_shown, 0, __ATOMIC_RELAXED);
 }
@@ -711,6 +717,9 @@ int input_rumble_hd_available(void) { return __atomic_load_n(&hd_shown, __ATOMIC
 int input_rumble_hd_on(void) {
     // the audio path needs no report thread, but one that did not open leaves the gamepad to its motors
     int audio = __atomic_load_n(&hd_audio, __ATOMIC_RELAXED);
+    if (audio && __atomic_load_n(&hd_audio_open, __ATOMIC_RELAXED) < 0 &&
+        plat_now_ns() - __atomic_load_n(&hd_audio_failed_at, __ATOMIC_RELAXED) >= HD_AUDIO_RETRY_NS)
+        __atomic_store_n(&hd_audio_open, 0, __ATOMIC_RELAXED);   // the next value tries it again
     return __atomic_load_n(&hd_shown, __ATOMIC_RELAXED) &&
            (audio ? __atomic_load_n(&hd_audio_open, __ATOMIC_RELAXED) >= 0
                   : __atomic_load_n(&hd_thread, __ATOMIC_RELAXED) >= 0) &&
@@ -725,8 +734,12 @@ void input_rumble_hd(const RumbleHdValue v[2], const int live[2], float strength
         if (!open) {
             char why[256];
             open = haptics_open(why, sizeof why) ? 1 : -1;
+            if (open < 0) __atomic_store_n(&hd_audio_failed_at, plat_now_ns(), __ATOMIC_RELAXED);
             __atomic_store_n(&hd_audio_open, open, __ATOMIC_RELAXED);
-            rt_log("input: HD rumble on the DualSense: %s%s", open > 0 ? "" : "not available: ", why);
+            if (open > 0 || !hd_audio_logged)
+                rt_log("input: HD rumble on the DualSense: %s%s", open > 0 ? "" : "not available yet (tried again every 2 s): ",
+                       why);
+            hd_audio_logged = 1;
         }
         if (open > 0) haptics_post(v, live, strength);
         return;

@@ -131,7 +131,8 @@ static void SDLCALL pull(void *userdata, SDL_AudioStream *s, int additional, int
     }
 }
 
-// The DualSense's playback device: a name with "DualSense" in it and four channels or more. 0 when there is none.
+// The DualSense's playback device: a name with "DualSense" or "Wireless Controller" in it (Windows uses either) and four
+// channels or more. 0 when there is none.
 static SDL_AudioDeviceID find(char *name, size_t cap) {
     int n = 0;
     SDL_AudioDeviceID *ids = SDL_GetAudioPlaybackDevices(&n), found = 0;
@@ -139,7 +140,7 @@ static SDL_AudioDeviceID find(char *name, size_t cap) {
         const char *nm = SDL_GetAudioDeviceName(ids[i]);
         SDL_AudioSpec spec;
         int frames;
-        if (nm && strstr(nm, "DualSense") && SDL_GetAudioDeviceFormat(ids[i], &spec, &frames) &&
+        if (nm && (strstr(nm, "DualSense") || strstr(nm, "Wireless Controller")) && SDL_GetAudioDeviceFormat(ids[i], &spec, &frames) &&
             spec.channels >= CHANNELS) {
             found = ids[i];
             snprintf(name, cap, "%s", nm);
