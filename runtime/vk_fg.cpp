@@ -47,11 +47,16 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg_generating)
+    int direct = 0;   // the last frame was generated for the DXGI presenter (vk_fg_direct_frame), without AMD's swapchain
     FgrRing cuts;   // each frame id's camera cut, for the generation callback (vk_fg_reset.h)
     uint64_t cut_frames = 0;   // frames handed to the callback as cuts
     int prepared = 0;          // the last frame was prepared (generation on with its inputs)
     uint64_t vram = 0;         // the frame generation context's video memory as the library reported it, 0 not told
 } F;
+
+// vk_fg_direct_frame's request while it runs vk_fg_frame: the presented picture, the image for the generated one, the
+// display's peak in nits; masked: the caller keeps the HUD itself; done: a generated frame was recorded.
+struct { VkImage present, out; float peak; int masked, done; } DR;
 
 VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
     vk_queue_lock();   // the game's queue is shared with the recorder and the present path
@@ -67,8 +72,9 @@ ffxReturnCode_t generate(ffxDispatchDescFrameGeneration *d, void *user) {
     return vk_ffx_dispatch((ffxContext *)user, &d->header);
 }
 
-FfxApiResource image(const VkFfxImage *i) {
+FfxApiResource image(const VkFfxImage *i, VkImageUsageFlags usage = 0) {
     VkImageCreateInfo ci = {};
+    ci.usage = usage;
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = i->format;
@@ -141,7 +147,15 @@ extern "C" int vk_fg_active(void) { return F.sc != nullptr || vk_fg4_active(); }
 
 extern "C" int vk_fg_generating(void) {
     if (vk_fg4_active()) return vk_fg4_generating();
-    return F.sc && !F.failed && __atomic_load_n(&F.on, __ATOMIC_RELAXED);
+    return (F.sc || (F.direct && vk_fg_direct_ok())) && !F.failed && __atomic_load_n(&F.on, __ATOMIC_RELAXED);
+}
+
+// Frame generation without AMD's swapchain, for the DXGI presenter (gfx_present.c fg_direct): the setting as
+// vk_fg_wanted reads it, with the FSR 3.1 library and an upscaler (its output before the HUD is what the HUD mask
+// compares), and no AMD swapchain in place. FSR 4's frame generation (use4) keeps its own swapchain.
+extern "C" int vk_fg_direct_ok(void) {
+    return !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") && cfg_bool("NX2NAVI_DLAA") && vk_dlaa_wanted() && !vk_dlssg_dpa() &&
+           !F.sc && !vk_fg4_active() && !use4() && !F.failed && vk_ffx_framegen_available();
 }
 
 extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
@@ -224,7 +238,10 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
                             VkImageView hudless_view, const int pic[4]) {
     (void)hudless_view;
     if (vk_fg4_active()) return vk_fg4_frame(cb, sc, fmt, ext, hudless, pic);
-    if (!F.sc || F.failed) return;
+    const bool direct = DR.present != VK_NULL_HANDLE;
+    if ((!F.sc && !direct) || F.failed) return;
+    if (direct && !vk_ffx_load()) return fail("loading the FSR 3.1 library", 0);
+    F.direct = direct;
     vk_dlaa_hudless_wanted = 1;   // the upscaling pass keeps a copy of the picture before the HUD (vk_dlaa.c hudless)
     const VkCtx *c = vk_ctx();
     VkFfxImage depth, mv;
@@ -283,10 +300,10 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     }
     // Only with the picture without the HUD: generated from the presented picture alone, the HUD would be warped along
     // with the scene behind it and trail when the camera turns. A frame without that picture is shown as it is.
-    int on = have && hudless && !menu_is_open();
+    int on = have && (hudless || (direct && DR.masked)) && !menu_is_open();
     __atomic_store_n(&F.on, on, __ATOMIC_RELAXED);
     if (!have) F.no_inputs++;
-    else if (!hudless) F.no_hudless++;
+    else if (!hudless && !(direct && DR.masked)) F.no_hudless++;
     else if (!on) F.paused++;
     F.frame++;
     // A cut: DLSS started a new history, or without an upscaler the same cases did (vk_dlaa_fg_inputs), or the frame before was not prepared (generation off for
@@ -310,11 +327,16 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     cfg.frameGenerationCallbackUserContext = &F.fg;
     cfg.frameGenerationEnabled = on != 0;
     cfg.allowAsyncWorkloads = false;
+    if (direct) {   // no swapchain to tell: the generation is dispatched below, into this frame's command buffer
+        cfg.swapChain = nullptr;
+        cfg.frameGenerationCallback = nullptr, cfg.frameGenerationCallbackUserContext = nullptr;
+        cfg.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    }
     // the picture's rectangle: with black bars beside or below it (a window of another shape) a generation over the
     // whole swapchain warped the picture's edges into the bars
     cfg.generationRect = pic && pic[2] > 0 && pic[3] > 0 ? FfxApiRect2D{pic[0], pic[1], pic[2], pic[3]}
                                                          : FfxApiRect2D{0, 0, (int32_t)ext.width, (int32_t)ext.height};
-    if (on) {
+    if (on && hudless) {
         VkFfxImage h = {hudless, fmt, ext.width, ext.height, 1};
         cfg.HUDLessColor = image(&h);
         F.hudless++;
@@ -346,6 +368,38 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     p.motionVectors = image(&mv);
     r = vk_ffx_dispatch(&F.fg, &p.header);
     if (r != FFX_API_RETURN_OK) return fail("frame generation preparation", r);
+    if (direct) {
+        ffxDispatchDescFrameGeneration g = {};
+        g.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+        g.commandList = cb;
+        VkFfxImage pi = {DR.present, fmt, ext.width, ext.height, 0}, oi = {DR.out, fmt, ext.width, ext.height, 1};
+        g.presentColor = image(&pi);
+        g.outputs[0] = image(&oi, VK_IMAGE_USAGE_STORAGE_BIT);
+        g.numGeneratedFrames = 1;
+        g.reset = reset != 0 || F.frame < 3;
+        g.backbufferTransferFunction = fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB
+                                     : hdr_format(fmt) ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ
+                                                       : FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        g.minMaxLuminance[0] = 0.0f, g.minMaxLuminance[1] = DR.peak > 0 ? DR.peak : 1000.0f;
+        g.generationRect = cfg.generationRect;
+        g.frameID = F.frame;
+        r = vk_ffx_dispatch(&F.fg, &g.header);
+        if (r != FFX_API_RETURN_OK) return fail("frame generation", r);
+        F.generated++;
+        DR.done = 1;
+    }
+}
+
+// The frame's preparation and its generated frame, both into cb: present is the picture the display gets (GENERAL,
+// sampled), out the image for the frame between it and the one before (GENERAL, storage). 1: out was written; 0: this
+// frame has no generated one (the menu is open, no depth or HUD-less picture, or a failure, which is logged).
+// masked: there is no HUD-less picture and the caller puts the rendered frame's HUD into out afterwards.
+extern "C" int vk_fg_direct_frame(VkCommandBuffer cb, VkFormat fmt, VkExtent2D ext, VkImage hudless, const int pic[4],
+                                  VkImage present, VkImage out, float peak_nits, int masked) {
+    DR = {present, out, peak_nits, masked, 0};
+    vk_fg_frame(cb, VK_NULL_HANDLE, fmt, ext, hudless, VK_NULL_HANDLE, pic);
+    DR.present = VK_NULL_HANDLE;
+    return DR.done;
 }
 
 extern "C" void vk_fg_release(void) {
@@ -357,6 +411,7 @@ extern "C" void vk_fg_release(void) {
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
     F.prepared = 0;
+    F.direct = 0;
 }
 
 // The frame generation contexts' video memory, FSR 3.1's and FSR 4's (vk_fg4_vram), for the memory report

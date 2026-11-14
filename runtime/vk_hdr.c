@@ -33,6 +33,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "gfx_dxp.h"
 #include "hdr_encode_spv.h"
 #include "hdr_fullscreen_spv.h"
 #include "hdr_tonemap_spv.h"
@@ -756,7 +757,8 @@ int vk_hdr_track;                 // vk_exec_draw.c calls vk_hdr_draw: set at th
 static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
 static PlatMutex rec_lock = PLAT_MUTEX_INIT;
 // per presented window image: what the last draw copied, and where in the stream (vk_exec_stream_pos)
-static struct { VkImage win, src; VkFormat fmt; uint64_t pos; } recs[4];
+static struct { VkImage win, src; VkFormat fmt; uint32_t w, h; uint64_t pos; } recs[4];
+static VkImage fg_win;   // vk_hdr_fg_track: the window image last presented with the game's own HDR picture
 static int nrecs;
 
 void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
@@ -778,6 +780,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     uint64_t pos = vk_exec_stream_pos();
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
+    uint32_t sw = 0, sh = 0;
     int ntex = 0, slot = -1;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
@@ -788,11 +791,12 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     if (ntex == 1 && slot >= 0 && slot < 128 && ex->tex[1][slot]) {
         const VkTexImage *s = vk_texture_by_id(NVN_HANDLE_TEX(ex->tex[1][slot]), NULL, NULL);
         if (s && is_float(s->format) && s->width == t->width && s->height == t->height && s->samples == 1)
-            src = s->image, fmt = s->format;
+            src = s->image, fmt = s->format, sw = s->width, sh = s->height;
     }
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++)
-        if (recs[i].win == t->image && pos >= recs[i].pos) recs[i].src = src, recs[i].fmt = fmt, recs[i].pos = pos;
+        if (recs[i].win == t->image && pos >= recs[i].pos)
+            recs[i].src = src, recs[i].fmt = fmt, recs[i].w = sw, recs[i].h = sh, recs[i].pos = pos;
     plat_mutex_unlock(&rec_lock);
 }
 
@@ -811,11 +815,36 @@ void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *form
     if (!logged && *image != win->image) logged = 1, rt_log("hdr: the present reads the game's float picture");
 }
 
+// Frame generation with the game's own HDR picture (gfx_present.c fg_direct): the float picture the game's last pass
+// read to make the window texture's, HUD included. vk_hdr_fg_track at each present of a window texture starts the
+// records (vk_hdr_draw) and names the texture; vk_hdr_fg_source gives what its last draw read. 0: none known.
+void vk_hdr_fg_track(const VkTexImage *win) {
+    if (!vk_hdr_native()) return;
+    vk_hdr_track = 1;
+    plat_mutex_lock(&rec_lock);
+    int r = -1;
+    for (int i = 0; i < nrecs; i++)
+        if (recs[i].win == win->image) r = i;
+    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE, recs[r].pos = 0;
+    fg_win = win->image;
+    plat_mutex_unlock(&rec_lock);
+}
+
+int vk_hdr_fg_source(VkImage *image, VkFormat *format, uint32_t *w, uint32_t *h) {
+    int ok = 0;
+    plat_mutex_lock(&rec_lock);
+    for (int i = 0; i < nrecs; i++)
+        if (recs[i].win == fg_win && recs[i].src) *image = recs[i].src, *format = recs[i].fmt, *w = recs[i].w, *h = recs[i].h, ok = 1;
+    plat_mutex_unlock(&rec_lock);
+    return ok;
+}
+
 void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget it as window or source
     if (!vk_hdr_track) return;   // no records before the first HDR present (vk_hdr_present_source): no lock per image
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++) {
         if (recs[i].src == image) recs[i].src = VK_NULL_HANDLE;
+        if (fg_win == image) fg_win = VK_NULL_HANDLE;
         if (recs[i].win == image) recs[i] = recs[--nrecs], recs[nrecs] = (typeof(recs[0])){0}, i--;
     }
     plat_mutex_unlock(&rec_lock);
@@ -824,7 +853,8 @@ void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget i
 // ---- swapchain
 
 // While NX2NAVI_HDR is on (vk_hdr_wanted), the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out
-// set, else 0 and the reason logged once.
+// set, else 0 and that logged once (gfx_present.c create_swapchain then tries the DXGI presenter and says what the
+// picture becomes).
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
     if (!vk_hdr_wanted()) return 0;
     static int logged;
@@ -844,9 +874,7 @@ int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceForm
                 logged = 1;
                 return 1;
             }
-    if (!logged)
-        rt_log("hdr: the display offers no HDR10 format, so the picture stays SDR (Windows: turn on \"Use HDR\" in the "
-               "display settings; Linux: a Wayland compositor with colour management and HDR on)");
+    if (!logged) rt_log("hdr: the window's Vulkan surface offers no HDR10 format");
     logged = 1;
     return 0;
 }
@@ -870,6 +898,17 @@ void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc) {
                           .maxFrameAverageLightLevel = n.game};
     set(c->device, 1, &sc, &m);
 }
+
+// The same for the DXGI presenter's swapchain (gfx_dxp.h), which takes them through its own call.
+void vk_hdr_metadata_dxgi(int new_sc) {
+    static unsigned sent = ~0u;
+    if (!new_sc && cfg_version() == sent) return;
+    sent = cfg_version();
+    Nits n = nits();
+    dxp_metadata(n.peak, n.game);
+}
+
+float vk_hdr_peak_nits(void) { return nits().peak; }
 
 // ---- 3. present passes
 

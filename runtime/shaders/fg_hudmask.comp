@@ -1,0 +1,37 @@
+#version 450
+// Frame generation with the game's own HDR picture (gfx_present.c fg_direct): the generated frame keeps the HUD of the
+// rendered frame. The game encodes its picture for the display itself, so there is no picture without the HUD in the
+// display's encoding for the generation to work from, and a generated frame warps the HUD with the scene behind it.
+// pre is the upscaler's output before the HUD was drawn, post the picture the game's last pass read, HUD included,
+// both linear: where they differ, and around it, the generated frame gets the rendered frame's pixel. Outside the
+// picture's rectangle (black bars) too.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D pre;
+layout(set = 0, binding = 1) uniform sampler2D post;
+layout(set = 0, binding = 2) uniform sampler2D cur;
+layout(set = 0, binding = 3, rgb10_a2) uniform writeonly image2D gen;
+layout(push_constant) uniform PC {
+    vec4 rect;   // the picture in the window: x, y, width, height in pixels
+    vec4 opt;    // x: debug (1: the mask in white instead)
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gen);
+    if (p.x >= size.x || p.y >= size.y) return;
+    vec2 uv = (vec2(p) + 0.5 - pc.rect.xy) / pc.rect.zw;
+    bool hud = uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0;
+    if (!hud) {
+        vec2 px = 2.0 / vec2(textureSize(pre, 0));   // two texels around: the generation smears a HUD edge that far
+        for (int y = -1; y <= 1 && !hud; y++)
+            for (int x = -1; x <= 1; x++) {
+                vec2 q = uv + vec2(x, y) * px;
+                vec3 a = textureLod(pre, q, 0.0).rgb, b = textureLod(post, q, 0.0).rgb;
+                vec3 d = abs(a - b);
+                float m = max(d.r, max(d.g, d.b)), s = max(a.r, max(a.g, a.b)) + max(b.r, max(b.g, b.b));
+                if (m > 0.04 * s + 0.004) { hud = true; break; }   // above what the two formats' rounding leaves
+            }
+    }
+    if (pc.opt.x > 0.5) imageStore(gen, p, hud ? vec4(1.0) : vec4(0.0, 0.0, 0.0, 1.0));
+    else if (hud) imageStore(gen, p, texelFetch(cur, p, 0));
+}

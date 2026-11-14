@@ -612,7 +612,17 @@ static struct {
 #define FG_INPUT_PRESENTS 4   // an evaluation is taken at its own present, or the one after when the present thread is behind
 static int fg_current(uint64_t made) { return D.presents - made <= FG_INPUT_PRESENTS; }
 
+// With the game's own HDR picture: the upscaler's output before the HUD, linear RGBA16F in GENERAL, once per copy.
+int vk_dlaa_fg_prehud(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h) {
+    if (!vk_hdr_native() || !D.hl_fresh) return 0;
+    D.hl_fresh = 0;
+    if (!fg_current(D.hl_at) || D.hl_fmt != VK_FORMAT_R16G16B16A16_SFLOAT) return 0;
+    *img = D.hl, *view = D.hl_view, *w = D.hl_w, *h = D.hl_h;
+    return 1;
+}
+
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt) {
+    if (vk_hdr_native()) return 0;   // the game encodes its picture itself: this copy is not what the display gets
     if (!D.hl_fresh) return 0;
     D.hl_fresh = 0;
     if (!fg_current(D.hl_at)) return 0;
@@ -2465,8 +2475,8 @@ static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32
 static void hudless(VkCommandBuffer cb, VkImage src, uint32_t w, uint32_t h) { hudless_from(cb, src, 0, 0, w, h); }
 static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32_t layer, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
-    int hdr = vk_hdr_wanted() && !vk_hdr_native();
-    if (vk_hdr_native()) return;
+    // the game's own HDR: the same linear copy, for the HUD's mask (vk_dlaa_fg_prehud); it is no HUD-less picture
+    int hdr = vk_hdr_wanted();
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();

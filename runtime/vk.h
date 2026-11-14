@@ -64,6 +64,7 @@ typedef struct VkCtx {
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
+        has_win32_sharing,                  // VK_KHR_external_memory_win32 and _semaphore_win32 (gfx_dxp.h)
         has_mesh_shader, has_vrs,           // VK_EXT_mesh_shader with taskShader and meshShader (NVN2 task/mesh stages)
         has_maximal_reconvergence,          // VK_KHR_shader_maximal_reconvergence (vk_pipeline.c spirv_reconverge)
         has_pipeline_binary,                // VK_KHR_pipeline_binary with VK_KHR_maintenance5 (vk_pipeline.c pipe_create)
@@ -246,6 +247,9 @@ int vk_hdr_needs_restart(void);   // the menu's HDR row: the value set takes eff
 void vk_hdr_off(void);   // probes that read back 8-bit swapchain pixels: SDR whatever the setting
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out);
 void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc);
+void vk_hdr_metadata_dxgi(int new_sc);   // the same for the DXGI presenter's swapchain (gfx_dxp.h)
+float vk_hdr_peak_nits(void);            // the display's peak as the HDR settings give it
+int vk_hdr_fg_source(VkImage *image, VkFormat *format, uint32_t *w, uint32_t *h);
 void vk_hdr_set_active(int on);
 int vk_hdr_active(void);
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
@@ -631,6 +635,7 @@ typedef struct {
                                    // the GPU is past the submission being recorded (vk_defer_free), as the replay and DLSS
                                    // keep pointers to render targets across a command buffer; no view of it is cached
 } VkTexImage;
+void vk_hdr_fg_track(const VkTexImage *win);   // frame generation with the game's own HDR picture (vk_hdr.c)
 // A 2D texture a shader samples as a 3D one: its one-slice 3D copy, refreshed when its content changed (vk_texture.c);
 // NULL when it does not qualify. Texture lock held.
 const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer);
