@@ -656,7 +656,7 @@ static const struct { const char *key, *value; } LOWEND[] = {
 // only then (ui/menu.cpp rows_low_end). Keys the game had before the mode (replay_async, freeze_idle, zstd_native,
 // tex_released_max, astc_scratch_keep) are not among them.
 static const char *const LOWEND_ONLY[] = {
-    "MESH_EMULATION", "MESH_EMU_MB", "MESH_EMU_TASKS", "MESH_EMU_BATCH", "TEX_CLOBBER", "MIRROR_STAGE", "MIRROR_HOT",
+    "MESH_EMULATION", "MESH_EMU_MB", "MESH_EMU_TASKS", "MESH_EMU_BATCH", "MIRROR_STAGE", "MIRROR_HOT",
     "SUBMIT_FINISH_GPU", "SUBMIT_FINISH_RESULTS", "SUBMIT_FINISH_KINDS", "SNAP_WIDEN", "VRAM_HEAP_LIMIT",
     "VRAM_RESERVE_MB", "UPLOAD_BATCH_MB", "FOLIAGE", "FLUSH_SKIP_CLEAN", "VEC_INDEX_FIX", "GUEST_OPT", "PASS_TIMES",
     "DUMP_KEY", "LOG_TEX_NEW", "SVC_WAITS",
