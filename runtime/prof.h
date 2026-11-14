@@ -4,6 +4,7 @@
 
 extern volatile uint32_t prof_render_tid;   // the thread that presents (perf_present)
 extern volatile uint32_t prof_main_tid;     // the guest main thread (perf_main_thread)
+extern volatile uint32_t prof_worker_tid[16];   // the replay workers (vk_exec.c rw_main): NX2NAVI_PROFILE_REPLAY=2
 extern volatile uint32_t prof_replay_tid;   // the asynchronous replay (perf_replay_thread): its waits hold up the frame too
 
 // The sampler; perf.c's weak versions do nothing.

@@ -415,6 +415,8 @@ typedef struct {
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
     VkPhysicalDevicePresentIdFeaturesKHR pid;
     VkPhysicalDeviceAntiLagFeaturesAMD antilag;
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT mprio;
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable;
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
@@ -455,6 +457,17 @@ static int create_device(void) {
     OPTIONAL_EXT(has_provoking_vertex, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
     OPTIONAL_EXT(has_robustness2, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, rob2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
+    // Pageable video memory (NX2NAVI_VRAM_PAGEABLE): past the budget Windows pages device memory out by the priority of
+    // each allocation, textures (0.3) before render targets, VRAM mirrors and physical pools (1.0): vk_texture.c
+    // image_alloc, vk_memory.c mirror_create and alloc_physical. VMA passes the priority with its flag (below). Without
+    // it the texture residency (vk_texture.c "residency") could not bring the use down to the budget.
+    if (cfg_bool("NX2NAVI_VRAM_PAGEABLE") && has_ext(ep, ne, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) &&
+        has_ext(ep, ne, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
+        OPTIONAL_EXT(has_memory_priority, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, mprio,
+                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT);
+        OPTIONAL_EXT(has_pageable, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME, pageable,
+                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT);
+    }
     // The translator's SPIR-V declares fragment shader interlock whenever the host reports it (vk_pipeline.c spirv_fixup).
     OPTIONAL_EXT(has_fragment_shader_interlock, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, fsi,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
@@ -584,6 +597,9 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;
+    if (!c->mprio.memoryPriority) g_vk.has_memory_priority = 0;
+    if (!c->pageable.pageableDeviceLocalMemory) g_vk.has_pageable = 0;
+    rt_log("vk: pageable video memory with priorities %s (NX2NAVI_VRAM_PAGEABLE)", g_vk.has_pageable && g_vk.has_memory_priority ? "on" : "off");
     if (g_vk.has_vrs) {   // the rate is set per draw; no rate attachment and no per-primitive rates
         c->vrs.attachmentFragmentShadingRate = c->vrs.primitiveFragmentShadingRate = VK_FALSE;
         if (!c->vrs.pipelineFragmentShadingRate) g_vk.has_vrs = 0;
@@ -712,7 +728,8 @@ static int create_device(void) {
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
-                                          (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
+                                          (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0) |
+                                          (g_vk.has_memory_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0),
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
     VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];

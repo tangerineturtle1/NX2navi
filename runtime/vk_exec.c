@@ -2034,6 +2034,7 @@ static void rw_main(void *arg) {
     RwWorker *w = arg;
     plat_thread_priority(PLAT_PRIO_HIGHEST);   // as the recording thread (rec_claim)
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME, as on the recording thread
+    if (w->idx >= 0 && w->idx < 16) prof_worker_tid[w->idx] = plat_thread_id();
     vk_exec_draw_ctx_use(w->dc);
     for (;;) {
         par_help();

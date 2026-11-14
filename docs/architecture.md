@@ -264,6 +264,16 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   the holes of fuller ones, a few per frame and only in frames with time to spare; which blocks is decided from a
   table of what lies in them (`vk_tex_compact.h`), and the old image of a moved texture stays until no descriptor
   set and no submission can still name it (`vk_texture.c`, "the pass").
+- Texture residency (`NX2NAVI_TEX_RESIDENCY`, on by default; `vk_texture.c` "residency"): past the video memory
+  budget less 256 MiB, textures the CPU provides that no shader sampled for 45 presents are copied on the GPU into
+  system memory, whole blocks of VMA's at a time, and a texture sampled again comes back. A released texture no lookup
+  reaches is dropped instead, and one an area load made that nothing sampled since counts as cold after 8 presents.
+  Textures of 1 MiB or more get memory of their own so that a move gives it back. Device memory is pageable
+  (`NX2NAVI_VRAM_PAGEABLE`) with priorities: render targets and VRAM mirrors are the last Windows moves out. The host
+  heaps that hold what moved out are guarded too: the moves stop 1 GiB short of their budget, and a pool import that
+  finds them full first frees textures there that nothing reaches. Pools that hold only the storage of CPU-provided
+  textures and that no submission ever resolved give their import back (`NX2NAVI_POOL_TEX_RELEASE`, `vk_memory.c`
+  "texture storage pools") and are imported again when resolved.
 - Memory report: beside each `mem: holes` line, `mem: by owner` splits the device-local memory the driver counts into
   VMA's allocations by the file that made them (`vk_vma_budget.c`, "owners"; the textures further by the texture
   cache's census), the free space inside VMA's blocks and what VMA never allocated (pipelines, descriptor memory, the

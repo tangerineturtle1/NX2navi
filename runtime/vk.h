@@ -59,6 +59,7 @@ typedef struct VkCtx {
     int validation;                         // layer active
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
+        has_memory_priority, has_pageable,  // VK_EXT_memory_priority, VK_EXT_pageable_device_local_memory (NX2NAVI_VRAM_PAGEABLE)
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
         has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints (NX2NAVI_PASS_CRUMBS=1, vk_crumbs.c)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
@@ -828,6 +829,11 @@ typedef struct {
     uint64_t bytes_live_gpu, bytes_live_idle, bytes_released_young;
 } VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
+// The storage ranges [lo, hi) of the textures whose content the CPU provides, sorted by lo, as pairs in a malloc'd
+// array (*n pairs); NULL when there are none.
+uint64_t *vk_texture_cpu_ranges(int *n);
+int vk_texture_host_room(uint64_t bytes);   // vk_texture.c: a pool's import found the host heaps full
+void vk_mem_tex_pools(uint64_t frame);   // vk_memory.c "texture storage pools", every few presents
 // The texture cache's host memory for the memory report (vk_memory.c system_log), in bytes: its entries and tables, and
 // the CPU's decode and write-back temporaries in use now and at most at once since the last call (which resets that).
 typedef struct { uint64_t entries, bytes, tmp, tmp_peak; } VkTexHost;

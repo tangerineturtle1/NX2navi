@@ -57,6 +57,8 @@ typedef struct PoolRec {
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
+    uint8_t tex_off;                   // POOL_IMPORT: its import was given back, as texture storage ("texture storage
+                                       // pools" below); a resolve imports it again
     // NX2NAVI_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
@@ -127,6 +129,7 @@ static void shadow_forget(PoolRec *r);
 static void pool_retiring(PoolRec *r);  // pool_fini: kept until pool_retire (or vk_mem_shutdown)
 static void shadow_table_add(PoolRec *r);
 static void pool_retire(void *arg);    // completion thread: destroys a finalized pool's record
+static int vk_mem_tex_pools_now(void);   // "texture storage pools"
 static int pool_fini_idle(void);
 static void pool_fini_wait(void);
 static void pool_wait_add(PoolRec *r);
@@ -547,7 +550,7 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
     if (ri.memoryRequirements.alignment > align) align = ri.memoryRequirements.alignment;
     VkMemoryRequirements req = {.size = (rb.size + align - 1) & ~(align - 1), .alignment = align, .memoryTypeBits = bits};
     VmaAllocationCreateInfo aci = {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, .priority = 1.0f};
     res = vmaAllocateMemory(c->vma, &req, &aci, &r->alloc, NULL);
     if (res != VK_SUCCESS) {   // video memory full (VMA heap limits, vk_device.c): any memory the pool can live in
         VmaAllocationCreateInfo any = {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
@@ -643,6 +646,9 @@ static int pool_init(pool_t *p) {
         r->kind = POOL_IMPORT;
         mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
         ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        // the host heap full: what holds only texture storage makes room, and the import is tried once more
+        if (!ok && vk_mem_tex_pools_now()) ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        if (!ok && vk_texture_host_room(p->size)) ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
             long n = plat_inc32(&n_import_failures);
@@ -847,6 +853,9 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
 // (shadow storage). A lookup (vk_mem_lookup) leaves it off: the caller reads guest memory itself or only asks what
 // backs the address. Shaders that reach a pool through the device address table resolve nothing: the part they run in
 // brings every pool of the table up to date (vk_mem_shadow_sync).
+static _Thread_local int resolve_off;   // resolve_locked met a pool whose import was given back (tex_pool_back)
+static int tex_pool_back(uint64_t addr);
+
 static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
@@ -867,7 +876,9 @@ static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) 
         }
         return 1;
     }
-    return resolve_locked(addr, size, out, touch);
+    int ok = resolve_locked(addr, size, out, touch);
+    if (!ok && resolve_off && tex_pool_back(addr)) ok = resolve_locked(addr, size, out, touch);
+    return ok;
 }
 
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) { return mem_resolve(addr, size, out, 1); }
@@ -880,6 +891,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
     int ok = 0;
+    resolve_off = r && r->kind == POOL_IMPORT && r->tex_off;
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
@@ -2895,8 +2907,9 @@ static void mirror_create(PoolRec *r) {
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    // the pool's buffers and vertices, read by every frame: the last video memory Windows moves out (memory priority)
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                  .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+                                  .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, .priority = 1.0f};
     VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
     if (res != VK_SUCCESS) {
         r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
@@ -6047,4 +6060,116 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "shadow base copies", sb, 0, sb * SB_PAGE);
     // the page generations handed out so far (gen_now, 32 bits, no wrap handling): how fast a session uses them up
     perf_size(s, "page generations handed out", (uint64_t)__atomic_load_n(&gen_now, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
+}
+
+// ---- texture storage pools (NX2NAVI_POOL_TEX_RELEASE, default on)
+// An imported pool is host memory the driver maps for the GPU and counts in its host heap, which Windows holds to half
+// of the installed memory (7.4 GiB of budget with 16 GB). Standing in Hyrule Field the game had 4.3 GiB imported in
+// pools no submission ever resolved, 2.7 GiB of it in three pools that hold nothing but the storage of textures the
+// CPU provides: the GPU samples those through the images the texture cache made from them and never reads the pool.
+// With the video memory past its budget too, the driver demoted device memory into the same heap, and once that heap
+// was full a new pool's import failed (VK_ERROR_OUT_OF_DEVICE_MEMORY) and the GPU wrote through a missing mapping:
+// the device was lost. Every 30 presents (vk_texstat_frame) such a pool (never resolved, no mirror, at least
+// TEX_POOL_PCT percent of its import CPU-provided texture storage, vk_texture_cpu_ranges) gives its import back: off
+// the device address table, then its buffer and memory once the GPU is past every submission issued until then.
+// A resolve that meets it later imports it again (tex_pool_back) before it answers, so a binding still gets the pool.
+#define TEX_POOL_PCT 90
+#define TEX_POOL_MIN ((uint64_t)16 << 20)
+typedef struct { VkBuffer buf; VkDeviceMemory mem; } TexPoolGone;
+static uint64_t tp_n, tp_bytes, tp_back, tp_back_bytes;
+
+static void tex_pool_free(void *arg) {   // completion thread
+    TexPoolGone *g = arg;
+    VkCtx *c = vk_ctx();
+    if (c) vkDestroyBuffer(c->device, g->buf, NULL), vkFreeMemory(c->device, g->mem, NULL);
+    free(g);
+}
+
+// The replaying thread, no lock held: imports the pool at addr again; 1 when it was given back and now is not.
+static int tex_pool_back(uint64_t addr) {
+    VkCtx *c = vk_ctx();
+    int ok = 0;
+    plat_mutex_lock(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, 1);
+    PoolRec *r = e ? e->buf : NULL;
+    if (c && r && r->kind == POOL_IMPORT && r->tex_off) {
+        mem_thaw(r->lo, r->size);   // the import may need write access to the pages
+        if (import_pool(c, r, r->lo, r->size)) {
+            r->tex_off = 0, ok = 1;
+            r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
+            __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
+            tp_back++, tp_back_bytes += r->import_hi - r->import_lo;
+        }
+    }
+    plat_mutex_unlock(&pool_lock);
+    if (ok && tp_back <= 8)
+        rt_log("mem: a pool given back as texture storage was resolved and is imported again (%#llx; %llu so far)",
+               (unsigned long long)addr, (unsigned long long)tp_back);
+    return ok;
+}
+
+// A failed import (pool_init): gives back what it can now; 1 when that was anything.
+static int vk_mem_tex_pools_now(void) {
+    uint64_t n0 = __atomic_load_n(&tp_n, __ATOMIC_RELAXED);
+    vk_mem_tex_pools(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    return __atomic_load_n(&tp_n, __ATOMIC_RELAXED) != n0;
+}
+
+void vk_mem_tex_pools(uint64_t frame) {
+    static int on = -1;
+    VkCtx *c = vk_ctx();
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_POOL_TEX_RELEASE") && !shadow_on && !dmabuf_on;
+        rt_log("mem: imports of pools that hold only texture storage %s (NX2NAVI_POOL_TEX_RELEASE)",
+               on ? "are given back" : "stay");
+    }
+    if (!on || !c) return;
+    int nrg = 0;
+    uint64_t *rg = vk_texture_cpu_ranges(&nrg);
+    if (!rg) return;
+    // candidates under the shared lock, given back one by one under the exclusive lock (still in the index, unused)
+    enum { CAND_MAX = 64 };
+    PoolRec *cand[CAND_MAX];
+    int nc = 0, rgi = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < pool_index.n && nc < CAND_MAX; i++) {
+        PoolRec *r = pool_index.e[i].buf;
+        if (r->kind != POOL_IMPORT || !r->buf || !r->mem || r->span || r->smap || r->mbuf || r->tex_off ||
+            __atomic_load_n(&r->used, __ATOMIC_RELAXED))
+            continue;
+        uint64_t n = r->import_hi - r->import_lo, cov = 0, at = r->import_lo;
+        if (n < TEX_POOL_MIN) continue;
+        while (rgi < nrg && rg[2 * rgi + 1] <= r->import_lo) rgi++;
+        for (int q = rgi; q < nrg && rg[2 * q] < r->import_hi; q++) {
+            uint64_t lo = rg[2 * q] > at ? rg[2 * q] : at, hi = rg[2 * q + 1] < r->import_hi ? rg[2 * q + 1] : r->import_hi;
+            if (hi > lo) cov += hi - lo, at = hi;
+        }
+        if (cov * 100 >= n * TEX_POOL_PCT) cand[nc++] = r;
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    free(rg);
+    for (int i = 0; i < nc; i++) {
+        PoolRec *r = cand[i];
+        plat_mutex_lock(&pool_lock);
+        const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)r->lo, 1);
+        int go = e && e->buf == r && r->buf && !r->tex_off && !r->mbuf && !__atomic_load_n(&r->used, __ATOMIC_RELAXED);
+        TexPoolGone *g = go ? malloc(sizeof *g) : NULL;
+        uint32_t rec = 0;
+        uint64_t lo = r->import_lo, hi = r->import_hi;
+        if (g) {
+            *g = (TexPoolGone){r->buf, r->mem};
+            rec = r->gpa_rec;
+            r->buf = VK_NULL_HANDLE, r->mem = VK_NULL_HANDLE, r->gpa_rec = 0, r->tex_off = 1;
+            __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
+            tp_n++, tp_bytes += hi - lo;
+        }
+        plat_mutex_unlock(&pool_lock);
+        if (!g) continue;
+        if (rec) vk_gpa_unmap(lo, hi, rec, gpa_cover);
+        vk_completion_add(vk_sync_issued() + 1, tex_pool_free, g);
+    }
+    if (nc)
+        rt_log("mem: frame %llu: imports given back as texture storage %llu (%.0f MiB) so far, imported again %llu "
+               "(%.0f MiB)", (unsigned long long)frame, (unsigned long long)tp_n, tp_bytes / 1048576.0,
+               (unsigned long long)tp_back, tp_back_bytes / 1048576.0);
 }

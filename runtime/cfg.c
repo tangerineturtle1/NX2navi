@@ -425,6 +425,9 @@ static const CfgMeta metas[] = {
     {"TEX_COMPACT", "0", "0|1", RESTART}, {"TEX_COMPACT_MIN_MB", "256", "64..65536", RESTART},
     {"TEX_COMPACT_FRAME_MB", "8", "1..32", RESTART},
     {"ASTC_BC1", "1", "0|1", RESTART},   // vk_astc.c bc1_on
+    {"VRAM_PAGEABLE", "1", "0|1", RESTART},   // vk_device.c: pageable video memory with priorities
+    {"TEX_RESIDENCY", "1", "0|1", RESTART},   // vk_texture.c residency_step
+    {"POOL_TEX_RELEASE", "1", "0|1", RESTART},   // vk_memory.c vk_mem_tex_pools
     {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
     {"DRAW_CRUMBS", "0", "0|1", RESTART},   // vk_crumbs.c draw marks: a mark at each change of shaders inside a pass
     {"STAGING_FAIL_AT", "0", "0..1000000000", RESTART},   // vk_memory.c staging_fail_now: a test of give_back

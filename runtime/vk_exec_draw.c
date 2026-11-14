@@ -2678,7 +2678,7 @@ static void pool_sync_entries(VkExec *ex);
 static void pool_sync(VkExec *ex);
 
 // A chunk of a parallel group (vk_exec.c "replay workers") binds the set as vk_exec_draw_group_begin left it, up to date
-// when the group began; the chunk that takes this submission's first set takes it in turn, under pool_mt. Elsewhere the
+// when the group began; a chunk that still finds no set of this submission takes it in turn, under pool_mt. Elsewhere the
 // replay syncs the pools at every draw that binds them, as before, under pool_mt past a group whose chunks still record
 // (NX2NAVI_REPLAY_PIPE): the set is the submission's, read by the GPU when the part runs.
 static void pool_sync_draw(VkExec *ex) {
@@ -2702,7 +2702,11 @@ uint32_t vk_exec_draw_group_begin(VkExec *ex) {
     dummies_init();
     if (vk_ctx()->has_mesh_shader && !vk_ctx()->mesh_fallback) mesh_ring_make();   // the chunks' indirect mesh draws
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
-    if (pool_on() && PL.cur_fence == ex->fence && !PL.sealed) {   // the set this submission took
+    // The set this submission took, or its first one when it has none yet: taken by a chunk instead, that chunk waited
+    // for every earlier chunk of the group to be done (pool_sync_draw), and so did each chunk that reached its first
+    // draw before one had taken it, so the first group of a submission recorded one chunk at a time (Hyrule Field:
+    // 2.4 ms for 209 draws where a later group of 784 took 0.8).
+    if (pool_on() && (PL.cur_fence != ex->fence || !PL.sealed)) {
         int lk = vk_exec_shared();   // earlier groups may still record (NX2NAVI_REPLAY_PIPE)
         if (lk) plat_mutex_lock(&pool_mt);
         pool_sync(ex);

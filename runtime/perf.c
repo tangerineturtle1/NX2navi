@@ -16,7 +16,7 @@
 #include "stutter_map.h"
 #include "platform/platform.h"
 
-volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
+volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid, prof_worker_tid[16];
 
 __attribute__((weak)) int prof_sampler_start(void) {
     if (cfg_get("NX2NAVI_PROFILE")) rt_log("prof: NX2NAVI_PROFILE: no sampling profiler on this OS");

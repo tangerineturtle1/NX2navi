@@ -57,6 +57,7 @@ typedef struct Tex {
     uint32_t checked;             // submit_epoch of the last check from a draw binding
     uint32_t use_round;           // look_round when a lookup last reached it (touch)
     uint64_t use_frame;           // gfx_counters.frames then
+    uint64_t made_frame;          // gfx_counters.frames when it was made or taken back as a new one (residency)
     uint64_t samp_frame;          // gfx_counters.frames when it was made, a marked shader last sampled it, or a lookup
                                   // other than the texture pool refresh reached it ("disuse")
     uint8_t retiring;             // evicted by disuse, in retiring[], not destroyed yet: the pool refresh leaves it out
@@ -505,9 +506,20 @@ static void tex_init(void *p) {
 // that took it (perf_lock_hold); lock is not inlined so that its return address names that code.
 static uint64_t hold_t0;
 static void *hold_site;
+// While the replay workers record (vk_exec_shared) up to nine threads take the lock for a few microseconds at each
+// draw's lookups. The OS lock spins only briefly before its waiter sleeps, and a sleeping waiter woke tens of
+// microseconds after the lock was free: in Hyrule Field the workers spent about a third of their recording asleep here
+// (bind_resources, shader_for). So a waiter then spins up to TEX_SPINS pauses for the lock to come free first.
+#define TEX_SPINS 2048
 __attribute__((noinline)) static void lock(void) {
     if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) plat_once(&tex_once, tex_init, NULL);
-    plat_rmutex_lock_at(&tex_lock, __builtin_return_address(0));
+    int got = 0;
+    if (__atomic_load_n(&tex_lock.owner, __ATOMIC_RELAXED) != plat_thread_id() && vk_exec_shared())
+        for (int i = 0; i < TEX_SPINS && !got; i++) {
+            if (!__atomic_load_n(&tex_lock.owner, __ATOMIC_RELAXED)) got = plat_rmutex_trylock(&tex_lock);
+            if (!got) plat_pause();
+        }
+    if (!got) plat_rmutex_lock_at(&tex_lock, __builtin_return_address(0));
     if (tex_lock.depth == 1 && perf_lock_holds_on()) hold_t0 = plat_now_ns(), hold_site = __builtin_return_address(0);
 }
 static void unlock(void) {
@@ -773,6 +785,7 @@ static void reuse_made(const Tex *e);
 static void reuse_taken_back(const Tex *e);
 static int compact_on(void);          // NX2NAVI_TEX_COMPACT ("compaction", near the end of the file)
 static void compact_step(void);
+static void residency_step(void);   // NX2NAVI_TEX_RESIDENCY ("residency", after the compaction)
 static void compact_forget(Tex *e);
 // How an entry's content started (start_at; Tex.og_start), in the order of start_names.
 enum { START_NEW, START_UPLOAD_LIVE, START_COPY_LIVE, START_COPY_RELEASED, START_EMPTY_LIVE, START_EMPTY_RELEASED,
@@ -866,6 +879,15 @@ static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, ui
 static nvn_hmap img_reqs = {.klen = sizeof(ImgKey)};   // ImgKey -> VkMemoryRequirements (malloc'd)
 static uint64_t n_bind_skips;   // since the last perf line
 #define DEDICATED_MIN ((VkDeviceSize)32 << 20)   // create_tex: images this large get memory of their own
+// With the texture residency on ("residency", near the end of the file) a texture the CPU provides gets memory of its
+// own from this size: moved to system memory it gives its memory back whole, where in one of VMA's blocks it left a
+// hole the driver goes on counting (no block in Hyrule Field held only cold textures)
+#define RES_DEDICATED_MIN ((VkDeviceSize)1 << 20)
+static int res_dedicated(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_TEX_RESIDENCY");
+    return on;
+}
 
 static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img, uint64_t guest_size) {
     VkMemoryRequirements req;
@@ -1219,8 +1241,14 @@ static VkResult image_alloc(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation
         {0, 0}};
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     for (int i = 0; i < 2; i++) {
+        // With pageable video memory (NX2NAVI_VRAM_PAGEABLE) Windows moves allocations out by their priority when the
+        // card is full: a texture goes before a render target, which every frame draws and reads. With the same priority
+        // for all, the GPU's frame in Hyrule Field took 19 ms in some runs and 45 to 50 ms in others, the textures the
+        // shaders sampled all in video memory.
+        int target = (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_STORAGE_BIT)) != 0;
         VmaAllocationCreateInfo ai = {.flags = step[i].flags | own, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                      .requiredFlags = step[i].req};
+                                      .requiredFlags = step[i].req, .priority = target ? 1.0f : 0.3f};
         r = vmaCreateImage(c->vma, ci, &ai, img, a, NULL);
         if (r == VK_SUCCESS) {
             note_placement(c, *a, i ? 2 : 0);   // 2: past the budget
@@ -1248,8 +1276,8 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
     vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
     VkMemoryRequirements mr = mr2.memoryRequirements;
     VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
-                                  .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
+                                  .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, .priority = 0.3f};   // image_alloc
+    int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX && !(res_dedicated() && mr.size >= RES_DEDICATED_MIN) &&
              vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
     if (ok) note_placement(c, *alloc, 0);
     if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
@@ -1269,7 +1297,8 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
 // block emptied; its own memory goes back when it does.
 static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
     const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, ik);
-    VmaAllocationCreateFlags own = (known ? known->size : image_size(ci)) >= DEDICATED_MIN
+    VkDeviceSize size = known ? known->size : image_size(ci);
+    VmaAllocationCreateFlags own = size >= DEDICATED_MIN || (res_dedicated() && size >= RES_DEDICATED_MIN)
                                        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
     return image_alloc(c, ci, own, img, alloc);
 }
@@ -3419,6 +3448,7 @@ void vk_texstat_add(int kind, uint64_t n, uint64_t bytes) {
 static void compact_frame_time(uint64_t d);
 
 void vk_texstat_frame(uint64_t frame, uint64_t d) {
+    if (frame % 30 == 15) vk_mem_tex_pools(frame);
     if (compact_on()) compact_frame_time(d);
     if (ts_log_ms < 0) {
         ts_log_ms = cfg_int("NX2NAVI_TEXUP_LOG_MS");
@@ -4484,10 +4514,12 @@ static Tex *entry_of(const tex_t *t) {
         log_new(e, &k);
         vk_texstat_time(VK_TS_CREATE, c0);
         e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);   // new: not disused before it is drawn
+        e->made_frame = e->samp_frame;
     }
     if (e->released) {
         flight_ev(e, FLIGHT_TEX_TAKEBACK, 0, 0);
         e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);   // in use again, as a new one
+        e->made_frame = e->samp_frame;
         uint64_t gap = e->samp_frame - e->rel_frame;
         if (gap > e->back_gap) e->back_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
         reuse_taken_back(e);
@@ -5147,6 +5179,7 @@ void vk_texture_new_submit(void) {
     round_checks = 0, pool_by_list = 0;
     if (!++submit_epoch) submit_epoch = 1;
     rate_tick();
+    residency_step();
     sweep_pressure();
     if (compact_on()) compact_step();
     static uint64_t log_at;
@@ -6296,6 +6329,7 @@ static void compact_old_sweep(void) {
 
 // e gets a new image in a hole of a block the pass does not empty, with the old image's texels (see above). 0 when no
 // such hole took it; e is as it was then.
+static void tex_move(VkCtx *c, Tex *e, VmaAllocation a, VkImage img);
 static int compact_move(VkCtx *c, Tex *e) {
     const ImgKey *k = &e->ik;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags, .imageType = (VkImageType)k->type,
@@ -6323,6 +6357,15 @@ static int compact_move(VkCtx *c, Tex *e) {
         vkDestroyImage(c->device, img, NULL);
         return 0;
     }
+    CP.old[CP.nold++] = (CompOld){e->pub.image, e->alloc, e->bytes, vk_pool_takes(), 0, frames_now()};
+    CP.old_bytes += e->bytes;
+    tex_move(c, e, a, img);
+    return 1;
+}
+
+// e takes img, bound to a, with the texels of its current image copied in on the GPU in the upload batch; the caller
+// keeps the old image and allocation until no pool set and no submission can name them (compact_old_sweep).
+static void tex_move(VkCtx *c, Tex *e, VmaAllocation a, VkImage img) {
     vk_exec_image_gone(img);   // views cached under the handle of a destroyed image (create_tex)
     VkCommandBuffer cb = vk_upload_begin();
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -6348,14 +6391,11 @@ static int compact_move(VkCtx *c, Tex *e) {
     }
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
-    CP.old[CP.nold++] = (CompOld){e->pub.image, e->alloc, e->bytes, vk_pool_takes(), 0, frames_now()};
-    CP.old_bytes += e->bytes;
     if (e->released) rel_bytes -= e->bytes;
     e->pub.image = img, e->alloc = a, e->reused = 0;
     own_memory(c, e);
     if (e->released) rel_bytes += e->bytes;
     tex_gen_bump(e->key.addr);
-    return 1;
 }
 
 // The pass is over: its line, the blocks the allocator kept, and when the holes are looked at next.
@@ -6838,4 +6878,330 @@ void vk_texture_sizes(PerfSizes *s) {
     perf_size(s, "reuse keys", reuse_keys, 0, PERF_SIZE_NONE);
     perf_size(s, "texture pool slots", tslot, VK_POOL_TEX, PERF_SIZE_NONE);
     perf_size(s, "sampler slots", sslot, VK_POOL_SAMP, PERF_SIZE_NONE);
+}
+
+// ---- residency (NX2NAVI_TEX_RESIDENCY, default on with the texture pool marks)
+// Standing in Hyrule Field at full texture detail the live textures held 4.1 GiB, of which the shaders sampled 1.5 GiB
+// in the last 30 presents (the pool marks, "disuse"); with the released ones, the render targets, the VRAM mirrors and
+// the driver's own the game used 7.4 GiB of a 6 GiB card's 5.1 GiB budget. Past the budget the driver kept memory in
+// system memory whatever its use and the GPU took 40 to 90 ms a frame where it takes 20 under it (9 against 28 fps).
+// Here the textures nothing samples make the room instead. The measure is the driver's figure (vk_mem_vram), which
+// counts VMA's blocks whole: a texture moved out of a block that keeps others leaves a hole the driver goes on
+// counting (1.3 GiB of them when textures were taken one by one). So textures leave by block:
+//  - out: while the figure is above the budget less RES_MARGIN, or a sampled texture waits in system memory for
+//    room, the blocks whose textures are all cold (no marked shader sampled them for RES_COLD presents, or released)
+//    by at least RES_BLOCK_COLD percent of their texture bytes give their cold textures to system memory, the
+//    coldest blocks first; a texture with memory of its own is a block by itself. An emptied block goes back to the
+//    driver once its old images have gone.
+//  - back: a texture in system memory that a shader sampled in the last presents gets video memory again, in a hole
+//    of a block first (no new memory), else in new memory while the figure allows it.
+// A move is compact_move's: a new image, a copy on the GPU in the upload batch, the entry takes it (tex_move), and the
+// old image goes once no pool set and no submission can name it. Nothing is decoded or uploaded again and no slot
+// shows a stand-in: a texture in system memory is sampled from there, over the bus, until it is back.
+// RES_FRAME_BYTES bounds the copies of a presented frame. A released texture that no lookup reaches is dropped instead
+// of copied (it comes back from its storage), and one made by an area load that no shader sampled since is cold after
+// RES_NEW presents (res_cold). The host heaps hold what moved out beside the game's imported pools, and are guarded
+// too (res_host_free). Textures of 1 MiB or more get memory of their own (RES_DEDICATED_MIN), so that a move gives it
+// back whole, and render targets keep a higher priority than textures for the pageable memory (image_alloc).
+#define RES_COLD PRESENTS(45)
+#define RES_HOT 3                        // presents: sampled this lately, it is wanted in video memory
+#define RES_MARGIN ((uint64_t)256 << 20)
+#define RES_FRAME_BYTES ((uint64_t)64 << 20)
+#define RES_OLD_N 2048
+#define RES_BLOCK_COLD 90
+static struct {
+    int on;                              // -1 not read yet
+    CompOld old[RES_OLD_N];              // the old images of moved textures, until they can go (res_old_sweep)
+    int nold;
+    uint64_t frame, frame_b;             // the presented frame of the moves counted in frame_b
+    uint64_t scan_frame;                 // the presented frame the texture table was last walked in
+    uint64_t used, budget, used_frame;   // the driver's figure at used_frame, give or take what moved since
+    uint64_t *out_blk;                   // this frame's blocks to empty (sorted device memory handles)
+    int nout_blk, waiting;               // waiting: sampled textures left in system memory for want of room
+    uint64_t n_down, down_b, n_up, up_b, n_fail, last_log, n_drop, drop_b, n_hdrop, hdrop_b;
+    uint64_t host_used, host_budget;     // the host heaps' figures at used_frame
+} RS = {.on = -1};
+
+static int res_sys(VkCtx *c, const Tex *e) {   // e's image lies in a heap that is not video memory
+    return !(c->mem_props.memoryHeaps[c->mem_props.memoryTypes[e->blk_type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+}
+
+static void res_old_sweep(void) {   // compact_old_sweep's rule
+    uint64_t takes = vk_pool_takes(), done = vk_sync_fence_done();
+    int k = 0;
+    for (int i = 0; i < RS.nold; i++) {
+        CompOld *o = &RS.old[i];
+        if (!o->due && takes - o->takes > VK_POOL_SETS) o->due = vk_sync_issued();
+        if (o->due && done >= o->due) {
+            vk_exec_image_gone(o->img);
+            vk_defer_image(o->img, o->alloc);
+            continue;
+        }
+        RS.old[k++] = *o;
+    }
+    RS.nold = k;
+}
+
+// e gets an image in system memory (to_sys) or in video memory, with its texels. hole: video memory only in blocks
+// that exist. 0 when there was no memory for it.
+static int res_move(VkCtx *c, Tex *e, int to_sys, int hole) {
+    const ImgKey *k = &e->ik;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags, .imageType = (VkImageType)k->type,
+                            .format = (VkFormat)k->format, .extent = {k->w, k->h, k->d}, .mipLevels = k->levels,
+                            .arrayLayers = k->layers, .samples = (VkSampleCountFlagBits)k->samples,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = k->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img;
+    if (vkCreateImage(c->device, &ci, NULL, &img) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(c->device, img, &mr);
+    uint32_t bits = 0;
+    for (uint32_t t = 0; t < c->mem_props.memoryTypeCount; t++) {
+        int local = !!(c->mem_props.memoryHeaps[c->mem_props.memoryTypes[t].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+        if ((mr.memoryTypeBits >> t & 1) && local != to_sys) bits |= 1u << t;
+    }
+    // video memory: a large one memory of its own (RES_DEDICATED_MIN), which no hole of a block takes
+    if (!to_sys && hole && mr.size >= RES_DEDICATED_MIN) {
+        vkDestroyImage(c->device, img, NULL);
+        return 0;
+    }
+    VmaAllocationCreateInfo ai = {.memoryTypeBits = bits,
+                                  .flags = to_sys ? (mr.size >= RES_DEDICATED_MIN ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0)
+                                         : hole ? VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT
+                                         : VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                                               (mr.size >= RES_DEDICATED_MIN ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0)};
+    VmaAllocation a = NULL;
+    int ok = bits && vmaAllocateMemory(c->vma, &mr, &ai, &a, NULL) == VK_SUCCESS;
+    if (ok && vmaBindImageMemory(c->vma, a, img) != VK_SUCCESS) vmaFreeMemory(c->vma, a), ok = 0;
+    if (!ok) {
+        vkDestroyImage(c->device, img, NULL);
+        if (!hole) RS.n_fail++;
+        return 0;
+    }
+    RS.old[RS.nold++] = (CompOld){e->pub.image, e->alloc, e->bytes, vk_pool_takes(), 0, frames_now()};
+    tex_move(c, e, a, img);
+    return 1;
+}
+
+// The host heaps: the textures moved out live there beside the game's imported pools, whose import fails once the
+// heaps are full (VK_ERROR_OUT_OF_DEVICE_MEMORY), and a pool without its import lost the device when the GPU went
+// through it. Moves out stop while the host heaps' use is within RES_HOST_MARGIN of their budget, and the textures in
+// system memory that no lookup reaches (idle) give way, released ones first (res_host_free).
+#define RES_HOST_MARGIN ((uint64_t)1 << 30)
+static int res_host(VkCtx *c, uint64_t *used, uint64_t *budget) {
+    *used = *budget = 0;
+    if (!c->has_memory_budget) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (!(p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            *used += b.heapUsage[h], *budget += b.heapBudget[h];
+    return *budget != 0;
+}
+
+// tex_lock held: drops up to want bytes of textures in system memory that come back intact and that no lookup reaches,
+// released ones first; returns the bytes dropped.
+static uint64_t res_host_free(VkCtx *c, uint64_t want, uint64_t now) {
+    enum { HF_MAX = 1024 };
+    Tex *v[HF_MAX];
+    int n = 0;
+    uint64_t got = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t i = 0; i < by_key.cap && n < HF_MAX && got < want; i++) {
+            Tex *e = by_key.vals[i];
+            if (!e || !e->alloc || !e->bytes || (pass == 0) != !!e->released || e->compacting || e->retiring ||
+                !res_sys(c, e) || !comes_back_intact(e) || !idle(e, now))
+                continue;
+            v[n++] = e, got += e->bytes;
+        }
+    for (int i = 0; i < n; i++) {
+        RS.n_hdrop++, RS.hdrop_b += v[i]->bytes;
+        drop_tex(v[i], v[i]->released ? DROP_VRAM : DROP_IDLE_VRAM);
+    }
+    return got;
+}
+
+// Any thread, no lock held: a pool's import failed for want of host memory; 1 when textures gave way for bytes.
+int vk_texture_host_room(uint64_t bytes) {
+    VkCtx *c = vk_ctx();
+    if (!c || RS.on != 1) return 0;
+    lock();
+    uint64_t got = res_host_free(c, bytes + ((uint64_t)256 << 20), frames_now());
+    unlock();
+    if (got)
+        rt_log("vk: a pool's import found the host heaps full: %.0f MiB of textures in system memory that nothing "
+               "reaches gave way", got / 1048576.0);
+    return got >= bytes;
+}
+
+// A texture no shader has sampled since it was made counts as cold after RES_NEW presents: the made stamp keeps it from
+// the disuse rules until it is drawn, and an area load makes gigabytes of them at a few frames a second, which held
+// the video memory 1 GiB past its budget for the whole load (the device was lost in about half the loads into Hyrule
+// Field at full texture detail). What is drawn then comes back (residency_step, back).
+#define RES_NEW PRESENTS(8)
+static int res_cold(const Tex *e, uint64_t now) {   // may go to system memory
+    return e->alloc && comes_back_intact(e) && !e->compacting && !e->retiring && e->uploaded &&
+           (e->released || now - e->samp_frame > RES_COLD || (e->samp_frame <= e->made_frame && now - e->made_frame > RES_NEW));
+}
+
+typedef struct { uint64_t mem, all, cold, age; } ResBlk;
+static int resblk_mem(const void *a, const void *b) {
+    uint64_t x = ((const ResBlk *)a)->mem, y = ((const ResBlk *)b)->mem;
+    return x < y ? -1 : x > y;
+}
+static int resblk_age(const void *a, const void *b) {   // the coldest (oldest samples) first
+    uint64_t x = ((const ResBlk *)a)->age, y = ((const ResBlk *)b)->age;
+    return x > y ? -1 : x < y;
+}
+static int u64_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+// The blocks of video memory to empty this frame (RS.out_blk): see above.
+static void res_plan(VkCtx *c, uint64_t now) {
+    free(RS.out_blk);
+    RS.out_blk = NULL, RS.nout_blk = 0;
+    ResBlk *b = malloc(sizeof *b * (by_key.cap ? by_key.cap : 1));
+    if (!b) return;
+    int n = 0;
+    for (uint32_t i = 0; i < by_key.cap; i++) {
+        const Tex *e = by_key.vals[i];
+        if (!e || !e->alloc || res_sys(c, e)) continue;
+        int cold = res_cold(e, now);
+        b[n++] = (ResBlk){e->blk_mem, e->bytes, cold ? e->bytes : 0, cold ? (e->released ? UINT32_MAX : now - e->samp_frame) : 0};
+    }
+    qsort(b, (size_t)n, sizeof *b, resblk_mem);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && b[m - 1].mem == b[i].mem) {
+            b[m - 1].all += b[i].all, b[m - 1].cold += b[i].cold;
+            if (b[i].age < b[m - 1].age) b[m - 1].age = b[i].age;   // a block is as cold as its warmest cold texture
+        } else {
+            b[m++] = b[i];
+        }
+    }
+    int k = 0;
+    for (int i = 0; i < m; i++)
+        if (b[i].cold && b[i].cold * 100 >= b[i].all * RES_BLOCK_COLD) b[k++] = b[i];
+    qsort(b, (size_t)k, sizeof *b, resblk_age);
+    uint64_t need = (RS.used > RS.budget - RES_MARGIN ? RS.used - (RS.budget - RES_MARGIN) : 0) + (RS.waiting ? 64ull << 20 : 0);
+    uint64_t *out = malloc(sizeof *out * (size_t)(k ? k : 1)), got = 0;
+    int no = 0;
+    for (int i = 0; out && i < k && got < need; i++) out[no++] = b[i].mem, got += b[i].cold;
+    free(b);
+    if (out && no) qsort(out, (size_t)no, sizeof *out, u64_cmp);
+    RS.out_blk = out, RS.nout_blk = no;
+}
+
+// Each submission, texture lock held (vk_texture_new_submit): see above.
+static void residency_step(void) {
+    if (RS.on < 0) {
+        RS.on = cfg_bool("NX2NAVI_TEX_RESIDENCY");
+        rt_log("vk: texture residency %s (NX2NAVI_TEX_RESIDENCY): textures no shader sampled for %d presents make room "
+               "in system memory past the video memory budget less %d MiB", RS.on ? "on" : "off", (int)RES_COLD,
+               (int)(RES_MARGIN >> 20));
+    }
+    if (RS.nold) res_old_sweep();
+    VkCtx *c = vk_ctx();
+    if (!RS.on || !c || !marks_tell() || CP.active) return;
+    uint64_t now = frames_now();
+    int new_frame = now != RS.used_frame;
+    if (now != RS.frame) RS.frame = now, RS.frame_b = 0;
+    if (new_frame) {
+        int exact;
+        if (!vk_mem_vram(&RS.used, &RS.budget, &exact) || RS.budget <= RES_MARGIN) return;
+        RS.used_frame = now;
+        if (res_host(c, &RS.host_used, &RS.host_budget) && RS.host_used + RES_HOST_MARGIN > RS.host_budget) {
+            uint64_t got = res_host_free(c, RS.host_used + RES_HOST_MARGIN - RS.host_budget, now);
+            RS.host_used = RS.host_used > got ? RS.host_used - got : 0;
+        }
+    }
+    // The walks below go over every texture: once a presented frame, not at each of its few dozen submissions, where
+    // they cost the submitting threads about 0.7 ms a frame in Hyrule Field.
+    if (RS.scan_frame == now) return;
+    RS.scan_frame = now;
+    uint64_t target = RS.budget - RES_MARGIN;
+    // back first: into holes, then into new memory while the figure allows it
+    int waiting = 0;
+    for (uint32_t i = 0; i < by_key.cap && RS.frame_b < RES_FRAME_BYTES && RS.nold < RES_OLD_N; i++) {
+        Tex *e = by_key.vals[i];
+        if (!e || !e->alloc || e->released || e->compacting || now - e->samp_frame > RES_HOT || !res_sys(c, e)) continue;
+        uint64_t b = e->bytes;
+        if (res_move(c, e, 0, 1)) {
+            RS.frame_b += b, RS.n_up++, RS.up_b += b;
+        } else if (RS.used + b <= target && res_move(c, e, 0, 0)) {
+            RS.used += b, RS.frame_b += b, RS.n_up++, RS.up_b += b;
+        } else {
+            waiting = 1;
+        }
+    }
+    RS.waiting = waiting;
+    // out: whole cold blocks, while above the target or something waits
+    if (new_frame) {
+        if (RS.used > target || RS.waiting) res_plan(c, now);
+        else free(RS.out_blk), RS.out_blk = NULL, RS.nout_blk = 0;
+    }
+    // A released entry of a chosen block is dropped, not copied: what it holds comes back from its storage, and the
+    // game releases hundreds of textures a minute in Hyrule Field with the camera still, which the copies to system
+    // memory took 250 MiB of GPU copies a minute for and freed later all the same. One a lookup still reaches (idle)
+    // is copied as a live one is.
+    enum { RES_DROPS = 256 };
+    Tex *drops[RES_DROPS];
+    int ndrops = 0;
+    for (uint32_t i = 0; i < by_key.cap && RS.nout_blk && RS.frame_b < RES_FRAME_BYTES && RS.nold < RES_OLD_N; i++) {
+        Tex *e = by_key.vals[i];
+        if (!e || res_sys(c, e) || !res_cold(e, now) ||
+            !bsearch(&e->blk_mem, RS.out_blk, (size_t)RS.nout_blk, sizeof *RS.out_blk, u64_cmp))
+            continue;
+        uint64_t b = e->bytes;
+        if (e->released && idle(e, now)) {
+            if (ndrops < RES_DROPS) drops[ndrops++] = e, RS.used = RS.used > b ? RS.used - b : 0;
+            continue;
+        }
+        if ((RS.host_budget && RS.host_used + RS.frame_b + b + RES_HOST_MARGIN > RS.host_budget) || !res_move(c, e, 1, 0))
+            break;
+        RS.used = RS.used > b ? RS.used - b : 0, RS.frame_b += b, RS.n_down++, RS.down_b += b;
+    }
+    for (int i = 0; i < ndrops; i++) RS.n_drop++, RS.drop_b += drops[i]->bytes, drop_tex(drops[i], DROP_VRAM);
+    if (now - RS.last_log >= PRESENTS(600) && (RS.n_down || RS.n_up || RS.n_fail)) {
+        RS.last_log = now;
+        uint64_t sys_n = 0, sys_b = 0, sys_hot = 0;   // in system memory, and of it sampled within RES_HOT presents
+        for (uint32_t i = 0; i < by_key.cap; i++) {
+            const Tex *e = by_key.vals[i];
+            if (!e || !e->alloc || !res_sys(c, e)) continue;
+            sys_n++, sys_b += e->bytes;
+            if (now - e->samp_frame <= RES_HOT) sys_hot += e->bytes;
+        }
+        const double M = 1048576.0;
+        rt_log("vk: texture residency frame %llu: video memory %.0f of %.0f MiB (target %.0f), host heaps %.0f of %.0f "
+               "MiB; so far %llu textures moved to system memory (%.0f MiB), %llu back (%.0f MiB), %llu moves without "
+               "memory, %llu released ones dropped (%.0f MiB), %llu for the host heaps (%.0f MiB); in system memory now "
+               "%llu (%.0f MiB, %.0f MiB of it sampled lately), %s", (unsigned long long)now, RS.used / M, RS.budget / M,
+               target / M, RS.host_used / M, RS.host_budget / M, (unsigned long long)RS.n_down, RS.down_b / M,
+               (unsigned long long)RS.n_up, RS.up_b / M, (unsigned long long)RS.n_fail, (unsigned long long)RS.n_drop,
+               RS.drop_b / M, (unsigned long long)RS.n_hdrop, RS.hdrop_b / M, (unsigned long long)sys_n, sys_b / M,
+               sys_hot / M, RS.waiting ? "sampled ones wait for room" : "none sampled waits");
+    }
+}
+
+static int range_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+uint64_t *vk_texture_cpu_ranges(int *n) {
+    *n = 0;
+    lock();
+    uint64_t *r = malloc(sizeof *r * 2 * (by_key.cap ? by_key.cap : 1));
+    for (uint32_t i = 0; r && i < by_key.cap; i++) {
+        const Tex *e = by_key.vals[i];
+        if (!e || !comes_back_intact(e) || !e->t.L.size) continue;
+        r[2 * *n] = e->pub.addr, r[2 * *n + 1] = e->pub.addr + e->t.L.size;
+        (*n)++;
+    }
+    unlock();
+    if (r && *n) qsort(r, (size_t)*n, sizeof *r * 2, range_cmp);
+    else free(r), r = NULL;
+    return r;
 }
