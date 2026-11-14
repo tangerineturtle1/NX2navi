@@ -10,7 +10,9 @@
 // 0.05), so each band first goes through a piecewise curve that lifts them (haptics_lift: nothing at or below 0.001,
 // then straight lines through 0.004 at 0.001, 0.55 at 0.1, 0.9 at 0.5 and 1 at 1), then through a square root, as the
 // felt strength of a voice coil follows the root of its drive; the two bands are scaled down together when they add up
-// past full scale. The output never goes past 0.8 of full scale, to spare the coils.
+// past full scale. The output never goes past 0.8 of full scale, to spare the coils. Between the curve and the root, a
+// vibration's start is sharpened (haptics_crisp): its first two slots play 1.41 times the value (+3 dB), the next six
+// 0.71 times (-3 dB), then the value itself, so a hit is felt as a hit and not as a swell.
 //
 // Samples are made in slots of SLOT frames (5.3 ms): each slot plays the strongest value posted during the slot before
 // it, so a tick of a single update (the game updates every 5 ms) followed at once by zero is still played. Within a
@@ -44,8 +46,33 @@ float haptics_lift(float a) {
     return clampf(v, 0, 1);
 }
 
+RumbleHdValue haptics_lifted(const RumbleHdValue *v) {
+    RumbleHdValue r = *v;
+    r.amp_low = haptics_lift(clampf(v->amp_low, 0, 1));
+    r.amp_high = haptics_lift(clampf(v->amp_high, 0, 1));
+    return r;
+}
+
+void haptics_crisp(int *since, RumbleHdValue *v) {
+    enum { ACCENT_SLOTS = 2, DIP_SLOTS = 6 };
+    if (v->amp_low * 65535 < 1 && v->amp_high * 65535 < 1) {   // silent: the next sound is a new start
+        *since = -1;
+        return;
+    }
+    if (*since < 0) *since = 0;
+    float gain = *since < ACCENT_SLOTS ? 1.41f : *since < ACCENT_SLOTS + DIP_SLOTS ? 0.71f : 1;
+    if (*since < ACCENT_SLOTS + DIP_SLOTS) ++*since;
+    if (gain == 1) return;
+    float lo = fminf(1, v->amp_low * gain), hi = fminf(1, v->amp_high * gain);
+    if (gain > 1) {   // a boost keeps the sum within the larger of 1 and the value's own sum
+        float limit = fmaxf(1, v->amp_low + v->amp_high), sum = lo + hi;
+        if (sum > limit) lo *= limit / sum, hi *= limit / sum;
+    }
+    v->amp_low = lo, v->amp_high = hi;
+}
+
 HapticsSide haptics_side(const RumbleHdValue *v) {
-    float lo = sqrtf(haptics_lift(clampf(v->amp_low, 0, 1))), hi = sqrtf(haptics_lift(clampf(v->amp_high, 0, 1)));
+    float lo = sqrtf(clampf(v->amp_low, 0, 1)), hi = sqrtf(clampf(v->amp_high, 0, 1));
     if (lo + hi > 1) {
         float k = 1 / (lo + hi);
         lo *= k, hi *= k;
@@ -72,8 +99,7 @@ void haptics_synth(HapticsVoice *voice, const HapticsSide *target, float gain, f
 
 // ---- the posted values, the slots and the stream
 static PlatMutex lock = PLAT_MUTEX_INIT;   // guards everything below up to `stream`
-static HapticsSide latest[2], held[2];     // the newest value per side, and the strongest since the slot began
-static float held_raw[2];                  // the game's amplitude sum of held
+static RumbleHdValue latest[2], held[2];   // lifted: the newest value per side, the strongest since the slot began
 static int held_set[2];                    // a value was posted since the slot began
 static float posted_strength = 1;
 static uint64_t posted_at;
@@ -83,16 +109,16 @@ static int audio_inited;
 static HapticsVoice voices[2];   // the pull side only
 static HapticsSide slot[2];
 static int slot_left;
+static int since_onset[2] = {-1, -1};   // per side: slots since the vibration started (haptics_crisp), -1 silent
 
 void haptics_post(const RumbleHdValue v[2], const int live[2], float strength) {
     plat_mutex_lock(&lock);
     for (int k = 0; k < 2; k++) {
         RumbleHdValue x = v[k];
         if (!live[k]) x.amp_low = x.amp_high = 0;
-        HapticsSide side = haptics_side(&x);
-        float raw = clampf(x.amp_low, 0, 1) + clampf(x.amp_high, 0, 1);
-        latest[k] = side;
-        if (!held_set[k] || raw >= held_raw[k]) held[k] = side, held_raw[k] = raw;   // the slot keeps its peak
+        x = haptics_lifted(&x);
+        latest[k] = x;
+        if (!held_set[k] || x.amp_low + x.amp_high >= held[k].amp_low + held[k].amp_high) held[k] = x;   // the peak
         held_set[k] = 1;
     }
     posted_strength = strength;
@@ -103,12 +129,17 @@ void haptics_post(const RumbleHdValue v[2], const int live[2], float strength) {
 static void slot_start(void) {
     plat_mutex_lock(&lock);
     int fresh = posted_at && plat_now_ns() - posted_at <= STALE_NS;
+    RumbleHdValue play[2];
     for (int k = 0; k < 2; k++) {
-        slot[k] = held_set[k] ? held[k] : latest[k];
-        if (!fresh) slot[k].amp[0] = slot[k].amp[1] = 0;
-        held[k] = latest[k], held_set[k] = 0, held_raw[k] = 0;
+        play[k] = held_set[k] ? held[k] : latest[k];
+        if (!fresh) play[k].amp_low = play[k].amp_high = 0;
+        held[k] = latest[k], held_set[k] = 0;
     }
     plat_mutex_unlock(&lock);
+    for (int k = 0; k < 2; k++) {
+        haptics_crisp(&since_onset[k], &play[k]);
+        slot[k] = haptics_side(&play[k]);
+    }
     slot_left = SLOT;
 }
 
@@ -167,6 +198,7 @@ int haptics_open(char *why, size_t cap) {
         memset(voices, 0, sizeof voices);
         memset(slot, 0, sizeof slot);
         slot_left = 0;
+        since_onset[0] = since_onset[1] = -1;
         stream = SDL_OpenAudioDeviceStream(id, &spec, pull, NULL);
         if (stream && SDL_ResumeAudioStreamDevice(stream)) {
             snprintf(why, cap, "its haptic actuators, the third and fourth channels of \"%s\"", name);

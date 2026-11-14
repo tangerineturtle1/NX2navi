@@ -36,6 +36,7 @@ int main(void) {
 
     // one side: the square root of the lifted amplitude; two loud bands scaled down to full scale together
     RumbleHdValue small = {0.02f, 160, 0, 320};
+    small = haptics_lifted(&small);
     HapticsSide s = haptics_side(&small);
     assert(near(s.amp[0], sqrt(0.1088), 0.002) && s.amp[1] == 0 && s.freq[0] == 160);
     RumbleHdValue loud = {1, 100, 1, 600};
@@ -63,6 +64,26 @@ int main(void) {
         float out[48];
         haptics_synth(&v, &tone, 0.8f, out, 48, 1);   // 1 ms
         for (int i = 0; i < 48; i++) assert(fabsf(out[i]) < 0.25f);
+    }
+
+    // a vibration's start: two slots at 1.41 times, six at 0.71 times, then as it is; silence starts it over; a boost
+    // keeps two loud bands within full scale
+    {
+        int since = -1;
+        float want[] = {1.41f, 1.41f, 0.71f, 0.71f, 0.71f, 0.71f, 0.71f, 0.71f, 1, 1};
+        for (int i = 0; i < 10; i++) {
+            RumbleHdValue x = {0.4f, 160, 0, 320};
+            haptics_crisp(&since, &x);
+            assert(near(x.amp_low, 0.4 * want[i], 1e-5));
+        }
+        RumbleHdValue quiet = {0, 160, 0, 320}, x = {0.4f, 160, 0, 320};
+        haptics_crisp(&since, &quiet);
+        haptics_crisp(&since, &x);
+        assert(since == 1 && near(x.amp_low, 0.4 * 1.41, 1e-5));
+        since = -1;
+        RumbleHdValue big = {0.6f, 160, 0.6f, 320};
+        haptics_crisp(&since, &big);
+        assert(near(big.amp_low + big.amp_high, 1.2, 1e-5));   // the sum stays at its own 1.2, not 1.69
     }
 
     // the slot's peak hold: a tick followed at once by zero, both posted within one slot, is what the next slot plays
