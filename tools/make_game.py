@@ -1227,14 +1227,14 @@ def preflight(msys, jobs, sources=None):
     say(f'check: {len(sources)} runtime files and the libraries pass, {time.time() - t0:.0f} s')
 
 
-def steps_to_run(state, identity, out, until=None):
+def steps_to_run(state, identity, out, until=None, *, guest_opt: int = 1):
     """The steps from exefs to shaders this build will run, as main's loop decides it: a step whose key is not the
     recorded one, and every step after one that runs but those that read nothing of it (UNAFFECTED). until: the
     step the build stops after (--until). For the checks made before the long steps (space_needs, probe_toolchain)."""
     runs = []
     for name in STEPS[:STEPS.index('shaders') + 1]:
         if (any((earlier, name) not in UNAFFECTED for earlier in runs)
-                or state['steps'].get(name) != step_key(name, identity, out)):
+                or state['steps'].get(name) != step_key(name, identity, out, guest_opt=guest_opt)):
             runs.append(name)
         if name == until:
             break
@@ -1622,29 +1622,30 @@ def pgo_gen_record(out, clang, env):
     (raw / PGO_TRAINING).write_text(json.dumps(record, indent=1) + '\n', encoding='utf-8')
 
 
-def guest_opt_ini(out):
-    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe (the low-end GPU rows of the menu's Game tab write it there)
-    when the environment does not set it: the next build of the game folder out takes it. Only while low_end_gpu = 1
-    is in the file too: the mode's settings count only with the mode on (runtime/cfg.c LOWEND_ONLY)."""
-    if os.environ.get('NX2NAVI_GUEST_OPT', '').strip():
-        return
-    found, low = '', False
+def guest_opt_ini(out: Path) -> int:
+    """The requested guest optimization level. The environment takes precedence over the low-end GPU setting in
+    nx2navi.ini, which applies only while low-end GPU mode is on (runtime/cfg.c LOWEND_ONLY)."""
+    env = os.environ.get('NX2NAVI_GUEST_OPT', '').strip()
+    if env:
+        return 2 if env == '2' else 1
+    ini = out / 'nx2navi.ini'
     try:
-        for line in (Path(out) / 'nx2navi.ini').read_text(encoding='utf-8', errors='replace').splitlines():
-            key, eq, value = line.partition('=')
-            key = key.strip().lower()
-            value = value.split('#')[0].split(';')[0].strip().strip('"')
-            if eq and key in ('guest_opt', 'nx2navi_guest_opt') and value:
-                found = value
-            if eq and key in ('low_end_gpu', 'nx2navi_low_end_gpu'):
-                low = value not in ('', '0')
-    except OSError:
-        pass
-    if found and low:
-        os.environ['NX2NAVI_GUEST_OPT'] = found
+        lines = ini.read_text(encoding='utf-8-sig', errors='replace').splitlines()
+    except FileNotFoundError:
+        return 1
+    found, low = '', False
+    for line in lines:
+        key, eq, value = line.partition('=')
+        key = key.strip().lower()
+        value = value.split('#')[0].split(';')[0].strip().strip('"')
+        if eq and key in ('guest_opt', 'nx2navi_guest_opt') and value:
+            found = value
+        if eq and key in ('low_end_gpu', 'nx2navi_low_end_gpu'):
+            low = value not in ('', '0')
+    return 2 if found == '2' and low else 1
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), pgo=()):
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), pgo=(), *, guest_opt: int = 1):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. first: include flags that go
     ahead of inc for the runtime's sources only (vulkan_headers); the lifted code includes none of those headers,
     and its command, which is part of its objects' keys, stays as it was. NX2NAVI_GUEST_OPT (an environment variable,
@@ -1652,7 +1653,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), pg
     bound the frame on a slower CPU; the build takes several times longer. pgo: the flags of a profile-guided build
     for every compile (pgo_use_flags, pgo_gen_flags); with them the lifted code is built at -O2 too, the level the
     profile's inlining and its layout of hot and cold code work at. Without them every command is what it was."""
-    guest_opt = '-O2' if pgo or os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2' else '-O1'   # -O1 unless guest_opt = 2
+    guest_flag = '-O2' if pgo or guest_opt == 2 else '-O1'
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
@@ -1664,7 +1665,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), pg
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', guest_opt if guest else '-O2',
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', guest_flag if guest else '-O2',
                 *march, '-fno-strict-aliasing', '-w', *declspec, *pgo, *([] if guest else first), *inc, '-o', str(dst),
                 str(src)]
     return cmd_for
@@ -1927,7 +1928,7 @@ def write_runtime_map(full, dst):
         pass
 
 
-def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
+def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False, *, guest_opt: int = 1):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
     update: a rebuild after a kit update (lifted_level). The kit's execution profile, when this build can use it
@@ -1960,8 +1961,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     cid, cid_old = compiler_ids(clang, env)   # fast_clang's compiler writes the same objects: not part of the key
     now = cpu_level(clang, env)
     level = lifted_level(obj, now, update)
-    guest_opt_ini(out)
-    if os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2':   # runtime_cmd's guest_opt
+    if guest_opt == 2:
         say('  lifted code at -O2 (NX2NAVI_GUEST_OPT): a long build')
     if level == now:
         say(f'  the lifted code is built for x86-64-v{level}, this processor\'s level' if level else
@@ -1985,13 +1985,13 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         pgo = pgo_use_flags(profile) if profile else []
         say(f'  the lifted code (at -O2) and the runtime are built with the execution profile {profile.name}'
             if profile else f'  {why}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan, pgo=pgo)
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan, pgo=pgo, guest_opt=guest_opt)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths; and
     # up to 0.7.1 the runtime's without the Vulkan headers' folder ahead of the system's (an object that compiled
     # against the system's headers is as good).
-    plain = runtime_cmd(clang, clangxx, inc, level, None, msys)
-    no_vulkan = runtime_cmd(clang, clangxx, inc, level, fast, msys)
+    plain = runtime_cmd(clang, clangxx, inc, level, None, msys, guest_opt=guest_opt)
+    no_vulkan = runtime_cmd(clang, clangxx, inc, level, fast, msys, guest_opt=guest_opt)
     fast_old = (cid_old + compiler_ids(fast, env)[1]) if fast else None
     kits = earlier_kits()
 
@@ -2568,15 +2568,15 @@ def step_scan(out):
              'retry this step')
 
 
-def step_key(step, identity, out=None):
+def step_key(step, identity, out=None, *, guest_opt: int = 1):
     """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS, the lifter and
     the mods' code cheats and ExeFS patches (mod_digest); compile: the lift, the runtime sources, this script and the
     processor (cpu_tag); shaders: the compile without the mods' code, the preparing script and the translator;
     prompts: the game files, the kit's button art, the version of the tools that draw it (PROMPT_TOOLS), the bind_
     lines of nx2navi.ini, and whether every folder it writes is still there; scan: the game files, the check's version
     (SCAN_TOOL) and whether its report is still there. The compile's key also names the kit's execution profile or
-    an instrumented build (pgo_tag); the shaders' key does not, as neither changes what the shaders are prepared
-    from."""
+    an instrumented build (pgo_tag) and the requested guest optimization level if it differs from the default.
+    These compile settings leave the shader inputs unchanged."""
     if step in ('exefs', 'romfs'):
         return f'{step}-1|{identity}'
     if step == 'scan':
@@ -2598,7 +2598,7 @@ def step_key(step, identity, out=None):
         return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}'
                 f'|{kit_version()}|cpu {cpu_tag()}')
     if step == 'compile':
-        return compile_of(lift) + pgo_tag()
+        return compile_of(lift) + pgo_tag() + ('|guest_opt 2' if guest_opt == 2 else '')
     # shaders: the built game without the mods' code (UNAFFECTED) and the translator that prepared them, the one
     # xlate_source finds (the kit's bin/, or a source checkout's build/xlate/)
     return (f'shaders-1|{compile_of(base)}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
@@ -2680,6 +2680,11 @@ def build_main():
         return
     if not out:
         ap.error('--out is needed to build')
+    guest_opt = guest_opt_ini(out)
+
+    def key(name: str) -> str:
+        return step_key(name, src.identity, out, guest_opt=guest_opt)
+
     msys = Path(a.msys)
     if WIN:
         for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
@@ -2713,21 +2718,22 @@ def build_main():
     keep_awake()
     # What can be known to fail later is looked at now: the disk space of every step that will run, and on Windows
     # that the build tools compile and link (not for a build the tests stop before its compile step, --until)
-    ahead = steps_to_run(state, src.identity, out, a.until)
+    ahead = steps_to_run(state, src.identity, out, a.until, guest_opt=guest_opt)
     check_space(out, space_needs(ahead, out, sum(src.romfs_size(ref) for _, ref in src.romfs) if 'romfs' in ahead else 0,
                                  a.rebuild and shader_carry(out)))
     if WIN and 'compile' in ahead:
         probe_toolchain(msys, cache / 'toolchain-check')
     # Linux: the compiler, headers and libraries are the system's, so they are tried on the runtime before the long
     # steps of a build that will reach the compile step (the first step whose key is not current makes the rest run)
-    if not WIN and any(state['steps'].get(n) != step_key(n, src.identity, out) for n in STEPS[:STEPS.index('compile') + 1]):
+    if not WIN and any(state['steps'].get(n) != key(n) for n in STEPS[:STEPS.index('compile') + 1]):
         preflight(msys, a.jobs)
     say(f'compiles at a time: {a.jobs} ({jobs_why})')
     t0 = time.time()
     romfs_job = None
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache),
-            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune),
+            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune,
+                                            guest_opt=guest_opt),
             'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out),
             'scan': lambda: step_scan(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
@@ -2749,7 +2755,7 @@ def build_main():
         t = time.time()
         runs[name]()
         with state_lock:
-            state['steps'][name] = step_key(name, src.identity, out)
+            state['steps'][name] = key(name)
         save()
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
@@ -2758,14 +2764,14 @@ def build_main():
         # Keep Build Cache off (the launcher) deletes the lift and the objects after a build and keeps this state:
         # the lift's key still matches then, and a compile step that runs would find no lifted code to compile
         return (name == 'lift' and not (cache / 'lift' / 'layout.json').is_file()
-                and state['steps'].get('compile') != step_key('compile', src.identity, out))
+                and state['steps'].get('compile') != key('compile'))
 
     try:
         for name in STEPS:
             if name == 'prompts' and not prompt_art_dir():
                 say('prompts: none to draw, the kit has no button art')
                 emit('step', step=name, state='skip')
-            elif state['steps'].get(name) == step_key(name, src.identity, out) and not lift_gone(name):
+            elif state['steps'].get(name) == key(name) and not lift_gone(name):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:
