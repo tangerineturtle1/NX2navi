@@ -27,6 +27,7 @@
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_gpa.h"
+#include "vk_mem_heap.h"
 #include "wb_lazy_choice.h"
 #include "wb_merge_spv.h"
 #include "platform/platform.h"
@@ -5755,15 +5756,16 @@ static void system_log(uint64_t frame, const ReportFig *f, const VkPipeMem *pm, 
     const double M = 1048576.0;
     uint64_t res, priv;
     plat_process_memory(&res, &priv);
-    // The C runtime heap's summary holds the heap's lock while it adds up: asked at the report only, and no more once
-    // one was slow, so that a heap grown past what the summary handles quickly does not hold every malloc up again.
-    static int heap_off;
+    // The C runtime heap's summary holds the heap's lock while it adds up, and every malloc with it: asked before play
+    // only (and with NX2NAVI_MEM_CENSUS at every report), and no more once one was slow (vk_mem_heap.h).
+    static int heap_off, heap_census = -1;
+    if (heap_census < 0) heap_census = cfg_bool("NX2NAVI_MEM_CENSUS");
     PlatHeapInfo hi = {0};
-    if (!heap_off) {
+    if (mem_heap_summary_due(heap_census, frame_step_world_us() >= 0, heap_off)) {
         uint64_t t0 = plat_now_ns();
         plat_heap_info(&hi);
         uint64_t took = plat_now_ns() - t0;
-        if (took > HEAP_SLOW_NS)
+        if (took > HEAP_SLOW_NS && !heap_census)
             heap_off = 1, rt_log("mem: the C runtime heap's summary took %.1f ms; it is not asked for again in this run",
                                  took / 1e6);
     }

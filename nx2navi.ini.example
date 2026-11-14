@@ -1104,7 +1104,9 @@
 # stands in for it) and where its committed memory lies every 3600 frames, and when the process's own commit (without
 # the video memory Windows charges to it) rose 1 GiB over the highest it was, at most once a minute (the "commit
 # census" lines). Each walk holds the address-space lock for 100-260 ms and delays the next frame by as much, so they
-# are off unless asked for: leave it off in a run whose smoothness is judged.
+# are off unless asked for: leave it off in a run whose smoothness is judged. With or without the trace, 1 also has
+# every memory report ask for the C runtime heap's summary in play, which holds every allocation of the game for as
+# long as it takes (50 to 70 ms with a heap of a few GB); without it the summary is taken before play only.
 # mem_census = 0
 # 1: with trace = perf, the process's handles counted by kind (events, sections, threads, files...) at the 600-frame
 # report when their number grew by 16 or more since the last count (the "mem: handles" line). It reads the system's
