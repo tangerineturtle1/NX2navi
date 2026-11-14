@@ -21,6 +21,7 @@
 #include "flight_flash.h"
 #include "fs.h"
 #include "gfx.h"
+#include "gfx_dxp.h"
 #include "gfx_wsys.h"
 #include "input.h"
 #include "nvn_api.h"
@@ -195,6 +196,13 @@ static int g_flip_on;            // vk_present_blit submitted the blit of swapch
 static uint32_t g_flip_idx;
 static uint64_t g_flip_frame;    // ... of this game frame, when a driver's low latency follows it (vk_lowlat.c); else 0
 
+// ---- the DXGI presenter in the swapchain's place (gfx_dxp.h; g_pl): g_sc is null and g_sc_img are its shared images
+static int g_dx;             // presents go through it (dx_swapchain)
+static int g_dx_failed;      // it could not be made: not tried again in this run
+static uint32_t g_dx_next;   // the image the next present composes into: they go round in turn
+static uint64_t g_dx_n;      // the last frame's number on its timelines
+static int g_hdr_was = -1;   // the kind of the last swapchain: the log says when a later one is of the other kind
+
 // ---- NX2NAVI_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
 // of a host-visible ring. A slot's tag names the frame it holds complete; recording a new frame clears the tag first,
 // and the tag is set once the fence of that present has signalled.
@@ -361,6 +369,16 @@ const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_go
 static void flip_locked(void) {
     if (!g_flip_on) return;
     g_flip_on = 0;
+    if (g_dx) {   // the frame was the last one submitted: its number is g_dx_n
+        const char *e = cfg_value("NX2NAVI_VK_PRESENT");
+        const int mailbox = !strcmp(e, "mailbox"), immediate = !strcmp(e, "immediate");
+        VkLowlatPresent ll;   // a driver's low latency: AMD's present stage, the frame's statistics (no Vulkan swapchain
+        vk_lowlat_present_begin(g_flip_frame, &ll);   // for NVIDIA's markers)
+        g_flip_frame = 0;
+        if (!dxp_present(g_flip_idx, g_dx_n, !mailbox && !immediate, immediate)) plat_xchg32(&g_dirty, 1);
+        vk_lowlat_present_end(&ll);
+        return;
+    }
     if (!g_sc) return;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
@@ -407,6 +425,49 @@ static void drop_swapchain_locked(VkCtx *c) {
     g_sc_n = 0;
 }
 
+// The DXGI presenter as the present's target (create_swapchain; g_pl held): HDR10 for a window whose display another
+// adapter drives, where the surface has no HDR10 format. A window has one swapchain, so the Vulkan one goes first.
+// 0: it could not be made, which is settled for this run; the caller makes a Vulkan swapchain.
+static int dx_swapchain(VkCtx *c, VkExtent2D ext) {
+    vk_queue_lock();
+    vkDeviceWaitIdle(c->device);
+    if (vk_fg_active()) {   // frame generation switched off in the menu: AMD's swapchain and contexts go
+        if (g_sc) vk_fg_destroy_swapchain(g_sc);
+        vk_fg_release();
+        g_sc = VK_NULL_HANDLE;
+    }
+    vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // the driver's low latency names a Vulkan swapchain: none from here on
+    drop_swapchain_locked(c);   // the Vulkan swapchain, or the views of the presenter's earlier images
+    int hdr = 1;
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    VkImage img[DXP_IMAGES];
+    if (!dxp_create(ext.width, ext.height, &hdr, &fmt, img)) {
+        dxp_destroy();   // its swapchain too: the window is free for a Vulkan one
+        g_dx = 0, g_dx_failed = 1;
+        vk_queue_unlock();
+        return 0;
+    }
+    g_dx = 1, g_dx_next = 0;
+    g_sc_fmt = fmt, g_sc_ext = ext, g_sc_hdr = hdr, g_sc_n = DXP_IMAGES;
+    if (g_hdr_was >= 0 && g_hdr_was != hdr) rt_log("gfx: the swapchain is now %s (format %d)", hdr ? "HDR10" : "SDR", (int)fmt);
+    g_hdr_was = hdr;
+    vk_hdr_set_active(hdr);
+    if (hdr) vk_hdr_metadata_dxgi(1);
+    for (uint32_t i = 0; i < DXP_IMAGES; i++) {
+        g_sc_img[i] = img[i];
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img[i],
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &g_sc_view[i]) != VK_SUCCESS) g_sc_view[i] = VK_NULL_HANDLE;
+    }
+    const char *e = cfg_value("NX2NAVI_VK_PRESENT");   // DXGI has the three modes (flip_locked)
+    __atomic_store_n(&g_present_got, !strcmp(e, "mailbox") ? "mailbox" : !strcmp(e, "immediate") ? "immediate" : "fifo",
+                     __ATOMIC_RELEASE);
+    free_capture();
+    vk_queue_unlock();
+    return 1;
+}
+
 // Returns 1 with a usable swapchain, 0 when the window has no area (minimised) or the create failed, which leaves
 // g_dirty set so the next present tries again. Called with g_pl held. g_dirty is cleared before the window's size is
 // read: a resize that arrives while the swapchain is being made (AMD's frame generation swapchain takes tens of ms)
@@ -435,6 +496,15 @@ static int create_swapchain(void) {
     VkSurfaceFormatKHR sf = fmts[0];
     g_sc_hdr_wanted = vk_hdr_wanted();
     int hdr = g_sc_hdr_wanted && vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
+    // HDR without an HDR10 surface format: through the DXGI presenter when the window's display shows HDR10 (not with
+    // frame generation, whose swapchains are Vulkan ones). Otherwise the picture stays SDR.
+    if (g_sc_hdr_wanted && !hdr) {
+        if (!g_dx_failed && !vk_fg_wanted() && !vk_dlssg_active() && dxp_hdr_display() && dx_swapchain(c, ext)) return 1;
+        static int told;
+        if (!told++)
+            rt_log("hdr: the picture stays SDR (Windows: turn on \"Use HDR\" in the display settings; Linux: a Wayland "
+                   "compositor with colour management and HDR on)");
+    }
     if (!hdr) vk_hdr_images_release();   // HDR off, or not on this display: what its encode made goes
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
@@ -450,6 +520,11 @@ static int create_swapchain(void) {
     vk_queue_lock();
     vkDeviceWaitIdle(c->device);
     vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // NVIDIA's low-latency calls name the swapchain: none while it is replaced
+    if (g_dx) {   // HDR was switched off, or frame generation on: the presenter leaves the window to a Vulkan swapchain
+        drop_swapchain_locked(c);   // the views of its images
+        dxp_destroy();
+        g_dx = 0;
+    }
     VkSwapchainKHR old = g_sc;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
@@ -519,10 +594,9 @@ static int create_swapchain(void) {
     drop_swapchain_locked(c);
     g_sc = made;
     g_sc_fmt = sf.format;
-    static int hdr_was = -1;   // the log says when a later swapchain is of the other kind (the menu's HDR row)
-    if (hdr_was >= 0 && hdr_was != hdr)
+    if (g_hdr_was >= 0 && g_hdr_was != hdr)   // the menu's HDR row
         rt_log("gfx: the swapchain is now %s (format %d)", hdr ? "HDR10" : "SDR", (int)sf.format);
-    hdr_was = hdr;
+    g_hdr_was = hdr;
     g_sc_hdr = hdr;
     vk_hdr_set_active(hdr);
     if (hdr) vk_hdr_metadata(g_sc, 1);
@@ -1345,7 +1419,7 @@ static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
 // The presenter and the images for the current swapchain (g_pl held). 0: frames go out the plain way.
 static int ng_ready(void) {
     if (!vk_ngxfg_wanted()) return 0;   // the Windows build, or a run that started without DLSS upscaling
-    int want = vk_ngxfg_on() && !g_sc_hdr && !vk_fg_active() && !vk_dlssg_active();
+    int want = vk_ngxfg_on() && !g_sc_hdr && !g_dx && !vk_fg_active() && !vk_dlssg_active();
     if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
     if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
         if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
@@ -1519,6 +1593,15 @@ static void ng_hand(uint32_t idx, int count, int set, uint64_t n) {
     plat_mutex_unlock(&ng.m);
 }
 
+// The image the present composes into, as *idx: the swapchain's next one (sem signals when it is free), or the DXGI
+// presenter's next in turn, where the submission waits for its last reader instead (present_image).
+static VkResult acquire_image(VkCtx *c, VkSemaphore sem, uint32_t *idx) {
+    if (g_dx) return *idx = g_dx_next, VK_SUCCESS;
+    return vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, sem, idx)
+         : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, sem, idx)
+                             : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, sem, VK_NULL_HANDLE, idx);
+}
+
 static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     {   // the presented image's format, when it changes (an HDR picture comes in another one)
@@ -1530,10 +1613,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
     flip_locked();
-    if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
-        if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
+    if (!(g_sc || g_dx) || plat_cas32(&g_dirty, 0, 0)) {
+        if (!wsys_minimized() && !create_swapchain() && !(g_sc || g_dx)) goto out;
     }
-    if (wsys_minimized() || !g_sc) goto out;
+    if (wsys_minimized() || !(g_sc || g_dx)) goto out;
 
     unsigned slot = g_frame % FRAMES;
     if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
@@ -1545,16 +1628,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
     const int ngp = ng_ready();
     vk_lowlat_fg_presents(ngp);   // the presenter presents several times a frame: a driver's low latency steps aside
-    VkResult r = ngp               ? VK_SUCCESS
-               : vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-               : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-                                   : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+    VkResult r = ngp ? VK_SUCCESS : acquire_image(c, g_acquire[slot], &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
         if (!create_swapchain()) goto out;
-        r = vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-          : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-                              : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+        r = acquire_image(c, g_acquire[slot], &idx);
     }
     vk_device_lost_check(r, "the acquire of a swapchain image");
     // not ready: skip the frame. Acquires that keep timing out (1 s each) mean a swapchain nothing will free an
@@ -1572,7 +1650,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
-    if (g_sc_hdr) vk_hdr_metadata(g_sc, 0);   // a changed peak or white goes to the display
+    if (g_sc_hdr && g_dx) vk_hdr_metadata_dxgi(0);   // a changed peak or white goes to the display
+    else if (g_sc_hdr) vk_hdr_metadata(g_sc, 0);
     if (g_th_pending[slot]) {   // that fence has signalled: the thumbnail its submission wrote is complete
         uint64_t done = g_th_pending[slot];
         g_th_tag[done % (uint64_t)g_th_n] = done;
@@ -1720,7 +1799,17 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     int ng_set = 0;
     const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, hudless, &ng_set, src != VK_NULL_HANDLE) : -1;
     const int via_ng = ng_count >= 0;
-    if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    if (g_dx) {   // the presenter's image goes to Direct3D, which copies it into its swapchain (gfx_dxp.h dxp_present)
+        VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = last_stage,
+                                   .srcAccessMask = last_write, .dstStageMask = VK_PIPELINE_STAGE_2_NONE, .oldLayout = last,
+                                   .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = c->gfx_family,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .image = dst,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+        vkCmdPipelineBarrier2(cb, &d);
+    } else if (!via_ng) {
+        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    }
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     pts_end(cb, slot);
     vkEndCommandBuffer(cb);
@@ -1750,6 +1839,17 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         si.waitSemaphoreInfoCount = ng_n > 2 ? 1u : 0u;
         if (ng_n > 2) ng_wait_signaled(ng_n - 2);
     }
+    if (g_dx) {
+        // No acquire to wait for here either. The frame waits on the GPU for the Direct3D copy that last read this
+        // image, and signals the timeline this frame's copy waits for (gfx_dxp.h).
+        uint64_t freed = 0;
+        VkSemaphore copied = dxp_copied(idx, &freed);
+        wait = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = copied, .value = freed,
+                                       .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        sig = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = dxp_rendered(),
+                                      .value = ++g_dx_n, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        si.waitSemaphoreInfoCount = freed ? 1u : 0u;
+    }
     vk_queue_lock();
     pts_sub[slot] = plat_now_ns();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
@@ -1762,6 +1862,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_flip_on = 1;
         g_flip_idx = idx;
         g_flip_frame = ll_frame;
+        if (g_dx) g_dx_next = (idx + 1) % DXP_IMAGES;
         if (!defer) flip_locked();
     } else {
         vk_device_lost_check(r, "the present's submit");
@@ -1769,8 +1870,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         // The fence was reset after the acquire and the acquire's semaphore is signalled: left so, this slot's fence
         // wait would time out (5 s) at every later present and the picture stop for good. An empty batch takes the
         // semaphore and signals the fence; the acquired image goes back with the swapchain, made again next frame.
-        // (through the presenter nothing was acquired: the batch only signals the fence)
-        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = via_ng ? 0u : 1u,
+        // (through a presenter nothing was acquired: the batch only signals the fence)
+        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = via_ng || g_dx ? 0u : 1u,
                                 .pWaitSemaphoreInfos = &wait};
         vk_queue_lock();
         VkResult r2 = vkQueueSubmit2(c->gfx_queue, 1, &settle, g_fence[slot]);
@@ -1850,6 +1951,8 @@ void gfx_window_release_vk(void) {
             if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
             g_sc_view[i] = VK_NULL_HANDLE;
         }
+        dxp_destroy();   // the DXGI presenter's images and timelines (their views went above)
+        g_dx = 0;
         if (g_pool) vkDestroyCommandPool(c->device, g_pool, NULL);
         if (g_sc && vk_fg_active()) vk_fg_destroy_swapchain(g_sc), vk_fg_release();
         else if (g_sc && vk_dlssg_active()) vk_dlssg_destroy_swapchain(c->device, g_sc);

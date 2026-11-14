@@ -512,6 +512,13 @@ static int create_device(void) {
         g_vk.has_hdr_metadata = 1;
         ext[n_ext++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
     }
+    // HDR10 through the DXGI presenter (gfx_dxp.h): its images and two fences are shared with Direct3D 12. Windows
+    // drivers report the two extensions.
+    if (vk_hdr_armed() && has_ext(ep, ne, "VK_KHR_external_memory_win32") && has_ext(ep, ne, "VK_KHR_external_semaphore_win32")) {
+        g_vk.has_win32_sharing = 1;
+        ext[n_ext++] = "VK_KHR_external_memory_win32";
+        ext[n_ext++] = "VK_KHR_external_semaphore_win32";
+    }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
     // Pass marks on NVIDIA (vk_crumbs.c): checkpoints only with NX2NAVI_PASS_CRUMBS=1, since NVIDIA documents a cost for

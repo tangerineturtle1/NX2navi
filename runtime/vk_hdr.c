@@ -33,6 +33,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "gfx_dxp.h"
 #include "hdr_encode_spv.h"
 #include "hdr_fullscreen_spv.h"
 #include "hdr_tonemap_spv.h"
@@ -824,7 +825,8 @@ void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget i
 // ---- swapchain
 
 // While NX2NAVI_HDR is on (vk_hdr_wanted), the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out
-// set, else 0 and the reason logged once.
+// set, else 0 and that logged once (gfx_present.c create_swapchain then tries the DXGI presenter and says what the
+// picture becomes).
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
     if (!vk_hdr_wanted()) return 0;
     static int logged;
@@ -844,9 +846,7 @@ int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceForm
                 logged = 1;
                 return 1;
             }
-    if (!logged)
-        rt_log("hdr: the display offers no HDR10 format, so the picture stays SDR (Windows: turn on \"Use HDR\" in the "
-               "display settings; Linux: a Wayland compositor with colour management and HDR on)");
+    if (!logged) rt_log("hdr: the window's Vulkan surface offers no HDR10 format");
     logged = 1;
     return 0;
 }
@@ -869,6 +869,15 @@ void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc) {
                           .maxLuminance = n.peak, .minLuminance = 0.0f, .maxContentLightLevel = n.peak,
                           .maxFrameAverageLightLevel = n.game};
     set(c->device, 1, &sc, &m);
+}
+
+// The same for the DXGI presenter's swapchain (gfx_dxp.h), which takes them through its own call.
+void vk_hdr_metadata_dxgi(int new_sc) {
+    static unsigned sent = ~0u;
+    if (!new_sc && cfg_version() == sent) return;
+    sent = cfg_version();
+    Nits n = nits();
+    dxp_metadata(n.peak, n.game);
 }
 
 // ---- 3. present passes
