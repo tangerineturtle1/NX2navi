@@ -4,13 +4,14 @@
 // game's own sprint runs: its speed, animation, camera and every rule that ends it.
 //
 // Settings (live): sprint_button picks the button (off, b the game's B button, the bottom face button of the Nintendo
-// layout, or l3 the left stick's click, which has no other use); sprint_mode is toggle (a press starts the sprint, the
+// layout, or l3 the left stick's click, whose only other use hides the text box in a conversation); sprint_mode is toggle (a press starts the sprint, the
 // next press or Link's state ends it) or hold (sprint while the button is held). During gameplay the button is kept
 // from the game (sprint_pad, called by ov_input.c npad_states), so it does not also fire its own action. B is kept only
 // for a press that begins while Link moves (Walk, Jump, Land, Fall, Clamber), and then until it is released, so it
 // puts the weapon away as usual otherwise and the game never sees half a press. Presses made in a menu, a cutscene or
 // a load (no update of Link within GAMEPLAY_POLLS polls) start nothing: B closes the pause menu, and that press is the
-// menu's. Under the game's Swap Jump Controls B is the jump, which a B sprint button keeps from the game while Link
+// menu's. Nor do presses while an event runs (event_running): Link's update goes on during a conversation, where L3
+// hides the text box, so that press is the game's too. Under the game's Swap Jump Controls B is the jump, which a B sprint button keeps from the game while Link
 // moves: L3 is the one to use then.
 // Patch page slots: the set's sites call +0xf40 and +0xf30; +0xf20 and +0xf50 to +0xff0 belong to other sets
 // (runtime/patches.c, mouse_direct.c, ov_zstd.c). A slot registered twice ends the start (dispatch.c rt_register_host).
@@ -98,6 +99,14 @@ static int is_link(uint64_t link) {
     return ld64(ctl + 0x18) == ld64(link + 0x18);
 }
 
+// An event (a conversation, a cutscene) is running: the event manager ([[main+0x4c7e090]]) has an active event at
+// +0x68, the field the game's SeqQueryIsEventRunning reads (main+0xbcc100).
+#define EVENT_MGR 0x4c7e090ull
+static int event_running(void) {
+    uint64_t slot = ld64(MOD_MAIN_BASE + EVENT_MGR), mgr = slot ? ld64(slot) : 0;
+    return mgr && ld64(mgr + 0x68);
+}
+
 static int state_kind(uint64_t link) {
     uint64_t p = ld64(link + 0x18);
     if (p) p = ld64(p + 0x270);
@@ -135,7 +144,7 @@ void sprint_pad(uint64_t *buttons) {
     }
     static uint64_t last;
     uint64_t bit = button_bits[b], now = *buttons;
-    int n = atomic_load(&polls), gameplay = n < GAMEPLAY_POLLS;
+    int n = atomic_load(&polls), gameplay = n < GAMEPLAY_POLLS && !event_running();
     if (n <= GAMEPLAY_POLLS) atomic_store(&polls, n + 1);
     // A press is decided at its start, for its whole length: kept from the game, and the sprint's, when it begins in
     // gameplay (B: while Link moves); else the game's alone, and no sprint's.

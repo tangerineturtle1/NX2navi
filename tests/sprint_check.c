@@ -228,6 +228,23 @@ int main(int argc, char **argv) {
     frame(0, WALK, link);
     assert(!dashing());
 
+    // a conversation: Link's update goes on, but an event runs, so L3 (hide the text box) is the game's and starts nothing
+    reset("l3", "toggle");
+    {
+        uint64_t event[0x10] = {0}, ev_ptr = (uintptr_t)event;
+        *(uint64_t *)(img + 0x4c7e090) = (uintptr_t)&ev_ptr;
+        frame(0, WALK, link);
+        event[0x68 / 8] = 1;   // the event starts
+        assert(frame(L3, WAIT_ID, link) == L3 && !dashing());
+        assert(frame(L3, WAIT_ID, link) == L3 && !dashing());
+        assert(frame(0, WAIT_ID, link) == 0 && !dashing());
+        event[0x68 / 8] = 0;   // it ends: the button is the sprint's again
+        frame(0, WALK, link);
+        assert(frame(L3, WALK, link) == 0 && dashing());
+        frame(0, WALK, link), frame(L3, WALK, link), frame(0, WALK, link);
+        *(uint64_t *)(img + 0x4c7e090) = 0;
+    }
+
     // the stand-still timings count 60 Hz frames: at 240 fps (a quarter frame an update) a stop of four updates goes on
     reset("l3", "toggle");
     step = 0.25f;
