@@ -5056,6 +5056,30 @@ class SteamTest(Tmp):
                                                        root / 'userdata' / '22' / 'config']))
 
 
+class LaunchTargetTest(Tmp):
+    def test_explicit_launch_skips_the_window_and_returns_the_game_status(self) -> None:
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        target = self.tmp / 'another game'
+        target.mkdir()
+        exe = target / ('ocarina.exe' if os.name == 'nt' else 'ocarina')
+        exe.touch()
+        root = self.tmp / 'launcher'
+        proc = mock.Mock()
+        proc.wait.return_value = 37
+        with mock.patch.object(app.winsys, 'start_game', return_value=proc) as start, \
+                mock.patch.object(app.tk, 'Tk') as window, contextlib.redirect_stderr(io.StringIO()) as err:
+            for game in (target, exe):
+                self.assertEqual(app.main(['--root', str(root), '--launch', str(game)]), 37)
+            self.assertEqual(start.call_args_list, [mock.call(exe), mock.call(exe)])
+            self.assertEqual(app.main(['--root', str(root), '--launch', str(target / 'missing')]), 1)
+            self.assertIn('is not a built game', err.getvalue())
+            self.assertEqual(start.call_count, 2)
+            window.assert_not_called()
+
+
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:

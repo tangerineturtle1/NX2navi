@@ -2697,8 +2697,11 @@ def parse_args(argv):
     ap.add_argument('--root', help='the launcher folder (tests)')
     ap.add_argument('--selftest', action='store_true', help='draw every screen and close')
     ap.add_argument('--shots', help='with --selftest: save a PNG of each screen into this folder')
-    ap.add_argument('--play', action='store_true',
-                    help='start the game without the window and wait for it (the Steam shortcut, launcher/steam.py)')
+    launch = ap.add_mutually_exclusive_group()
+    launch.add_argument('--play', action='store_true',
+                        help='start the game without the window and wait for it (the Steam shortcut, launcher/steam.py)')
+    launch.add_argument('--launch', metavar='TARGET', type=Path,
+                        help='start a built game by folder or executable path, without opening the launcher window')
     a, _unknown = ap.parse_known_args(argv)
     return a
 
@@ -2760,12 +2763,33 @@ def play_only(ctx):
     return 0
 
 
+def launch_target(ctx: Context, target: Path) -> int:
+    """Start an explicit built game and wait for it without opening the launcher window."""
+    exe_name = 'ocarina.exe' if os.name == 'nt' else 'ocarina'
+    try:
+        exe = Path(os.path.abspath(target.expanduser()))
+        if exe.is_dir():
+            exe /= exe_name
+        if exe.name.lower() != exe_name or not exe.is_file():
+            raise FileNotFoundError(f'{exe} is not a built game. Give the game folder or its {exe_name}.')
+        proc = winsys.start_game(exe)
+    except OSError as e:
+        ctx.log(f'launch target: {e}')
+        if sys.stderr is not None:
+            print(f'NX2navi: {e}', file=sys.stderr)
+        return 1
+    ctx.log(f'launch target: {exe}')
+    return proc.wait()
+
+
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
     winsys.dpi_aware()
     winsys.app_id()
     from ..paths import Layout
     ctx = Context(Layout(root=a.root) if a.root else None)
+    if a.launch is not None:
+        return launch_target(ctx, a.launch)
     if a.play and not a.selftest:
         code = play_only(ctx)
         if code is not None:

@@ -463,6 +463,10 @@ game folder is the default `<launcher>\game`. The dump is never touched.
 `rebuild [--game D]`, `fonts`. `NX2navi.exe --desktop-shortcut on|off` and `--shortcuts on|off` are the stub's own.
 `NX2navi-Setup.exe` takes `--dest DIR`, `--no-shortcuts`, `--no-launch` and `--quiet`.
 
+`NX2navi.exe --launch "D:\Games\Ocarina"` starts that built game without opening the launcher window. Pass its
+folder or the `ocarina.exe` path. Relative paths start from the caller's working directory. The command waits for the
+game process and returns its exit code. Errors before launch are recorded in `data/logs/launcher.log`.
+
 ## One launcher, one job
 
 One process works in a launcher folder at a time (`launcher/locks.py`). The window holds the folder's lock,
