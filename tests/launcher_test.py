@@ -3206,6 +3206,54 @@ class MakeGameTest(Tmp):
         self.assertEqual(mg.steps_to_run(state, ident, self.out, 'compile'), ['romfs', 'compile'])
         self.assertEqual(mg.steps_to_run({'steps': {}}, ident, self.out, 'romfs'), ['exefs', 'romfs'])
 
+    def test_clean_rebuild_recreates_caches_and_keeps_the_game_data(self):
+        mg = self.mg
+        made_up_game(self.out)
+        state_path = self.out / 'build-cache' / 'state.json'
+        state = json.loads(state_path.read_text())
+        cache_files = ('build-cache/lift/layout.json', 'build-cache/obj/objects.json', 'build-cache/gen/romfs_config.h',
+                       'build-cache/link.key', 'shader-cache/shader-cache.pack', 'pipeline-cache.bin',
+                       'shader-prepared.bin', 'nvidia-cache/driver')
+        player_files = ('nx2navi.ini', 'profile/save/slot_00/progress.sav', 'mods/example/romfs/file')
+        for name in (*cache_files, *player_files):
+            path = self.out / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'old')
+        for step in ('lift', 'compile', 'shaders'):
+            state['steps'][step] = mg.step_key(step, state['input'], self.out)
+        state_path.write_text(json.dumps(state))
+        calls: list[str] = []
+
+        def lift(out, cache):
+            self.assertFalse(any((out / name).exists() for name in cache_files))
+            self.assertEqual(set(json.loads(state_path.read_text())['steps']), {'exefs', 'romfs'})
+            calls.append('lift')
+
+        def compile_(out, cache, msys, jobs, romfs_job, update, *, local_runtime):
+            self.assertTrue(local_runtime)
+            self.assertFalse(update)
+            calls.append('compile')
+
+        def shaders(out, update):
+            self.assertFalse(update)
+            calls.append('shaders')
+
+        with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CACHE': 'custom-cache', 'NX2NAVI_PIPELINE_CACHE': ''}):
+            code, log = self.main_rebuild(lift, compile_, '--clean', '--until', 'shaders')
+        self.assertEqual(code, 1, log)
+        self.assertIn('clear the NX2NAVI_SHADER_CACHE override', log)
+        self.assertEqual(json.loads(state_path.read_text()), state)
+        self.assertTrue(all((self.out / name).is_file() for name in cache_files))
+
+        with mock.patch.object(mg, 'step_shaders', shaders), \
+                mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CACHE': '', 'NX2NAVI_PIPELINE_CACHE': ''}):
+            code, log = self.main_rebuild(lift, compile_, '--clean', '--until', 'shaders')
+        self.assertEqual(code, 0, log)
+        self.assertEqual(calls, ['lift', 'compile', 'shaders'])
+        for name in player_files:
+            self.assertEqual((self.out / name).read_bytes(), b'old')
+        self.assertEqual((self.out / 'ocarina.exe').read_bytes(), b'MZ')
+
     def test_the_build_tools_are_tried_before_the_long_steps(self):
         """On Windows a build whose compile step will run first compiles and links an empty program with the
         installed tools; tools that do not work stop it there with what is wrong and how to mend it."""

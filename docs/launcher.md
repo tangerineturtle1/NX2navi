@@ -463,6 +463,11 @@ game folder is the default `<launcher>\game`. The dump is never touched.
 `rebuild [--game D]`, `fonts`. `NX2navi.exe --desktop-shortcut on|off` and `--shortcuts on|off` are the stub's own.
 `NX2navi-Setup.exe` takes `--dest DIR`, `--no-shortcuts`, `--no-launch` and `--quiet`.
 
+**Clean Rebuild** on the home screen uses the unpacked game files to generate and compile the code again, then
+prepares shaders with fresh local caches. It can take as long as a first build. The game settings, controller
+bindings, saves and mods stay in the game folder. If you use a shader or pipeline cache override, clear it before
+starting a clean rebuild.
+
 ## One launcher, one job
 
 One process works in a launcher folder at a time (`launcher/locks.py`). The window holds the folder's lock,

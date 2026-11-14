@@ -1927,12 +1927,13 @@ def write_runtime_map(full, dst):
         pass
 
 
-def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
+def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False, *, local_runtime: bool = False):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
     update: a rebuild after a kit update (lifted_level). The kit's execution profile, when this build can use it
     (pgo_profile), goes into every compile; NX2NAVI_PGO=gen makes an instrumented game instead (pgo_gen_flags), its
-    runtime compiled here too, as the prebuilt one counts nothing."""
+    runtime compiled here too, as the prebuilt one counts nothing. local_runtime compiles the runtime here for a
+    clean rebuild."""
     lift, gen, obj = cache_dir / 'lift', cache_dir / 'gen', cache_dir / 'obj'
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
@@ -1947,7 +1948,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     ld = ['-fuse-ld=lld'] if ((msys / 'bin' / 'ld.lld.exe').is_file() if WIN else shutil.which('ld.lld')) else []
     if gen_counts:
         pgo_gen_check(clangxx, env, cache_dir / 'pgo-trial', msys, ld)
-    prebuilt = None if gen_counts else prebuilt_runtime(clang, env)
+    prebuilt = None if gen_counts or local_runtime else prebuilt_runtime(clang, env)
     runtime = [(p, obj / name) for p, name in runtime_sources()]
     if prebuilt:
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
@@ -2483,6 +2484,49 @@ def keep_awake():
         pass
 
 
+def check_clean_cache_paths(out: Path) -> None:
+    """A clean rebuild only clears colocated caches. A custom path can be shared with another installation."""
+    overrides = {'SHADER_CACHE', 'PIPELINE_CACHE'}
+    ini_values: dict[str, str] = {}
+    try:
+        data = (out / 'nx2navi.ini').read_bytes()
+    except FileNotFoundError:
+        data = b''
+    encoding = 'utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
+    for line in data.decode(encoding, errors='replace').splitlines():
+        key, sep, value = line.partition('=')
+        name = key.strip().upper().removeprefix('NX2NAVI_')
+        if sep and name in overrides and (value := value.strip().strip('"')):
+            ini_values[name] = value
+    for name in sorted(overrides):
+        key = f'NX2NAVI_{name}'
+        if os.environ.get(key, ini_values.get(name, '')):
+            fail(f'clear the {key} override before a clean rebuild to protect shared caches')
+
+
+def clear_rebuild_cache(cache: Path) -> None:
+    """Remove generated code and objects while keeping the unpacked-source record for retries."""
+    for name in ('lift', 'obj', 'gen'):
+        folder = cache / name
+        if folder.exists():
+            shutil.rmtree(folder)
+    for name in ('link.rsp', 'link.key'):
+        (cache / name).unlink(missing_ok=True)
+
+
+def clear_shader_cache(out: Path) -> None:
+    """Remove this installation's shader and pipeline caches before a clean preparation."""
+    for name in ('shader-cache', 'nvidia-cache'):
+        folder = out / name
+        if folder.exists():
+            shutil.rmtree(folder)
+    for name in ('shader-prepared.bin', 'shader-prepare-journal.bin', 'shader-warm-journal.bin', 'shader-warm.txt',
+                 'shader-answers.bin', 'shader-programs.bin', 'pipeline-cache.bin', 'pipeline-cache-play.bin',
+                 'pipeline-binaries.bin', 'pipeline-keys.bin', 'seed-pipeline-keys.bin', 'compute-used.bin',
+                 'boot-warm-owed.txt', 'pipeline-prewarm-running.txt', 'pipeline-prewarm-skip.txt'):
+        (out / name).unlink(missing_ok=True)
+
+
 def load_state(path):
     try:
         state = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
@@ -2637,6 +2681,8 @@ def build_main():
     ap.add_argument('--retune', action='store_true',
                     help="with --rebuild: compile the lifted code for this processor's level even when the objects "
                          'kept from before an update were compiled for another (Rebuild the Game)')
+    ap.add_argument('--clean', action='store_true',
+                    help='with --rebuild: rebuild generated code, objects and local shader caches from scratch')
     ap.add_argument('--out', help='the folder for the finished game')
     ap.add_argument('--check', action='store_true', help='only check the game\'s version; builds nothing')
     ap.add_argument('--msys', default=r'C:\msys64\ucrt64',
@@ -2652,6 +2698,8 @@ def build_main():
                          'environment variable NX2NAVI_PGO, else build with the profile of the kit when it fits')
     ap.add_argument('--until', choices=STEPS, help=argparse.SUPPRESS)   # tests: stop after this step
     a = ap.parse_args()
+    if a.clean and (not a.rebuild or a.check):
+        ap.error('--clean requires a build with --rebuild')
     EVENTS = a.events
     PGO_MODE = a.pgo or ''
     jobs_why = '--jobs'
@@ -2680,6 +2728,8 @@ def build_main():
         return
     if not out:
         ap.error('--out is needed to build')
+    if a.clean:
+        check_clean_cache_paths(out)
     msys = Path(a.msys)
     if WIN:
         for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
@@ -2707,6 +2757,9 @@ def build_main():
     if reset:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}
     state['kit'] = kit_version()
+    if a.clean:
+        for name in ('lift', 'compile', 'shaders'):
+            state['steps'].pop(name, None)
     if a.rebuild and a.retune and retune_due(cache / 'obj', msys):
         # the compile step's key does not name the level: without this a finished compile reads as done before
         state['steps'].pop('compile', None)
@@ -2714,8 +2767,9 @@ def build_main():
     # What can be known to fail later is looked at now: the disk space of every step that will run, and on Windows
     # that the build tools compile and link (not for a build the tests stop before its compile step, --until)
     ahead = steps_to_run(state, src.identity, out, a.until)
-    check_space(out, space_needs(ahead, out, sum(src.romfs_size(ref) for _, ref in src.romfs) if 'romfs' in ahead else 0,
-                                 a.rebuild and shader_carry(out)))
+    if not a.clean:
+        check_space(out, space_needs(ahead, out, sum(src.romfs_size(ref) for _, ref in src.romfs) if 'romfs' in ahead else 0,
+                                     a.rebuild and shader_carry(out)))
     if WIN and 'compile' in ahead:
         probe_toolchain(msys, cache / 'toolchain-check')
     # Linux: the compiler, headers and libraries are the system's, so they are tried on the runtime before the long
@@ -2725,10 +2779,17 @@ def build_main():
     say(f'compiles at a time: {a.jobs} ({jobs_why})')
     t0 = time.time()
     romfs_job = None
+    def compile_game() -> None:
+        update = a.rebuild and not (a.retune or a.clean)
+        if a.clean:
+            step_compile(out, cache, msys, a.jobs, romfs_job, update, local_runtime=True)
+        else:
+            step_compile(out, cache, msys, a.jobs, romfs_job, update)
+
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache),
-            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune),
-            'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out),
+            'compile': compile_game,
+            'shaders': lambda: step_shaders(out, a.rebuild and not a.clean), 'prompts': lambda: step_prompts(out),
             'scan': lambda: step_scan(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
@@ -2740,10 +2801,15 @@ def build_main():
             tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
             os.replace(tmp, state_path)
 
-    if reset:
-        # on disk at once: the exefs step rewrites <out>/exefs in place, and a run cut short there would leave the
-        # old state.json saying the old game's steps are done, which --rebuild trusts
+    if reset or a.clean:
+        # Record invalidated steps before overwriting ExeFS or removing caches, so an interrupted build can resume.
         save()
+    if a.clean:
+        clear_rebuild_cache(cache)
+        if 'shaders' in ahead:
+            clear_shader_cache(out)
+        image_bytes = sum(src.romfs_size(ref) for _, ref in src.romfs) if 'romfs' in ahead else 0
+        check_space(out, space_needs(ahead, out, image_bytes))
 
     def run(name):
         t = time.time()
