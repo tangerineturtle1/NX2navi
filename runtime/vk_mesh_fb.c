@@ -154,21 +154,32 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
     if (has_task && M.cap_slots[i] > M.list_bytes / 4) M.cap_slots[i] = (uint32_t)(M.list_bytes / 4);
     *rec = M.rec;
     int n = 0;
-    vkCmdFillBuffer(cb, M.rec, at, REC_BYTES, 1), n++;
+    // Every word of the record is written by exactly one command. A fill of the whole record followed by fills and
+    // copies into parts of it were transfer writes to the same bytes without a barrier between them, which the GPU may
+    // run in any order: on an RX 580 the vertex count, the first vertex or instance or the task count was the fill's 1
+    // in about half the draws, and the foliage of the mesh programs flashed (missing, or white from the wrong slots).
+    // Fills and copies only: they go through the recorder thread (vk_rec.h) like the replay's other commands.
+    uint32_t r[REC_BYTES / 4], copied = 0;   // copied: the words the GPU-written count goes to
+    for (uint32_t k = 0; k < REC_BYTES / 4; k++) r[k] = 1;
     // where the workgroup count goes: the task dispatch, or the mesh dispatch, the draw's instances and the report
-    VkDeviceSize to[3] = {has_task ? at : at + 16, at + 36, at + 48};
+    VkDeviceSize to[3] = {has_task ? 0 : 16, 36, 48};
     int nto = has_task ? 1 : 3;
-    if (!has_task) {
-        vkCmdFillBuffer(cb, M.rec, at + 32, 4, verts), n++;
-        vkCmdFillBuffer(cb, M.rec, at + 40, 8, 0), n++;
-        vkCmdFillBuffer(cb, M.rec, at + 52, 4, 0), n++;
+    if (!has_task) r[32 / 4] = verts, r[40 / 4] = 0, r[44 / 4] = 0, r[52 / 4] = 0;
+    for (int k = 0; k < nto; k++) {
+        if (src) copied |= 1u << (to[k] / 4);
+        else r[to[k] / 4] = count;
+    }
+    for (uint32_t k = 0; k < REC_BYTES / 4;) {
+        if (copied >> k & 1) { k++; continue; }
+        uint32_t e = k + 1;
+        while (e < REC_BYTES / 4 && !(copied >> e & 1) && r[e] == r[k]) e++;
+        vkCmdFillBuffer(cb, M.rec, at + 4 * (VkDeviceSize)k, 4 * (VkDeviceSize)(e - k), r[k]), n++;
+        k = e;
     }
     if (src) {
         VkBufferCopy cp[3];
-        for (int k = 0; k < nto; k++) cp[k] = (VkBufferCopy){src_off, to[k], 4};
+        for (int k = 0; k < nto; k++) cp[k] = (VkBufferCopy){src_off, at + to[k], 4};
         vkCmdCopyBuffer(cb, src, M.rec, (uint32_t)nto, cp), n++;
-    } else {
-        for (int k = 0; k < nto; k++) vkCmdFillBuffer(cb, M.rec, to[k], 4, count), n++;
     }
     *cmds = n;
     return at;
