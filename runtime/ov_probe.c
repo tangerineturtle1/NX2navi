@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "amiibo.h"
+#include "amiibo_crypto.h"
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
@@ -73,6 +74,26 @@ static Ov ovs[] = {
     {"nfp.StopDetection", "_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE"},
     {"nfp.GetTagInfo", "_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE"},
     {"nfp.GetModelInfo", "_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE"},
+    {"nfp.GetRegisterInfo", "_ZN2nn3nfp15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE"},
+    {"nfp.GetCommonInfo", "_ZN2nn3nfp13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE"},
+    {"nfp.OpenApplicationArea", "_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj"},
+    {"nfp.CreateApplicationArea",
+     "_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE"},
+    {"nfp.GetApplicationArea", "_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm"},
+    {"nfp.SetApplicationArea", "_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm"},
+    {"nfp.Flush", "_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE"},
+    {"nfp.RecreateApplicationArea",
+     "_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE"},
+    {"nfp.StartNicknameAndOwnerSettingsInfo",
+     "_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_"
+     "24AmiiboSettingsStartParamERKNS0_7TagInfoERKS4_"},
+    {"nfp.StartNicknameAndOwnerSettings",
+     "_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_"
+     "24AmiiboSettingsStartParamERKNS0_7TagInfoE"},
+    {"nfp.StartRestorer",
+     "_ZN2nn3nfp13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"},
+    {"nfp.StartGameDataEraser",
+     "_ZN2nn3nfp19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE"},
     {"err.ShowError", "_ZN2nn3err9ShowErrorENS_6ResultE"},
     // SDK-internal (section 5.2)
     {"nndiagStartup", "nndiagStartup"},
@@ -357,6 +378,123 @@ static int event_set(uint64_t ev) {
     return (uint8_t)rt_call(gc, try_wait, 1, ev) && (uint8_t)rt_call(gc, try_wait, 1, ev);
 }
 
+// The application area on the made-up figure probe_applet loaded, through the overrides as the game calls them: the
+// results without an area and for another access id, create, open, set, flush and get, the write counter in
+// CommonInfo, the figure's data saved in the profile and read back from there by a second load, recreate, the three
+// settings applets and the menu's erase. 1 when every check held.
+static int probe_app_area(const uint8_t *handles, const char *dump_path, const char *dat_path) {
+    int before = failures;
+    amiibo_tap_tag();
+    CHECK((uint32_t)CALL("nfp.Mount", U(handles), 0, 0) == 0, "nfp Mount with a figure on the reader");
+    uint8_t reg[0x100], common[0x40];
+    memset(reg, 0xEE, sizeof reg);
+    uint32_t r = (uint32_t)CALL("nfp.GetRegisterInfo", U(reg), U(handles));
+    CHECK(r == 0 && !strcmp((const char *)reg + 0x5C, "probe-amii"),
+          "RegisterInfo: %#x, nickname '%.40s', not the file name cut to 10 characters", r, (const char *)reg + 0x5C);
+    memset(common, 0xEE, sizeof common);
+    r = (uint32_t)CALL("nfp.GetCommonInfo", U(common), U(handles));
+    CHECK(r == 0 && common[4] == 0 && common[5] == 0 && common[6] == 2 && common[8] == 0xD8 && common[9] == 0 &&
+          common[10] == 0 && common[11] == 0,
+          "CommonInfo of a new figure: %#x, counter %02x %02x, version %u, area size %02x %02x", r, common[4],
+          common[5], common[6], common[8], common[9]);
+
+    const uint32_t id = 0x1A2B3C4Du, id2 = 0x0BADF00Du;
+    uint8_t area[AMIIBO_APP_AREA_SIZE];
+    uint64_t n = 0;
+    r = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id);
+    CHECK(r == 0x10073, "OpenApplicationArea without an area: %#x, not 0x10073", r);
+    r = (uint32_t)CALL("nfp.GetApplicationArea", U(area), U(&n), U(handles), sizeof area);
+    CHECK(r == 0x10073, "GetApplicationArea without an area: %#x, not 0x10073", r);
+
+    // ApplicationAreaCreateInfo: u32 access id, u32 initial data size, u64 initial data address
+    static const uint8_t init[4] = {'i', 'n', 'i', 't'};
+    uint8_t ci[16];
+    uint32_t init_size = sizeof init;
+    uint64_t init_addr = U(init);
+    memcpy(ci, &id, 4);
+    memcpy(ci + 4, &init_size, 4);
+    memcpy(ci + 8, &init_addr, 8);
+    r = (uint32_t)CALL("nfp.CreateApplicationArea", U(handles), U(ci));
+    CHECK(r == 0, "CreateApplicationArea: %#x", r);
+    r = (uint32_t)CALL("nfp.CreateApplicationArea", U(handles), U(ci));
+    CHECK(r == 0x15073, "CreateApplicationArea a second time: %#x, not 0x15073", r);
+    r = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id + 1);
+    CHECK(r == 0x13073, "OpenApplicationArea with another access id: %#x, not 0x13073", r);
+    r = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id);
+    CHECK(r == 0, "OpenApplicationArea: %#x", r);
+    memset(area, 0xEE, sizeof area);
+    r = (uint32_t)CALL("nfp.GetApplicationArea", U(area), U(&n), U(handles), sizeof area);
+    CHECK(r == 0 && n == sizeof area && !memcmp(area, init, sizeof init) && area[sizeof init] == 0,
+          "GetApplicationArea after create: %#x, %llu bytes, %02x %02x %02x %02x %02x", r, (unsigned long long)n,
+          area[0], area[1], area[2], area[3], area[4]);
+
+    uint8_t mine[AMIIBO_APP_AREA_SIZE];
+    for (size_t i = 0; i < sizeof mine; i++) mine[i] = (uint8_t)(i * 7 + 1);
+    r = (uint32_t)CALL("nfp.SetApplicationArea", U(handles), U(mine), sizeof mine);
+    CHECK(r == 0, "SetApplicationArea: %#x", r);
+    r = (uint32_t)CALL("nfp.Flush", U(handles));
+    CHECK(r == 0, "Flush: %#x", r);
+    r = (uint32_t)CALL("nfp.GetCommonInfo", U(common), U(handles));
+    CHECK(r == 0 && common[4] == 2 && common[5] == 0,
+          "CommonInfo write counter after create and flush: %02x %02x, not 2", common[4], common[5]);
+    memset(area, 0xEE, sizeof area);
+    r = (uint32_t)CALL("nfp.GetApplicationArea", U(area), U(&n), U(handles), sizeof area);
+    CHECK(r == 0 && n == sizeof area && !memcmp(area, mine, sizeof mine),
+          "GetApplicationArea after flush: %#x, %llu bytes", r, (unsigned long long)n);
+
+    // Saved in the profile: a second load of the dump reads the figure back from the .dat
+    CHECK(plat_file_exists(dat_path), "the figure's data was not saved to %s", dat_path);
+    AmiiboFigureData fd;
+    memset(&fd, 0, sizeof fd);
+    int reread = amiibo_load_file(dump_path) && amiibo_get_figure_data(&fd);
+    CHECK(reread && fd.source == AMIIBO_SOURCE_SAVED && fd.registered && fd.has_app_area && fd.access_id == id &&
+          fd.write_counter == 2 && fd.app_area_size == sizeof mine && !memcmp(fd.app_area, mine, sizeof mine),
+          "the figure read back from %s: source %d, area %d, access id %#x, counter %u, %u bytes", dat_path,
+          (int)fd.source, (int)fd.has_app_area, fd.access_id, (unsigned)fd.write_counter, fd.app_area_size);
+
+    memcpy(ci, &id2, 4);
+    memset(ci + 4, 0, 12);
+    r = (uint32_t)CALL("nfp.RecreateApplicationArea", U(handles), U(ci));
+    uint32_t r_old = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id);
+    uint32_t r_new = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id2);
+    memset(area, 0xEE, sizeof area);
+    CALL("nfp.GetApplicationArea", U(area), U(&n), U(handles), sizeof area);
+    int zero = 1;
+    for (size_t i = 0; i < sizeof area; i++) zero &= area[i] == 0;
+    CHECK(r == 0 && r_old == 0x13073 && r_new == 0 && zero,
+          "RecreateApplicationArea: %#x, then open with the old access id %#x and the new one %#x, area empty %d", r,
+          r_old, r_new, zero);
+
+    // The settings applets answer at once with the reader's handle
+    uint8_t dev[8], param[0x40] = {0}, ti[0x58], reg2[0x100];
+    uint8_t registered = 0;
+    amiibo_get_tag_info(ti);
+    memset(dev, 0, sizeof dev);
+    memset(reg, 0xEE, sizeof reg);
+    r = (uint32_t)CALL("nfp.StartNicknameAndOwnerSettings", U(dev), U(&registered), U(reg), U(param), U(ti));
+    CHECK(r == 0 && registered == 1 && dev[0] == 1 && !strcmp((const char *)reg + 0x5C, "probe-amii"),
+          "StartNicknameAndOwnerSettings: %#x, registered %u, handle %u, nickname '%.40s'", r, registered, dev[0],
+          (const char *)reg + 0x5C);
+    memcpy(reg2, reg, sizeof reg2);
+    memset(dev, 0, sizeof dev);
+    registered = 0;
+    r = (uint32_t)CALL("nfp.StartNicknameAndOwnerSettingsInfo", U(dev), U(&registered), U(reg), U(param), U(ti),
+                       U(reg2));
+    CHECK(r == 0 && registered == 1 && dev[0] == 1, "StartNicknameAndOwnerSettings with a RegisterInfo: %#x", r);
+    memset(dev, 0, sizeof dev);
+    r = (uint32_t)CALL("nfp.StartRestorer", U(dev), U(param), U(ti));
+    CHECK(r == 0 && dev[0] == 1, "StartRestorer: %#x", r);
+    memset(dev, 0, sizeof dev);
+    r = (uint32_t)CALL("nfp.StartGameDataEraser", U(dev), U(param), U(ti));
+    r_new = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), id2);
+    CHECK(r == 0 && dev[0] == 1 && r_new == 0x10073, "StartGameDataEraser: %#x, then open %#x, not 0x10073", r, r_new);
+    memset(&fd, 0, sizeof fd);
+    CHECK(amiibo_erase_app_area() && amiibo_get_figure_data(&fd) && !fd.has_app_area && fd.app_area_size == 0,
+          "the menu's erase leaves an application area");
+    amiibo_unmount();
+    return failures == before;
+}
+
 static void probe_applet(void) {
     uint8_t *report = guest_alloc(0x100);
     uint64_t uid[2] = {1, 2};
@@ -374,13 +512,26 @@ static void probe_applet(void) {
     int nfp_event = event_set(ev);
     CHECK(nfp_event, "the nfp availability event is not set for the emulated reader, or clears itself");
     CHECK((uint32_t)CALL("nfp.GetDeviceState", U(handles)) == 0, "nfp device state");
-    static const char *const none[] = {"nfp.Mount", "nfp.GetTagInfo", "nfp.GetModelInfo"};
+    static const char *const none[] = {"nfp.Mount", "nfp.GetTagInfo", "nfp.GetModelInfo", "nfp.GetRegisterInfo",
+                                       "nfp.GetCommonInfo"};
     uint8_t out[0x100];
     for (size_t i = 0; i < sizeof none / sizeof *none; i++) {
         int first_is_handle = !strcmp(none[i], "nfp.Mount");
         uint64_t r = first_is_handle ? CALL(none[i], U(handles), 0, 0) : CALL(none[i], U(out), U(handles));
         CHECK((uint32_t)r == 0x8073, "%s: %#x, not device-not-found", none[i], (uint32_t)r);
     }
+    // The application area calls without a mounted figure: device not found as well
+    uint8_t create_info[16] = {0};   // ApplicationAreaCreateInfo: access id, initial size, initial data address
+    uint64_t area_size = 0;
+    uint32_t r_open = (uint32_t)CALL("nfp.OpenApplicationArea", U(handles), 1);
+    uint32_t r_create = (uint32_t)CALL("nfp.CreateApplicationArea", U(handles), U(create_info));
+    uint32_t r_recreate = (uint32_t)CALL("nfp.RecreateApplicationArea", U(handles), U(create_info));
+    uint32_t r_get = (uint32_t)CALL("nfp.GetApplicationArea", U(out), U(&area_size), U(handles), sizeof out);
+    uint32_t r_set = (uint32_t)CALL("nfp.SetApplicationArea", U(handles), U(out), 4);
+    uint32_t r_flush = (uint32_t)CALL("nfp.Flush", U(handles));
+    CHECK(r_open == 0x8073 && r_create == 0x8073 && r_recreate == 0x8073 && r_get == 0x8073 && r_set == 0x8073 &&
+          r_flush == 0x8073, "application area calls without a figure: open %#x create %#x recreate %#x get %#x set "
+          "%#x flush %#x, not device-not-found", r_open, r_create, r_recreate, r_get, r_set, r_flush);
     CHECK((uint32_t)CALL("nfp.GetNpadId", U(out), U(handles)) == 0, "nfp GetNpadId");
     uint64_t activate = U(guest_alloc(0x100)), deactivate = U(guest_alloc(0x100));
     CHECK(CALL("nfp.AttachActivateEvent", activate, U(handles)) == 0, "nfp AttachActivateEvent");
@@ -409,6 +560,12 @@ static void probe_applet(void) {
     static const uint8_t id[8] = {0x01, 0x00, 0x00, 0x00, 0x03, 0x53, 0x09, 0x02};
     memcpy(dump + 0x54, id, sizeof id);
     const char *dump_path = "probe-amiibo.bin";
+    // The figure's data of this made-up UID goes to <profile>/amiibo/04112233445566.dat (amiibo.c dat_paths): gone
+    // before the test, so the figure starts new, and after it. No real figure has this UID.
+    char dat_path[1200], bak_path[64];
+    snprintf(dat_path, sizeof dat_path, "%s/amiibo/04112233445566.dat", rt_config()->profile);
+    snprintf(bak_path, sizeof bak_path, "%s.bak", dump_path);
+    plat_fs_unlink(dat_path);
     int amiibo_ok = plat_file_write(dump_path, dump, sizeof dump) && amiibo_load_file(dump_path);
     // TagInfo carries the 7-byte UID without its check byte; ModelInfo has the series at 3, the model number
     // little-endian at 4 and the figure type at 6
@@ -421,9 +578,14 @@ static void probe_applet(void) {
           ti[0], ti[1], ti[2], ti[3], ti[4], ti[5], ti[6]);
     CHECK(amiibo_ok && !memcmp(mi, want_model, 7), "amiibo ModelInfo %02x %02x %02x %02x %02x %02x %02x", mi[0], mi[1],
           mi[2], mi[3], mi[4], mi[5], mi[6]);
+    int area_ok = probe_app_area(handles, dump_path, dat_path);
+    CHECK(amiibo_crypto_selftest(), "amiibo crypto self-test (AES-128, HMAC-SHA256, decrypt and encrypt round trip)");
     dump[0x0C] = 0xE1;
     amiibo_ok = amiibo_ok && plat_file_write(dump_path, dump, sizeof dump) && !amiibo_load_file(dump_path);
+    amiibo_remove_tag();
     plat_fs_unlink(dump_path);
+    plat_fs_unlink(bak_path);
+    plat_fs_unlink(dat_path);
     CHECK(amiibo_ok, "the amiibo loader refuses a dump with the amiibo capability container, or takes a plain NDEF one");
     CHECK(CALL("nfp.Finalize", 0) == 0 && (uint32_t)CALL("nfp.GetState", 0) == 0, "nfp finalize");
     CALL("err.ShowError", 0x2a8);
@@ -435,7 +597,8 @@ static void probe_applet(void) {
     CALL("diag.InitializeApplicationAbortObserver", 0);
     printf("applet/prepo/nfp/err: launch parameter none, volume balance, play reports local, an NFC reader without "
            "an amiibo, availability event (bound through the SDK's CreateSystemEvent) %s, activate and deactivate events "
-           "destroyed and attached again %s\n", nfp_event ? "ok" : "FAILED", reattached ? "ok" : "FAILED");
+           "destroyed and attached again %s, application area round trip on a made-up figure %s\n",
+           nfp_event ? "ok" : "FAILED", reattached ? "ok" : "FAILED", area_ok ? "ok" : "FAILED");
 }
 
 static void probe_account(void) {

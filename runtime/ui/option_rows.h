@@ -25,6 +25,9 @@ void opt_reserve_bottom(float h);
 float opt_bottom(void);
 // The next page's first row takes the controller's cursor (opening the menu, switching tabs).
 void opt_focus_first(void);
+// A page that lays out its own widgets (ui/amiibo_page.cpp): true once when its first item should take the cursor, as
+// opt_focus_first asked; the request is used up.
+bool opt_focus_take(void);
 // The row of key (or button id) takes the cursor, scrolled into view, when it is next drawn.
 void opt_focus_key(const char *key);
 // The next row is greyed out like one the environment fixes, with note under its label and in its description.

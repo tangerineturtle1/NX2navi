@@ -154,6 +154,9 @@ static void set_open(int open) { change_open(open); }
 // The debug menu (ui/debug_menu.cpp; F9 with NX2NAVI_DEBUG_MENU = 1) is laid out in this menu's place: open is the one
 // state for both, with its input, its sounds and the game's blocked pad, and g_debug says which window it shows.
 static std::atomic<int> g_debug{0};
+// The amiibo picker (ui/amiibo_page.cpp) is laid out in the menu's place the same way, when the game starts waiting for
+// an amiibo; F1 and the pad's combination close it like the menu.
+static std::atomic<int> g_picker{0};
 extern "C" int menu_debug_enabled(void) { return cfg_bool("NX2NAVI_DEBUG_MENU"); }
 
 static int g_failed_flag();
@@ -163,7 +166,7 @@ static std::atomic<int> g_booting{1};
 extern "C" int menu_is_open(void) { return g_open.load(std::memory_order_relaxed); }
 extern "C" void menu_toggle(void) {
     if (g_failed_flag() || g_booting.load(std::memory_order_acquire)) return;
-    if (!menu_is_open()) g_debug.store(0);   // F1 opens the settings; with either window open it closes that one
+    if (!menu_is_open()) g_debug.store(0), g_picker.store(0);   // F1 opens the settings; with a window open it closes it
     change_open(-1);
 }
 // F9: opens the debug menu, and closes it again; with the settings menu open it does nothing.
@@ -174,6 +177,7 @@ extern "C" void menu_debug_toggle(void) {
         return;
     }
     g_debug.store(1);
+    g_picker.store(0);
     change_open(1);
 }
 
@@ -515,7 +519,7 @@ static int fonts_up(float scale) {
         // what the title face shows in the CJK languages: the menu's title and tabs (Simplified Chinese menu text) and
         // the boot screen's title (the game's language)
         static const UiTextId titles[] = {UI_MENU_TITLE, UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                          UI_MENU_TAB_CONTROLS, UI_BOOT_TITLE};
+                                          UI_MENU_TAB_CONTROLS, UI_MENU_TAB_AMIIBO, UI_BOOT_TITLE};
         for (int i = 0; i < N; i++) {
             if (!data[i]) continue;
             ImFontGlyphRangesBuilder b;
@@ -583,7 +587,7 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 // Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_AMIIBO, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1794,7 +1798,7 @@ static void rows_low_end(void) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_AMIIBO};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1915,6 +1919,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_AMIIBO: tab_amiibo(scale); break;   // ui/amiibo_page.cpp: the emulated NFC reader
             }
             ImGui::EndTabItem();
         }
@@ -2173,6 +2178,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     if (g_perf_save.exchange(0)) cfg_save();
     perf_tick(plat_now_ns(), t);
     amiibo_tick();
+    const bool picker_wanted = amiibo_picker_wanted();   // every frame: it follows the reader's state
     int cap_number, cap_ok;
     char cap_name[64];
     const bool capture_shows = bugcap_note(&cap_number, &cap_ok, cap_name) != 0;   // the note after F8
@@ -2190,10 +2196,17 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             g_test.page = 0;
             g_tab_request = 0;
             g_debug.store(cfg_get("NX2NAVI_MENU_TEST_DEBUG") != NULL);   // the test shoots the debug menu's tabs instead
+            g_picker.store(0);
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !capture_shows) {
+        } else if (picker_wanted) {   // the game started waiting for an amiibo: its list opens over the game
+            g_debug.store(0);
+            g_picker.store(1);
+            amiibo_picker_begin();
+            set_open(1);
+            open = true;
+        } else if (!g_perf_mode && !capture_shows && !amiibo_note_shows()) {
             return 0;
         }
     }
@@ -2254,11 +2267,14 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
         // Esc, or B on the pad when no field is being typed in, closes it
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
             set_open(0);
+    } else if (open && g_picker.load(std::memory_order_relaxed)) {
+        if (!amiibo_picker_layout(t->width, t->height, scale)) set_open(0);
     } else if (open) {
         layout_menu(t->width, t->height, scale);
     }
     perf_draw(t, scale);
     capture_note(t, scale);
+    amiibo_note_draw(t->width, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;

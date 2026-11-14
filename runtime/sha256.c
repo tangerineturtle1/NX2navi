@@ -128,3 +128,31 @@ void sha256(const void *data, size_t n, uint8_t out[32]) {
     sha256_update(&s, data, n);
     sha256_final(&s, out);
 }
+
+static void hmac_wipe(void *p, size_t n) {
+    volatile uint8_t *v = p;
+    while (n--) *v++ = 0;
+}
+
+// SHA-256((K ^ opad) || SHA-256((K ^ ipad) || msg)), K the key padded with zeros to the 64-byte block. The padded key
+// and the inner hash are wiped afterwards: they are key material (amiibo_crypto.c derives its keys with this).
+void hmac_sha256(const void *key, size_t key_len, const void *msg, size_t msg_len, uint8_t out[32]) {
+    uint8_t k[64] = {0}, pad[64], inner[32];
+    Sha256 s;
+    if (key_len > 64) sha256(key, key_len, k);
+    else if (key_len) memcpy(k, key, key_len);
+    for (int i = 0; i < 64; i++) pad[i] = k[i] ^ 0x36;
+    sha256_init(&s);
+    sha256_update(&s, pad, 64);
+    if (msg_len) sha256_update(&s, msg, msg_len);
+    sha256_final(&s, inner);
+    for (int i = 0; i < 64; i++) pad[i] = k[i] ^ 0x5c;
+    sha256_init(&s);
+    sha256_update(&s, pad, 64);
+    sha256_update(&s, inner, 32);
+    sha256_final(&s, out);
+    hmac_wipe(k, sizeof k);
+    hmac_wipe(pad, sizeof pad);
+    hmac_wipe(inner, sizeof inner);
+    hmac_wipe(&s, sizeof s);
+}

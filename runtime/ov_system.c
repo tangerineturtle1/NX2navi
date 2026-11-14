@@ -313,7 +313,9 @@ static void ov_report_limit_event(Cpu *c) {
 }
 static void ov_nothing(Cpu *c) { (void)c; }
 
-// nn::nfp: NFC reader & amiibo support
+// nn::nfp: NFC reader & amiibo support. Every nn::nfp import of the game has an override here, so the SDK's own nfp
+// code (whose session Initialize never opens) is not reached. amiibo.c keeps the figure's data and application area.
+static const uint8_t nfp_device[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };   // the DeviceHandle of the one emulated reader
 static volatile int32_t nfp_state;
 static void ov_nfp_initialize(Cpu *c) { plat_xchg32(&nfp_state, 1); ret_x(c, 0); }
 static void ov_nfp_finalize(Cpu *c) {
@@ -334,10 +336,7 @@ static void ov_nfp_list(Cpu *c) {
         ret_x(c, NFP_R_DEVICE_NOT_FOUND);
         return;
     }
-    if (out && max > 0) {
-        static const uint8_t dev[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
-        memcpy(out, dev, sizeof dev);
-    }
+    if (out && max > 0) memcpy(out, nfp_device, sizeof nfp_device);
     if (count) *count = 1;
     ret_x(c, 0);
 }
@@ -430,7 +429,93 @@ static void ov_nfp_get_model_info(Cpu *c) {
     ret_x(c, 0);
 }
 
-static void ov_nfp_no_device(Cpu *c) { ret_x(c, NFP_R_DEVICE_NOT_FOUND); }
+// Result GetRegisterInfo(RegisterInfo *out, const DeviceHandle &)
+static void ov_nfp_get_register_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!amiibo_is_mounted()) {
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    if (out) amiibo_get_register_info(out);
+    ret_x(c, 0);
+}
+
+// Result GetCommonInfo(CommonInfo *out, const DeviceHandle &)
+static void ov_nfp_get_common_info(Cpu *c) {
+    void *out = arg_p(c, 0);
+    if (!amiibo_is_mounted()) {
+        ret_x(c, NFP_R_DEVICE_NOT_FOUND);
+        return;
+    }
+    if (out) amiibo_get_common_info(out);
+    ret_x(c, 0);
+}
+
+// Result OpenApplicationArea(const DeviceHandle &, u32 access_id)
+static void ov_nfp_open_app_area(Cpu *c) { ret_x(c, amiibo_open_app_area((uint32_t)arg_x(c, 1))); }
+
+// Result GetApplicationArea(void *out, size_t *out_size, const DeviceHandle &, size_t size)
+static void ov_nfp_get_app_area(Cpu *c) {
+    void *out = arg_p(c, 0);
+    uint64_t *out_size = arg_p(c, 1);
+    uint64_t n = 0;
+    uint32_t r = amiibo_get_app_area(out, out ? arg_x(c, 3) : 0, &n);
+    if (!r && out_size) *out_size = n;
+    ret_x(c, r);
+}
+
+// Result SetApplicationArea(const DeviceHandle &, const void *data, size_t size)
+static void ov_nfp_set_app_area(Cpu *c) { ret_x(c, amiibo_set_app_area(arg_p(c, 1), arg_x(c, 2))); }
+
+// Result Flush(const DeviceHandle &)
+static void ov_nfp_flush(Cpu *c) { ret_x(c, amiibo_flush_figure()); }
+
+// Result CreateApplicationArea / RecreateApplicationArea(const DeviceHandle &, const ApplicationAreaCreateInfo &).
+// ApplicationAreaCreateInfo: u32 access id at 0, u32 initial data size at 4, u64 initial data address at 8 (size and
+// address 0 without initial data).
+static uint32_t nfp_create_app_area(Cpu *c, bool recreate) {
+    const uint8_t *info = arg_p(c, 1);
+    if (!info) rt_fatal("nn::nfp::%sApplicationArea: null create info", recreate ? "Recreate" : "Create");
+    uint32_t access_id, size;
+    uint64_t data;
+    memcpy(&access_id, info, 4);
+    memcpy(&size, info + 4, 4);
+    memcpy(&data, info + 8, 8);
+    return amiibo_create_app_area(access_id, (const void *)(uintptr_t)data, data ? size : 0, recreate);
+}
+static void ov_nfp_create_app_area(Cpu *c) { ret_x(c, nfp_create_app_area(c, false)); }
+static void ov_nfp_recreate_app_area(Cpu *c) { ret_x(c, nfp_create_app_area(c, true)); }
+
+// The amiibo settings applets: no window, the answer the applet gives when the player confirms at once, with the
+// reader's DeviceHandle in the first argument.
+// Result StartNicknameAndOwnerSettings(DeviceHandle *out, bool *registered, RegisterInfo *out_info,
+//                                      const AmiiboSettingsStartParam &, const TagInfo &[, const RegisterInfo &])
+static void ov_nfp_owner_settings(Cpu *c) {
+    void *handle = arg_p(c, 0);
+    uint8_t *registered = arg_p(c, 1);
+    void *info = arg_p(c, 2);
+    if (handle) memcpy(handle, nfp_device, sizeof nfp_device);
+    if (info) amiibo_get_register_info(info);
+    if (registered) *registered = 1;
+    ret_x(c, 0);
+}
+
+// Result StartRestorer(DeviceHandle *out, const AmiiboSettingsStartParam &, const TagInfo &): a figure here is never
+// damaged, so there is nothing to restore.
+static void ov_nfp_restorer(Cpu *c) {
+    void *handle = arg_p(c, 0);
+    if (handle) memcpy(handle, nfp_device, sizeof nfp_device);
+    ret_x(c, 0);
+}
+
+// Result StartGameDataEraser(DeviceHandle *out, const AmiiboSettingsStartParam &, const TagInfo &): drops the loaded
+// figure's application area.
+static void ov_nfp_game_data_eraser(Cpu *c) {
+    void *handle = arg_p(c, 0);
+    if (handle) memcpy(handle, nfp_device, sizeof nfp_device);
+    amiibo_erase_app_area();
+    ret_x(c, 0);
+}
 
 // void err::ShowError(Result): the game's error dialog, logged
 static void ov_show_error(Cpu *c) {
@@ -1022,6 +1107,24 @@ HOST_OVERRIDE("_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", ov_nfp_start_d
 HOST_OVERRIDE("_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", ov_nfp_stop_detection);
 HOST_OVERRIDE("_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", ov_nfp_get_tag_info);
 HOST_OVERRIDE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", ov_nfp_get_model_info);
+HOST_OVERRIDE("_ZN2nn3nfp15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE", ov_nfp_get_register_info);
+HOST_OVERRIDE("_ZN2nn3nfp13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE", ov_nfp_get_common_info);
+HOST_OVERRIDE("_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj", ov_nfp_open_app_area);
+HOST_OVERRIDE("_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE",
+              ov_nfp_create_app_area);
+HOST_OVERRIDE("_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm", ov_nfp_get_app_area);
+HOST_OVERRIDE("_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm", ov_nfp_set_app_area);
+HOST_OVERRIDE("_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE", ov_nfp_flush);
+HOST_OVERRIDE("_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE",
+              ov_nfp_recreate_app_area);
+HOST_OVERRIDE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_"
+              "24AmiiboSettingsStartParamERKNS0_7TagInfoERKS4_", ov_nfp_owner_settings);
+HOST_OVERRIDE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_"
+              "24AmiiboSettingsStartParamERKNS0_7TagInfoE", ov_nfp_owner_settings);
+HOST_OVERRIDE("_ZN2nn3nfp13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE",
+              ov_nfp_restorer);
+HOST_OVERRIDE("_ZN2nn3nfp19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE",
+              ov_nfp_game_data_eraser);
 HOST_OVERRIDE("_ZN2nn3err9ShowErrorENS_6ResultE", ov_show_error);
 
 HOST_OVERRIDE("nndiagStartup", ov_diag_startup);

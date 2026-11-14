@@ -946,6 +946,22 @@
 # bind_X = pad:west, key:space
 # bind_Y = pad:north, key:mouse_l
 
+[amiibo]
+# The Amiibo tab of the settings menu (F1) puts an amiibo dump (a 540-byte .bin or .nfc file) on the game's NFC reader
+# (docs/amiibo.md). Folder the tab lists, with its subfolders; it is saved when you pick another one. A relative folder
+# is under the folder the game starts in, the game's folder when the launcher starts it. Default: amiibo there.
+# amiibo_dir =
+# 1: when the game asks for an amiibo, the list of dumps opens over the game; A taps one, B closes it. Default: 1.
+# amiibo_popup = 1
+# Your own amiibo keys file (160 bytes). With it the port reads the data a figure already holds (its nickname and the
+# game data a game saved on it) and can write the game's changes back into the dump. The Amiibo tab's Reload keys
+# reads it again. Default: key_retail.bin in the amiibo folder.
+# amiibo_keys =
+# 1: the game's writes to a figure also go into its dump file, encrypted and signed again, so the dump keeps them for
+# other programs. Needs the keys. Before the first write the dump is copied once to <dump>.bak. The port keeps every
+# figure's data in profile/amiibo either way. Default: 0.
+# amiibo_writeback = 0
+
 [mods]
 # Folder with the player's mods, one subfolder per mod (<name>/romfs, <name>/exefs, <name>/cheats). A relative folder
 # is under the game's folder. Default: mods next to the game's exe. The build takes the ExeFS patches and code cheats

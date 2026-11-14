@@ -86,26 +86,52 @@ static void nfp_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
         rs->result = 0;
         return;
     }
+    // The application area calls share amiibo.c's backend with the nn::nfp overrides (ov_system.c).
     case 7: {   // OpenApplicationAreaNfp(DeviceHandle, u32 access_id)
-        if (!amiibo_is_mounted()) {
-            rs->result = 0x927Fu;   // not mounted
-            return;
-        }
-        rs->result = 0;
+        rs->result = amiibo_open_app_area(IPC_ARG(rq, uint32_t, 8));
         return;
     }
     case 8: {   // GetApplicationAreaNfp(DeviceHandle) -> (u32 size, buffer<data, 0x6>)
-        if (!amiibo_is_mounted()) {
-            rs->result = 0x927Fu;
-            return;
-        }
-        uint32_t area_size = 0xD8;
+        void *dst = NULL;
+        uint64_t cap = 0, n = 0;
         if (rq->nb > 0 && rq->b[0].size > 0) {
-            void *dst = ipc_guest(rq->b[0].addr, rq->b[0].size);
-            area_size = (uint32_t)amiibo_get_application_area(dst, (uint32_t)rq->b[0].size);
+            dst = ipc_guest(rq->b[0].addr, rq->b[0].size);
+            cap = rq->b[0].size;
         }
-        IPC_OUT(rs, area_size);
-        rs->result = 0;
+        rs->result = amiibo_get_app_area(dst, cap, &n);
+        if (!rs->result) {
+            uint32_t area_size = (uint32_t)n;
+            IPC_OUT(rs, area_size);
+        }
+        return;
+    }
+    case 9: {   // SetApplicationAreaNfp(DeviceHandle, buffer<data, 0x5>)
+        const void *src = NULL;
+        uint64_t size = 0;
+        if (rq->na > 0 && rq->a[0].size > 0) {
+            src = ipc_guest(rq->a[0].addr, rq->a[0].size);
+            size = rq->a[0].size;
+        }
+        rs->result = amiibo_set_app_area(src, size);
+        return;
+    }
+    case 10: {  // FlushNfp(DeviceHandle)
+        rs->result = amiibo_flush_figure();
+        return;
+    }
+    case 11: {  // RestoreNfp(DeviceHandle): a figure here is never damaged
+        rs->result = amiibo_is_mounted() ? 0 : AMIIBO_R_DEVICE_NOT_FOUND;
+        return;
+    }
+    case 12:    // CreateApplicationAreaNfp(DeviceHandle, u32 access_id, buffer<initial data, 0x5>)
+    case 24: {  // RecreateApplicationAreaNfp(DeviceHandle, u32 access_id, buffer<initial data, 0x5>)
+        const void *src = NULL;
+        uint64_t size = 0;
+        if (rq->na > 0 && rq->a[0].size > 0) {
+            src = ipc_guest(rq->a[0].addr, rq->a[0].size);
+            size = rq->a[0].size;
+        }
+        rs->result = amiibo_create_app_area(IPC_ARG(rq, uint32_t, 8), src, size, rq->cmd == 24);
         return;
     }
     case 13: {  // GetTagInfoNfp(DeviceHandle) -> buffer<TagInfo, 0x1a>

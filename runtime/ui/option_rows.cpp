@@ -61,6 +61,12 @@ static void desc_set(Desc &d, const char *desc, const char *key, const CfgMeta *
 
 void opt_focus_first(void) { g_focus_req = true; }
 
+bool opt_focus_take(void) {
+    const bool req = g_focus_req;
+    g_focus_req = false;
+    return req;
+}
+
 void opt_focus_key(const char *key) { snprintf(g_focus_key, sizeof g_focus_key, "%s", key); }
 
 void opt_reserve_bottom(float h) { g_bottom = h; }
