@@ -25,7 +25,7 @@
 // The size bound (trl_cap_mb: a thirty-second of the video memory budget, TRL_CAP_MIN_MB to TRL_CAP_MAX_MB) is what
 // decides how much video memory the cache costs: past it the oldest released textures go even when young, and with the
 // hold on, young ones past it are kept while the card and the system have room (trl_room), up to TRL_ROOM_TIMES the
-// bound. Until 0.10.2 the hold was 180 s and the bound a quarter of the budget (4 GiB on a 32 GiB card, 8 with room).
+// bound. Until 0.11.0 the hold was 180 s and the bound a quarter of the budget (4 GiB on a 32 GiB card, 8 with room).
 // A run through Hyrule Field showed what that bought (2026-11-14, RTX 5090, 5120x2160 with DLSS Performance, about
 // three minutes of running; the game keeps 4.8 GiB of textures live there and lets go of and loads about 190 a
 // second): the released textures held 5.3 GiB on average and 6.4 at most, the video memory in use went from 11.1 to

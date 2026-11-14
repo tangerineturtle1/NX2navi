@@ -918,7 +918,7 @@ static void in_range_quiet(void) {
     }
 }
 
-/* 6. NX2NAVI_AUDIO_STRICT=1: such a value ends the process, as most did before 0.10.2 (tests/audio_params_check.py
+/* 6. NX2NAVI_AUDIO_STRICT=1: such a value ends the process, as most did before 0.11.0 (tests/audio_params_check.py
    runs these in their own processes and expects exit 2). */
 static int strict(const char *what) {
     strict_setting = 1;

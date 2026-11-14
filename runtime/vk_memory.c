@@ -1185,7 +1185,7 @@ _Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0), "64-bit page gene
 static void gen_mark(uint64_t g) {
     uint64_t frames = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     double secs = rt_guest_start_ns ? (double)(kern_now_ns() - rt_guest_start_ns) / 1e9 : 0;
-    rt_log("mem: page generations reached %llu at frame %llu after %.1f h of play (%.0f a frame); before 0.10.2 they "
+    rt_log("mem: page generations reached %llu at frame %llu after %.1f h of play (%.0f a frame); before 0.11.0 they "
            "were 32 bits and ran out here, after which textures and pool mirrors could miss the CPU's writes",
            (unsigned long long)g, (unsigned long long)frames, secs / 3600, frames ? (double)g / (double)frames : 0.0);
 }

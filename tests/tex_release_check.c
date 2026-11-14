@@ -231,10 +231,10 @@ static void print_result(const char *scenario, const Policy *p, int room, const 
 }
 
 static void session_checks(void) {
-    // RTX 5090, 31 GiB budget: until 0.10.2 a quarter of it (4008 MiB, the logs' figure) and 180 s; now trl_cap_mb
-    const Policy was = {"until 0.10.2", MB(4008), 180}, now = {"0.10.2", MB(trl_cap_mb(31419)), TRL_HOLD_S};
+    // RTX 5090, 31 GiB budget: until 0.11.0 a quarter of it (4008 MiB, the logs' figure) and 180 s; now trl_cap_mb
+    const Policy was = {"until 0.11.0", MB(4008), 180}, now = {"0.11.0", MB(trl_cap_mb(31419)), TRL_HOLD_S};
     // an 8 GiB card: no room in play
-    const Policy was8 = {"until 0.10.2", MB(1920), 180}, now8 = {"0.10.2", MB(trl_cap_mb(7680)), TRL_HOLD_S};
+    const Policy was8 = {"until 0.11.0", MB(1920), 180}, now8 = {"0.11.0", MB(trl_cap_mb(7680)), TRL_HOLD_S};
     struct { const char *name; uint32_t burst_s; double burst_mbs; uint32_t end_s; double calm_mbs; } sc[] = {
         // the Balanced session's second line: 3.2 GiB released and kept within 35 s; then 10 minutes in one area
         {"area changes 70 s, calm 10 min", 70, 93.0, 670, 1.0},

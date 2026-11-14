@@ -416,19 +416,19 @@
 # left. In play the game took released textures back within a minute or not at all; one taken back after its drop is
 # made again and shows its stand-in for a frame. A texture whose content only the GPU made waits twice as long, and one
 # the GPU drew into since its last copy back to game memory stays. 0: released textures stay up to tex_released_mb for
-# the whole session (as before 0.10). Default: 60 (180 until 0.10.2). Read at start.
+# the whole session (as before 0.10). Default: 60 (180 until 0.11.0). Read at start.
 # tex_released_hold = 60
 # Megabytes the released textures may hold (0: no bound). Past it the oldest go even when young; while tex_released_hold
 # is on, young ones may stay past it, up to twice it, as long as video memory and the system's commit have room.
 # What they hold at their fullest is video memory the game keeps for the rest of the session, so this is what the cache
-# costs. Default: a thirty-second of the video memory budget, at least 384 and at most 1024 (until 0.10.2 a quarter of
+# costs. Default: a thirty-second of the video memory budget, at least 384 and at most 1024 (until 0.11.0 a quarter of
 # the budget, up to 8192: on a run through Hyrule Field that held 3.3 GB more video memory and saved one texture in
 # thirty from being loaded again). A larger value keeps more textures the game may take back, which are otherwise made
 # again and show their stand-in for a frame. Read at start.
 # tex_released_mb = 1024
 # A texture whose memory the game writes again with the bytes it already held is left as it is instead of being
 # uploaded (and, for most, decoded on the graphics card) a second time: its bytes are compared by a hash taken at the
-# upload. Textures up to 64 KB always were; since 0.10.2 those up to 8 MB are too. Running through Hyrule Field the
+# upload. Textures up to 64 KB always were; since 0.11.0 those up to 8 MB are too. Running through Hyrule Field the
 # game does this all the time: 52,000 second uploads in three minutes without it, 600 with it. 0: only the small ones,
 # as before (for a comparison; nothing should look different). Read at start.
 # tex_same_big = 1
@@ -821,7 +821,7 @@
 # takes up to a frame of the game's off the delay from the controller to the screen. The game's own limiter takes the
 # limit back while a movie plays, while the window is minimised, and for the rest of the run when the frames show that
 # Reflex does not hold it; the log's "frame rate:" lines say which one holds it. 0 leaves the limit to the game's own
-# limiter, as before 0.10.2. Needs the nx2navi_dlssg.dll of 0.10.2 or later (an older one leaves the limit to the
+# limiter, as before 0.11.0. Needs the nx2navi_dlssg.dll of 0.11.0 or later (an older one leaves the limit to the
 # game). Changes while the game runs take effect at once.
 # reflex_limit = 1
 # Low latency without frame generation: 0 off, 1 on, 2 on with boost (NVIDIA's: the GPU keeps a high clock; on AMD 2
@@ -932,7 +932,7 @@
 # audio_catchup = 1
 # When the game sends an audio value this version cannot use (an effect setting out of range, an id it does not have),
 # that effect or sound is left out and the log gets one line per kind (0, the default). 1 ends the game there instead,
-# with the details in the log, as versions before 0.10.2 did for most of them: for bug reports. Takes effect at the
+# with the details in the log, as versions before 0.11.0 did for most of them: for bug reports. Takes effect at the
 # next start.
 # audio_strict = 0
 # Volume in percent (0 to 100), on top of the game's own. Changes while the game runs take effect at once.
@@ -1161,7 +1161,7 @@
 # device_lost_at = 0
 # A test of the page write generations (how the renderer tells which game memory changed since it last looked): they
 # start after this number instead of 0, so a run reaches 4294967296, where the 32-bit generations of versions before
-# 0.10.2 ran out, within its first seconds (4294966000 does that). Decimal, or hexadecimal with 0x; at most
+# 0.11.0 ran out, within its first seconds (4294966000 does that). Decimal, or hexadecimal with 0x; at most
 # 4611686018427387904. The log says where they start. Nothing else changes. Read at start. Default: 0.
 # gen_seed = 0
 # Once a second, puts the crash report's exception filter back if a GPU driver or an overlay loaded after the start set

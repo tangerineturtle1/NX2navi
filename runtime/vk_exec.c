@@ -1903,7 +1903,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // dispatch (op_dispatch: 20x1x1 groups of cs d7566eb1, a depth probe) and nothing after it marked, since the group of
 // draws that followed was recorded by the workers, whose passes have no marks; an occlusion query slot was found
 // unavailable after its fence just before. An RX 6600 lost it the same way twice (0.9.2). The cause is not known;
-// auto gives that driver no workers (vk_exec_replay_workers_auto), and auto is the default again since 0.10.2.
+// auto gives that driver no workers (vk_exec_replay_workers_auto), and auto is the default again since 0.11.0.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or

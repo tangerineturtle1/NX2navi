@@ -1440,7 +1440,7 @@ void cfg_init(void) {
         rt_log("cfg: device profile Steam Deck: defaults for the keys nx2navi.ini does not set (NX2NAVI_DEVICE_PROFILE=desktop "
                "turns it off)");
     if (lowend_set())
-        rt_log("cfg: low_end_gpu is on, and the low-end GPU mode was removed in 0.10.2: the line does nothing, and the game "
+        rt_log("cfg: low_end_gpu is on, and the low-end GPU mode was removed in 0.11.0: the line does nothing, and the game "
                "runs as it does without it. The mode's single settings (mesh_emulation, tex_clobber, foliage, "
                "vram_reserve_mb and the others) still count where nx2navi.ini or the environment sets them");
     start_values();

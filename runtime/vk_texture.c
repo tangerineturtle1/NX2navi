@@ -2634,7 +2634,7 @@ static uint64_t released_cap_bytes(void) {
             // By the card: a thirty-second of its budget, 384 MiB to 1 GiB (vk_tex_release.h trl_cap_mb, which has the
             // run that set it). What the released textures hold at their fullest stays in use for the rest of the
             // session, as free space inside the allocator's blocks once they are dropped, so the bound is the price of
-            // the cache; until 0.10.2 it was a quarter of the budget, up to 8 GiB. The two pressure rules still come
+            // the cache; until 0.11.0 it was a quarter of the budget, up to 8 GiB. The two pressure rules still come
             // first: released entries go before anything else above NX2NAVI_TEX_VRAM_PRESSURE of the budget, and the
             // bound falls to COMMIT_LOW_KEEP while the commit is low.
             uint64_t vused = 0, vbudget = 0;
@@ -3669,7 +3669,7 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // costs a staging buffer, a copy and a barrier, several microseconds, where hashing 1.5 KiB takes a fraction of one.
 // A CPU write during the hash sets the pages' write bits again, so the next check sees it.
 //
-// NX2NAVI_TEX_SAME_BIG (default 1 since 0.10.2; ab): textures up to CHASH_BIG_MAX keep the hash too. While the player runs through
+// NX2NAVI_TEX_SAME_BIG (default 1 since 0.11.0; ab): textures up to CHASH_BIG_MAX keep the hash too. While the player runs through
 // a town the game moves about 32 textures to new storage every four or five frames, back to back in one block, and a
 // frame after their first upload every page of the block shows a write again. Of the ones the hash covers, 0 to 4 in a
 // hundred are uploaded again (128x128, 171x171, 256x256 BC1: 9 of 440 in one recording of 600 frames); of the others,
@@ -3687,7 +3687,7 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // The second uploads took 2.9 s of the submitting thread in such a run, the two hashes about 3 s. A texture the CPU
 // really rewrites would pay the hash for nothing each time: after CHASH_MISSES comparisons in a row that found other
 // bytes its uploads take no hash any more. An area load takes none either (vk_exec_pool_loading): it uploads
-// gigabytes in a few frames. NX2NAVI_TEX_SAME_BIG=0 hashes only the textures up to CHASH_MAX, as before 0.10.2.
+// gigabytes in a few frames. NX2NAVI_TEX_SAME_BIG=0 hashes only the textures up to CHASH_MAX, as before 0.11.0.
 // The pool log's buckets line counts the comparisons and the hashed bytes.
 enum { CHASH_MAX = 64 << 10, CHASH_BIG_MAX = 8 << 20, CHASH_MISSES = 2 };
 static uint64_t content_hash(const void *p, uint64_t n) {
