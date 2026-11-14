@@ -2616,11 +2616,14 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         default:
             if (RW.n > 0) {   // the perf line's split of the replay outside groups
                 if (Q.drained < Q.out && !pipe_op(h->op)) RW.pd_op[h->op]++, group_drain(ex, PW_OP);
+                // timed only for the perf line: two clock reads for each of the ~1,700 ops a submission replays
+                // here were 4 % of the submitting thread's replay in Hyrule Field
                 int k = ser_kind(h->op);
-                uint64_t t = kern_now_ns();
+                uint64_t t = rt_trace & RT_TRACE_PERF ? kern_now_ns() : 0;
                 op_one(ex, h);
                 if (vk_texture_deferred_take()) op_again(ex, h);
-                RW.ser_n[k]++, RW.ser_ns[k] += kern_now_ns() - t;
+                RW.ser_n[k]++;
+                if (t) RW.ser_ns[k] += kern_now_ns() - t;
             } else op_one(ex, h);
             break;
         }

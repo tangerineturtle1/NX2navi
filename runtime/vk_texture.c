@@ -6428,7 +6428,7 @@ static void compact_table(CompTable *t, const VkBlockRow *other, int nother, uin
 #define COMPACT_VICTIMS 32
 #define COMPACT_HELD_N 64
 
-typedef struct { VkImage img; VmaAllocation alloc; uint64_t bytes, takes, due, frame; } CompOld;
+typedef struct { VkImage img; VmaAllocation alloc; uint64_t bytes, takes, due, frame; int vram; } CompOld;   // vram: residency's, in video memory
 typedef struct { uint64_t mem, size; volatile int32_t freed; uint8_t gave_up; } CompVictim;
 typedef struct { Tex *e; uint8_t v; } CompItem;
 
@@ -7181,6 +7181,7 @@ void vk_texture_sizes(PerfSizes *s) {
 // back whole, and render targets keep a higher priority than textures for the pageable memory (image_alloc).
 #define RES_COLD PRESENTS(45)
 #define RES_HOT 3                        // presents: sampled this lately, it is wanted in video memory
+#define RES_WARM PRESENTS(15)            // presents: cold enough to make room for one sampled lately (res_plan)
 #define RES_MARGIN ((uint64_t)256 << 20)
 #define RES_FRAME_BYTES ((uint64_t)64 << 20)
 #define RES_OLD_N 2048
@@ -7191,12 +7192,15 @@ static struct {
     int nold;
     uint64_t frame, frame_b;             // the presented frame of the moves counted in frame_b
     uint64_t scan_frame;                 // the presented frame the texture table was last walked in
-    uint64_t used, budget, used_frame;   // the driver's figure at used_frame, give or take what moved since
+    uint64_t used, budget, used_frame;   // the driver's figure at used_frame less pend_b, give or take what moved since
     uint64_t *out_blk;                   // this frame's blocks to empty (sorted device memory handles)
     int nout_blk, waiting;               // waiting: sampled textures left in system memory for want of room
+    uint64_t wait_b;                     // the smallest of those, in bytes: the room res_plan makes
+    uint64_t cold_after;                 // presents without a sample that make a texture cold this frame (res_plan)
+    uint64_t pend_b;                     // video memory of moved textures' old images, freed once no work names them
     uint64_t n_down, down_b, n_up, up_b, n_fail, last_log, n_drop, drop_b, n_hdrop, hdrop_b;
     uint64_t host_used, host_budget;     // the host heaps' figures at used_frame
-} RS = {.on = -1};
+} RS = {.on = -1, .cold_after = (uint64_t)-1};
 
 static int res_sys(VkCtx *c, const Tex *e) {   // e's image lies in a heap that is not video memory
     return !(c->mem_props.memoryHeaps[c->mem_props.memoryTypes[e->blk_type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
@@ -7209,6 +7213,7 @@ static void res_old_sweep(void) {   // compact_old_sweep's rule
         CompOld *o = &RS.old[i];
         if (!o->due && takes - o->takes > VK_POOL_SETS) o->due = vk_sync_issued();
         if (o->due && done >= o->due) {
+            if (o->vram) RS.pend_b = RS.pend_b > o->bytes ? RS.pend_b - o->bytes : 0;
             vk_exec_image_gone(o->img);
             vk_defer_image(o->img, o->alloc);
             continue;
@@ -7253,7 +7258,8 @@ static int res_move(VkCtx *c, Tex *e, int to_sys, int hole) {
         if (!hole) RS.n_fail++;
         return 0;
     }
-    RS.old[RS.nold++] = (CompOld){e->pub.image, e->alloc, e->bytes, vk_pool_takes(), 0, frames_now()};
+    RS.old[RS.nold++] = (CompOld){e->pub.image, e->alloc, e->bytes, vk_pool_takes(), 0, frames_now(), to_sys};
+    if (to_sys) RS.pend_b += e->bytes;
     tex_move(c, e, a, img);
     return 1;
 }
@@ -7317,7 +7323,8 @@ int vk_texture_host_room(uint64_t bytes) {
 #define RES_NEW PRESENTS(8)
 static int res_cold(const Tex *e, uint64_t now) {   // may go to system memory
     return e->alloc && comes_back_intact(e) && !e->compacting && !e->retiring && e->uploaded &&
-           (e->released || now - e->samp_frame > RES_COLD || (e->samp_frame <= e->made_frame && now - e->made_frame > RES_NEW));
+           (e->released || now - e->samp_frame > RS.cold_after ||
+            (e->samp_frame <= e->made_frame && now - e->made_frame > RES_NEW));
 }
 
 typedef struct { uint64_t mem, all, cold, age; } ResBlk;
@@ -7338,6 +7345,14 @@ static int u64_cmp(const void *a, const void *b) {
 static void res_plan(VkCtx *c, uint64_t now) {
     free(RS.out_blk);
     RS.out_blk = NULL, RS.nout_blk = 0;
+    // Room for the smallest sampled texture that waits in system memory, past the target. The textures sampled within
+    // RES_COLD alone can fill the video memory: then the room comes from those sampled least lately, down to RES_WARM
+    // presents ago (the coldest blocks go first, and only as many as the room needs). A 263 MiB texture array that
+    // Hyrule Field samples every frame stayed in system memory for good in about half the runs (180 MiB under the
+    // target, with a fixed 64 MiB asked for it), and the GPU's frame took 2 to 4 ms longer.
+    uint64_t target = RS.budget - RES_MARGIN, over = RS.used > target ? RS.used - target : 0;
+    uint64_t room = RS.waiting && RS.used + RS.wait_b + (16ull << 20) > target ? RS.used + RS.wait_b + (16ull << 20) - target : 0;
+    RS.cold_after = room ? RES_WARM : RES_COLD;
     ResBlk *b = malloc(sizeof *b * (by_key.cap ? by_key.cap : 1));
     if (!b) return;
     int n = 0;
@@ -7361,7 +7376,7 @@ static void res_plan(VkCtx *c, uint64_t now) {
     for (int i = 0; i < m; i++)
         if (b[i].cold && b[i].cold * 100 >= b[i].all * RES_BLOCK_COLD) b[k++] = b[i];
     qsort(b, (size_t)k, sizeof *b, resblk_age);
-    uint64_t need = (RS.used > RS.budget - RES_MARGIN ? RS.used - (RS.budget - RES_MARGIN) : 0) + (RS.waiting ? 64ull << 20 : 0);
+    uint64_t need = over > room ? over : room;
     uint64_t *out = malloc(sizeof *out * (size_t)(k ? k : 1)), got = 0;
     int no = 0;
     for (int i = 0; out && i < k && got < need; i++) out[no++] = b[i].mem, got += b[i].cold;
@@ -7387,6 +7402,9 @@ static void residency_step(void) {
     if (new_frame) {
         int exact;
         if (!vk_mem_vram(&RS.used, &RS.budget, &exact) || RS.budget <= RES_MARGIN) return;
+        // The old images of the textures moved out still count in the driver's figure until they go, a few frames
+        // later: counted, they made the room asked for look taken, and new textures took it meanwhile.
+        RS.used = RS.used > RS.pend_b ? RS.used - RS.pend_b : 0;
         RS.used_frame = now;
         if (res_host(c, &RS.host_used, &RS.host_budget) && RS.host_used + RES_HOST_MARGIN > RS.host_budget) {
             uint64_t got = res_host_free(c, RS.host_used + RES_HOST_MARGIN - RS.host_budget, now);
@@ -7400,6 +7418,7 @@ static void residency_step(void) {
     uint64_t target = RS.budget - RES_MARGIN;
     // back first: into holes, then into new memory while the figure allows it
     int waiting = 0;
+    uint64_t wait_b = UINT64_MAX;
     for (uint32_t i = 0; i < by_key.cap && RS.frame_b < RES_FRAME_BYTES && RS.nold < RES_OLD_N; i++) {
         Tex *e = by_key.vals[i];
         if (!e || !e->alloc || e->released || e->compacting || now - e->samp_frame > RES_HOT || !res_sys(c, e)) continue;
@@ -7410,9 +7429,10 @@ static void residency_step(void) {
             RS.used += b, RS.frame_b += b, RS.n_up++, RS.up_b += b;
         } else {
             waiting = 1;
+            if (b < wait_b) wait_b = b;
         }
     }
-    RS.waiting = waiting;
+    RS.waiting = waiting, RS.wait_b = waiting ? wait_b : 0;
     // out: whole cold blocks, while above the target or something waits
     if (new_frame) {
         if (RS.used > target || RS.waiting) res_plan(c, now);
@@ -7453,11 +7473,11 @@ static void residency_step(void) {
         rt_log("vk: texture residency frame %llu: video memory %.0f of %.0f MiB (target %.0f), host heaps %.0f of %.0f "
                "MiB; so far %llu textures moved to system memory (%.0f MiB), %llu back (%.0f MiB), %llu moves without "
                "memory, %llu released ones dropped (%.0f MiB), %llu for the host heaps (%.0f MiB); in system memory now "
-               "%llu (%.0f MiB, %.0f MiB of it sampled lately), %s", (unsigned long long)now, RS.used / M, RS.budget / M,
+               "%llu (%.0f MiB, %.0f MiB of it sampled lately), %s (the smallest %.0f MiB)", (unsigned long long)now, RS.used / M, RS.budget / M,
                target / M, RS.host_used / M, RS.host_budget / M, (unsigned long long)RS.n_down, RS.down_b / M,
                (unsigned long long)RS.n_up, RS.up_b / M, (unsigned long long)RS.n_fail, (unsigned long long)RS.n_drop,
                RS.drop_b / M, (unsigned long long)RS.n_hdrop, RS.hdrop_b / M, (unsigned long long)sys_n, sys_b / M,
-               sys_hot / M, RS.waiting ? "sampled ones wait for room" : "none sampled waits");
+               sys_hot / M, RS.waiting ? "sampled ones wait for room" : "none sampled waits", RS.wait_b / M);
     }
 }
 
