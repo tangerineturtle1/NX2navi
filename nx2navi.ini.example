@@ -767,6 +767,8 @@
 # driver allow (Streamline reports it) is lowered to that, with a line in the log; the menu offers only what they allow.
 # Each step adds a little latency, and a display shows no more than its refresh rate. Changes while the game runs
 # take effect at once.
+# adaptive: treat fps_limit as a displayed-frame target capped at the monitor's refresh rate. Generate frames
+# when needed to reach that target. Fixed multipliers use a numeric fps_limit as the game-frame limit.
 # framegen_multiplier = 2
 # Low latency without frame generation: 0 off, 1 on, 2 on with boost (NVIDIA's: the GPU keeps a high clock; on AMD 2
 # is 1). The graphics driver holds each frame's start, so the game reads the controller as late as the picture allows

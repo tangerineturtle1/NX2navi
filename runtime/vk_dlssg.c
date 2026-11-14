@@ -11,8 +11,8 @@
 // Multi frame generation: NX2NAVI_FRAMEGEN_MULTIPLIER (2, 3 or 4, live) is how many frames the display gets per
 // rendered frame, so one, two or three generated ones. Streamline says how many this GPU and driver can generate
 // (numFramesToGenerateMax: one where only 2x runs, three on an RTX 50); a higher setting is clamped to it with a log
-// line. frame_rate.c divides the frame limit by the multiplier in effect (vk_dlssg_multiplier), so the display gets the
-// limit and the game renders a half, a third or a quarter of it.
+// line. With adaptive selected, frame_rate.c treats the limit as the displayed rate and divides the game rate by the
+// multiplier in effect; fixed multipliers retain the usual frame-limit behavior.
 //
 // DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
 // game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency
@@ -61,6 +61,95 @@ static struct {
     PFN_vkAcquireNextImageKHR acquire;
     PFN_vkQueuePresentKHR present;
 } S = {.wanted = -1, .fail = DLSSG_NO_FILES, .shown_mult = 1};
+
+// ---------- Adaptive frame generation
+// The game's thread measures each frame's work (nvn_api_obj.c nvnWindowAcquireTexture) and vk_dlssg_adaptive_sample
+// keeps the last ADAPT_WIN of them. With the display's goal G frames a second and multiplier m the game has m / G
+// seconds a frame.
+//   more generation (m + 1): a quarter of the last ADAPT_LATE_WIN frames took longer than they have.
+//   less generation (m - 1): all but ADAPT_FAST_MISS of the last ADAPT_WIN frames fit in ADAPT_FAST of what they would
+//                            have then, so the game keeps a fifth of the frame spare after the change.
+// One long frame (a shader or a load) is one sample and changes nothing. Each change is an slDLSSGSetOptions call and
+// can be seen, so a change waits ADAPT_HOLD_NS after the last one, and a change to less generation that had to be
+// taken back within ADAPT_FAIL_NS doubles the wait before the next try (10 s, 20 s, ... 160 s): a place that sits at
+// the edge settles on generation instead of switching back and forth. A minute without taking one back clears that.
+#define ADAPT_WIN 120
+#define ADAPT_LATE_WIN 60
+#define ADAPT_LATE_PART 4            // one in this many of the last ADAPT_LATE_WIN frames late: more generation
+#define ADAPT_LATE 1.03              // a frame is late past this share of its time
+#define ADAPT_FAST 0.80              // less generation needs frames within this share of the shorter time
+#define ADAPT_FAST_MISS 3            // frames of ADAPT_WIN that may be slower than that
+#define ADAPT_HOLD_NS 3000000000ull
+#define ADAPT_FAIL_NS 20000000000ull
+#define ADAPT_CALM_NS 60000000000ull
+static struct {
+    float work[ADAPT_WIN];   // seconds of work of the newest frames, a ring
+    int n, at;               // samples held, and where the next one goes
+    int mult;                // the multiplier adaptive wants: 1 (no generated frames) to the GPU's limit
+    int fails;               // changes to less generation taken back soon after: each doubles the next wait
+    uint64_t changed_ns, down_ns;   // the last change, and the last change to less generation
+    int logs;
+} A = {.mult = 2};
+
+static int adaptive_set(void) { return !strcmp(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), "adaptive"); }
+
+static void adaptive_change(int to, uint64_t now, double goal_hz, double worst) {
+    if (A.logs++ < 400)
+        rt_log("dlssg: adaptive: %dx -> %dx (the %g fps goal gives the game %.1f ms a frame at %dx; newest frames up to %.1f ms)",
+               A.mult, to, goal_hz, 1e3 * to / goal_hz, to, 1e3 * worst);
+    if (to < A.mult) A.down_ns = now;
+    A.changed_ns = now;
+    A.n = A.at = 0;   // the frames before the change say nothing about the pace after it
+    __atomic_store_n(&A.mult, to, __ATOMIC_RELAXED);
+}
+
+void vk_dlssg_adaptive_sample(double work_s, double goal_hz) {
+    if (!S.active || !adaptive_set()) return;
+    int max = 2;   // until Streamline says: one generated frame
+    uint32_t gen_max = S.frames_max ? S.frames_max() : 0;
+    if (gen_max) max = gen_max >= 3 ? 4 : (int)gen_max + 1;
+    if (A.mult > max) __atomic_store_n(&A.mult, max, __ATOMIC_RELAXED);
+    // A movie, an unlimited rate, the menu, or a pending multiplier change supplies no useful sample.
+    if (goal_hz <= 0 || menu_is_open() || __atomic_load_n(&S.shown_mult, __ATOMIC_RELAXED) != A.mult) {
+        A.n = A.at = 0;
+        return;
+    }
+    A.work[A.at] = (float)work_s;
+    A.at = (A.at + 1) % ADAPT_WIN;
+    if (A.n < ADAPT_WIN) A.n++;
+    uint64_t now = kern_now_ns();
+    if (now - A.changed_ns < ADAPT_HOLD_NS) return;
+    if (A.fails && A.down_ns && now - A.down_ns > ADAPT_CALM_NS && A.mult < max) A.fails = 0;
+    double have = A.mult / goal_hz, worst = 0;
+    // more generation: the newest frames do not fit
+    if (A.mult < max && A.n >= ADAPT_LATE_WIN) {
+        int late = 0;
+        for (int i = 1; i <= ADAPT_LATE_WIN; i++) {
+            double w = A.work[(A.at + ADAPT_WIN - i) % ADAPT_WIN];
+            if (w > have * ADAPT_LATE) late++;
+            if (w > worst) worst = w;
+        }
+        if (late * ADAPT_LATE_PART >= ADAPT_LATE_WIN) {
+            if (A.down_ns && now - A.down_ns < ADAPT_FAIL_NS && A.fails < 5) A.fails++;
+            adaptive_change(A.mult + 1, now, goal_hz, worst);
+            return;
+        }
+    }
+    // less generation: the window's frames would fit with room to spare, and the wait after a failed try is over
+    if (A.mult > 1 && A.n >= ADAPT_WIN) {
+        uint64_t wait = A.fails ? 10000000000ull << (A.fails - 1) : ADAPT_HOLD_NS;
+        if (now - A.changed_ns < wait) return;
+        double fit = (A.mult - 1) / goal_hz * ADAPT_FAST;
+        int miss = 0;
+        worst = 0;
+        for (int i = 0; i < ADAPT_WIN; i++) {
+            if (A.work[i] > fit) miss++;
+            else if (A.work[i] > worst) worst = A.work[i];
+        }
+        if (miss <= ADAPT_FAST_MISS) adaptive_change(A.mult - 1, now, goal_hz, worst);
+    }
+}
+
 
 static void sl_line(const char *line) { rt_log("%s", line); }
 
@@ -214,6 +303,10 @@ static int multiplier_wanted(void) {
     static int last_max = -1, m = 2;
     const char *value = cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER");
     int max = gpu_multiplier_max(NULL);
+    if (!strcmp(value, "adaptive")) {
+        int current = __atomic_load_n(&A.mult, __ATOMIC_RELAXED), top = max ? max : 2;
+        return current > top ? top : current;
+    }
     if (max == last_max && !strncmp(value, last, sizeof last - 1)) return m;
     snprintf(last, sizeof last, "%s", value);
     last_max = max;
@@ -281,8 +374,8 @@ uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
     if (!S.active) return;
-    VkFfxImage d, m;
-    VkImageView dv, mvv;
+    VkFfxImage d = {0}, m = {0};
+    VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
@@ -291,7 +384,7 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
     if (want == S.mode) S.pending = 0;
     else if (++S.pending >= FG_SETTLE_FRAMES) { S.mode = want; S.pending = 0; }
     else want = S.mode;   // hold the state it has until the new one stays
-    int on = want, mult = multiplier_wanted();
+    int mult = multiplier_wanted(), on = want && mult > 1;
     __atomic_store_n(&S.shown_mult, on ? mult : 1, __ATOMIC_RELAXED);   // the pacer's divisor (frame_rate.c)
     Nx2SlImage zd = {d.image, dv, d.format, d.width, d.height, VK_IMAGE_LAYOUT_GENERAL,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};

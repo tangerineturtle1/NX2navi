@@ -401,6 +401,7 @@ void rt_patch_switch(int set, int on);                     // at run time (live 
 void *rt_patch_page(void);                                 // the page the patched code reads (NULL without the table)
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
+void frame_step_work(uint64_t work_ns);
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
 int frame_step_movie_hz(void);                             // the movie rate frame_step_cap_ns paces at; 0: no movie
 int ov_movie_live(void);                                   // ov_movie2.c: a movie plays (frame_rate.c movie_cap_hz)

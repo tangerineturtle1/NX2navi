@@ -43,6 +43,8 @@ int vk_dlssg_multiplier_max(int *old_dll);
 // The frames the display gets per game frame now: the multiplier while generation runs, 1 while it is off or paused
 // (the menu). frame_rate.c paces the game at the frame limit over it. Any thread.
 int vk_dlssg_multiplier(void);
+// One game frame's work (seconds), excluding pacing sleeps; goal is the desired display rate (0 disables sampling).
+void vk_dlssg_adaptive_sample(double work_s, double goal_hz);
 // Why DLSS-G runs or not: DLSSG_NOT_WANTED (NX2NAVI_FRAMEGEN was not dlss at start, or no DLSS or FSR 3.1 upscaling),
 // DLSSG_NO_FILES (nx2navi_dlssg.dll, Streamline or its swapchain hooks missing or failing), DLSSG_UNAVAILABLE (Streamline
 // loaded but DLSS-G or a required plugin function was unavailable).

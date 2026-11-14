@@ -828,9 +828,11 @@ NVN_API(nvnWindowAcquireTexture) {
     int idx = o->active ? o->next++ % o->active : 0;
     *out = idx;
     uint64_t at = idx < 4 ? o->avail[idx] : 0;
+    uint64_t idle_ns = 0;
     if (at) {
-        uint64_t p0 = perf_begin();
+        uint64_t p0 = perf_begin(), w0 = kern_now_ns();
         sleep_until(at);
+        idle_ns = kern_now_ns() - w0;
         perf_end(PERF_PACE, p0);
     }
     // On the Switch the image comes back only after the display has shown it, which needs the GPU to have finished the
@@ -854,7 +856,13 @@ NVN_API(nvnWindowAcquireTexture) {
             perf_end(PERF_PACE, p0);
         }
     }
+    uint64_t f0 = kern_now_ns();
     if (gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
+    static uint64_t work_start;
+    uint64_t f1 = kern_now_ns();
+    idle_ns += f1 - f0;
+    if (work_start && f1 - work_start > idle_ns) frame_step_work(f1 - work_start - idle_ns);
+    work_start = f1;
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {

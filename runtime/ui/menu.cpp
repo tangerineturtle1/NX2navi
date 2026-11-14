@@ -1137,9 +1137,13 @@ static void row_framegen_mult(bool restart) {
     if (max == 2) note = menu_text(old_dll ? UI_MENU_FRAMEGEN_MULT_OLD_DLL : UI_MENU_FRAMEGEN_MULT_RTX50);
     else if (max == 3) snprintf(upto, sizeof upto, menu_text(UI_MENU_FRAMEGEN_MULT_UPTO), max), note = upto;
     if (!max) max = 4;   // not known yet: every multiplier, the setting as it is
-    static const char *const values[] = {"2", "3", "4"};
-    static const char *const names[] = {"2x", "3x", "4x"};
-    int n = max - 1, cur = vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), max, nullptr) - 2;
+    const char *values[] = {"2", "3", "4", "adaptive"};
+    const char *names[] = {"2x", "3x", "4x", nullptr};
+    int n = max - 1;
+    values[n] = "adaptive", names[n] = menu_text(UI_MENU_FRAMEGEN_MULT_ADAPTIVE);
+    int cur = !strcmp(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), "adaptive") ? n :
+              vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), max, nullptr) - 2;
+    n++;
     int nv = opt_choice_index("NX2NAVI_FRAMEGEN_MULTIPLIER", UI_MENU_FRAMEGEN_MULT, names, n, cur, 0,
                               UI_MENU_FRAMEGEN_MULT_DESC, note);
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN_MULTIPLIER", values[nv]);
@@ -2098,9 +2102,12 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
     const bool fsr_fg = !strcmp(fg, "fsr3") && vk_ffx_framegen_available();   // set but not loadable: off
     snprintf(v[10], sizeof v[10], "%s", fsr_fg ? (vk_fg4_active() ? fg4_label() : "AMD FSR 3.1")
                                       : !strcmp(fg, "dlss") ? "NVIDIA DLSS" : menu_text(UI_MENU_FRAMEGEN_OFF));
-    if (!strcmp(fg, "dlss") && vk_dlssg_active())   // its multiplier as set, clamped to what this GPU allows
-        snprintf(v[10], sizeof v[10], "NVIDIA DLSS %dx",
-                 vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), vk_dlssg_multiplier_max(nullptr), nullptr));
+    if (!strcmp(fg, "dlss") && vk_dlssg_active()) {
+        const char *value = cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER");
+        int mult = !strcmp(value, "adaptive") ? vk_dlssg_multiplier() :
+                   vk_dlssg_multiplier_of(value, vk_dlssg_multiplier_max(nullptr), nullptr);
+        snprintf(v[10], sizeof v[10], "NVIDIA DLSS %dx", mult);
+    }
     // The 3D scene's size is known only where resolution.c sets it (the builds with its patch sets); Ocarina sizes its
     // own scene dynamically and res_sizes would report a fixed 1600x900, so the line is left out
     p->scene_known = res_adjustable() != 0;

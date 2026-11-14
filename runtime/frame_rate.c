@@ -257,10 +257,35 @@ static int generated_factor(void) { return vk_fg_generating() ? 2 : vk_dlssg_mul
 // The limit counts the frames the game draws, and frame generation adds its frames on top: a limit of 60 at 4x is 60
 // drawn and 240 shown. Counted on the screen instead, the game was paced at the limit over the factor, so each step up
 // of the multiplier took drawn frames away (60 at 4x drew 15) and the generated ones had less to work from and more
-// delay. Only "display" is a rate on the screen, the monitor's: there the game draws that rate over the factor, since a
-// frame past the monitor's refresh is never seen. The result is game frames a second, before the ceiling of the step.
+// delay. "display" is a rate on the screen, the monitor's: the game draws that rate over the factor. Adaptive also
+// treats a numeric limit as the displayed rate. The result is game frames a second, before the ceiling of the step.
+
+// ---------- Adaptive frame generation's displayed-frame goal
+// Adaptive mode (vk_dlssg.c vk_dlssg_adaptive_sample) aims the frames on screen, generated ones included, at a goal and
+// paces the game at the goal divided by the multiplier. A frame past the monitor's refresh is never seen: with a limit of 90
+// on a 60 Hz monitor the goal of 90 had 2x render 45 and present 90, and the display dropped every third present,
+// unevenly, which reads as judder. It also made 1x render 90, so adaptive stepped up to 2x where 60 real frames were
+// within reach. So the goal is the limit, or the monitor's rate for "display", and never more than the monitor's rate.
+// A fixed multiplier (2, 3, 4) keeps upstream's meaning: the limit counts the frames the game draws.
+static int adaptive_framegen(void) {
+    return vk_dlssg_active() && !strcmp(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), "adaptive");
+}
+static double adaptive_goal_hz(int limit) {
+    double refresh = gfx_window_refresh_hz();
+    double goal = shown_hz(limit ? limit : refresh);
+    // an unknown or implausible refresh (0, or below the lowest limit) leaves the limit as it is
+    return refresh >= LIMIT_MIN_HZ && goal > refresh ? refresh : goal;
+}
+
 static double limit_game_hz(int limit, int gen) {
-    if (limit) return shown_hz(limit);
+    if (limit) {
+        // adaptive: the capped goal shared out over the frames each game frame becomes on screen
+        if (adaptive_framegen()) {
+            double hz = adaptive_goal_hz(limit);
+            return gen > 1 ? hz / gen : hz;
+        }
+        return shown_hz(limit);
+    }
     double hz = shown_hz(gfx_window_refresh_hz());
     return gen > 1 ? hz / gen : hz;
 }
@@ -277,6 +302,8 @@ double frame_step_game_hz(void) {
 // frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
 // out, and so does a driver's low latency while it is in effect (vk_lowlat.c): the driver holds the limit where the
 // frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove.
+static double shown_goal_hz;
+void frame_step_work(uint64_t work_ns) { vk_dlssg_adaptive_sample((double)work_ns / 1e9, shown_goal_hz); }
 static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
 static int movie_paced;   // the movie rate the newest frame_step_cap_ns paces at (ocarina_step, frame_step_movie_hz); 0: none
 int frame_step_movie_hz(void) { return movie_paced; }
@@ -307,10 +334,13 @@ uint64_t frame_step_cap_ns(void) {
     if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames, and
         rtss_limit_want(rtss ? 0 : -1);                              // RTSS's limit is cleared
         paced_hz = 0;
+        shown_goal_hz = 0;
         return 0;
     }
     // unlimited in a build that steps by the clock: LIMIT_FREE_MAX_HZ game frames; during a movie, the movie's rate
     double hz = limit_hz == -2 ? LIMIT_FREE_MAX_HZ : limit_game_hz(limit_hz, gen);
+    // Adaptive uses the selected limit as its displayed-frame goal, held to the monitor's rate (adaptive_goal_hz).
+    shown_goal_hz = movie_hz || limit_hz == -2 ? 0 : adaptive_goal_hz(limit_hz);
     double max = frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ;
     if (hz > max) hz = max;
     static double logged_hz;

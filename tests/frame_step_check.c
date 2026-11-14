@@ -20,6 +20,9 @@ const char *cfg_get(const char *key) {
     if (!strcmp(key, "NX2NAVI_RTSS")) return "0";
     return NULL;
 }
+static const char *fg_setting = "2";
+const char *cfg_value(const char *key) { return !strcmp(key, "NX2NAVI_FRAMEGEN_MULTIPLIER") ? fg_setting : ""; }
+void vk_dlssg_adaptive_sample(double work_s, double goal_hz) { (void)work_s; (void)goal_hz; }
 unsigned cfg_version(void) { return version; }
 int rt_patch_set(const char *name) { return !strcmp(name, "ostep") ? 0 : !strcmp(name, "ofollow") ? 1 : -1; }
 int rt_patch_enabled(int set) { return set == 0 || set == 1; }
@@ -27,7 +30,8 @@ void rt_patch_disable(int set) { (void)set; }
 void rt_patch_switch(int set, int on) { (void)set, (void)on; }
 void *rt_patch_page(void) { return page; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
-double gfx_window_refresh_hz(void) { return 144; }
+static double refresh_hz = 144;   // the monitor's rate the checks give (the adaptive goal is held to it)
+double gfx_window_refresh_hz(void) { return refresh_hz; }
 static int movie;   // a movie plays (frame_rate.c movie_cap_hz)
 int ov_movie_live(void) { return movie; }
 int vk_fg_generating(void) { return 0; }
@@ -36,7 +40,8 @@ int vk_fg_active(void) { return 0; }
 int vk_fg_wanted(void) { return 0; }
 static int fg_mult = 1;   // frames on screen per game frame
 int vk_dlssg_multiplier(void) { return fg_mult; }
-int vk_dlssg_active(void) { return fg_mult > 1; }
+static int dlssg_up;   // DLSS-G set up on the swapchain while adaptive sits at 1x (vk_dlssg.c S.active stays 1)
+int vk_dlssg_active(void) { return dlssg_up || fg_mult > 1; }
 int vk_lowlat_on(void) { return 0; }
 void rtss_limit_want(int64_t millihz) { (void)millihz; }
 int rtss_limit_active(void) { return 0; }
@@ -278,6 +283,29 @@ int main(int argc, char **argv) {
         CHECK(fabs(game - caps[i].game_hz) < 0.01, "limit %s at %dx reports %.3f game fps, not %.0f", caps[i].l,
               caps[i].gen, game, caps[i].game_hz);
     }
+    // Adaptive treats a numeric cap as the displayed target, while fixed multipliers keep upstream semantics.
+    fg_setting = "adaptive";
+    set_limit("60");
+    fg_mult = 2;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 30) < 0.01, "adaptive 60 at 2x must render at 30");
+    CHECK(fabs(frame_step_game_hz() - 30) < 0.01, "adaptive game rate must match the pacer");
+    fg_mult = 1;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 60) < 0.01, "adaptive 60 without generation must render at 60");
+    // A limit above a 60 Hz monitor: adaptive aims at what the screen can show, 60, not 90 (2x renders 30, 1x 60).
+    refresh_hz = 60;
+    dlssg_up = 1;
+    set_limit("90");
+    fg_mult = 2;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 30) < 0.01, "adaptive 90 on a 60 Hz monitor at 2x must render at 30");
+    fg_mult = 1;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 60) < 0.01, "adaptive 90 on a 60 Hz monitor at 1x must render at 60");
+    // a fixed multiplier keeps upstream's meaning there: the limit counts the frames the game draws
+    fg_setting = "2";
+    fg_mult = 2;
+    CHECK(fabs(1e9 / frame_step_cap_ns() - 90) < 0.01, "fixed 2x with limit 90 must still render at 90");
+    refresh_hz = 144;
+    dlssg_up = 0;
+    set_limit("60");
     fg_mult = 1;
 
     // The water's ripples at 144 fps, a step of 60/144 frame: 64 water objects asked once a frame each run 600 steps
