@@ -22,6 +22,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -260,7 +261,9 @@ static class SwshXlate
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags,
                         ["pool"] = t.ArrayLength == Accessor.TexturePoolLength ? 1 : t.ArrayLength == Accessor.SamplerPoolLength ? 2 : 0 });
-                File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                // WriteAllText can preallocate large writes, leaving trailing NULs on some filesystems.
+                byte[] reflection = Encoding.UTF8.GetBytes(res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                File.WriteAllBytes(Path.Combine(outDir, key + ".res.json"), reflection);
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
