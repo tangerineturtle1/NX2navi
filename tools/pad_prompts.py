@@ -25,9 +25,9 @@ position, so Switch A is the right face button, labelled B on an Xbox pad and ci
 for A show that button (A as B or circle, B as A or cross, X as Y or triangle, Y as X or square). label, for
 pad_layout = xbox, playstation and auto: Switch A is the bottom face button, so A shows A or cross, B shows B or
 circle, X shows X or square and Y shows Y or triangle.
-pc shows the first key each button has (PC_KEYS, Ocarina's defaults, with the bind_ lines of --binds over them; by
-default <game>/nx2navi.ini), the mouse buttons as a mouse, and for the right stick the mouse moving. A key bound
-later shows after the tool runs again.
+The bind_ lines of --binds (default <game>/nx2navi.ini) override those layouts with the primary physical button
+where there is art for it. pc shows the first key each button has, the mouse buttons as a mouse, and for the right
+stick the mouse moving. Bindings show after the tool runs again.
 
 What changes, the rest of each file staying as it is:
 - Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs, the button font every prompt in text uses (dialogue, the button
@@ -53,6 +53,7 @@ import json
 import struct
 import sys
 from pathlib import Path
+from typing import Iterator
 
 import zstandard
 from PIL import Image, ImageDraw, ImageFont
@@ -89,12 +90,47 @@ MASKS = {'KeyTexFontA_00': 'A', 'KeyTexFontB_00': 'B', 'KeyTexFontX_00': 'X', 'K
 NOTES = {'OcarinaButtonA_00': 'A', 'OcarinaButtonB_00': 'B', 'OcarinaButtonX_00': 'X', 'OcarinaButtonY_00': 'Y',
          'OcarinaButtonL_00': 'L', 'OcarinaButtonR_00': 'R'}
 
+PAD_ART = {'south': 'south', 'east': 'east', 'west': 'west', 'north': 'north', 'l': 'L', 'r': 'R', 'zl': 'ZL', 'zr': 'ZR',
+           'start': 'PLUS', 'back': 'MINUS', 'lstick': 'LSTICK_PRESS', 'rstick': 'RSTICK_PRESS',
+           'dpad_up': 'DPAD_UP', 'dpad_down': 'DPAD_DOWN', 'dpad_left': 'DPAD_LEFT', 'dpad_right': 'DPAD_RIGHT'}
+PAD_NAMES = PAD_ART.keys() | {'lpaddle1', 'rpaddle1', 'lpaddle2', 'rpaddle2'}
+PAD_GLYPHS = {'LSTICK_PRESS': 'LCLICK', 'RSTICK_PRESS': 'RCLICK', 'DPAD_UP': 'UP', 'DPAD_DOWN': 'DOWN',
+              'DPAD_LEFT': 'LEFT', 'DPAD_RIGHT': 'RIGHT'}
 
-def pad_pictures(style, layout):
-    """(glyph, note) for a pad style: Switch button -> picture, the face buttons through FACE."""
+
+def binding_lines(ini_text: str | None) -> Iterator[tuple[str, list[str]]]:
+    for line in (ini_text or '').removeprefix('\ufeff').splitlines():
+        key, sep, value = line.split('#')[0].split(';')[0].strip().partition('=')
+        key = key.strip().upper().removeprefix('NX2NAVI_')
+        if sep and key.startswith('BIND_') and (value := value.strip().strip('"')):
+            yield key[5:], [entry.strip().lower() for entry in value.split(',')]
+
+
+def pad_binds(ini_text: str | None) -> dict[str, str]:
+    """Art for each action's primary physical button. input_map.c input_map_bind puts defaults before explicit
+    bindings. A paddle has no art, so its action keeps the layout picture."""
+    pads: dict[str, str] = {}
+    for button, entries in binding_lines(ini_text):
+        names = [entry[4:].strip() for entry in entries if entry.startswith('pad:')]
+        primary = next((name for name in names if name in PAD_NAMES), '')
+        if 'default' not in names and primary in PAD_ART:
+            pads[button] = PAD_ART[primary]
+        else:
+            pads.pop(button, None)
+    return pads
+
+
+def pad_pictures(style: str, layout: str, pads: dict[str, str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    """Button glyphs and note pictures using the bindings where the style has the required art."""
     s = STYLES[style]
-    glyph = {b: s['glyph'][FACE[layout].get(b, b)] for b in set(GLYPHS.values())}
-    note = {b: s['note'][FACE[layout].get(b, b)] for b in NOTES.values()}
+    overrides = pads or {}
+
+    def picture(art: dict[str, str], button: str) -> str:
+        bound = overrides.get(PAD_GLYPHS.get(button, button), '')
+        return art.get(bound) or art[FACE[layout].get(button, button)]
+
+    glyph = {b: picture(s['glyph'], b) for b in set(GLYPHS.values())}
+    note = {b: picture(s['note'], b) for b in NOTES.values()}
     return glyph, note
 
 
@@ -118,18 +154,14 @@ KEY_LABELS = {'comma': ',', 'period': '.', 'equals': '=', 'num_decimal': '.', 'b
               'mouse_x2': 'M5'}
 
 
-def pc_keys(ini_text=None):
+def pc_keys(ini_text: str | None = None) -> dict[str, str]:
     """PC_KEYS with the first key of each bind_<button> line of a nx2navi.ini text over it. A line without a key
     entry, or with key:default first, keeps the default (the prompt then shows a key the line took away)."""
     keys = dict(PC_KEYS)
-    for line in (ini_text or '').splitlines():
-        line = line.split('#')[0].split(';')[0].strip()
-        if not line.lower().startswith('bind_') or '=' not in line:
-            continue
-        button, value = (s.strip() for s in line.split('=', 1))
-        entries = [e.strip()[4:].strip().lower() for e in value.split(',') if e.strip().lower().startswith('key:')]
-        if entries and entries[0] != 'default' and button[5:].upper() in keys:
-            keys[button[5:].upper()] = entries[0]
+    for button, entries in binding_lines(ini_text):
+        first = next((entry[4:].strip() for entry in entries if entry.startswith('key:')), '')
+        if first and first != 'default' and button in keys:
+            keys[button] = first
     return keys
 
 
@@ -513,25 +545,25 @@ def bounds(outlines):
 
 
 # ---- the button font
-def draw_font(otf, glyph, traced, lit_dpad):
+def draw_font(otf, glyph, traced, reference, lit_dpad):
     """The button font with the glyphs of GLYPHS drawn from glyph (Switch button -> picture). Every picture is scaled
     as A's picture is to the game's A (both fill their square the same way), centred in its advance and placed at the
     height of the art's own square, so the arrows of a stick reach out as they do in the art. A grid of keys is made
-    no taller than the game's A and centred on it. A wider picture widens its glyph. lit_dpad: the d-pad directions
-    are lit pad pictures (ink lit)."""
+    no taller than the game's A and centred on it. A wider picture widens its glyph. reference is the default A picture
+    for pad styles, so remapping A keeps the font's scale. lit_dpad holds the pictures with lit d-pad directions."""
     font = TTFont(io.BytesIO(otf))
     glyphs, cmap, hmtx = font.getGlyphSet(), font.getBestCmap(), font['hmtx']
     box = BoundsPen(glyphs)
     glyphs[cmap[0xE040]].draw(box)
     gx0, gy0, gx1, gy1 = box.bounds   # the game's A: a round button
-    rx0, ry0, rx1, ry1 = bounds(traced(glyph['A']))
+    rx0, ry0, rx1, ry1 = bounds(traced(reference))
     scale = (gy1 - gy0) / (ry1 - ry0)
     mid_y_px, mid_y = (ry0 + ry1) / 2, (gy0 + gy1) / 2
     side = gx0   # the game's A has this much room on either side
     drawn = {}
     for cp, button in GLYPHS.items():
         pic = glyph[button]
-        outlines = traced(pic, lit_dpad and button.startswith('DPAD_'))
+        outlines = traced(pic, pic in lit_dpad)
         x0, y0, x1, y1 = bounds(outlines)
         s, cy = scale, mid_y_px
         if isinstance(pic, tuple) and pic[0] == 'grid':
@@ -811,7 +843,7 @@ def main():
     ap.add_argument('--romfs', type=Path, help='default <game>/romfs')
     ap.add_argument('--style', choices=sorted(STYLES) + ['pc'], help='default: every one')
     ap.add_argument('--layout', choices=sorted(FACE), help='default: both (pc has one)')
-    ap.add_argument('--binds', type=Path, help='pc: a nx2navi.ini whose bind_ lines the keys follow '
+    ap.add_argument('--binds', type=Path, help='a nx2navi.ini whose bind_ lines the prompts follow '
                                                '(default <game>/nx2navi.ini when there is one)')
     ap.add_argument('--out', type=Path, help='the overlay folder, for one --style and --layout')
     ap.add_argument('--level', type=int, default=9, help='zstd level of the written files')
@@ -821,7 +853,8 @@ def main():
     if args.out and not (args.style and (args.layout or args.style == 'pc')):
         ap.error('--out writes one folder: give --style and --layout')
     binds = args.binds or (args.game / 'nx2navi.ini' if args.game and (args.game / 'nx2navi.ini').is_file() else None)
-    keys = pc_keys(binds.read_text(encoding='utf-8', errors='replace') if binds else None)
+    ini_text = binds.read_text(encoding='utf-8', errors='replace') if binds else None
+    keys, pads = pc_keys(ini_text), pad_binds(ini_text)
     romfs = Romfs(args.romfs or args.game / 'romfs')
     restbl = max((p for p in romfs.paths() if p.startswith('System/Resource/ResourceSizeTable.') and p.endswith('.zs')),
                  key=lambda p: int(p.split('.')[2]) if p.split('.')[2].isdigit() else 0, default=None)
@@ -843,11 +876,14 @@ def main():
 
     report = []
     for style in [args.style] if args.style else sorted(STYLES) + ['pc']:
+        pad_art = STYLES[style]['glyph'] if style != 'pc' else {}
+        lit_dpad = {pic for button, pic in pad_art.items() if button.startswith('DPAD_')}
         # the keyboard follows no pad layout: one folder, romfs-patches-pc
         for layout in [None] if style == 'pc' else [args.layout] if args.layout else sorted(FACE):
             out = args.out or args.game / overlay_folder(style, layout)
-            glyph, note = pc_pictures(args.art, keys) if style == 'pc' else pad_pictures(style, layout)
-            new_otf = draw_font(otf, glyph, traced, style != 'pc')
+            glyph, note = pc_pictures(args.art, keys) if style == 'pc' else pad_pictures(style, layout, pads)
+            reference = pad_art[FACE[layout]['A']] if pad_art else glyph['A']
+            new_otf = draw_font(otf, glyph, traced, reference, lit_dpad)
             blob = button_icons.bfotf_encode(new_otf, key, font_blob)
             data = bytearray(textures)
             draw_textures(data, glyph, note, args.art, cache)
