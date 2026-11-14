@@ -42,7 +42,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   the game paces movies itself, and takes the limit back while it is minimised and whenever RivaTuner is not seen
   holding it; where frame generation or low latency keeps it out, the game says when a limit set in RivaTuner itself
   holds the game as well
-- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu
+- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu, and for the tone mapped picture the tone mapper, gamma correction, exposure, highlights, shadows, contrast and saturation
 - The game's known shaders prepared when the game is built, and the pipelines met in play built again in the
   background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
   still hold a frame, and a draw that must wait for its pipeline has it built on worker threads, never on the game's

@@ -44,8 +44,8 @@
 #define MAX_DESC 1024
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
-#define SUPPORT_BYTES 1456u   // the translator's SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...;
-                              // 1408 pcss and 1424 shadow_spread (translator patches 0010, 0011), 1440..1455 HDR (support_fill)
+#define SUPPORT_BYTES 1520u   // the translator's SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...;
+                              // 1408 pcss and 1424 shadow_spread (translator patches 0010, 0011), 1440..1519 HDR (support_fill)
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
@@ -3323,7 +3323,7 @@ static void support_fill(uint8_t *b, float w, float h, float point_size) {
     memcpy(b + 1424, shadow_spread_params(), 16);    // shadow_spread (translator patch 0011): sun shadow filter width
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
     if (vk_hdr_armed()) {   // read by the game's tonemap only, once vk_hdr.c tonemap_splice has grown its block past the translator's
-        float hdr[4];
+        float hdr[20];
         vk_hdr_support(hdr);
         memcpy(b + 1440, hdr, sizeof hdr);
     }

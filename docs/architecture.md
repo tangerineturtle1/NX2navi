@@ -251,11 +251,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
   holds the HDR picture relative to the HUD's white (the function gets the values the curve takes, and the scene
-  before the game's exposure gain with that gain, which it anchors mid grey on); the game's FSR 1 pass loses its output
-  clamp; the present reads the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ
-  for an HDR10 swapchain, showing the picture as a display of gamma 2.2 would (the game is graded for one: decoded as
-  its sRGB encode, the darkest tones would sit far above black). The look is fixed; the settings are the peak, game and
-  HUD whites.
+  before the game's exposure gain with that gain, which its default tone mapper anchors mid grey on); the game's FSR 1
+  pass loses its output clamp; the present reads the float picture in place of the window texture and
+  `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain, showing the picture as a display of gamma 2.2 would (the
+  game is graded for one: decoded as its sRGB encode, the darkest tones would sit far above black). The settings are
+  the peak, game and HUD whites, the tone mapper (`NX2NAVI_HDR_TONEMAP`: the observer-response mapper, the game's own
+  curve or the luminance mapper), what each tone mapper takes, the grading sliders and the gamma correction
+  (`NX2NAVI_HDR_GAMMA`, with every tone mapper); they travel in five vec4 the support buffer gains, and at their
+  defaults the shader leaves every grading step out.
   `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
   The menu switches between off and `1` during a run: the splice, the HDR extensions and the settings in the support
   buffer are there from the start whatever is set (`vk_hdr_armed`), the spliced tonemap returns the game's SDR result

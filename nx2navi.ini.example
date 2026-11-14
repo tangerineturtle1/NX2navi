@@ -836,11 +836,10 @@
 # low_latency = 0
 
 # HDR output, two kinds (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management;
-# without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display, one
-# fixed look, and applies at once; hdr = native shows the game's own HDR mode, which the game takes up at the next
-# start. hdr_peak_nits is your display's peak, hdr_game_nits the picture's white (paper white, 203 is the HDR
-# reference) and hdr_ui_nits the HUD's and the menu's. The settings of the look of earlier versions
-# (hdr_tonemap, hdr_exposure, hdr_gamma and the rest) are read by nothing now and do no harm.
+# without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display and
+# applies at once; hdr = native shows the game's own HDR mode, which the game takes up at the next start.
+# hdr_peak_nits is your display's peak, hdr_game_nits the picture's white (paper white, 203 is the HDR reference) and
+# hdr_ui_nits the HUD's and the menu's.
 # hdr = 0
 # hdr_live = 0 leaves the HDR path out of a run that starts with hdr = 0, as before hdr followed the menu: switching
 # HDR on then takes a restart. Only worth setting if the picture differs with it at 1.
@@ -848,6 +847,40 @@
 # hdr_peak_nits = 1000
 # hdr_game_nits = 203
 # hdr_ui_nits = 203
+# The settings from here to the end of this section shape the picture of hdr = 1 and apply at once; hdr = native does
+# not take them. Left as they are, they give the one look hdr = 1 had from 0.9.0 to 0.10.1, which read none of them: a
+# value your file still holds from an older version counts again.
+# The tone mapper: vanilla is the game's own curve at SDR brightness; psychov35 sends the scene through a model of the
+# eye's response, matched to the game's mid grey and tone, up to the peak; renodrt carries the game's SDR look up to
+# the peak by brightness.
+# hdr_tonemap = psychov35
+# Gamma correction, with every tone mapper: 2.2 or 2.4 shows the picture as a display of that power would, as the game
+# was made to be seen; off keeps the sRGB curve, which leaves the darkest tones well above black.
+# hdr_gamma = 2.2
+# With psychov35: where the scene's mid grey lands (vanilla: where the game's curve puts it; render: at the scene's
+# value); whether the mid tones get the contrast of the game's curve; the tone curve's steepness through mid grey from
+# 0 to 100 (50 unchanged); and in percent how much bright colours turn as where the game's SDR picture clips (fire
+# towards yellow and white).
+# hdr_midgray = vanilla
+# hdr_match_slope = 1
+# hdr_tone_slope = 50
+# hdr_hue_clip = 50
+# With psychov35 and renodrt: exposure in percent (100 unchanged); highlights, shadows, contrast and saturation from 0
+# to 100 (50 unchanged).
+# hdr_exposure = 100
+# hdr_highlights = 50
+# hdr_shadows = 50
+# hdr_contrast = 50
+# hdr_saturation = 50
+# With renodrt: highlight saturation from 0 to 100 (50 unchanged); blowout (bright parts towards white) and flare
+# (lifted blacks) from 0 to 100 (0 none); hue correction in percent (how much bright colours keep their hue); grade,
+# the percentage of the game's own colour grading the picture keeps.
+# hdr_highlight_sat = 50
+# hdr_blowout = 0
+# hdr_flare = 0
+# hdr_hue = 100
+# hdr_grade = 100
+
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.
 # locale = en-US

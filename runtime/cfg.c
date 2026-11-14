@@ -56,8 +56,6 @@ static const char *const known[] = {
     "FFX_PIPE_CACHE", "FLIGHT_SPIKE_MS", "FREEZE_QUIET_MS", "FREEZE_LOAD_HOLD_MS", "STUTTER_MAP", "PAR_JOBS", "PIPE_RELEASE", "FLIGHT_THUMBS", "FLIGHT_EVERY", "FLIGHT_FLASH", "FLIGHT_FLASH_DIFF", "FLIGHT_FLASH_CELLS", "FLUSH_SPAN", "FLUSH_UPLOAD", "FOG_CULL", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FG_MULT", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FRAMEGEN_MULTIPLIER", "FREEZE_IDLE", "FREEZE_ASYNC", "FREEZE_BUDGET_US", "FREE_CORES",
     "FULLSCREEN", "FXAA", "GAME_ASPECT", "GAME_RES", "GPA", "GPA_EMPTY", "GPA_TWIN", "GPA_TWIN_MAX_KB", "MIRROR_CAPTURE_KB", "WB_SKIP_MB", "GPL", "GPL_DRAW_BUILD", "GPL_FEEDBACK", "GPL_MESH", "PIPE_AHEAD", "PIPE_FAST_WORKERS", "PIPE_FRAME_WAIT_MS", "PIPE_LINK_DRAW_MS", "PIPE_SKIP_STEADY", "DRAW_WRITERS_WAIT", "PROG_LEAD", "GPU", "GPU_INDEX", "GPU_PASSES", "GPU_NAME", "HDR",
     "HDR_GAME_NITS", "HDR_LIVE", "HEAP_LAZY", "HDR_PEAK_NITS", "HDR_UI_NITS",
-    // retired: the HDR look's settings of earlier versions, now fixed (vk_hdr.c, shaders/hdr_tonemap.frag); read by
-    // nothing, listed so that a file which still sets them logs no unknown key
     "HDR_BLOWOUT", "HDR_CONTRAST", "HDR_EXPOSURE", "HDR_FLARE", "HDR_GAMMA", "HDR_GRADE", "HDR_HIGHLIGHT_SAT",
     "HDR_HIGHLIGHTS", "HDR_HUE", "HDR_HUE_CLIP", "HDR_MATCH_SLOPE", "HDR_MIDGRAY", "HDR_SATURATION", "HDR_SHADOWS",
     "HDR_TONEMAP", "HDR_TONE_SLOPE", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
@@ -132,7 +130,11 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_PRESET", "display"},
     {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_LIVE", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
-    {"HDR_UI_NITS", "display"}, {"SHADOW_RES", "display"},
+    {"HDR_UI_NITS", "display"}, {"HDR_GAMMA", "display"}, {"HDR_TONEMAP", "display"}, {"HDR_EXPOSURE", "display"},
+    {"HDR_HIGHLIGHTS", "display"}, {"HDR_SHADOWS", "display"}, {"HDR_CONTRAST", "display"}, {"HDR_SATURATION", "display"},
+    {"HDR_HIGHLIGHT_SAT", "display"}, {"HDR_BLOWOUT", "display"}, {"HDR_FLARE", "display"}, {"HDR_HUE", "display"},
+    {"HDR_GRADE", "display"}, {"HDR_MIDGRAY", "display"}, {"HDR_MATCH_SLOPE", "display"}, {"HDR_TONE_SLOPE", "display"},
+    {"HDR_HUE_CLIP", "display"}, {"SHADOW_RES", "display"},
     {"DLAA", "display"}, {"FSR4", "display"}, {"FSR4_FG", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_IDLE_FREE", "display"}, {"DLSS_RANGE", "display"}, {"DLSS_PREBLOOM", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"}, {"AA", "display"},
     {"UPSCALER_IDLE_WAIT", "display"},
     {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"}, {"FG_MULT", "display"}, {"SKIN_MOTION", "display"},
@@ -252,13 +254,23 @@ static const CfgMeta metas[] = {
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", "0", "-30..30", LIVE},
     {"COLOR_CONTRAST", "100", "70..150", LIVE}, {"COLOR_SATURATION", "100", "50..200", LIVE},
     {"COLOR_GAMMA", "1", "0.8..1.2", LIVE},
-    // HDR output (vk_hdr.c): on and off apply at once (the HDR tonemap is spliced into the game's as shaders load
-    // whatever is set, vk_hdr_armed); native is the game's own and is asked for once, at start
-    // (vk_hdr_needs_restart). HDR_LIVE = 0 leaves the HDR path out of a run that starts with HDR off. The look is
-    // fixed: only the three whites are settings.
+    // HDR output (vk_hdr.c): on, off, the tone mapper and its grading apply at once (the HDR tonemap is spliced into
+    // the game's as shaders load whatever is set, vk_hdr_armed); native is the game's own and is asked for once, at
+    // start (vk_hdr_needs_restart). HDR_LIVE = 0 leaves the HDR path out of a run that starts with HDR off.
+    // The grading sliders: 50 leaves the picture as it is, exposure in percent. HDR_GAMMA is the display the present
+    // shows the picture as, with every tone mapper; off shows the sRGB code as it decodes, the dark tones lighter.
     {"HDR", "0", "0|1|native", LIVE}, {"HDR_LIVE", "1", "0|1", RESTART},
     {"HDR_PEAK_NITS", "1000", "400..10000", LIVE}, {"HDR_GAME_NITS", "203", "48..500", LIVE},
-    {"HDR_UI_NITS", "203", "48..500", LIVE},
+    {"HDR_UI_NITS", "203", "48..500", LIVE}, {"HDR_GAMMA", "2.2", "off|2.2|2.4", LIVE},
+    {"HDR_TONEMAP", "psychov35", "vanilla|psychov35|renodrt", LIVE}, {"HDR_EXPOSURE", "100", "0..200", LIVE},
+    // the observer-response mapper's: where scene grey lands, its slope there matched to the game's curve, that slope
+    // (50 unchanged) and how much of the game's hue bend at its clamp bright colours get
+    {"HDR_MIDGRAY", "vanilla", "render|vanilla", LIVE}, {"HDR_MATCH_SLOPE", "1", "0|1", LIVE},
+    {"HDR_TONE_SLOPE", "50", "0..100", LIVE}, {"HDR_HUE_CLIP", "50", "0..100", LIVE},
+    {"HDR_HIGHLIGHTS", "50", "0..100", LIVE}, {"HDR_SHADOWS", "50", "0..100", LIVE}, {"HDR_CONTRAST", "50", "0..100", LIVE},
+    {"HDR_SATURATION", "50", "0..100", LIVE}, {"HDR_HIGHLIGHT_SAT", "50", "0..100", LIVE},
+    {"HDR_BLOWOUT", "0", "0..100", LIVE}, {"HDR_FLARE", "0", "0..100", LIVE}, {"HDR_HUE", "100", "0..100", LIVE},
+    {"HDR_GRADE", "100", "0..100", LIVE},
     {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
     {"SHADOW_RES", "game", "game|256|512|768|1024|1536|2048", RESTART},
     {"SHADOW_SCALE", "1", "1..4", RESTART}, {"SHADOW_COMPARE", "1", "0|1", RESTART},   // vk_texture.c
