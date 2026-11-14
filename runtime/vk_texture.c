@@ -3669,7 +3669,7 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // costs a staging buffer, a copy and a barrier, several microseconds, where hashing 1.5 KiB takes a fraction of one.
 // A CPU write during the hash sets the pages' write bits again, so the next check sees it.
 //
-// NX2NAVI_TEX_SAME_BIG=1 (default 0; ab): textures up to CHASH_BIG_MAX keep the hash too. While the player runs through
+// NX2NAVI_TEX_SAME_BIG (default 1 since 0.10.2; ab): textures up to CHASH_BIG_MAX keep the hash too. While the player runs through
 // a town the game moves about 32 textures to new storage every four or five frames, back to back in one block, and a
 // frame after their first upload every page of the block shows a write again. Of the ones the hash covers, 0 to 4 in a
 // hundred are uploaded again (128x128, 171x171, 256x256 BC1: 9 of 440 in one recording of 600 frames); of the others,
@@ -3677,12 +3677,17 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // uploads in those 600 frames beside 4,233 first ones, their ASTC ones decoded and encoded on the GPU a second time.
 // The frames of those second uploads take 0.9 to 2.5 ms longer than the frames without uploads and the frames after
 // them wait 0.3 to 1.3 ms longer for the GPU (six recordings of one player, RTX 5090, 2026-11-12).
-// What the hash costs is why the switch is off: the bytes are read once more at the first upload and once at the
-// comparison, 15 to 18 us each for 300 KiB (17 to 20 GB/s, below), together about what the second upload takes on
-// the submitting thread (27 us for 300 KiB). So the gain is the GPU's work and whatever else a second upload costs a
-// frame, and that has not been measured in play. A texture the CPU really rewrites would pay the hash for nothing each
-// time: after CHASH_MISSES comparisons in a row that found other bytes its uploads take no hash any more. An area load
-// takes none either (vk_exec_pool_loading): it uploads gigabytes in a few frames.
+// What the hash costs: the bytes are read once more at the first upload and once at the comparison, 15 to 18 us each
+// for 300 KiB (17 to 20 GB/s, below), together about what the second upload takes on the submitting thread (27 us
+// for 300 KiB). The gain is the GPU's work, and a run through Hyrule Field measured it (2026-11-14, RTX 5090, about
+// three minutes of running, the same route each time): without the hash 44,000 to 52,000 second uploads of 33 to 47
+// GiB of storage in four runs of six (9,000 and 11,000 in the other two), one 1536x1536 texture 29 times within 300
+// frames with the same bytes each time, 66 thousand million texels decoded on the GPU in a run; with it 592 second
+// uploads of 195 MiB, 24 GiB found unchanged, and 24 thousand million texels decoded, which is the first uploads.
+// The second uploads took 2.9 s of the submitting thread in such a run, the two hashes about 3 s. A texture the CPU
+// really rewrites would pay the hash for nothing each time: after CHASH_MISSES comparisons in a row that found other
+// bytes its uploads take no hash any more. An area load takes none either (vk_exec_pool_loading): it uploads
+// gigabytes in a few frames. NX2NAVI_TEX_SAME_BIG=0 hashes only the textures up to CHASH_MAX, as before 0.10.2.
 // The pool log's buckets line counts the comparisons and the hashed bytes.
 enum { CHASH_MAX = 64 << 10, CHASH_BIG_MAX = 8 << 20, CHASH_MISSES = 2 };
 static uint64_t content_hash(const void *p, uint64_t n) {
@@ -3855,7 +3860,7 @@ static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint
 static int chash_wanted(const Tex *e) {
     static int mode = -1;
     if (e->t.L.size <= CHASH_MAX) return 1;
-    if (mode < 0) mode = rt_knob("TEX_SAME_BIG", "0");
+    if (mode < 0) mode = rt_knob("TEX_SAME_BIG", "1");
     return RT_KNOB_ON(mode) && e->t.L.size <= CHASH_BIG_MAX && e->chash_miss < CHASH_MISSES && !vk_exec_pool_loading();
 }
 

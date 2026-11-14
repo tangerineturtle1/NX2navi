@@ -1061,11 +1061,11 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
 #ifdef _WIN32   // elsewhere an import's pinning can mark pages written again without a CPU write: the count is not exact
     GCHECK(re1 == re0 + 1, "storage rewritten: %llu re-uploads (want 1)", (unsigned long long)(re1 - re0));
     // The same bytes written again, so that every page of the storage shows a write. The texture is over 64 KiB: with
-    // NX2NAVI_TEX_SAME_BIG it is compared by content and left as it is, without the switch it is uploaded again. Other
+    // NX2NAVI_TEX_SAME_BIG (the default) it is compared by content and left as it is, with 0 it is uploaded again. Other
     // bytes upload either way, and the image holds them. After two comparisons in a row that found other bytes its
     // uploads take no hash any more, so the same bytes written again then upload with the switch too.
     {
-        int big = rt_knob("TEX_SAME_BIG", "0") == 1;
+        int big = rt_knob("TEX_SAME_BIG", "1") == 1;
         volatile uint8_t *sm = (volatile uint8_t *)t.mem;
         uint64_t re2, re3, re4, re5;
         GCHECK(t.L.size > (64u << 10), "the RGBA8 texture's storage is %llu bytes, not over 64 KiB", (unsigned long long)t.L.size);

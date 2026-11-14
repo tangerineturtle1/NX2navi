@@ -426,6 +426,12 @@
 # thirty from being loaded again). A larger value keeps more textures the game may take back, which are otherwise made
 # again and show their stand-in for a frame. Read at start.
 # tex_released_mb = 1024
+# A texture whose memory the game writes again with the bytes it already held is left as it is instead of being
+# uploaded (and, for most, decoded on the graphics card) a second time: its bytes are compared by a hash taken at the
+# upload. Textures up to 64 KB always were; since 0.10.2 those up to 8 MB are too. Running through Hyrule Field the
+# game does this all the time: 52,000 second uploads in three minutes without it, 600 with it. 0: only the small ones,
+# as before (for a comparison; nothing should look different). Read at start.
+# tex_same_big = 1
 # Texture compaction (experimental). Video memory is taken in blocks (vma_block_mb), and a block goes back to the
 # driver only once everything in it is freed: after a long session the blocks hold textures scattered between holes,
 # and the game holds a gigabyte or two of video memory it does not use. 1: textures no shader sampled for ten seconds
