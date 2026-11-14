@@ -22,6 +22,12 @@ set zstd        NX2NAVI_ZSTD_NATIVE       1
 set osolver     NX2NAVI_PHYSICS_STEPS     1
 set opickup     NX2NAVI_PICKUP_COUNT      1
 set freecam     NX2NAVI_PATCH_FREECAM     0
+set sprint_boost NX2NAVI_SPRINT_PATCH    0
+
+# Optional native player speed multiplier (runtime/cheats.c, page +384 float).
+# Apply to the player's final desired speed after steering, before the native character controller receives it.
+# x16 and s31 are caller-saved and unused by this function. The original instruction and flags are preserved.
+site sprint_boost main 93498c aa1403e0 aa1403e0 @page:x16 bd41821f 1e3f0800
 set omovie      NX2NAVI_MOVIE_PTS         1
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
@@ -308,6 +314,18 @@ site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
 # own work.
 site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70
 
+# Magic spin phase 2 timer threshold only. Native Great Fairy and magic checks remain intact.
+# 0.125 native ticks avoids a zero denominator while charging within the next gameplay update.
+set spin_instant NX2NAVI_SPIN_INSTANT_PATCH 0
+site spin_instant main bfd164 bd416b08 1e281008
+
+# Native spin-only length/thickness results, before return to the weapon collision updater.
+# The callback validates Link's current sword and multiplies these native scales without storing state.
+# x30 is restored by this function's epilogue; all other registers and flags are preserved by the callback.
+set spin_range NX2NAVI_SPIN_RANGE_PATCH 1
+site spin_range main adeff8 1e241001 1e241001 950f07be
+site spin_range main adf0ac 1e249001 1e249001 950f0791
+site spin_range main adf0d8 1e245001 1e245001 950f0786
 # Occlusion queries off, an experiment (patch_occlusion_off = 1; off by default). main+0x11ac790 copies the values of a
 # parameter object (x20) into a list of options (x21): an option is found by the CRC-32 of its name (vtable +0x38) and
 # keeps its value at +0x18. Two of the parameters are CreateZPrePassOcclusionQuery (the byte main+0xf5acc0 returns:
@@ -363,3 +381,21 @@ site sprint main c07f3c 39400108 39400108 950a63fd   # ldrb w8, [x8] -> ldrb w8,
 set text_speed NX2NAVI_TEXT_SPEED_PATCH 1
 site text_speed main 774b74 36000074 @page:x9 394d2a6a d100054a 8a0a010a f901012a 39483129 2a140129 36000069   # tbz w20, #0, #0x774b80 -> adrp x9, page; ldrb w10, [x19, #0x34a]; sub x10, x10, #1; and x10, x8, x10; str x10, [x9, #0x200]; ldrb w9, [x9, #0x20c]; orr w9, w9, w20; tbz w9, #0, #0x774b80
 site text_speed main afe1d8 bd404e61 bd404e61 @page:x22 f94102db cb13037b dac0137b d346ff7b 9e220362 bd420ac8 1e280842 1f020421   # ldr s1, [x19, #0x4c]; adrp x22, page; ldr x27, [x22, #0x200]; sub x27, x27, x19; clz x27, x27; lsr x27, x27, #6; scvtf s2, x27; ldr s8, [x22, #0x208]; fmul s2, s2, s8; fmadd s1, s1, s2, s1
+
+# Preserve incoming LR across the projectile entry callback.
+set bomb_arrows NX2NAVI_BOMB_ARROWS_PATCH 1
+site bomb_arrows main 2eabc30 d503237f aa1e03f0 947fd4ac
+
+# Process asynchronous bomb actor requests on the native framework thread.
+site bomb_arrows main 6e6be0 d503237f aa1e03f0 951ee8bc
+
+# Native map collectible visibility and texture selection. The same updater serves the full map and minimap.
+# Visibility loads run first; callbacks change their result. The style callback then makes the native animation call.
+# Floor selection and position transforms remain native.
+set world_map NX2NAVI_WORLD_MAP_PATCH 1
+site world_map main 2090a8 39517268 39517268 95325f86
+site world_map main 2091a4 b94017e9 b94017e9 95325f43
+site world_map main 20934c 94032691 95325ed5
+site world_map main 207760 39516e69 39516e69 953265cc
+site world_map main 203af0 94001a3c 953274e4
+site world_map main 2032ac 94033eb9 953276f1

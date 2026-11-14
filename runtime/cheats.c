@@ -1,4 +1,6 @@
-// Cheats of the mods' Atmosphere cheat files (cheats.h). Each enabled mod the port can use (mods.h) may hold
+// Built-in resource policies and the mods' Atmosphere cheat files (cheats.h).
+// Essentials uses a build-specific, validated GameData lookup rather than emulator heap offsets.
+// Each enabled mod the port can use (mods.h) may hold
 // <build id>.txt in its cheats folder, the build id the first 8 bytes of main's NSO build id, as Atmosphere and the
 // emulators name it; the file name's case does not matter. Each cheat's switch is the setting NX2NAVI_CHEAT_<hash>
 // (cheat_<hash> under [cheats] in nx2navi.ini), the hash FNV-1a 32 of "<mod folder name>/<cheat name>", so two mods'
@@ -17,6 +19,7 @@
 // it. Buttons are input_poll's HidNpadButton bits, the same as the cheat format's key masks; they read 0 while the menu
 // is open.
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +30,7 @@
 #include "host.h"
 #include "input.h"
 #include "mods.h"
+#include "ui_text.h"
 #include "platform/platform.h"
 
 #ifdef _WIN32
@@ -44,6 +48,7 @@ typedef struct {
     int dup;              // 1 for the first cheat of its name in its file, 2 for the next ...
     uint32_t content;     // FNV-1a 32 of its words as tools/cheats.py writes them
     int set;              // patch set, -1 none
+    int basic;            // built-in player resource policy, 0 for an imported cheat
     volatile int32_t on;
     char note[STATUS_MAX];
 } Cheat;
@@ -54,6 +59,9 @@ static char g_file[64];        // "<build id>.txt"
 static char g_dir[PLAT_PATH_MAX];   // the folder of nx2navi.exe, with a trailing separator
 static int g_files;            // mods whose file was read
 static uint64_t g_main, g_main_size, g_code_end;   // main's image; its code with the padding up to .rodata
+static int g_movement_build;
+static int g_sprint_set = -2;
+static int g_jump_held;
 
 static uint32_t fnv(const char *s, size_t n) {
     uint32_t h = 0x811C9DC5u;
@@ -195,6 +203,368 @@ static void wr(uint64_t a, int width, uint64_t v) {
         wr_main(a, (const uint8_t *)&v, width);
     } else if (guest_ok(a, (unsigned)width, 2)) {
         memcpy(p, &v, (size_t)width);   // a frozen region thaws on the write (memory.c)
+    }
+}
+
+// Ocarina 1.1.1's gmd integer table. The manager is reached through the same
+// singleton chain as the game's getters; heap allocation addresses are never kept.
+// Both the name hash and its expected index must agree before a resource is used.
+static uint64_t basic_entry(uint32_t hash, uint32_t expected, unsigned offset, unsigned expected_count,
+                            unsigned stride, unsigned value_offset, unsigned width) {
+    uint64_t root, manager, count, entries, table, slots;
+    if (!rd(g_main + 0x4c7e180, 8, &root) || !rd(root, 8, &manager) ||
+        !rd(manager + offset, 4, &count) || count != expected_count ||
+        !rd(manager + offset + 8, 8, &entries) || !rd(manager + offset + 16, 8, &table) ||
+        !rd(manager + offset + 28, 4, &slots) || slots != 2 * count) return 0;
+    uint32_t slot = hash % (uint32_t)slots;
+    for (uint32_t tried = 0; tried < slots; tried++, slot = (slot + 1) % (uint32_t)slots) {
+        uint64_t key, index;
+        if (!rd(table + 8 * slot, 4, &key) || !key) return 0;
+        if (key != hash) continue;
+        if (!rd(table + 8 * slot + 4, 4, &index) || index != expected || index >= count) return 0;
+        uint64_t entry = entries + index * stride, vtable;
+        if (!rd(entry, 8, &vtable) || !in_main(vtable, 8) || !guest_ok(entry + value_offset, width, 1)) return 0;
+        return entry + value_offset;
+    }
+    return 0;
+}
+
+static uint64_t basic_int(uint32_t hash, uint32_t expected) {
+    uint64_t a = basic_entry(hash, expected, 0xd0, 1259, 40, 28, 8);
+    return a && guest_ok(a, 8, 2) ? a : 0;
+}
+
+static int basic_owned(uint32_t hash, uint32_t expected) {
+    uint64_t a = basic_entry(hash, expected, 0x10, 11292, 24, 22, 1), value;
+    return a && rd(a, 1, &value) && value == 1;
+}
+
+int cheats_bomb_arrow_ammo(int consume) {
+    if (!g_movement_build) return 0;
+    uint64_t bombs=basic_int(0xdb1bcd4f,1007),bag=basic_int(0xe753508b,972),quiver=basic_int(0x418db791,971);
+    uint64_t stock,cap,bow;
+    if (!bombs || !bag || !quiver || !rd(bombs,4,&stock) || !rd(bag,4,&cap) || !rd(quiver,4,&bow) ||
+        !cap || cap>9999 || !bow || bow>9999 || !stock || stock>cap) return 0;
+    if (consume) { wr(bombs,4,stock-1); wr(bombs+4,4,stock-1); }
+    return 1;
+}
+
+static const uint32_t bottle_valid_hash[CHEAT_BOTTLE_SLOTS] = {0xf39ce410, 0x000ff6ea, 0xf63b1194, 0xb7f052ce, 0xe27b136d};
+static const uint32_t bottle_item_hash[CHEAT_BOTTLE_SLOTS] = {0x7d48df76, 0x1edd164a, 0xb80c70a8, 0xe4c1b1fc, 0x365e1953};
+static const uint32_t bottle_values[] = {0xbe69de49, 0xeaba6067, 0x049d37c1, 0xf383d6e5, 0x1c293517,
+    0x1e834ef8, 0x0f24e808, 0xcdc21471, 0x02084f9e, 0x74d62ecb, 0x6f49e357, 0x73356827, 0xeef6e4b0};
+
+static uint64_t bottle_entry(int slot) {
+    if (!g_movement_build || slot < 0 || slot >= CHEAT_BOTTLE_SLOTS || !basic_owned(bottle_valid_hash[slot], 10756 + slot)) return 0;
+    return basic_entry(bottle_item_hash[slot], 60 + slot, 0x250, 130, 56, 28, 8);
+}
+
+int cheats_bottle_content(int slot) {
+    uint64_t a = bottle_entry(slot), value;
+    if (!a || !rd(a, 4, &value)) return -1;
+    for (int i = 0; i < (int)(sizeof bottle_values / sizeof *bottle_values); i++)
+        if (value == bottle_values[i]) return i;
+    return -1;
+}
+
+int cheats_bottle_set(int slot, int content) {
+    if (content < 0 || content >= (int)(sizeof bottle_values / sizeof *bottle_values)) return 0;
+    uint64_t a = bottle_entry(slot), count, values;
+    // The enum's native list must also contain the requested value. Unlock flags and bottle stock are read-only.
+    if (!a || !guest_ok(a, 8, 2) || !rd(a + 12, 4, &count) || count != 13 || !rd(a + 20, 8, &values)) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t value;
+        if (!rd(values + i * 4, 4, &value)) return 0;
+        if (value == bottle_values[content]) {
+            wr(a, 4, value);
+            wr(a + 4, 4, value);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t g_health_binding;
+static uint64_t g_magic_binding;
+
+static int magic_binding(uint64_t a, uint64_t *value) {
+    uint64_t key, max_key, extra_key;
+    // Native resource controller passed to main+0x1639b0. These three GameData keys identify the magic pool.
+    return rd(a + 0x38, 4, &key) && key == 0x76b18200 &&
+           rd(a + 0x3c, 4, &max_key) && max_key == 0x12d63a97 &&
+           rd(a + 0x40, 4, &extra_key) && extra_key == 0x3afa3349 &&
+           rd(a + 0x44, 4, value) && *value <= 9999 && guest_ok(a + 0x44, 4, 2);
+}
+
+// The player's live linked integers feed GameData every tick. Writing the GameData
+// copy alone changes the display briefly, then loses to the next linked-value sync.
+static int health_binding(uint64_t a, uint64_t *value, uint64_t *capacity) {
+    uint64_t vt, next_vt, life_key, max_key;
+    return rd(a, 8, &vt) && vt == g_main + 0x4b63438 &&
+           rd(a + 12, 4, &life_key) && life_key == 0x31ab5580 &&
+           rd(a + 16, 8, &next_vt) && next_vt == vt &&
+           rd(a + 28, 4, &max_key) && max_key == 0xfbe01da1 &&
+           rd(a + 8, 4, value) && rd(a + 24, 4, capacity) &&
+           *capacity >= 4 && *capacity <= 160 && !(*capacity % 4) && *value <= *capacity &&
+           guest_ok(a + 8, 4, 2);
+}
+
+// The existing entry observer is enabled only until the game synchronizes this
+// binding. No heap scan or persistent function tracing runs while playing.
+void cheats_fn_hit(uint64_t addr, uint64_t x0) {
+    uint64_t value, capacity;
+    if (addr == g_main + 0x1639b0 && (__atomic_load_n(&g_fnprof, __ATOMIC_RELAXED) & FNPROF_MAGIC) && magic_binding(x0, &value)) {
+        __atomic_store_n(&g_magic_binding, x0, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&g_fnprof, ~FNPROF_MAGIC, __ATOMIC_RELAXED);
+        rt_log("cheats: active magic binding resolved");
+    }
+    if (addr != g_main + 0x163b20) return;
+    if (!(__atomic_load_n(&g_fnprof, __ATOMIC_RELAXED) & FNPROF_CHEATS) || !health_binding(x0, &value, &capacity)) return;
+    __atomic_store_n(&g_health_binding, x0, __ATOMIC_RELEASE);
+    __atomic_fetch_and(&g_fnprof, ~FNPROF_CHEATS, __ATOMIC_RELAXED);
+    rt_log("cheats: active health binding resolved");
+}
+
+static void basic_health(void) {
+    uint64_t a = __atomic_load_n(&g_health_binding, __ATOMIC_ACQUIRE), value, capacity, saved_cap;
+    uint64_t max = basic_int(0xfbe01da1, 964);
+    if (!a || !health_binding(a, &value, &capacity) || !max || !rd(max, 4, &saved_cap) || saved_cap != capacity) {
+        __atomic_store_n(&g_health_binding, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&g_fnprof, FNPROF_CHEATS, __ATOMIC_RELAXED);
+        return;
+    }
+    if (value && value < capacity) wr(a + 8, 4, capacity);   // never revive after death or add containers
+}
+
+static void basic_magic(void) {
+    uint64_t cap_target = basic_int(0x12d63a97, 967), capacity, value;
+    if (!cap_target || !rd(cap_target, 4, &capacity) || !capacity || capacity > 9999) return;
+    uint64_t a = __atomic_load_n(&g_magic_binding, __ATOMIC_ACQUIRE);
+    if (!a || !magic_binding(a, &value) || value > capacity) {
+        __atomic_store_n(&g_magic_binding, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&g_fnprof, FNPROF_MAGIC, __ATOMIC_RELAXED);
+        return;
+    }
+    if (value < capacity) wr(a + 0x44, 4, capacity);
+}
+
+static void basic_refill(uint32_t hash, uint32_t index, uint32_t cap_hash, uint32_t cap_index, int hearts) {
+    uint64_t target = basic_int(hash, index), cap_target = basic_int(cap_hash, cap_index), value, capacity;
+    if (!target || !cap_target || !rd(target, 4, &value) || !rd(cap_target, 4, &capacity)) return;
+    // Zero capacity means the item/bag has not been obtained. Health never revives
+    // a dead player or changes the maximum number of hearts.
+    if (!capacity || capacity > (hearts ? 160u : 9999u) || value > 9999 ||
+        (hearts && (!value || capacity % 4 || value >= capacity))) return;
+    wr(target, 4, capacity);
+    wr(target + 4, 4, capacity);   // keep the buffered value used by saved game state in agreement
+}
+
+static uint64_t g_shared_timer_entry;
+static float g_shared_timer_held;
+
+static void basic_shared_countdown(void) {
+    // The shared minigame/event timer uses 60-Hz ticks. Keep its running flag intact so objectives still work.
+    uint64_t active = basic_entry(0xf0312188, 10101, 0x10, 11292, 24, 22, 1);
+    uint64_t down = basic_entry(0xdd49184a, 10100, 0x10, 11292, 24, 22, 1), running, countdown;
+    uint64_t a = basic_entry(0x9d350590, 67, 0x190, 89, 40, 28, 8), raw;
+    if (!active || !down || !a || !rd(active, 1, &running) || running != 1 ||
+        !rd(down, 1, &countdown) || countdown != 1 || !rd(a, 4, &raw) || !guest_ok(a, 8, 2)) {
+        g_shared_timer_entry = 0; return;
+    }
+    uint32_t bits = (uint32_t)raw;
+    float value;
+    memcpy(&value, &bits, 4);
+    if (!isfinite(value) || value <= 0 || value > 216000) { g_shared_timer_entry = 0; return; }
+    // Rebase when a timer starts, changes duration, or receives an explicit large time adjustment.
+    if (a != g_shared_timer_entry || value > g_shared_timer_held + .1f || g_shared_timer_held - value > 120.0f) {
+        g_shared_timer_entry = a;
+        g_shared_timer_held = value;
+    }
+    memcpy(&bits, &g_shared_timer_held, 4);
+    wr(a, 4, bits);
+    wr(a + 4, 4, bits);
+}
+
+static void basic_fixed_item(uint32_t hash, uint32_t index, uint32_t owned_hash, uint32_t owned_index, uint32_t max) {
+    uint64_t a, value;
+    if (!basic_owned(owned_hash, owned_index) || !(a = basic_int(hash, index)) ||
+        !rd(a, 4, &value) || value > max) return;
+    wr(a, 4, max);
+    wr(a + 4, 4, max);
+}
+
+static void basic_run(int kind) {
+    switch (kind) {
+    case 1: basic_health(); break;
+    case 2: basic_refill(0xa77921d7, 962, 0xe0010a50, 976, 0); break;
+    case 3: basic_refill(0xdb1bcd4f, 1007, 0xe753508b, 972, 0); break;
+    case 4: break;   // legacy combined switch: migrated to the independent ammunition policies at startup
+    case 6: basic_magic(); break;
+    case 7: break;   // legacy combined items switch; independent policies below own all replenishment
+    case 8: basic_refill(0x518ec74b, 1006, 0x418db791, 971, 0); break;
+    case 9:
+        if (basic_owned(0x5ab49c8e, 8852)) basic_refill(0xdf7c517a, 1011, 0xe753508b, 972, 0);
+        break;
+    case 10: basic_refill(0xf30d9f54, 1019, 0x735b00f7, 973, 0); break;
+    case 11: basic_refill(0x5fadf7fc, 1020, 0xae8cc742, 974, 0); break;
+    case 12: basic_refill(0xb9494411, 1021, 0x457616b0, 975, 0); break;
+    case 13: basic_fixed_item(0xb003124d, 1032, 0x6d39c600, 8896, 10); break;
+    case 14: basic_fixed_item(0x600e29eb, 1057, 0xcfbb16f6, 8934, 30); break;
+    case 15: basic_shared_countdown(); break;
+    }
+}
+
+static void basic_add(const char *bid) {
+    if (strcmp(bid, "E0F3CCFAF50065AE")) return;
+    g_movement_build = 1;
+    static const char *const names[] = {"Infinite health", "Infinite rupees", "Infinite bombs", "Infinite ammo",
+                                         "Infinite challenge timers", "Infinite magic", "Infinite items",
+                                         "Infinite arrows", "Infinite bombchus", "Infinite Deku nuts", "Infinite Deku seeds", "Infinite Deku sticks",
+                                         "Infinite magic beans", "Infinite Scrub seeds", "Freeze shared countdown"};
+    static const char *const notes[] = {
+        "Refills your existing hearts while alive. Does not add heart containers or revive after death.",
+        "Keeps rupees at your current wallet capacity. Does not upgrade the wallet.",
+        "Refills bombs to your current bomb-bag capacity. Obtain a bomb bag first.",
+        "Refills arrows, Deku seeds, nuts and sticks to their current capacities. Does not unlock items or upgrades.",
+        "Not available yet for this build. Quest and minigame timers still run; bomb fuses are unchanged.",
+        "Refills magic to your existing magic-meter capacity. Obtain a magic meter first. Does not unlock or upgrade it.",
+        "Refills owned magic beans and Scrub seeds. Set ammunition separately. Does not unlock items.",
+        "Refills arrows to the current quiver capacity.", "Refills owned bombchus to the current bomb-bag capacity.",
+        "Refills Deku nuts to their current capacity.", "Refills Deku seeds to their current capacity.",
+        "Refills Deku sticks to their current capacity.",
+        "Keeps already obtained magic beans at the native limit of 10.",
+        "Keeps already obtained Scrub business seeds at the native limit of 30.",
+        "Freezes the shared minigame/event countdown. Count-up timers and unrelated timer systems are unchanged."};
+    g_cap = 32;
+    g_cheats = (Cheat *)calloc((size_t)g_cap, sizeof *g_cheats);
+    if (!g_cheats) rt_fatal("cheats: out of memory");
+    for (int i = 0; i < 15; i++) {
+        Cheat *c = &g_cheats[g_n++];
+        c->info.name = strdup(names[i]);
+        c->info.mod = "Essentials";
+        c->set = -1;
+        c->dup = 1;
+        c->basic = i + 1;
+        snprintf(c->note, sizeof c->note, "%s", notes[i]);
+    }
+}
+
+// Player-specific parameters and the character controller; no position writes or global time scaling.
+static uint64_t move_ptr(uint64_t a) {
+    uint64_t p = 0;
+    return rd(a, 8, &p) ? p : 0;
+}
+
+static int move_float(uint64_t a, float *out) {
+    uint64_t bits;
+    if (!rd(a, 4, &bits)) return 0;
+    uint32_t b = (uint32_t)bits;
+    memcpy(out, &b, 4);
+    return isfinite(*out);
+}
+
+static void move_write_float(uint64_t a, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    wr(a, 4, bits);
+}
+
+static uint64_t move_param(uint64_t components) {
+    uint64_t bb = move_ptr(components + 0xa8), count, entries;
+    if (!bb || !rd(bb + 0x30, 4, &count) || count < 1 || count > 4096 ||
+        !(entries = move_ptr(bb + 0x38))) return 0;
+    // The same sorted blackboard lookup the native jump action uses.
+    uint32_t lo = 0, hi = (uint32_t)count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint64_t entry = move_ptr(entries + 8ull * mid), hash;
+        if (!entry || !rd(entry, 4, &hash)) return 0;
+        if (hash < 0x6b7e094a) lo = mid + 1;
+        else if (hash > 0x6b7e094a) hi = mid;
+        else {
+            uint64_t p = move_ptr(move_ptr(entry + 8) + 0x150);
+            return p && move_ptr(p) == g_main + 0x4b6d1a8 ? p : 0;
+        }
+    }
+    return 0;
+}
+
+// Called only on the native charged-spin branches of Weapon::getAttackShapeScale.
+// The game still owns sword-specific geometry, attack windows, magic checks and shape restoration.
+// s0 is (length scale - 1), s1 the thickness scale; the caller adds 1 to s0 afterwards.
+void cheats_spin_range_host(Cpu *c) {
+    if (!g_movement_build) return;
+    const char *mode = cfg_value("NX2NAVI_SPIN_RANGE");
+    float factor = !strcmp(mode, "1.5") ? 1.5f : !strcmp(mode, "2") ? 2.0f : !strcmp(mode, "2.5") ? 2.5f : 1.0f;
+    if (factor == 1) return;
+    uint64_t weapon = c->x[20], sword = move_ptr(weapon + 0x18);
+    uint64_t actor = move_ptr(move_ptr(g_main + 0x4e371d0) + 0x480);
+    uint64_t components = move_ptr(actor + 0x270), equipment = move_ptr(components + 0x200);
+    uint64_t entry = move_ptr(equipment + 0x28), generation, actual;
+    if (!actor || move_ptr(actor) != g_main + 0x4b25e18 || !equipment || !entry ||
+        !rd(equipment + 0x30, 4, &generation) || generation == 0xffffffffu ||
+        !rd(entry + 0x48, 4, &actual) || generation != actual || move_ptr(entry + 0x40) != sword ||
+        move_ptr(move_ptr(sword + 0x270) + 0x458) != weapon) return;
+    uint64_t name = move_ptr(sword + 0x20);
+    if (!name || !guest_ok(name, 13, 1) || memcmp((void *)(uintptr_t)name, "Weapon_Sword_", 13)) return;
+    float length, radius;
+    memcpy(&length, &c->v[0], 4);
+    memcpy(&radius, &c->v[1], 4);
+    if (!isfinite(length) || !isfinite(radius) || length <= -1 || length > 20 || radius < 1 || radius > 20) return;
+    length = (length + 1) * factor - 1;
+    radius *= factor;
+    memcpy(&c->v[0], &length, 4);
+    memcpy(&c->v[1], &radius, 4);
+}
+
+static void movement_frame(uint64_t keys, int32_t lx, int32_t ly) {
+    static int charge_set = -2;
+    if (charge_set == -2) charge_set = rt_patch_set("spin_instant");
+    int instant = g_movement_build && !strcmp(cfg_value("NX2NAVI_SPIN_CHARGE"), "instant");
+    if (charge_set >= 0 && rt_patch_enabled(charge_set) != instant) rt_patch_switch(charge_set, instant);
+    int jump_down = (keys & (1ull << 2)) != 0;   // native jump action after input mapping
+    int jump_press = jump_down && !g_jump_held;
+    g_jump_held = jump_down;
+    const char *mode = cfg_value("NX2NAVI_SPRINT_SPEED");
+    float multiplier = !strcmp(mode, "2") ? 2.0f : !strcmp(mode, "3.5") ? 3.5f : !strcmp(mode, "5") ? 5.0f : 1.0f;
+    int sprint = multiplier > 1 && (keys & 1) && (lx > 4096 || lx < -4096 || ly > 4096 || ly < -4096);
+    int jump = cfg_bool("NX2NAVI_AIR_JUMPS") && jump_press;
+    // Only the native player movement speed is scaled. Native input, animation, gravity and collisions stay in charge.
+    if (g_sprint_set == -2) g_sprint_set = rt_patch_set("sprint_boost");
+    void *page = rt_patch_page();
+    if (g_movement_build && page && g_sprint_set >= 0) {
+        float factor = sprint ? multiplier : 1.0f;
+        uint32_t bits;
+        memcpy(&bits, &factor, 4);
+        __atomic_store_n((uint32_t *)((uint8_t *)page + 384), bits, __ATOMIC_RELAXED);
+        if (rt_patch_enabled(g_sprint_set) != sprint) rt_patch_switch(g_sprint_set, sprint);
+    }
+    if (!g_movement_build || !jump) return;
+    uint64_t actor = move_ptr(move_ptr(g_main + 0x4e371d0) + 0x480);
+    char name[7];
+    uint64_t name_ptr = move_ptr(actor + 0x20);
+    if (!actor || move_ptr(actor) != g_main + 0x4b25e18 || !name_ptr ||
+        !guest_ok(name_ptr, sizeof name, 1)) return;
+    memcpy(name, (const void *)(uintptr_t)name_ptr, sizeof name);
+    if (memcmp(name, "Player", sizeof name)) return;
+    uint64_t components = move_ptr(actor + 0x270), player = move_ptr(components + 0x358);
+    if (!components || !player || move_ptr(player) != g_main + 0x4b4dfc0) return;
+    uint64_t param = move_param(components);
+    if (!param) return;
+    if (jump) {
+        uint64_t physics = move_ptr(components + 0x50), cct = move_ptr(physics + 0x20);
+        uint64_t character = move_ptr(cct + 0x10), motion = move_ptr(character + 8), state = move_ptr(motion + 0x30);
+        uint64_t parent = move_ptr(state + 0x30), flags;
+        float height;
+        if (!physics || !cct || !character || !motion || !state || !parent ||
+            move_ptr(state) != g_main + 0x4b9c298 || move_ptr(state + 0x10) != character ||
+            !move_float(param + 0x334, &height) || height <= 0 || height > 5 ||
+            !rd(parent + 0x20, 4, &flags) || !guest_ok(state + 0x3c, 0x11, 2) ||
+            !guest_ok(parent + 0x20, 4, 2)) return;
+        // The native setter requests one impulse and marks the controller dirty. The physics update consumes it.
+        move_write_float(state + 0x3c, height);
+        wr(state + 0x4c, 1, 1);
+        wr(parent + 0x20, 4, flags | 2);
     }
 }
 
@@ -519,6 +889,7 @@ void cheats_init(void) {
     g_main_size = m->size;
     g_code_end = m->base + ((m->text_end + 0xFFF) & ~0xFFFull);
     snprintf(g_file, sizeof g_file, "%s.txt", bid);
+    basic_add(bid);
     mods_scan();
     for (int k = 0; k < mods_count(); k++) {   // the Mods tab's order, top first
         const ModInfo *mod = mods_at(k);
@@ -533,7 +904,7 @@ void cheats_init(void) {
         free(text);
         g_files++;
     }
-    if (!g_files) {
+    if (!g_files && !g_n) {
         rt_log("cheats: no enabled mod holds cheats/%s", g_file);
         rebuild_if_needed(dir);   // an enabled mod's ExeFS patches may still wait for it
         return;
@@ -560,7 +931,9 @@ void cheats_init(void) {
         int master = c->info.kind == CHEAT_MASTER;
         char *f[5];
         CheatKind kind;
-        if (status && status_of(status, key, f) && !strcmp(f[1], content)) {
+        if (c->basic) {
+            kind = c->basic == 5 ? CHEAT_UNSUPPORTED : CHEAT_DATA;
+        } else if (status && status_of(status, key, f) && !strcmp(f[1], content)) {
             const char *k = f[2];
             kind = !strcmp(k, "code") ? CHEAT_CODE : !strcmp(k, "key") ? CHEAT_KEY : !strcmp(k, "master") ? CHEAT_MASTER
                  : !strcmp(k, "restore") ? CHEAT_RESTORE : !strcmp(k, "heading") ? CHEAT_HEADING
@@ -586,6 +959,23 @@ void cheats_init(void) {
         counts[kind]++;
     }
     free(status);
+    int legacy_ammo = 0, legacy_items = 0, migrated = 0;
+    for (int i = 0; i < g_n; i++) {
+        if (g_cheats[i].basic == 4) legacy_ammo = g_cheats[i].on;
+        if (g_cheats[i].basic == 7) legacy_items = g_cheats[i].on;
+    }
+    for (int i = 0; i < g_n; i++) {
+        Cheat *c = &g_cheats[i];
+        if (c->basic >= 8 && c->basic <= 12 && (c->basic == 9 ? legacy_items : legacy_ammo) && !cfg_get(c->info.key)) {
+            cfg_set(c->info.key, "1");
+            c->on = 1;
+            migrated = 1;
+        }
+        if (c->basic >= 13 && c->basic <= 14 && legacy_items && !cfg_get(c->info.key)) {
+            cfg_set(c->info.key, "1"); c->on = 1; migrated = 1;
+        }
+    }
+    if (migrated && !cfg_save()) rt_log("cheats: could not save the independent ammunition settings");
     rebuild_if_needed(dir);
     for (int i = 0; i < g_n; i++) plain_name((char *)g_cheats[i].info.name);   // the hashes above read the file's bytes
     int on = 0;
@@ -620,11 +1010,42 @@ int cheats_on(int i) { return i >= 0 && i < g_n && g_cheats[i].on; }
 
 const char *cheats_file(void) { return g_file; }
 
+int cheats_builtin_kind(int i) { return i >= 0 && i < g_n ? g_cheats[i].basic : 0; }
+
+const char *cheats_display_name(int i) {
+    static const UiTextId ids[] = {UI_MENU_CHEAT_HEALTH, UI_MENU_CHEAT_RUPEES, UI_MENU_CHEAT_BOMBS,
+        UI_MENU_CHEAT_AMMO, UI_MENU_CHEAT_TIMERS, UI_MENU_CHEAT_MAGIC, UI_MENU_CHEAT_ITEMS,
+        UI_MENU_CHEAT_ARROWS, UI_MENU_CHEAT_BOMBCHUS, UI_MENU_CHEAT_NUTS, UI_MENU_CHEAT_SEEDS, UI_MENU_CHEAT_STICKS,
+        UI_MENU_CHEAT_BEANS, UI_MENU_CHEAT_SCRUB_SEEDS, UI_MENU_TIMER_MINIGAME};
+    int kind = cheats_builtin_kind(i);
+    if (kind >= 1 && kind <= (int)(sizeof ids / sizeof *ids)) return menu_text(ids[kind - 1]);
+    return i >= 0 && i < g_n ? g_cheats[i].info.name : "";
+}
+
+const char *cheats_display_note(int i) {
+    static const UiTextId ids[] = {UI_MENU_CHEAT_HEALTH_DESC, UI_MENU_CHEAT_RUPEES_DESC, UI_MENU_CHEAT_BOMBS_DESC,
+        UI_MENU_CHEAT_AMMO_DESC, UI_MENU_CHEAT_TIMERS_DESC, UI_MENU_CHEAT_MAGIC_DESC, UI_MENU_CHEAT_ITEMS_DESC,
+        UI_MENU_CHEAT_ARROWS_DESC, UI_MENU_CHEAT_BOMBCHUS_DESC, UI_MENU_CHEAT_NUTS_DESC, UI_MENU_CHEAT_SEEDS_DESC, UI_MENU_CHEAT_STICKS_DESC,
+        UI_MENU_CHEAT_BEANS_DESC, UI_MENU_CHEAT_SCRUB_SEEDS_DESC, UI_MENU_TIMER_MINIGAME_DESC};
+    int kind = cheats_builtin_kind(i);
+    if (kind >= 1 && kind <= (int)(sizeof ids / sizeof *ids)) return menu_text(ids[kind - 1]);
+    return i >= 0 && i < g_n ? g_cheats[i].note : "";
+}
+
 void cheats_set(int i, int on) {
     if (i < 0 || i >= g_n) return;
     Cheat *c = &g_cheats[i];
     if (c->info.kind != CHEAT_CODE && c->info.kind != CHEAT_KEY && c->info.kind != CHEAT_DATA) return;
     plat_xchg32(&c->on, on != 0);
+    if (c->basic == 1 && !on) {
+        __atomic_store_n(&g_health_binding, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&g_fnprof, ~FNPROF_CHEATS, __ATOMIC_RELAXED);
+    }
+    if (c->basic == 6 && !on) {
+        __atomic_store_n(&g_magic_binding, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&g_fnprof, ~FNPROF_MAGIC, __ATOMIC_RELAXED);
+    }
+    if (c->basic == 15 && !on) g_shared_timer_entry = 0;
     if (c->info.kind == CHEAT_CODE) rt_patch_switch(c->set, on);   // CHEAT_KEY: cheats_frame follows the buttons
     cfg_set(c->info.key, on ? "1" : "0");
     rt_log("cheats: %s/%s %s", c->info.mod, c->info.name, on ? "on" : "off");
@@ -635,6 +1056,7 @@ void cheats_frame(uint64_t frame) {
     uint64_t keys = 0;
     int32_t lx, ly, rx, ry;
     input_poll(&keys, &lx, &ly, &rx, &ry);   // 0 while the menu is open
+    movement_frame(keys, lx, ly);
     for (int i = 0; i < g_n; i++) {
         Cheat *c = &g_cheats[i];
         switch (c->info.kind) {
@@ -645,7 +1067,10 @@ void cheats_frame(uint64_t frame) {
             }
             break;
         case CHEAT_DATA:
-            if (c->on) run(c, keys);
+            if (c->on) {
+                if (c->basic) basic_run(c->basic);
+                else run(c, keys);
+            }
             break;
         case CHEAT_MASTER:
             if (c->set < 0) run(c, keys);

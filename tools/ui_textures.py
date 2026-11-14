@@ -128,15 +128,15 @@ def bc4(lin, wb, hb, w, h):
     return rgba
 
 
-def astc_library(out):
+def astc_library(out, compiler=None, env=None):
     """The runtime's ASTC decoder as a library, built once into out."""
     dll = out / 'astc.dll'
     src = ROOT / 'runtime' / 'tex_astc.c'
     if not dll.is_file() or dll.stat().st_mtime < src.stat().st_mtime:
-        cc = shutil.which('clang') or r'C:\msys64\ucrt64\bin\clang.exe'
+        cc = compiler or shutil.which('clang') or r'C:\msys64\ucrt64\bin\clang.exe'
         vma = Path(cc).resolve().parents[1] / 'include' / 'vma'   # tex.h reaches the Vulkan allocator's header
         if subprocess.run([cc, '-shared', '-O2', '-static', '-w', '-I', str(ROOT / 'runtime'), '-I', str(vma), str(src), '-o',
-                           str(dll)]).returncode:
+                           str(dll)], env=env).returncode:
             sys.exit('tex_astc.c did not compile')
     lib = ctypes.CDLL(str(dll))
     lib.astc_decode_ldr.restype = None

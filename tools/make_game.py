@@ -133,7 +133,7 @@ SCAN_TOOL = '55ea0c150aaf9dac93a2e6fd3b4ca11e1c572b5eee8b6bd74960535964384634'
 # each time every install drew its prompts again, a minute. Changed by hand when a change to the scripts can change
 # what they write. Its value is their digest in 0.7.0 and 0.7.1, so the key of an install made by those stays what it
 # is. tests/launcher_test.py test_the_prompt_tools_logic_is_the_recorded_one asks the question when the logic changes.
-PROMPT_TOOLS = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'
+PROMPT_TOOLS = '6a5ad3419b223527ba42da6c569148dc996f1dfb3500bc7df7663292a50ad1df'
 
 # Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
 LIFT_FIXES = [
@@ -1937,8 +1937,10 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
-    runtime_headers(rt)
+    from world_map_art import prepare as prepare_world_map
     clang, clangxx, env, vma = toolchain(msys)
+    prepare_world_map(out, compiler=clang, env=env)
+    runtime_headers(rt)
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
@@ -2453,6 +2455,8 @@ def step_prompts(out):
     if rc:
         fail('drawing the button prompts failed (the lines above say why); the game still runs. Run the build again '
              'to retry this step')
+    from world_map_night import patch_prompts
+    patch_prompts(out)
 
 
 AWAKE = None   # keep_awake's systemd-inhibit process on Linux; dropping it would close the pipe and end the hold

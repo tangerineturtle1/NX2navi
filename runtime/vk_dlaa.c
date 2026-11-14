@@ -23,6 +23,7 @@
 #include <wchar.h>
 
 #include "cfg.h"
+#include "bomb_arrows.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -1658,6 +1659,13 @@ static int scene_color(VkFormat f);
 
 static void dlaa_draw_locked(VkExec *ex);
 void vk_dlaa_draw(VkExec *ex) {
+    if(bomb_arrows_camera_needed() && ex->depth.image && ex->depth.width>=DLAA_SCENE_MIN_W &&
+       ex->depth.format==VK_FORMAT_D32_SFLOAT && ex->pipe.ds.dt && ex->pipe.ds.dw &&
+       ex->color[0].image && scene_color(ex->color[0].format) && ex->ubo[0][0].size==OCAM_BLOCK) {
+        float rows[OCAM_BYTES/4];uint64_t address=ex->ubo[0][0].addr;
+        if(address && vk_usnap_read(address,sizeof rows,rows))
+            bomb_arrows_camera_observe(__atomic_load_n(&gfx_counters.frames,__ATOMIC_RELAXED),address,rows);
+    }
     if (!inputs_on() || D.ended) return;
     static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once (vk_exec.c chunks)
     int lk = vk_exec_shared();

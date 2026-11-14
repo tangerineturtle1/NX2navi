@@ -3508,10 +3508,12 @@ class FileCheckTest(Tmp):
 # PromptToolsTest.test_the_prompt_tools_logic_is_the_recorded_one. If the change can alter what the tools write, give
 # PROMPT_TOOLS a new value (every install then draws its prompts again) and record both here; if it cannot, record
 # only the new digests.
-PROMPT_LOGIC = ('ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249',
+PROMPT_LOGIC = ('6a5ad3419b223527ba42da6c569148dc996f1dfb3500bc7df7663292a50ad1df',
                 {'pad_prompts.py': '780c246b5fde7a0e9dbf3f59ad16372e1737592add6f2f2d9825bee6df4e296f',
                  'prompt_art.py': '87edacabcddb4952f5862373815d7d46a05c67f350e0734025ae4d2f83b12038',
-                 'button_icons.py': '3804e371a030965bc9eb4226f333b611651f25efaa67ee523b404edc3257818a'})
+                 'button_icons.py': '3804e371a030965bc9eb4226f333b611651f25efaa67ee523b404edc3257818a',
+                 'world_map_night.py': 'c1d86c900c796453f3a73f30fbe04092fa5ed9412cfdf953b532f0ad511a6a3b',
+                 'world_extra_art.py': 'adf117f213ba8bb6fe79ffcbae4a9f9e3bc1f405a5cab3f2dae3a58c68e126f3'})
 
 
 def load_pad_prompts():
@@ -3591,7 +3593,7 @@ class PromptToolsTest(Tmp):
         content, used = romfs.load('UI/dict.bntx.zs')
         self.assertEqual((content, used.dict_id()), (b''.join(samples[:50]), dic.dict_id()))
 
-    def test_the_prompts_key_is_the_one_installs_have(self):
+    def test_the_prompts_key_refreshes_installs_for_night_composition(self):
         import make_game
         kit = self.tmp / 'kit'
         art = kit / 'prompt-art' / 'XGamepad' / 'Default'
@@ -3600,8 +3602,9 @@ class PromptToolsTest(Tmp):
         out = self.tmp / 'game'
         out.mkdir()
         ident = 'nup C:\\dumps\\game.nup 28000000000 1760000000'
-        released = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'   # the scripts of 0.7.1
+        released = '6a5ad3419b223527ba42da6c569148dc996f1dfb3500bc7df7663292a50ad1df'   # includes night-icon composition after prompt generation
         with mock.patch.object(make_game, 'KIT', kit):
+            self.assertNotEqual(make_game.PROMPT_TOOLS, 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249')
             pictures = make_game.tree_digest(kit / 'prompt-art', ('**/*.png',))
             binds = make_game.sha256_bytes(b'[]')
             self.assertEqual(make_game.step_key('prompts', ident, out),

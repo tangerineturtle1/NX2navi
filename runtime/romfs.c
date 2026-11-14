@@ -43,6 +43,7 @@
 #include "restbl.h"
 #include "sha256.h"
 #include "stutter_map.h"
+#include "world_map.h"
 
 #include <zstd.h>
 
@@ -55,7 +56,7 @@ typedef struct { uint64_t offset, size; uint32_t name, len; } Entry;
 _Static_assert(sizeof(Entry) == 24, "index entry layout");
 
 typedef struct { uint32_t volume, pad; uint64_t file_id, size, write_time, create_time; } Identity;   // no padding
-// prio: which overlay serves a path two of them give (the higher); romfs-patches 0, the NX2NAVI_ROMFS_MODS manifest 1, a
+// prio: which overlay serves a path two of them give (the higher); collectible icons -1, romfs-patches 0, the NX2NAVI_ROMFS_MODS manifest 1, a
 // player mod 2 + its distance from the bottom of the order. mod: its index in mods_at + 1, 0 for any other overlay.
 typedef struct { uint64_t index, size; char *path, *name; Identity id; int prio, mod; } Overlay;
 
@@ -480,7 +481,7 @@ static int contest_order(const void *a, const void *b) {
 }
 
 static const char *owner_name(const Overlay *o) {
-    return o->mod ? mods_at(o->mod - 1)->name : o->prio ? "romfs_mods" : "the port's patches";
+    return o->mod ? mods_at(o->mod - 1)->name : o->prio > 0 ? "romfs_mods" : "the port's patches";
 }
 
 // One overlay per path: the highest prio serves it; the others are dropped and counted on their mod.
@@ -654,7 +655,7 @@ static Restbl *restbl_unpack(const void *z, size_t n) {
 // that mod's files, and each served mod file's entry raised to what its size needs (restbl_grow for a file the game
 // has, restbl_estimate for an added one). Never lowers the game's entries.
 static void restbl_overlay(void) {
-    int player = 0;
+    int player = world_map_ready();
     for (size_t k = 0; k < noverlay; k++) player |= overlays[k].mod || overlays[k].prio == 1;
     if (!player || !restbl_rel[0]) return;
     static const char keeps[] = "mod files that grew may fail to load";
@@ -700,7 +701,8 @@ static void restbl_overlay(void) {
     for (size_t k = 0; k < noverlay; k++) {
         Overlay *o = &overlays[k];
         if (o->index == gi) served = o;
-        if ((!o->mod && o->prio != 1) || o->index == gi) continue;
+        // Built-in world resources can grow too; their lower priority must not exclude their allocation sizes.
+        if ((!o->mod && o->prio != 1 && !(world_map_ready() && o->prio == -1)) || o->index == gi) continue;
         char key[4200];
         restbl_key(o->name, key, sizeof key);
         int mc = ends_with(o->name, ".mc");
@@ -948,6 +950,10 @@ static void overlay_init(void) {
     if (plain_ok) plain[strlen(plain) - strlen("/manifest.tsv")] = 0;
     if (!patches && !prompts_loaded && plain_ok) patches = plain;
     if (patches && *patches && strcmp(patches, "0")) overlay_load(patches, 0, 0);
+    char world_dir[2100], world_file[2400];
+    need(snprintf(world_dir,sizeof world_dir,"%s/romfs-patches-world",index_dir)<(int)sizeof world_dir,"world map overlay path");
+    need(snprintf(world_file,sizeof world_file,"%s/UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs",world_dir)<(int)sizeof world_file,"world map archive path");
+    overlay_load(world_dir,1,-1); // Any explicit resource mod keeps precedence over the built-in collectible layout.
     size_t mods_first = noverlay;
     if (mods && *mods && strcmp(mods, "0")) overlay_load(mods, 0, 1);
     mods_overlay_init();
@@ -963,6 +969,29 @@ static void overlay_init(void) {
     }
     restbl_collect();
     overlay_contest();
+    int world_ready=0;
+    for(size_t k=0;k<noverlay;k++) if(!strcmp(overlays[k].path,world_file))world_ready=1;
+    world_map_art_loaded(world_ready);
+    int night_ready=0;
+    static const char texture_name[]="UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs";
+    if(world_ready)for(size_t k=0;k<noverlay;k++)if(!strcmp(overlays[k].name,texture_name)) {
+        char stamp[2400],expected[65]={0},actual[65];
+        size_t prefix=strlen(overlays[k].path)-strlen(texture_name);
+        if(prefix+strlen("night-icons.stamp")+1>sizeof stamp)break;
+        memcpy(stamp,overlays[k].path,prefix);strcpy(stamp+prefix,"night-icons.stamp");
+        FILE *file=fopen(stamp,"rb");
+        if(file) { int have=fread(expected,1,64,file)==64;fclose(file);
+            PlatFile *texture=have?open_read(overlays[k].path):NULL;
+            if(texture) { sha_range(texture,0,overlays[k].size,actual,0);plat_file_close(texture);night_ready=!strcmp(actual,expected); }
+        }
+        break;
+    }
+    world_map_night_loaded(world_dir,night_ready);
+    int extra_ready=0;
+    for(size_t k=0;k<noverlay;k++)if(!strcmp(overlays[k].name,"Banc/BancBasedResource/MapParam.byml.zs")) {
+        size_t n=strlen(world_dir);extra_ready=!strncmp(overlays[k].path,world_dir,n) && overlays[k].path[n]=='/';break;
+    }
+    world_extra_loaded(world_dir,extra_ready,night_ready);
     mods_overlay_log();
     restbl_overlay();
     heapdef_overlay();

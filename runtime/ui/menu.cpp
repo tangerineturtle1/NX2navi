@@ -50,11 +50,13 @@ extern "C" {
 #include "fs.h"
 #include "input.h"
 #include "input_map.h"
+int64_t frame_step_world_us(void);   // scripted menu changes may use the loaded save's clock
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
 #include "save_share.h"
 #include "sprint.h"
+#include "bomb_arrows.h"
 #include "sysinfo.h"
 #include "text_speed.h"
 #include "ui/menu.h"
@@ -515,7 +517,7 @@ static int fonts_up(float scale) {
         // what the title face shows in the CJK languages: the menu's title and tabs (Simplified Chinese menu text) and
         // the boot screen's title (the game's language)
         static const UiTextId titles[] = {UI_MENU_TITLE, UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                          UI_MENU_TAB_CONTROLS, UI_BOOT_TITLE};
+                                          UI_MENU_TAB_CONTROLS, UI_MENU_TAB_CHEATS, UI_BOOT_TITLE};
         for (int i = 0; i < N; i++) {
             if (!data[i]) continue;
             ImFontGlyphRangesBuilder b;
@@ -583,9 +585,9 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 // Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
-enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
-struct TestSet { uint64_t frame; char key[64], value[64]; };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_CHEATS, TAB_COUNT };
+enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 64, TEST_OPENS = 8 };
+struct TestSet { uint64_t frame; int world_ms; char key[64], value[64]; };
 static struct {
     int parsed;
     uint64_t at[TEST_OPENS];  // NX2NAVI_MENU_TEST frames, in order
@@ -613,6 +615,8 @@ static void test_parse(void) {
     }
     const char *s = cfg_get("NX2NAVI_MENU_TEST_SET");
     while (s && *s) {   // groups "<frame>:<key>=<value>,..." separated by ';'
+        int world_ms = *s == '@';   // @milliseconds: the loaded save's world clock, like scripted input
+        if (world_ms) s++;
         char *end;
         unsigned long long f = strtoull(s, &end, 10);
         if (*end != ':') break;
@@ -623,6 +627,7 @@ static void test_parse(void) {
             if (eq) {
                 TestSet &t = g_test.sets[g_test.n_sets++];
                 t.frame = f;
+                t.world_ms = world_ms;
                 int kn = (int)(eq - s), vn = (int)(s + n - eq - 1);
                 snprintf(t.key, sizeof t.key, "%s%.*s", strncmp(s, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", kn, s);
                 snprintf(t.value, sizeof t.value, "%.*s", vn, eq + 1);
@@ -640,17 +645,29 @@ static void test_parse(void) {
 }
 
 static void test_apply_sets(uint64_t frame) {
-    for (; g_test.next_set < g_test.n_sets && g_test.sets[g_test.next_set].frame <= frame; g_test.next_set++) {
+    for (; g_test.next_set < g_test.n_sets; g_test.next_set++) {
         const TestSet &t = g_test.sets[g_test.next_set];
-        rt_log("menu: test hook: frame %llu: %s=%s", (unsigned long long)frame, t.key, t.value);
+        int64_t world = t.world_ms ? frame_step_world_us() : 0;
+        if (t.world_ms ? world < 0 || (uint64_t)world / 1000 < t.frame : frame < t.frame) break;
+        // a room's secret stays out of the log here too
+        const bool secret = !strcmp(t.key, "NX2NAVI_COOP_JOIN") || !strcmp(t.key, "NX2NAVI_COOP_ROOM");
+        rt_log("menu: test hook: frame %llu: %s=%s", (unsigned long long)frame, t.key, secret ? "(set, not shown)" : t.value);
         if (!strcmp(t.key, "NX2NAVI_SAVE")) {
             rt_log("menu: test hook: cfg_save %s", cfg_save() ? "wrote" : "failed");
+        } else if (!strncmp(t.key, "NX2NAVI_TEST_BOTTLE_", strlen("NX2NAVI_TEST_BOTTLE_"))) {
+            int slot = atoi(t.key + strlen("NX2NAVI_TEST_BOTTLE_")) - 1;
+            rt_log("menu: test hook: bottle edit %s", cheats_bottle_set(slot, atoi(t.value)) ? "applied" : "rejected");
         } else if (!strcmp(t.key, "NX2NAVI_FOCUS")) {
             char row[80];
-            snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
+            snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) && strncmp(t.value, "##", 2) ? "NX2NAVI_" : "", t.value);
             opt_focus_key(row);
         } else {
             cfg_set(t.key, t.value);
+            // Exercise the live cheat switch, just as the toggle in tab_cheats does.
+            if (!strncmp(t.key, "NX2NAVI_CHEAT_", 14)) {
+                for (int i = 0; i < cheats_count(); i++)
+                    if (!strcmp(cheats_info(i)->key, t.key)) cheats_set(i, atoi(t.value) != 0);
+            }
         }
     }
 }
@@ -1794,7 +1811,7 @@ static void rows_low_end(void) {
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_CHEATS};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1915,6 +1932,13 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_CHEATS:
+                if (tab_cheats(scale)) {
+                    restart_rebuild = true;
+                    g_confirm_quit = false;
+                    ImGui::OpenPopup("##confirm");
+                }
+                break;
             }
             ImGui::EndTabItem();
         }
@@ -2169,13 +2193,15 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     menu_art_start();      // the game's interface textures decode on a worker from the first present on
     cheats_frame(frame);   // the data cheats and the buttons of the cheats that need them held
     if (!g_test.parsed) test_parse();
-    if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
+    if (g_test.next_set < g_test.n_sets) test_apply_sets(frame);
     if (g_perf_save.exchange(0)) cfg_save();
     perf_tick(plat_now_ns(), t);
     amiibo_tick();
     int cap_number, cap_ok;
     char cap_name[64];
     const bool capture_shows = bugcap_note(&cap_number, &cap_ok, cap_name) != 0;   // the note after F8
+    BombArrowVisual arrow_visual;
+    const bool arrow_shows = bomb_arrows_visuals(&arrow_visual,1)>0 && plat_now_ns()-arrow_visual.seen_ns<150000000ull;
     if (g_booting.load(std::memory_order_relaxed)) g_booting.store(0, std::memory_order_release);   // the game runs
     bool open = g_open.load(std::memory_order_relaxed);
     // the frame the menu is first laid out after opening: also when its g_reset went to an earlier frame of the overlay
@@ -2193,7 +2219,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !capture_shows) {
+        } else if (!g_perf_mode && !capture_shows && !arrow_shows) {
             return 0;
         }
     }
@@ -2249,6 +2275,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     // no ImGui_ImplVulkan_NewFrame: all it does is upload Dear ImGui's own font atlas when the back end holds none,
     // which it never does here (fonts_up uploads it, ui/menu_art.cpp menu_font_upload)
     ImGui::NewFrame();
+    if (!open) bomb_arrows_draw((float)t->width,(float)t->height);
     if (open && g_debug.load(std::memory_order_relaxed)) {
         debug_menu_layout(t->width, t->height, scale);
         // Esc, or B on the pad when no field is being typed in, closes it

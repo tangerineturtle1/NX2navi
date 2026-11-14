@@ -970,6 +970,25 @@
 # shared_fonts =
 
 [cheats]
+# Built-in policies for game 1.1.1 are switched individually in Settings > Cheats (docs/cheats.md).
+# Sprint speed while using the native sprint action: normal, 2, 3.5 or 5. Extra jumps require another jump press.
+# sprint_speed = normal
+# air_jumps = 0
+# Equipment: explosive normal arrows with a black aura; requires the bow and bombs, costs one of each per shot.
+# bomb_arrows = 0
+# Spin hit range relative to each sword: normal, 1.5, 2, 2.5.
+# spin_range = normal
+# Magic spin charging: normal or instant; still requires the Great Fairy upgrade.
+# spin_charge = normal
+# World: reveal native collectible locations on the map and minimap; collected items keep a check mark.
+# world_skulltulas = 0
+# world_heart_pieces = 0
+# Additional World switches; each is independent and off by default.
+# world_grottos = 0
+# world_chests = 0
+# world_bean_plots = 0
+# world_fairies = 0
+# world_upgrades = 0
 # One line per cheat of the mods' cheat files, mods\<mod>\cheats\<build id>.txt (docs/cheats.md); the Cheats tab of
 # the menu writes them. cheat_<hash> = 1 switches a cheat on, the hash being FNV-1a 32 of "<mod folder>/<cheat name>".
 # Default: every cheat off.

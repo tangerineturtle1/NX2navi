@@ -222,7 +222,13 @@ const RtConfig *rt_config(void) { return &cfg; }
 
 // ---- runtime services the generated code calls (cpu.h)
 volatile int g_fnprof = 0;   // resolution.c switches it on until the game sets its render size (res_fn_hit)
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)lr, res_fn_hit(addr, x0); }
+void cheats_fn_hit(uint64_t addr, uint64_t x0);
+void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) {
+    (void)lr;
+    int observers = __atomic_load_n(&g_fnprof, __ATOMIC_RELAXED);
+    if (observers & FNPROF_RESOLUTION) res_fn_hit(addr, x0);
+    if (observers & (FNPROF_CHEATS | FNPROF_MAGIC)) cheats_fn_hit(addr, x0);
+}
 
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
     char at[128], lr[128];
@@ -750,6 +756,7 @@ static int main_run(int argc, char **argv) {
     if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
     if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
     if (!strcmp(mode, "--probe-services")) return probe_services();
+    if (!strcmp(mode, "--probe-ui-text")) return probe_ui_text();
     if (!strcmp(mode, "--probe-fs")) return probe_fs();
     if (!strcmp(mode, "--probe-gfx-abi")) return probe_gfx_abi();
     if (!strcmp(mode, "--probe-nvn")) return probe_nvn();

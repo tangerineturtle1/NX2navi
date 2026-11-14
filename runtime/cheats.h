@@ -4,6 +4,9 @@
 #pragma once
 #include <stdint.h>
 
+// Validate native bow/bomb capacities and stock; optionally spend one bomb for a newly fired arrow.
+int cheats_bomb_arrow_ammo(int consume);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,6 +45,13 @@ const char *cheats_file(void);             // "<build id>.txt", the name the fil
 void cheats_frame(uint64_t frame);
 // The button names of a mask ("ZL + Right stick left"), into buf.
 const char *cheats_buttons(uint32_t mask, char *buf, int n);
+enum { CHEAT_BOTTLE_SLOTS = 5 };
+// Native bottle contents, slots 0..4. -1 hides a locked/unavailable slot; setters never unlock a bottle.
+int cheats_bottle_content(int slot);
+int cheats_bottle_set(int slot, int content);   // one edit, normal consumption afterwards
+int cheats_builtin_kind(int index);             // stable policy id, 0 for imported cheats
+const char *cheats_display_name(int index);      // menu language; canonical names and setting keys stay stable
+const char *cheats_display_note(int index);
 
 #ifdef __cplusplus
 }

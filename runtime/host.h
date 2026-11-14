@@ -15,6 +15,9 @@
 #include "cpu.h"
 #include "dispatch.h"
 
+// Function-entry observers share the existing guest entry gate; each clears only its own bit.
+enum { FNPROF_RESOLUTION = 1, FNPROF_CHEATS = 2, FNPROF_MAGIC = 4 };
+
 // ---- logging and results
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to the log, one write
 // The log is stderr plus, in a game run whose stderr is not a file, logs\nx2navi.log next to nx2navi.exe (main.c log_open).
@@ -454,6 +457,7 @@ int probe_mods(void);                                      // mods_probe.c
 void discord_init(void);                                   // discord_rpc.c: the Rich Presence thread, game runs only
 int probe_discord(void);                                   // discord_rpc.c
 int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void), probe_fs(void);
+int probe_ui_text(void);   // standalone catalog and live menu-language checks; no guest SDK binding required
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
 int probe_vkdevice(void);                                 // vk_device.c
 int vk_sync_probe_devlost(void);                          // vk_sync.c: --probe-devlost

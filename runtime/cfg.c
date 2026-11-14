@@ -34,6 +34,8 @@ static int save_ok = 1;                         // the last cfg_save_to wrote (o
 // Every name the runtime reads (and the patch sets in generated/), without the prefix. A file key outside this list is
 // logged as unknown. A new variable goes here too, or its ini key logs a harmless "unknown key" line.
 static const char *const known[] = {
+    "SPRINT_SPEED", "AIR_JUMPS", "SPIN_RANGE", "SPIN_CHARGE", "BOMB_ARROWS", "WORLD_SKULLTULAS", "WORLD_HEART_PIECES",
+    "WORLD_GROTTOS", "WORLD_CHESTS", "WORLD_BEAN_PLOTS", "WORLD_FAIRIES", "WORLD_UPGRADES",
     "CORES", "TM_DISPATCH", "NVN2_CS_TABLE", "SKIP_SHADERS", "MOVIE_DEBAND", "MOVIE_FPS", "MOVIE_SKIP", "MOVIE_OVERLAY", "MOVIES", "NPLN", "NVN2_PROGRAMS", "NVN_TRAP", "OCARINA_REALTIME", "ONESHOT_BUDGET", "ONESHOT_WAIT_MS", "OCARINA_STEP", "PHYSICS_STEPS", "PHYSICS_STEPS_FULL", "PICKUP_COUNT", "WATER_STEPS", "SOUND_STEPS", "FLOOR_PROBE", "FLOOR_SCAN", "FLOOR_WATCH", "FLOOR_CARRY", "MOVIE_PTS", "STEP_STEADY", "VI_HZ", "VI_VRR", "TIME_DUMP", "SHADER_DUMP", "SHOT_AFTER", "SHOT_DIR", "SHOT_EVERY",   // Switch 2 port: movie skip (romfs.c), NVN2 proc traps (nvn_procs.c)
     "AA", "AA_LOG", "AB", "AMIIBO_DIR", "ANISO", "APP_POOL", "ASPECT", "ASPECT_PATCH", "ASSUME_FOCUS", "ASTC", "ASTC_BC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_CATCHUP", "AUDIO_CHANNELS", "AUDIO_DEVICE", "AUDIO_GAME_PRIO", "AUDIO_OFF", "AUDIO_PREFILL_MS", "AUDIO_RAMP", "AUDIO_STATS",
     "BARRIER_GAME", "MESH_AHEAD", "MESH_FALLBACK", "MESH_FALLBACK_MB", "MESH_FALLBACK_WORKERS", "PROBE_MESHFB_DIR",
@@ -98,6 +100,11 @@ static const char *const known[] = {
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
 static const struct { const char *key, *section; } sections[] = {
+    {"BOMB_ARROWS", "cheats"},
+    {"WORLD_SKULLTULAS", "cheats"}, {"WORLD_HEART_PIECES", "cheats"},
+    {"WORLD_GROTTOS", "cheats"}, {"WORLD_CHESTS", "cheats"}, {"WORLD_BEAN_PLOTS", "cheats"},
+    {"WORLD_FAIRIES", "cheats"}, {"WORLD_UPGRADES", "cheats"},
+    {"SPIN_RANGE", "cheats"}, {"SPIN_CHARGE", "cheats"}, {"SPRINT_SPEED", "cheats"}, {"AIR_JUMPS", "cheats"},
     // the low-end GPU mode's rows in the menu's Game tab (ui/menu.cpp rows_low_end)
     {"TEX_RELEASED_MAX", "performance"}, {"MIRROR_HOT", "performance"}, {"FREEZE_IDLE", "performance"}, {"SUBMIT_FINISH_KINDS", "performance"}, {"FOLIAGE", "performance"},
     {"ZSTD_NATIVE", "performance"},
@@ -188,6 +195,16 @@ static const struct { const char *key, *section; } sections[] = {
 #endif
 
 static const CfgMeta metas[] = {
+    {"BOMB_ARROWS", "0", "0|1", LIVE},
+    {"WORLD_SKULLTULAS", "0", "0|1", LIVE},
+    {"WORLD_HEART_PIECES", "0", "0|1", LIVE},
+    {"WORLD_GROTTOS", "0", "0|1", LIVE}, {"WORLD_CHESTS", "0", "0|1", LIVE},
+    {"WORLD_BEAN_PLOTS", "0", "0|1", LIVE}, {"WORLD_FAIRIES", "0", "0|1", LIVE},
+    {"WORLD_UPGRADES", "0", "0|1", LIVE},
+    {"SPRINT_SPEED", "normal", "normal|2|3.5|5", LIVE},
+    {"AIR_JUMPS", "0", "0|1", LIVE},
+    {"SPIN_RANGE", "normal", "normal|1.5|2|2.5", LIVE},
+    {"SPIN_CHARGE", "normal", "normal|instant", LIVE},
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
     {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},

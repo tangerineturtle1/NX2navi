@@ -176,7 +176,7 @@ static void click_test(const char *key, ImVec2 la, ImVec2 lb, ImVec2 ra, ImVec2 
             size_t n = strcspn(s, ",");
             const char *colon = (const char *)memchr(s, ':', n);
             if (colon) {
-                snprintf(t.c[t.n].key, sizeof t.c[0].key, "NX2NAVI_%.*s", (int)(colon - s), s);
+                snprintf(t.c[t.n].key, sizeof t.c[0].key, "%s%.*s", n >= 2 && s[0] == '#' && s[1] == '#' ? "" : "NX2NAVI_", (int)(colon - s), s);
                 t.c[t.n++].part = colon[1];
             }
             s += n;
@@ -190,12 +190,12 @@ static void click_test(const char *key, ImVec2 la, ImVec2 lb, ImVec2 ra, ImVec2 
                                     : label;
     ImGuiIO &io = ImGui::GetIO();
     const int f = t.frame++;
-    if (f == 0) io.AddMousePosEvent(to.x, to.y);
+    if (f < 4) io.AddMousePosEvent(to.x, to.y);
     else if (f == 4) io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
     else if (f == 7) io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
     else if (f == 12) {
         rt_log("menu: test hook: click on %s of %s: now %s",
-               part == 'l' ? "the left arrow" : part == 'r' ? "the right arrow" : "the body", key, cfg_value(key));
+               part == 'l' ? "the left arrow" : part == 'r' ? "the right arrow" : "the body", key, cfg_meta(key) ? cfg_value(key) : "live value");
         t.at++, t.frame = 0;
     }
 }
@@ -512,6 +512,17 @@ int opt_choice_index(const char *key, UiTextId label, const char *const *names, 
     if (nv == cur) return -1;
     menu_sound_play(MENU_SOUND_CURSOR);
     return nv;
+}
+
+int opt_choice_text(const char *id, const char *label, const char *const *names, int n, int cur, const char *desc) {
+    if (n <= 0 || cur < 0 || cur >= n) return -1;
+    RowView v = {names[cur], false, true, nullptr, value_width(names, n), cur == 0, cur == n - 1};
+    int step = row_text(id, label, desc, v, false);
+    if (!step) return -1;
+    int next = step == 2 ? (cur + 1) % n : cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;
+    if (next == cur) return -1;
+    menu_sound_play(MENU_SOUND_CURSOR);
+    return next;
 }
 
 void opt_apply(const char *key, const char *value) {   // as apply, without its sound: a row writing several keys
