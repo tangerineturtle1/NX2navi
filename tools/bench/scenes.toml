@@ -79,3 +79,47 @@ dbg = [["@1000", "warp KokiriForest_Child ReturnFromDreamWorld"],
        ["@12000", "event Dm_Kokiri_0030"], ["@14000", "event Dm_Kokiri_0030"], ["@16000", "event Dm_Kokiri_0030"]]
 warmup_s = 18
 measure_s = 25
+
+[[scene]]
+name = "dekuboss"
+note = "The Deku Tree's boss room, the free camera looking up at the ceiling (players reported the frame rate falls there)"
+dbg = [["@1000", "warp GohmaStage GohmaStage"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+# RSTICK y raises the view 1.8 radians a second at full tilt: 1 s at half tilt looks about 50 degrees up, a turn on the
+# spot, 0.6 s more to about 80 degrees, a turn back, then level again and the slow turn of the other scenes.
+moves = [[0, "RSTICK", 0, 16384, 1.0],
+         [1.5, "RSTICK", 16384, 0, 5.24],
+         [7, "RSTICK", 0, 16384, 0.6],
+         [8, "RSTICK", -16384, 0, 5.24],
+         [14, "RSTICK", 0, -16384, 1.6],
+         [16, "RSTICK", 8192, 0, 10.48]]
+warmup_s = 14
+measure_s = 30
+
+[[scene]]
+name = "market"
+note = "Market, child, from the square: the crowd of people and the shops around it"
+dbg = [["@1000", "warp Market_Child GameOverRespawn"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "fieldrun"
+note = "Hyrule Field at speed, from outside the Market gate: the free camera flies 8 m a second, about 130 m out over the open field and back, so new parts of the field come into view as when running across it"
+dbg = [["@1000", "warp HyruleField_Child HyruleField_FrontOfMarket"], ["@10000", "freecam 1 1 8"], ["@10000", "camavoid 1"],
+       ["@10500", "camgo 0 3 0 0 0.087"]]
+# The game's camera starts 0.087 rad below level and ground avoidance needs DLSS, DLAA or FSR, so the camgo levels the
+# view and lifts it 3 m: the legs fly level over the field instead of into it. 128 m out, a half turn, 128 m back and a
+# half turn again, so the last frame looks out over the field as the first did.
+moves = [[0, "LSTICK", 0, 32767, 16],
+         [16.5, "RSTICK", 16384, 0, 2.62],
+         [19.5, "LSTICK", 0, 32767, 13.5],
+         [36, "RSTICK", 16384, 0, 2.62]]
+warmup_s = 14
+measure_s = 40

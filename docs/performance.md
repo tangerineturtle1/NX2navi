@@ -30,9 +30,15 @@ How to measure the frame rate of a scene the same way twice, and how to read the
   picture every 5 s of the flight, to check where it went. Leave it off for numbers: each picture costs a readback.
 - **Rounds**: `--runs 3` (the default) plays every scene once per round, three rounds, so a drift over time (heat,
   background work) reaches every scene alike. The summary gives the spread between runs.
-- **Results** in `build/bench/<date>-<label>/`: per run the game's log, a CSV of every measured frame and a PNG of
-  the last frame (for comparing pictures between builds); `summary.md` and `summary.csv`; `meta.json` with the commit,
-  the machine and the settings.
+- **Results** in `build/bench/<date>-<label>/`: per run the game's log and a CSV of every measured frame;
+  `summary.md` and `summary.csv`; `meta.json` with the commit, the machine, the settings and the mode.
+- **Play mode and `--shot`**: a run plays as a player does. Pipelines are built in the background, and a draw whose
+  pipeline is not ready yet is skipped for that frame. `--shot` also saves a PNG of each run's last frame, to compare
+  pictures between builds. The runtime then builds every pipeline on the render thread and waits for the boot's
+  pipeline warm-up (`runtime/boot.c`), so the picture does not depend on build timing. A scene's first visit then
+  stalls far longer than in play: on an RX 570 with empty caches, the Market was blocked on pipeline builds for 123 s
+  with `--shot` and 15 s without. Compare runs of the same mode only; `summary.md` says which mode a run used, and
+  results from before the mode was recorded were all `--shot` runs.
 - **MangoHud**: `--mangohud` runs the game with MangoHud's logging on and puts its average fps beside the game's,
   over the same stretch.
 - **One game at a time**: a run waits while another copy of the game or Ninja runs (`run_game.py --quiet`). Leave the

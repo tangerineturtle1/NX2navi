@@ -2,7 +2,7 @@
 
     python tools/bench.py run <game folder> --save <backup> [--scenes tools/bench/scenes.toml] [--only kokiri,...]
                           [--runs 3] [--out build/bench/<date>-<label>] [--label base] [--set KEY=VALUE ...]
-                          [--mangohud]
+                          [--mangohud] [--shot]
     python tools/bench.py summary <out folder>        # the summary again from the logs a run left
 
 Each run starts the game through tools/run_game.py on a copy of its profile with <backup> as the save (run_game.py says
@@ -23,8 +23,13 @@ A frame is
 The 60-frame window lines add the GPU's own busy time (timestamps) and the runtime's own bound verdict.
 
 1% low is the frame rate of the mean of the slowest 1% of frames; p99 is the 99th percentile frame time. The run's
-CSV (one row per frame), the game's log, the screenshot at the end and summary.md / summary.csv go to the out folder,
-with the commit, the settings and the machine. Only ignored folders are written: build/ and the game folder.
+CSV (one row per frame), the game's log and summary.md / summary.csv go to the out folder, with the commit, the
+settings and the machine. Only ignored folders are written: build/ and the game folder.
+
+The game runs as it does for a player: pipelines are built in the background and a draw whose pipeline is not ready yet
+is skipped. --shot also saves a PNG of the last frame, for comparing pictures between builds, but the runtime then
+builds every pipeline on the render thread before it draws (runtime/boot.c), so the picture does not depend on build
+timing: a scene's first frames stall far longer than in play, and its numbers are not comparable with a run without it.
 
 --mangohud runs the game under MangoHud with logging on (MANGOHUD=1) and compares the frame times it saw over the same
 stretch with the game's own.
@@ -50,7 +55,7 @@ SCENES = ROOT / 'tools' / 'bench' / 'scenes.toml'
 
 # ---- the log lines (runtime/perf.c); tests/bench_check.py checks the format strings are still there
 SLOW_RE = re.compile(r'perf: slow frame (\d+): ([\d.]+) ms; blocked pipeline ([\d.]+) xlate ([\d.]+) texture ([\d.]+) '
-                     r'astc ([\d.]+) fence ([\d.]+) pacing ([\d.]+) drain ([\d.]+); replay ([\d.]+)')
+                     r'astc ([\d.]+) fence ([\d.]+) pacing ([\d.]+) drain ([\d.]+)(?: handoff [\d.]+)?; replay ([\d.]+)')
 SEG_START_RE = re.compile(r"segment: '([^']*)' starts at frame (\d+), world ([\d.]+|n/a) s")
 SEG_END_RE = re.compile(r"segment: '([^']*)' frames (\d+)-(\d+), world \S+ to \S+ s: (\d+) frames in ([\d.]+) s, "
                         r"mean ([\d.]+) ms \(([\d.]+) fps\), 1% low ([\d.]+) fps")
@@ -253,7 +258,7 @@ def cmd_run(a):
     scenes = load_scenes(a.scenes, a.only)
     meta = {'label': a.label, 'game': str(game), 'started': stamp, 'head': git('rev-parse', 'HEAD'),
             'origin_main': git('rev-parse', 'origin/main'), 'machine': machine(), 'set': a.set,
-            'runs': a.runs, 'scenes': [s['name'] for s in scenes]}
+            'runs': a.runs, 'scenes': [s['name'] for s in scenes], 'shot': a.shot}
     ini = game / 'nx2navi.ini'
     if ini.is_file():
         shutil.copyfile(ini, out / 'nx2navi.ini')
@@ -276,7 +281,9 @@ def cmd_run(a):
                                       f'output_folder={mh_dir}']
             cmd = [sys.executable, str(RUN_GAME), str(game), '--save', a.save, '--script', str(script),
                    '--seconds', str(seconds), '--wall', str(seconds + a.boot_wall), '--tag', f'bench-{tag}',
-                   '--log', str(out / f'{tag}.log'), '--shot', str(out / f'{tag}.png'), '--quiet']
+                   '--log', str(out / f'{tag}.log'), '--quiet']
+            if a.shot:
+                cmd += ['--shot', str(out / f'{tag}.png')]
             for e in env:
                 cmd += ['--env', e]
             print(f'bench: {tag} ...', flush=True)
@@ -333,7 +340,11 @@ def summarize(out):
     md = [f'# Benchmark {meta.get("label", "")} ({meta.get("started", "")})', '',
           f'- Game: {meta.get("game", "")}, NX2navi {version or "?"}',
           f'- Commit: HEAD {meta.get("head", "")[:10]}, origin/main {meta.get("origin_main", "")[:10]}',
-          f'- Machine: {meta.get("machine", {})}', f'- Extra settings: {meta.get("set") or "none"} '
+          f'- Machine: {meta.get("machine", {})}',
+          # results from before the 'shot' key always ran with --shot
+          '- Mode: ' + ('--shot (pipelines built on the render thread; not comparable with play mode)'
+                        if meta.get('shot', True) else 'play (pipelines built in the background)'),
+          f'- Extra settings: {meta.get("set") or "none"} '
           '(plus NX2NAVI_FPS_LIMIT=unlimited; the rest from the copied nx2navi.ini)', '',
           '| Scene | Runs | Avg fps (min-max) | 1% low fps (min-max) | p99 ms | Spread avg | CPU % | GPU % | Stall % '
           '| GPU ms | Replay ms | Game says | MangoHud avg fps |',
@@ -372,6 +383,10 @@ def main():
     r.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
                    help='extra environment, repeatable; {tag} becomes the run\'s scene and number')
     r.add_argument('--mangohud', action='store_true')
+    r.add_argument('--shot', action='store_true',
+                   help='save a PNG of each run\'s last frame; the runtime then builds pipelines on the render thread '
+                        '(runtime/boot.c), so first visits stall longer than in play and the numbers are not '
+                        'comparable with a run without it')
     r.add_argument('--boot-wall', type=float, default=240, help='wall seconds allowed for boot and save load')
     s = sub.add_parser('summary')
     s.add_argument('out')
