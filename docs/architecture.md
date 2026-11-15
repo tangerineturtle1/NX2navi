@@ -187,7 +187,7 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     the draws stay in their pass with no barrier (`runtime/vk_exec_draw.c` "the mesh fallback's batches"). The part
     is cut at the pass's first such draw, so the game's culling before the pass runs first. Each draw of a batch gets
     windows of the buffers (`mesh_fallback_mb`, 128 MiB) of its own, which its modules bind as buffers: exactly its
-    workgroup count when the CPU knows it, else what its program asked for so far with half again as margin
+    workgroup count when the CPU knows it, else what its program asked for so far with half again as margin and at least a 64th of the buffer
     (`runtime/vk_mesh_fb.c` `vk_meshfb_window`). A window that does not fit what the batch left cuts the part again
     and starts a new batch. A draw that emits more than its window loses what does not fit, the log says so ("did not
     fit its window"), and its program's next windows are sized for it, a few frames later, once its submission is
