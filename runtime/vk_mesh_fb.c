@@ -9,7 +9,9 @@
 // the largest draw needs, not what a frame's draws need together. mesh_fallback_mb sets it: an eighth for the task
 // buffer, the rest for the mesh buffer. Workgroups past either buffer's end write nothing and draw nothing (the
 // modules check the buffer's length); the draws that happened to are counted and the log names the size they needed.
-// A record is used by one draw and written again only after MESHFB_RECS further draws.
+// A record is used by one draw and written again only after MESHFB_RECS further draws. What its draw asked for is
+// read back once the draw's submission is done (drain), so a program's need (MeshFbNeed) is known a few frames
+// after its draws, not when the ring comes round again about 80 frames later.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,11 +34,13 @@ static struct {
     const uint32_t *stat_map;                          // per record: mesh workgroups and task workgroups it asked for
     uint32_t cap_slots[MESHFB_RECS], slot_words[MESHFB_RECS], cap_tasks[MESHFB_RECS];   // what the record's draw had room for
     uint8_t noted[MESHFB_RECS];
-    // NX2NAVI_TRACE=perf only (vk_meshfb_record): what the report of the most one pass asks for needs of each record
+    uint64_t fence[MESHFB_RECS];      // the timeline value after which the record can be read back
+    MeshFbNeed *need[MESHFB_RECS];    // the draw's program's, which learns what the draw asked for
+    // the perf line's report of the most one pass asks for (NX2NAVI_TRACE=perf), and the need's ratio (has_task)
     uint32_t group[MESHFB_RECS], task_words[MESHFB_RECS];   // the draw's group (vk_meshfb_record); its task payload's size
     uint64_t bound[MESHFB_RECS];                            // the most mesh workgroups the CPU could tell it needs (0: unknown)
     uint8_t has_task[MESHFB_RECS], indirect[MESHFB_RECS];
-    uint32_t next;
+    uint32_t next, drained;   // records handed out; records read back (or passed over), in ring order
     uint64_t draws, short_draws, worst_bytes;
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
@@ -159,12 +163,32 @@ static void perf_account(uint32_t i, uint32_t want, uint32_t tasks) {
     if (asked >= PF.largest) PF.largest = asked, PF.largest_bound = M.bound[i] * sw;
 }
 
-// The record about to be written again: what its last draw asked for against what it had room for. `account`: also
-// count it for the perf line (only the ring's own walk, not the sweep of vk_meshfb_short, which is out of order).
+// What a draw asked for, into its program's need: the most mesh and task workgroups, and the most mesh workgroups per
+// task workgroup. With fewer task workgroups run than asked for (the task buffer's room), the mesh workgroups the
+// others would have asked for are counted in at that ratio.
+static void need_note(MeshFbNeed *n, uint32_t i, uint32_t want, uint32_t tasks) {
+    uint64_t est = want;
+    if (M.has_task[i]) {
+        uint32_t ran = tasks < M.cap_tasks[i] ? tasks : M.cap_tasks[i];
+        if (ran) {
+            uint64_t r = ((uint64_t)want * 16 + ran - 1) / ran;
+            if (r > n->ratio16) n->ratio16 = r > 0xffffffffu ? 0xffffffffu : (uint32_t)r;
+            if (ran < tasks) est = (uint64_t)want * tasks / ran;
+        }
+        if (tasks > n->max_tasks) n->max_tasks = tasks;
+    }
+    if (est > n->max_want) n->max_want = est > 0xffffffffu ? 0xffffffffu : (uint32_t)est;
+    n->seen++;
+}
+
+// A record whose draw has run: what it asked for against what it had room for, and into its program's need.
+// `account`: also count it for the perf line (only the ring's own walk, not the sweep of vk_meshfb_short, which is out
+// of order).
 static void record_check(uint32_t i, int account) {
     if (!M.noted[i]) return;
     M.noted[i] = 0;
     uint32_t want = M.stat_map[2 * i], tasks = M.stat_map[2 * i + 1];
+    if (M.need[i]) need_note(M.need[i], i, want, tasks);
     if (account && (rt_trace & RT_TRACE_PERF)) perf_account(i, want, tasks);
     if (want <= M.cap_slots[i] && tasks <= M.cap_tasks[i]) return;
     uint64_t need = (uint64_t)want * M.slot_words[i] * 4;
@@ -180,17 +204,29 @@ static void record_check(uint32_t i, int account) {
     }
 }
 
+// Reads back the records whose submissions are done, in ring order (their fences only grow), and before the ring
+// hands out a record again the one it held, done or not, as before the read back by fence. The host's copy of the
+// words is made current first: the stat buffer may be host memory that is cached and not coherent.
+static void drain(int reuse) {
+    uint64_t done = vk_sync_fence_done();
+    uint32_t i = M.drained % MESHFB_RECS;
+    int ready = M.drained != M.next && M.fence[i] <= done;
+    if (!ready && !(reuse && M.next - M.drained >= MESHFB_RECS)) return;
+    vmaInvalidateAllocation(vk_ctx()->vma, M.stat_a, 0, VK_WHOLE_SIZE);
+    for (; M.drained != M.next && M.fence[M.drained % MESHFB_RECS] <= done; M.drained++) record_check(M.drained % MESHFB_RECS, 1);
+    if (reuse && M.next - M.drained >= MESHFB_RECS) record_check(M.drained++ % MESHFB_RECS, 1);
+}
+
 VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, uint32_t count, int has_task,
-                              uint32_t verts, uint32_t slot_words, uint32_t group, uint64_t bound_slots, VkBuffer *rec,
-                              int *cmds) {
+                              uint32_t verts, uint32_t slot_words, uint32_t group, uint64_t bound_slots,
+                              MeshFbNeed *need, uint64_t fence, VkBuffer *rec, int *cmds) {
+    drain(1);
     uint32_t i = M.next++ % MESHFB_RECS;
     VkDeviceSize at = (VkDeviceSize)i * REC_BYTES;
-    record_check(i, 1);
     M.draws++;
-    if (rt_trace & RT_TRACE_PERF) {
-        M.group[i] = group, M.bound[i] = bound_slots, M.task_words[i] = 0;
-        M.has_task[i] = (uint8_t)(has_task != 0), M.indirect[i] = src != VK_NULL_HANDLE;
-    }
+    M.fence[i] = fence, M.need[i] = need;
+    M.group[i] = group, M.bound[i] = bound_slots, M.task_words[i] = 0;
+    M.has_task[i] = (uint8_t)(has_task != 0), M.indirect[i] = src != VK_NULL_HANDLE;
     M.slot_words[i] = slot_words, M.cap_slots[i] = (uint32_t)(M.mesh_bytes / 4 / (slot_words ? slot_words : 1));
     M.cap_tasks[i] = 0xffffffffu;   // vk_meshfb_scan knows the payload size
     if (has_task && M.cap_slots[i] > M.list_bytes / 4) M.cap_slots[i] = (uint32_t)(M.list_bytes / 4);
@@ -271,7 +307,9 @@ void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at) {
 
 uint64_t vk_meshfb_short(void) {
     if (!M.ok) return 0;
+    vmaInvalidateAllocation(vk_ctx()->vma, M.stat_a, 0, VK_WHOLE_SIZE);
     for (uint32_t i = 0; i < MESHFB_RECS; i++) record_check(i, 0);
+    M.drained = M.next;
     return M.short_draws;
 }
 

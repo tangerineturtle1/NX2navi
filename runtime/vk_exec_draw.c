@@ -5888,6 +5888,7 @@ typedef struct MfbCs {
     MeshFbInfo mi, ti;
     volatile int32_t state;                // 0 queued or being made, 1 ready, -1 failed
     const GfxShader *cs_mesh, *cs_task;    // the compute modules (gfx_shader_own)
+    MeshFbNeed need;                       // what its draws asked for, read back (vk_mesh_fb.c)
     struct MfbCs *next;                    // the worker's queue
 } MfbCs;
 typedef struct { const GfxShader *ms; uint32_t mask; uint8_t type[32]; const GfxShader *vs; } MfbVs;
@@ -6147,7 +6148,8 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     vk_gpu_gap_note(VK_GAP_MESH_FB, 64);   // the record's fills and its count's copy
     VkDeviceSize at = vk_meshfb_record(ex->cb, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts != NULL,
                                        verts, slot_words, mfb_group,
-                                       ind ? 0 : ts ? (uint64_t)count * (c->ti.threads < 255 ? c->ti.threads : 255) : count, &rec, &cmds);
+                                       ind ? 0 : ts ? (uint64_t)count * (c->ti.threads < 255 ? c->ti.threads : 255) : count,
+                                       &c->need, ex->fence, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
     // the record: the dispatches' indirect arguments, the clamp's and the scan's words, and without a task stage the
     // copy of the note

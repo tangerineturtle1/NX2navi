@@ -10,16 +10,27 @@ int vk_meshfb_init(void);
 VkDescriptorBufferInfo vk_meshfb_buffer(int cb_slot);
 uint64_t vk_meshfb_mesh_words(void);   // the mesh buffer's size as a binding sees it, in words
 
+// What the draws of one task and mesh program pair asked for so far, as the host read it back from their records
+// (vk_mesh_fb.c record_check, once the submission of a draw is done). One per pair (vk_exec_draw.c MfbCs).
+typedef struct MeshFbNeed {
+    uint32_t seen;        // draws read back
+    uint32_t max_want;    // the most mesh workgroups one draw asked for
+    uint32_t max_tasks;   // the most task workgroups one draw asked for
+    uint32_t ratio16;     // the most mesh workgroups per task workgroup one draw asked for, in sixteenths
+} MeshFbNeed;
+
 // A draw's record, 64 bytes of the record buffer (*rec) at the offset returned: the task dispatch at +0, the mesh
 // dispatch at +16, the draw (VkDrawIndirectCommand) at +32. Records the fills and copies that start it, outside a
 // pass: the workgroup count from 4 bytes at src_off of src, or `count` when src is VK_NULL_HANDLE. Without a task
 // stage that count is the mesh dispatch and the draw's instance count; with one it is the task dispatch, and
 // vk_meshfb_scan writes the rest. slot_words: of the draw's mesh program, for the report of a draw the mesh buffer
 // was too small for. group: the draws of one pass share a number (NX2NAVI_TRACE=perf adds up the draws of a group);
-// bound_slots: the most mesh workgroups the CPU can tell the draw needs, 0 when it cannot (indirect). Returns the number of commands recorded in *cmds.
+// bound_slots: the most mesh workgroups the CPU can tell the draw needs, 0 when it cannot (indirect). need: the
+// program's, which gets what the draw asked for once it is read back; fence: the timeline value of the submission
+// that runs the draw, after which it can be. Returns the number of commands recorded in *cmds.
 VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, uint32_t count, int has_task,
-                              uint32_t verts, uint32_t slot_words, uint32_t group,
-                              uint64_t bound_slots, VkBuffer *rec, int *cmds);
+                              uint32_t verts, uint32_t slot_words, uint32_t group, uint64_t bound_slots,
+                              MeshFbNeed *need, uint64_t fence, VkBuffer *rec, int *cmds);
 // For a record whose count came from src (a count the GPU wrote): cuts it to what the buffers hold, in the task dispatch
 // (task_words, the task stage's payload words) or without a task stage (0) in the mesh dispatch and the instances
 // (shaders/meshfb_clamp.comp). Binds its own compute pipeline and set; four commands, between two barriers.
@@ -30,7 +41,7 @@ void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, ui
 // reads it later. One copy command.
 void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at);
 // NX2NAVI_TRACE=perf, every 600 frames: the line with the most mesh, task and list bytes one pass group asked for
-// (draws are looked at when their record comes round again, so it trails by about 80 frames). Nothing when off.
+// (draws are looked at once their submission is done, a few frames later). Nothing when off.
 void vk_meshfb_perf_log(uint64_t frame);
 // Draws so far whose programs emitted more than the buffers hold, the records not looked at yet included: call it
 // with the device idle (a probe, the shutdown).
