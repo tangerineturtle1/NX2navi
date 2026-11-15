@@ -4,11 +4,20 @@
 //   list          per mesh workgroup after a task stage: its task and its index among that task's (meshfb_scan.comp)
 //   mesh buffer   a mesh workgroup's vertex lines and primitive area at its slot
 //   records       per draw 64 bytes: the indirect arguments of its task dispatch, its mesh dispatch and its draw
-// The three buffers are reused by every draw: a draw's dispatches write them and its vertex stage has read them
-// before the next draw's dispatches run, with a barrier in between (vk_exec_draw.c mfb_draw), so their size is what
-// the largest draw needs, not what a frame's draws need together. mesh_fallback_mb sets it: an eighth for the task
-// buffer, the rest for the mesh buffer. Workgroups past either buffer's end write nothing and draw nothing (the
-// modules check the buffer's length); the draws that happened to are counted and the log names the size they needed.
+// Every module and the scan reach the three buffers through a storage binding and check what they write and read
+// against its length, so a binding of a part of a buffer (a window) is to them a buffer of its own:
+//   A draw drawn by itself (vk_exec_draw.c mfb_draw) gets the whole buffers. Its dispatches write them and its vertex
+//   stage has read them before the next draw's dispatches run, with a barrier in between.
+//   The draws of one batch, whose dispatches run together before their pass (NX2NAVI_MESH_FB_BATCH), each get windows
+//   of their own, handed out one after the other from the buffers' starts (vk_meshfb_window). A batch ends with its
+//   pre-pass command buffer (vk_meshfb_batch_reset), which runs after the part before it, where the last batch's
+//   draws read their windows, so the next batch starts at the buffers' starts again. A draw's window is what it can
+//   need where the CPU knows that (the workgroup count of a draw without a task stage), else what its program asked
+//   for so far with a margin (MeshFbNeed); a window that does not fit what is left ends the batch (the caller cuts
+//   the pass there) rather than shrink.
+// mesh_fallback_mb sets the size: an eighth for the task buffer, the rest for the mesh buffer. Workgroups past a
+// buffer's or a window's end write nothing and draw nothing; the draws that had too little room are counted and the
+// log names the size they needed, and a window too small makes its program's next windows larger.
 // A record is used by one draw and written again only after MESHFB_RECS further draws. What its draw asked for is
 // read back once the draw's submission is done (drain), so a program's need (MeshFbNeed) is known a few frames
 // after its draws, not when the ring comes round again about 80 frames later.
@@ -41,12 +50,25 @@ static struct {
     uint64_t bound[MESHFB_RECS];                            // the most mesh workgroups the CPU could tell it needs (0: unknown)
     uint8_t has_task[MESHFB_RECS], indirect[MESHFB_RECS];
     uint32_t next, drained;   // records handed out; records read back (or passed over), in ring order
-    uint64_t draws, short_draws, worst_bytes;
+    uint64_t draws, short_draws, worst_bytes, clipped;   // clipped: of short_draws, those whose window was a part
+    // the windows (WIN_*): the current one, which the bindings get (vk_meshfb_buffer), and each record's
+    VkDescriptorBufferInfo cur[3];
+    VkDeviceSize rwin[MESHFB_RECS][3][2];   // offset and range
+    VkDeviceSize used[3], align;           // the batch's windows end at used; offsets are multiples of align
+    uint32_t serial, batch_draws;          // serial: changes with the current window (vk_meshfb_window_serial)
+    uint64_t batches, batched, cuts, most_draws, most_bytes;   // NX2NAVI_TRACE=perf: since the last perf line
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkPipeline scan, clamp;
 } M;
+
+enum { WIN_TASK, WIN_MESH, WIN_LIST };
+
+static VkDescriptorBufferInfo whole(int k) {
+    return k == WIN_TASK ? (VkDescriptorBufferInfo){M.task, 0, M.task_bytes}
+         : k == WIN_LIST ? (VkDescriptorBufferInfo){M.list, 0, M.list_bytes} : (VkDescriptorBufferInfo){M.mesh, 0, M.mesh_bytes};
+}
 
 // What the checked records of one group (draws that one pass would batch) asked for.
 typedef struct { uint32_t id, draws, list, unbounded; uint64_t mesh, task, bound; } PerfGroup;
@@ -91,6 +113,9 @@ int vk_meshfb_init(void) {
     M.stat_map = map;
     memset(map, 0, (size_t)MESHFB_RECS * 8);
     M.task_bytes = task < range ? task : range, M.mesh_bytes = mesh < range ? mesh : range, M.list_bytes = list < range ? list : range;
+    M.align = c->props.limits.minStorageBufferOffsetAlignment;
+    if (M.align < 4) M.align = 4;
+    for (int k = 0; k < 3; k++) M.cur[k] = whole(k);
 
     M.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     VkDescriptorSetLayoutBinding b[4];
@@ -133,9 +158,69 @@ fail:
 }
 
 VkDescriptorBufferInfo vk_meshfb_buffer(int cb_slot) {
-    if (cb_slot == MESHFB_CB_TASK) return (VkDescriptorBufferInfo){M.task, 0, M.task_bytes};
-    if (cb_slot == MESHFB_CB_LIST) return (VkDescriptorBufferInfo){M.list, 0, M.list_bytes};
-    return (VkDescriptorBufferInfo){M.mesh, 0, M.mesh_bytes};
+    return M.cur[cb_slot == MESHFB_CB_TASK ? WIN_TASK : cb_slot == MESHFB_CB_LIST ? WIN_LIST : WIN_MESH];
+}
+
+uint32_t vk_meshfb_window_serial(void) { return M.serial; }
+
+void vk_meshfb_window_whole(void) {
+    if (M.cur[WIN_MESH].range == M.mesh_bytes && !M.cur[WIN_MESH].offset && M.cur[WIN_TASK].range == M.task_bytes &&
+        !M.cur[WIN_TASK].offset && M.cur[WIN_LIST].range == M.list_bytes && !M.cur[WIN_LIST].offset)
+        return;
+    for (int k = 0; k < 3; k++) M.cur[k] = whole(k);
+    M.serial++;
+}
+
+static VkDeviceSize round_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
+static uint64_t at_most(uint64_t v, uint64_t most) { return v < most ? v : most; }
+
+int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_t count, uint32_t fan, uint32_t slot_words,
+                     uint32_t task_words) {
+    if (!slot_words) slot_words = 1;
+    if (!task_words) task_words = 1;
+    if (fan > 255) fan = 255;   // as the scan reads it
+    uint64_t room = M.mesh_bytes / 4 / slot_words, task_room = M.task_bytes / 4 / task_words;
+    if (has_task && room > M.list_bytes / 4) room = M.list_bytes / 4;
+    uint64_t slots, tasks = 0;
+    if (!has_task) {
+        // a direct draw's workgroup count is its need; an indirect one's is what the program asked for at most so far
+        slots = !indirect ? count : need->seen ? (uint64_t)need->max_want * 3 / 2 + 64 : room / 2;
+    } else if (!indirect) {
+        // its task workgroups exactly; each starts fan mesh workgroups at most, and as many as the program's most so far
+        tasks = count;
+        uint64_t bound = (uint64_t)count * fan;
+        slots = need->seen ? at_most(bound, (uint64_t)count * need->ratio16 * 3 / 32 + 64) : at_most(bound, room / 2);
+    } else {
+        tasks = need->seen ? (uint64_t)need->max_tasks * 3 / 2 + 16 : task_room / 2;
+        slots = need->seen ? (uint64_t)need->max_want * 3 / 2 + 64 : room / 2;
+    }
+    slots = at_most(slots ? slots : 1, room), tasks = at_most(tasks, task_room);
+    VkDeviceSize bytes[3] = {has_task ? tasks * task_words * 4 : 0, slots * slot_words * 4, has_task ? slots * 4 : 0};
+    VkDeviceSize total[3] = {M.task_bytes, M.mesh_bytes, M.list_bytes}, off[3];
+    for (int k = 0; k < 3; k++) {
+        off[k] = round_up(M.used[k], M.align);
+        if (bytes[k] && off[k] + bytes[k] > total[k]) {
+            if (M.batch_draws) return M.cuts++, 0;   // the caller cuts the pass and asks again with the batch empty
+            off[k] = 0;
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        // a stage the draw does not have binds nothing of the buffer: a range of one word keeps the binding valid
+        M.cur[k] = (VkDescriptorBufferInfo){whole(k).buffer, bytes[k] ? off[k] : 0, bytes[k] ? bytes[k] : 4};
+        if (bytes[k]) M.used[k] = off[k] + bytes[k];
+    }
+    M.serial++;
+    M.batch_draws++, M.batched++;
+    VkDeviceSize b = M.used[WIN_MESH] + M.used[WIN_TASK] + M.used[WIN_LIST];
+    if (b > M.most_bytes) M.most_bytes = b;
+    if (M.batch_draws > M.most_draws) M.most_draws = M.batch_draws;
+    return 1;
+}
+
+void vk_meshfb_batch_reset(void) {
+    if (M.batch_draws) M.batches++;
+    M.batch_draws = 0;
+    M.used[0] = M.used[1] = M.used[2] = 0;
 }
 
 uint64_t vk_meshfb_mesh_words(void) { return M.mesh_bytes / 4; }
@@ -194,6 +279,20 @@ static void record_check(uint32_t i, int account) {
     uint64_t need = (uint64_t)want * M.slot_words[i] * 4;
     if (need > M.worst_bytes) M.worst_bytes = need;
     uint64_t n = ++M.short_draws;
+    if (M.rwin[i][WIN_MESH][1] != M.mesh_bytes || M.rwin[i][WIN_TASK][1] != M.task_bytes ||
+        M.rwin[i][WIN_LIST][1] != M.list_bytes) {
+        // a window, sized from what the program asked for before (vk_meshfb_window): its need now holds this draw's
+        uint64_t k = ++M.clipped;
+        if (k <= 16 || !(k & (k - 1))) {
+            char from[96] = "";
+            if (tasks) snprintf(from, sizeof from, " from %u task workgroups (room for %u)", tasks, M.cap_tasks[i]);
+            rt_log("vk: mesh fallback: a batched draw did not fit its window: its programs emitted %u mesh workgroups of %u "
+                   "bytes%s, and the window holds %u: what did not fit was not drawn, and the program's next windows are "
+                   "sized for it (%llu such draws of %llu)", want, M.slot_words[i] * 4, from, M.cap_slots[i],
+                   (unsigned long long)k, (unsigned long long)M.draws);
+        }
+        return;
+    }
     if (n <= 4 || !(n & (n - 1))) {
         char from[96] = "";
         if (tasks) snprintf(from, sizeof from, " from %u task workgroups (room for %u)", tasks, M.cap_tasks[i]);
@@ -227,9 +326,10 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
     M.fence[i] = fence, M.need[i] = need;
     M.group[i] = group, M.bound[i] = bound_slots, M.task_words[i] = 0;
     M.has_task[i] = (uint8_t)(has_task != 0), M.indirect[i] = src != VK_NULL_HANDLE;
-    M.slot_words[i] = slot_words, M.cap_slots[i] = (uint32_t)(M.mesh_bytes / 4 / (slot_words ? slot_words : 1));
+    for (int k = 0; k < 3; k++) M.rwin[i][k][0] = M.cur[k].offset, M.rwin[i][k][1] = M.cur[k].range;
+    M.slot_words[i] = slot_words, M.cap_slots[i] = (uint32_t)(M.cur[WIN_MESH].range / 4 / (slot_words ? slot_words : 1));
     M.cap_tasks[i] = 0xffffffffu;   // vk_meshfb_scan knows the payload size
-    if (has_task && M.cap_slots[i] > M.list_bytes / 4) M.cap_slots[i] = (uint32_t)(M.list_bytes / 4);
+    if (has_task && M.cap_slots[i] > M.cur[WIN_LIST].range / 4) M.cap_slots[i] = (uint32_t)(M.cur[WIN_LIST].range / 4);
     *rec = M.rec;
     int n = 0;
     // Every word of the record is written by exactly one command. A fill of the whole record followed by fills and
@@ -265,10 +365,12 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
 
 void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, uint32_t fan, uint32_t slot_words, uint32_t verts) {
     uint32_t i = (uint32_t)(at / REC_BYTES);
-    M.cap_tasks[i] = (uint32_t)(M.task_bytes / 4 / (task_words ? task_words : 1));
+    M.cap_tasks[i] = (uint32_t)(M.rwin[i][WIN_TASK][1] / 4 / (task_words ? task_words : 1));
     M.task_words[i] = task_words;
-    VkDescriptorBufferInfo bi[4] = {{M.rec, 0, VK_WHOLE_SIZE}, {M.task, 0, M.task_bytes}, {M.list, 0, M.list_bytes},
-                                    {M.mesh, 0, M.mesh_bytes}};
+    // the record's windows: the scan counts the tasks and the room in them, as the modules do
+    VkDescriptorBufferInfo bi[4] = {{M.rec, 0, VK_WHOLE_SIZE}, {M.task, M.rwin[i][WIN_TASK][0], M.rwin[i][WIN_TASK][1]},
+                                    {M.list, M.rwin[i][WIN_LIST][0], M.rwin[i][WIN_LIST][1]},
+                                    {M.mesh, M.rwin[i][WIN_MESH][0], M.rwin[i][WIN_MESH][1]}};
     VkWriteDescriptorSet w[4];
     for (int k = 0; k < 4; k++)
         w[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)k,
@@ -281,12 +383,16 @@ void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, ui
     vkCmdDispatch(cb, 1, 1, 1);
 }
 
-// A count the GPU wrote, copied into record `at` (vk_meshfb_record with a source), cut to what the buffers hold before a
-// dispatch reads it (meshfb_clamp.comp says why). task_words: the task stage's payload words, 0 without a task stage.
-// One single-thread dispatch; the caller orders it after the record's copies and before the first dispatch.
+// A count the GPU wrote, copied into record `at` (vk_meshfb_record with a source), cut to what the record's windows hold
+// before a dispatch reads it (meshfb_clamp.comp says why). The room is the record's own: the task window's payloads,
+// or without a task stage the mesh window's slots (cap_slots, as record_check measures the draw against). A batched
+// draw's windows are its own parts of the buffers, so a garbage count launches no more workgroups and instances than
+// its window holds, the same that its modules and vertex stage would let write and draw, and nothing of another draw's
+// window is touched. task_words: the task stage's payload words, 0 without a task stage. One single-thread dispatch;
+// the caller orders it after the record's copies and before the first dispatch.
 void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words) {
     uint32_t i = (uint32_t)(at / REC_BYTES), most = vk_ctx()->props.limits.maxComputeWorkGroupCount[0];
-    uint32_t room = task_words ? (uint32_t)(M.task_bytes / 4 / task_words) : M.cap_slots[i];
+    uint32_t room = task_words ? (uint32_t)(M.rwin[i][WIN_TASK][1] / 4 / task_words) : M.cap_slots[i];
     if (room > most) room = most;
     VkDescriptorBufferInfo bi = {M.rec, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
@@ -333,9 +439,9 @@ void vk_meshfb_shutdown(void) {
     VkCtx *c = vk_ctx();
     if (!c || !M.tried) return;
     if (vk_meshfb_short())
-        rt_log("vk: mesh fallback: %llu of %llu draws emitted more than the buffers hold (mesh_fallback_mb of %llu or more would "
-               "hold the largest)", (unsigned long long)M.short_draws, (unsigned long long)M.draws,
-               (unsigned long long)((M.worst_bytes * 8 / 7 >> 20) + 1));
+        rt_log("vk: mesh fallback: %llu of %llu draws emitted more than the buffers hold, %llu of them more than their window "
+               "of a batch (mesh_fallback_mb of %llu or more would hold the largest)", (unsigned long long)M.short_draws,
+               (unsigned long long)M.draws, (unsigned long long)M.clipped, (unsigned long long)((M.worst_bytes * 8 / 7 >> 20) + 1));
     if (M.scan) vkDestroyPipeline(c->device, M.scan, NULL);
     if (M.clamp) vkDestroyPipeline(c->device, M.clamp, NULL);
     if (M.layout) vkDestroyPipelineLayout(c->device, M.layout, NULL);
