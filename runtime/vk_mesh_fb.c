@@ -358,9 +358,11 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
     // Fills and copies only: they go through the recorder thread (vk_rec.h) like the replay's other commands.
     uint32_t r[REC_BYTES / 4], copied = 0;   // copied: the words the GPU-written count goes to
     for (uint32_t k = 0; k < REC_BYTES / 4; k++) r[k] = 1;
-    // where the workgroup count goes: the task dispatch, or the mesh dispatch, the draw's instances and the report
-    VkDeviceSize to[3] = {has_task ? 0 : 16, 36, 48};
-    int nto = has_task ? 1 : 3;
+    // where the workgroup count goes: the task dispatch and the report's task word, or the mesh dispatch, the draw's
+    // instances and the report's mesh word. The report words keep the count asked for when vk_meshfb_clamp cuts the
+    // dispatch's, so record_check measures what the draw asked for against its room.
+    VkDeviceSize to[3] = {has_task ? 0 : 16, has_task ? 52 : 36, 48};
+    int nto = has_task ? 2 : 3;
     if (!has_task) r[32 / 4] = verts, r[40 / 4] = 0, r[44 / 4] = 0, r[52 / 4] = 0;
     for (int k = 0; k < nto; k++) {
         if (src) copied |= 1u << (to[k] / 4);

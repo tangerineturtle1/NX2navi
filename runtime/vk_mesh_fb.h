@@ -41,8 +41,8 @@ uint64_t vk_meshfb_cuts_total(void);
 // A draw's record, 64 bytes of the record buffer (*rec) at the offset returned: the task dispatch at +0, the mesh
 // dispatch at +16, the draw (VkDrawIndirectCommand) at +32. Records the fills and copies that start it, outside a
 // pass: the workgroup count from 4 bytes at src_off of src, or `count` when src is VK_NULL_HANDLE. Without a task
-// stage that count is the mesh dispatch and the draw's instance count; with one it is the task dispatch, and
-// vk_meshfb_scan writes the rest. slot_words: of the draw's mesh program, for the report of a draw the mesh buffer
+// stage that count is the mesh dispatch, the draw's instance count and the report's mesh word; with one it is the
+// task dispatch and the report's task word, and vk_meshfb_scan writes the rest. slot_words: of the draw's mesh program, for the report of a draw the mesh buffer
 // was too small for. group: the draws of one pass share a number (NX2NAVI_TRACE=perf adds up the draws of a group);
 // bound_slots: the most mesh workgroups the CPU can tell the draw needs, 0 when it cannot (indirect). need: the
 // program's, which gets what the draw asked for once it is read back; fence: the timeline value of the submission
@@ -53,7 +53,7 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
                               MeshFbNeed *need, uint64_t fence, VkBuffer *rec, int *cmds);
 // For a record whose count came from src (a count the GPU wrote): cuts it to what the record's windows hold (the whole
 // buffers outside a batch), in the task dispatch (task_words, the task stage's payload words) or without a task stage
-// (0) in the mesh dispatch and the instances (shaders/meshfb_clamp.comp). The report word keeps the count asked for.
+// (0) in the mesh dispatch and the instances (shaders/meshfb_clamp.comp). The report words keep the count asked for.
 // Binds its own compute pipeline and set; four commands, after a barrier that orders the record's fills and copies
 // and before one that orders the cut count for the dispatches.
 void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words);

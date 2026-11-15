@@ -5868,6 +5868,7 @@ static void mesh_shading_rate(VkExec *ex) {
 // device with mesh_fallback = 1. The program's task and mesh stages run as compute dispatches that write the
 // fallback's buffers, and an ordinary draw reads them (mesh_fb.c makes the modules, vk_mesh_fb.c holds the buffers):
 //   the draw's record        its workgroup count, copied on the GPU when the game's own record holds it
+//   [clamp                   cuts a count the GPU wrote to what the draw's buffers or windows hold]
 //   [task dispatch           the task module, with the task stage's bindings
 //    scan                    lists the mesh workgroups the tasks started and counts them into the record]
 //   mesh dispatch            the mesh module, with the mesh stage's bindings
@@ -5880,8 +5881,9 @@ static void mesh_shading_rate(VkExec *ex) {
 // its culling, and the last draw's reads of the buffers come first), and the next draw begins it again; it gets the
 // whole buffers, which the full barrier before its first step makes safe: the draws before have read them by then.
 // Between the steps stand barriers of the stages and accesses each one orders (mfb_barrier, mfb_flush): the fills and
-// copies before the dispatches that read the record as indirect arguments, the task dispatch before the scan, the
-// scan before the mesh dispatch, and the mesh dispatch before everything after it, the draw first.
+// copies before the clamp and the dispatches that read the record as indirect arguments, the clamp before the
+// dispatches, the task dispatch before the scan, the scan before the mesh dispatch, and the mesh dispatch before
+// everything after it, the draw first.
 //
 // The modules of a program are made once, on a thread of their own, with their compute pipelines (a mesh program of
 // the game is up to 900,000 SPIR-V words, and its pipeline compiles for as long as the mesh pipeline it replaces):

@@ -7,7 +7,8 @@
 // draw by draw and in batches (NX2NAVI_MESH_FB_BATCH), and the pictures are compared texel by texel; without mesh
 // shaders on the device only the fallback draws, and the probe says that the mesh pipeline's were not compared. Then
 // two draws that do not fit one batch's windows (each drawn whole, in two batches), a draw larger than the mesh buffer
-// and larger than its window, and the background builds. The mesh buffer is 16 MiB (mesh_fallback_mb) unless the
+// and larger than its window, a batch whose indirect draws' GPU-written counts are far larger than their windows, and
+// the background builds. The mesh buffer is 16 MiB (mesh_fallback_mb) unless the
 // settings give another size.
 //
 // Module part, with NX2NAVI_PROBE_MESHFB_DIR=<dir>: every "<name>" of <dir>/list.txt names <dir>/<name>.in (a stored
@@ -427,6 +428,54 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
         printf("probe-meshfb: a draw of %u workgroups %s with room for %u: the picture of the first 24 is whole, the draw "
                "was counted\n", over, how[k], slots);
     }
+    // A garbage count the GPU wrote, in a batch: one pass of a direct task draw, an indirect draw without a task stage
+    // and an indirect task draw, the two indirect ones of programs of their own (new shader objects) whose draws so far
+    // asked for 24 mesh and 10 task workgroups, so that their windows are a 32nd of the mesh buffer and a 16th of the
+    // task buffer (vk_mesh_fb.c vk_meshfb_window). Their records then hold 2^30 workgroups, far past those windows. The
+    // count is cut to each draw's own windows (vk_meshfb_clamp in vk_exec_draw.c mfb_flush): the submission ends in
+    // moments, not past the driver's timeout, and the picture is the one of the same pass with the right counts drawn
+    // draw by draw. The cells past the grids are outside the picture, and nothing of the direct draw's windows is
+    // touched. Both indirect draws are counted as not fitting their windows, by the counts they asked for.
+    const GfxShader *fs3 = gfx_shader_own(meshfb_probe_f_spv, sizeof meshfb_probe_f_spv / 4, RES_FS);
+    const GfxShader *ms3 = gfx_shader_own(meshfb_probe_m_spv, sizeof meshfb_probe_m_spv / 4, RES_MS);
+    const GfxShader *ts3 = gfx_shader_own(meshfb_probe_t_spv, sizeof meshfb_probe_t_spv / 4, RES_TS);
+    const GfxShader *tm3 = gfx_shader_own(meshfb_probe_tm_spv, sizeof meshfb_probe_tm_spv / 4, RES_MS);
+    CHECK(fs3 && ms3 && ts3 && tm3, "a probe shader is malformed");
+    prog_t *plain3 = make_prog(ms3, NULL, fs3), *tasked3 = make_prog(tm3, ts3, fs3);
+    const uint32_t garbage = 1u << 30;
+    MeshDraw wild[3] = {{tasked, 10, 0, {8, 5}, {1, 1, 1, 1}}, {plain3, 24, 1, {6, 4}, {0.5f, 1, 0.25f, 1}},
+                        {tasked3, 10, 1, {10, 4}, {1, 0.5f, 0.5f, 1}}};
+    static uint32_t wref[TEX_W * TEX_H];
+    c->mesh_fallback = 1;
+    vk_exec_meshfb_batch(1);
+    bad = draw_picture(b, &pool, &color, wild, 3, bpx);   // the programs' first draws: what they ask for is learnt
+    vk_exec_meshfb_batch(0);
+    bad = bad || draw_picture(b, &pool, &color, wild, 3, wref);
+    c->mesh_fallback = was;
+    if (bad) return 1;
+    b->finish();
+    CHECK(drawn_texels(wref) > TEX_W * TEX_H / 20, "three draws with the right counts drew %d texels", drawn_texels(wref));
+    uint64_t short0 = vk_meshfb_short(), clip0 = vk_meshfb_clipped(), cuts0 = vk_meshfb_cuts_total();
+    wild[1].count = wild[2].count = garbage;
+    c->mesh_fallback = 1;
+    vk_exec_meshfb_batch(1);
+    uint64_t t0 = plat_now_ns();
+    bad = draw_picture(b, &pool, &color, wild, 3, bpx);
+    double took = (double)(plat_now_ns() - t0) / 1e6;
+    c->mesh_fallback = was;
+    if (bad) return 1;
+    b->finish();
+    int wg, dg = differing(bpx, wref, &wg);
+    uint64_t shorts = vk_meshfb_short() - short0, clips = vk_meshfb_clipped() - clip0;
+    CHECK(vk_meshfb_cuts_total() == cuts0, "a batch with two counts of %u the GPU wrote was cut %llu times", garbage,
+          (unsigned long long)(vk_meshfb_cuts_total() - cuts0));
+    CHECK(!dg, "a batch with two counts of %u the GPU wrote: %d texels differ from the picture with the right counts, by up "
+          "to %d of 255", garbage, dg, wg);
+    CHECK(took < 10000, "a batch with two counts of %u the GPU wrote took %.0f ms", garbage, took);
+    CHECK(shorts == 2 && clips == 2, "a batch with two counts of %u the GPU wrote: %llu draws counted as not fitting, %llu "
+          "of them their window (2 and 2 expected)", garbage, (unsigned long long)shorts, (unsigned long long)clips);
+    printf("probe-meshfb: a batch with two counts of %u the GPU wrote, far past their windows: drawn in %.0f ms, the picture "
+           "of the right counts, both counted against their windows\n", garbage, took);
     // As the game runs it: pipelines built in the background, and a program's modules made on the fallback's own
     // thread. New shader objects of the same programs are drawn until the picture is whole: the draws before that are
     // skipped, and none may leave a partial picture behind for good.

@@ -23,8 +23,9 @@ layout(push_constant) uniform Params {
     uint max_groups;   // workgroups one dispatch may have (maxComputeWorkGroupCount)
 } pc;
 
-// The record: words 0-2 the task dispatch (x written before this pass), 4-6 the mesh dispatch, 8-11 the draw (vertices,
-// instances, first vertex, first instance), 12 the mesh workgroups the tasks asked for, 13 the task workgroups.
+// The record: words 0-2 the task dispatch (x written before this pass, and cut to the task window by meshfb_clamp.comp
+// when the GPU wrote it), 4-6 the mesh dispatch, 8-11 the draw (vertices, instances, first vertex, first instance), 12
+// the mesh workgroups the tasks asked for, 13 the task workgroups asked for (written with word 0, before any cut).
 layout(set = 0, binding = 0) buffer Rec { uint w[]; } rec;
 layout(set = 0, binding = 1) readonly buffer Task { uint w[]; } task;
 layout(set = 0, binding = 2) writeonly buffer List { uint e[]; } list;
@@ -34,8 +35,7 @@ shared uint sums[THREADS];   // the chunk's counts, summed up to and including e
 
 void main() {
     uint lid = gl_LocalInvocationIndex;
-    uint asked = rec.w[pc.rec];
-    uint tasks = min(min(asked, uint(task.w.length()) / pc.task_words), 1u << 24);
+    uint tasks = min(min(rec.w[pc.rec], uint(task.w.length()) / pc.task_words), 1u << 24);
     uint room = min(min(uint(mesh.w.length()) / pc.slot_words, uint(list.e.length())), pc.max_groups);
     uint fan = min(pc.fan, 255u);
     uint m = 0u, want = 0u;   // entries written so far (at most room), and mesh workgroups asked for
@@ -74,5 +74,4 @@ void main() {
     rec.w[pc.rec + 10u] = 0u;
     rec.w[pc.rec + 11u] = 0u;
     rec.w[pc.rec + 12u] = want;
-    rec.w[pc.rec + 13u] = asked;
 }

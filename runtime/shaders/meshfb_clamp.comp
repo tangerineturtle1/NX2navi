@@ -1,21 +1,23 @@
 #version 450
 // The mesh fallback's pass between a draw's record and its first dispatch, for a draw whose workgroup count the GPU
-// wrote (vk_mesh_fb.c vk_meshfb_clamp, vk_exec_draw.c mfb_draw). The record's copies put that count into the first
-// dispatch and, without a task stage, into the draw's instances as it is; a garbage count (the game's culling pass
-// reading memory nothing wrote) would launch up to millions of workgroups that write nothing and instances that draw
-// nothing, past the buffers' end, and keep the GPU busy past the driver's timeout. The count is cut to what the
-// buffers hold, which changes nothing that is drawn; the record's report word keeps the count asked for, so the log
-// names such a draw (vk_mesh_fb.c record_check).
+// wrote (vk_mesh_fb.c vk_meshfb_clamp; vk_exec_draw.c mfb_draw for a draw by itself, mfb_flush for a batch's draws).
+// The record's copies put that count into the first dispatch and, without a task stage, into the draw's instances as
+// it is; a garbage count (the game's culling pass reading memory nothing wrote) would launch up to millions of
+// workgroups that write nothing and instances that draw nothing, past the end of the draw's buffers, and keep the GPU
+// busy past the driver's timeout. The count is cut to what the draw's room holds: the whole buffers for a draw by
+// itself, its own windows for a draw of a batch. That changes nothing that is drawn, as the modules and the vertex
+// stage write and read nothing past their bindings. The record's report words (12 and 13) keep the count asked for,
+// so the log names such a draw (vk_mesh_fb.c record_check).
 layout(local_size_x = 1) in;
 
 layout(push_constant) uniform Params {
     uint rec;    // the record's first word in the record buffer
     uint task;   // 1: the count is the task dispatch's (word 0); 0: the mesh dispatch's and the draw's instances (4, 9)
-    uint room;   // workgroups the buffers hold, at most what one dispatch may have
+    uint room;   // workgroups the draw's buffers or windows hold, at most what one dispatch may have
 } pc;
 
 // The record (meshfb_scan.comp): words 0-2 the task dispatch, 4-6 the mesh dispatch, 8-11 the draw (vertices,
-// instances, first vertex, first instance), 12 the mesh workgroups asked for, 13 the task workgroups.
+// instances, first vertex, first instance), 12 the mesh workgroups asked for, 13 the task workgroups asked for.
 layout(set = 0, binding = 0) buffer Rec { uint w[]; } rec;
 
 void main() {

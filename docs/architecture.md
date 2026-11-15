@@ -175,7 +175,8 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     they are, so a device with mesh shaders keeps its shaders and never sees these modules, and a device without
     needs no other cache or prepared shader list.
   - A draw is: its record (the workgroup count, copied on the GPU when the game's record holds it, then cut to what
-    the buffers hold by `shaders/meshfb_clamp.comp`, so a garbage count cannot launch work past them); the task
+    the draw's buffers, or in a batch its windows, hold by `shaders/meshfb_clamp.comp`, so a garbage count cannot
+    launch work past them; the record's report words keep the count asked for); the task
     dispatch, which writes each task workgroup's payload into the task buffer; a scan (`shaders/meshfb_scan.comp`)
     that lists the mesh workgroups the tasks started, in task order, and writes their number into the record; the
     mesh dispatch, which writes each workgroup's vertex lines and primitive bytes into its slot of the mesh buffer;
@@ -183,12 +184,13 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     primitive corner up in the slot (`runtime/vk_exec_draw.c` `mfb_draw`, `runtime/vk_mesh_fb.c`).
   - Each step reads what the one before wrote, and dispatches cannot be recorded inside a pass. With `mesh_fb_batch`
     (default 1) the dispatches of a pass's draws run together before the pass, in the part's pre-pass command buffer:
-    every task dispatch, every scan, every mesh dispatch, with one barrier between those stages for all the draws, and
-    the draws stay in their pass with no barrier (`runtime/vk_exec_draw.c` "the mesh fallback's batches"). The part
-    is cut at the pass's first such draw, so the game's culling before the pass runs first. Each draw of a batch gets
-    windows of the buffers (`mesh_fallback_mb`, 128 MiB) of its own, which its modules bind as buffers: exactly its
-    workgroup count when the CPU knows it, else what its program asked for so far doubled as margin and at least a 32nd of the mesh buffer and a 16th of the task buffer
-    (`runtime/vk_mesh_fb.c` `vk_meshfb_window`). A window that does not fit what the batch left cuts the part again
+    every clamp of a count the GPU wrote, every task dispatch, every scan, every mesh dispatch, with one barrier
+    between those stages for all the draws, and the draws stay in their pass with no barrier
+    (`runtime/vk_exec_draw.c` "the mesh fallback's batches"). The part is cut at the pass's first such draw, so the
+    game's culling before the pass runs first. Each draw of a batch gets windows of the buffers (`mesh_fallback_mb`,
+    128 MiB) of its own, which its modules bind as buffers: exactly its workgroup count when the CPU knows it, else
+    what its program asked for so far doubled as margin and at least a 32nd of the mesh buffer and a 16th of the task
+    buffer (`runtime/vk_mesh_fb.c` `vk_meshfb_window`). A window that does not fit what the batch left cuts the part again
     and starts a new batch. A draw that emits more than its window loses what does not fit, the log says so ("did not
     fit its window"), and its program's next windows are sized for it, a few frames later, once its submission is
     done. With `mesh_fb_batch = 0`, and for a draw a batch does not take (a compute layout without push descriptors,
