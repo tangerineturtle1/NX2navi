@@ -12,6 +12,9 @@ typedef struct {
 } Reverb3dParam;
 _Static_assert(__builtin_offsetof(Reverb3dParam, status) == 72, "reverb3d wire layout");
 typedef struct Reverb3d Reverb3d;
+/* Why the game's block `p` cannot be used, as a constant string, or NULL. create and update end the process on such
+   a block, so the caller asks first. */
+const char *audio_reverb_invalid(const Reverb3dParam *p);
 Reverb3d *audio_reverb_create(const Reverb3dParam *p);
 void audio_reverb_free(Reverb3d *s);
 void audio_reverb_update(Reverb3d *s, const Reverb3dParam *p);

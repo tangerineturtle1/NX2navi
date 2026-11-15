@@ -41,7 +41,7 @@ static struct {
     char *buf, *out;                 // LOGQ_CAP bytes each: the queue, and what the log thread is writing
     size_t n;
     LogqSink sink;
-    volatile int32_t on, saying;
+    volatile int32_t on, saying, now;   // now: logq_nudge asked for the gathered lines at once
     volatile int64_t slow, said, worst_ns, full;   // slow writes, those reported, the longest; lines that found no room
     volatile uint64_t said_at;
 } Q = {.q = PLAT_MUTEX_INIT, .io = PLAT_MUTEX_INIT, .more = PLAT_COND_INIT};
@@ -135,9 +135,10 @@ static void log_main(void *arg) {
     for (;;) {
         plat_mutex_lock(&Q.q);
         while (!Q.n) plat_cond_wait(&Q.more, &Q.q);
-        for (uint64_t t0 = plat_now_ns(), spent = 0; Q.n && Q.n < LOGQ_GATHER_BYTES && spent < LOGQ_GATHER_NS;
+        for (uint64_t t0 = plat_now_ns(), spent = 0; Q.n && Q.n < LOGQ_GATHER_BYTES && spent < LOGQ_GATHER_NS && !Q.now;
              spent = plat_now_ns() - t0)
             plat_cond_wait_ns(&Q.more, &Q.q, LOGQ_GATHER_NS - spent);
+        Q.now = 0;
         plat_mutex_unlock(&Q.q);
         drain();
         say_slow();
@@ -150,6 +151,46 @@ int logq_async(void) {
     if (!Q.buf || !Q.out || !plat_thread_spawn(log_main, NULL, "log", 0)) return 0;
     __atomic_store_n(&Q.on, 1, __ATOMIC_RELEASE);
     return 1;
+}
+
+// What is queued, written now on the calling thread, with the queue left on: a point the log is to have reached on the
+// disk before something slow comes (the orderly end before its pipeline save, gfx_present.c rt_exit_steps). Each lock
+// is tried for at most 100 ms: the log thread may be stuck in a write and hold io. Without both locks nothing is
+// written here, since other threads still queue and write, and the log thread writes the lines when it can.
+void logq_flush(void) {
+    if (!__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE)) return;
+    int io = 0, q = 0;
+    for (int i = 0; i < 100 && !(io = plat_mutex_trylock(&Q.io)); i++) plat_sleep_ms(1);
+    if (!io) return;
+    for (int i = 0; i < 100 && !(q = plat_mutex_trylock(&Q.q)); i++) plat_sleep_ms(1);
+    if (!q) {
+        plat_mutex_unlock(&Q.io);
+        return;
+    }
+    char *b = Q.buf;
+    size_t n = Q.n;
+    Q.buf = Q.out, Q.out = b, Q.n = 0;
+    plat_mutex_unlock(&Q.q);
+    if (n) put_out(b, n);
+    plat_mutex_unlock(&Q.io);
+}
+
+// The log thread writes what it gathers now instead of when the gathering time is up: a focus loss, after which the
+// process may be ended from outside (main.c rt_log_focus_lost); such an end loses what was being gathered.
+void logq_nudge(void) {
+    if (!__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&Q.q);
+    Q.now = 1;
+    plat_mutex_unlock(&Q.q);
+    plat_cond_signal(&Q.more);
+}
+
+// What is queued, as it stands, with no lock: for the note of an end nobody asked for, written with every other thread
+// stopped (platform.h plat_exit_note_setup). Nothing once the queue is off.
+void logq_peek(const char **p, size_t *n) {
+    size_t k = __atomic_load_n(&Q.n, __ATOMIC_RELAXED);
+    *p = __atomic_load_n(&Q.buf, __ATOMIC_RELAXED);
+    *n = __atomic_load_n(&Q.on, __ATOMIC_RELAXED) && k <= LOGQ_CAP ? k : 0;
 }
 
 void logq_sync(void) {

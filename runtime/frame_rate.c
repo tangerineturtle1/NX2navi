@@ -55,6 +55,7 @@
 #include "input.h"
 #include "layout.h"
 #include "platform/platform.h"
+#include "rtss_decide.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
@@ -179,6 +180,13 @@ static double shown_hz(double hz) { return hz <= 0 ? 60 : hz < LIMIT_MIN_HZ ? LI
 #define LIMIT_FREE_MAX_HZ 240
 int frame_free_running(void) { return rt_patch_set("fps60") < 0 && rt_patch_set("realtime") < 0; }
 int frame_limit_adjustable(void) { return 1; }
+
+// The period the pacer keeps while something else holds the frame limit where the frame starts (Reflex with DLSS Frame
+// Generation, vk_dlssg.c vk_dlssg_pace): a limiter that lets go, or counts other frames than the game's, still leaves
+// the game no faster than the rate its code survives.
+uint64_t frame_step_ceiling_ns(void) {
+    return 1000000000ull / (frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ);
+}
 static unsigned limit_seen;
 static int limit_read;
 static int limit_hz = -1;   // 0: display; -2: unlimited (free-running builds); -1 before the first read
@@ -273,10 +281,15 @@ double frame_step_game_hz(void) {
     return !frame_free_running() && !step_word && hz > 60 ? 60 : hz > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : hz;
 }
 
-// RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
-// frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
-// out, and so does a driver's low latency while it is in effect (vk_lowlat.c): the driver holds the limit where the
-// frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove.
+// RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds the
+// frames only to LIMIT_FREE_MAX_HZ, the ceiling the game's code needs, so the two do not stack, except at a limit of
+// 240 or unlimited, where the ceiling is RTSS's own period; and it takes the limit back once no picture went out for
+// 200 ms (rtss_decide.h rtss_pace_period): a minimised window or a frame hold leaves
+// RTSS no present to hold. While a movie plays the pacer holds the movie's rate and keeps its slots whatever RTSS does.
+// NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out, and so does a driver's low
+// latency while it is in effect (vk_lowlat.c): the driver holds the limit where the frame starts, and RTSS would hold
+// the finished picture, the wait that mode is there to remove. RTSS gets the reason (RTSS_OUT_*), for the log and for
+// its check of a limit set in RTSS itself.
 static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
 static int movie_paced;   // the movie rate the newest frame_step_cap_ns paces at (ocarina_step, frame_step_movie_hz); 0: none
 int frame_step_movie_hz(void) { return movie_paced; }
@@ -287,7 +300,10 @@ uint64_t frame_step_cap_ns(void) {
         const char *e = cfg_get("NX2NAVI_RTSS");
         rtss_allowed = !(e && !strcmp(e, "0"));
     }
-    int rtss = rtss_allowed && !vk_fg_wanted() && !vk_dlssg_active() && !vk_lowlat_on();
+    int64_t rtss_out = !rtss_allowed                          ? RTSS_OUT_SETTING
+                       : vk_fg_wanted() || vk_dlssg_active() ? RTSS_OUT_FRAMEGEN
+                       : vk_lowlat_on()                      ? RTSS_OUT_LOWLAT
+                                                             : 0;
     int gen = generated_factor();
     int movie_hz = movie_cap_hz();
     static int movie_clock = -1;   // NX2NAVI_MOVIE_CLOCK=0: the steady step and the usual pacing through a movie too
@@ -304,8 +320,9 @@ uint64_t frame_step_cap_ns(void) {
             else rt_log("frame rate: the movie ended: the frame limit again");
         }
     }
-    if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames, and
-        rtss_limit_want(rtss ? 0 : -1);                              // RTSS's limit is cleared
+    rtss_limit_movie(movie_hz);
+    if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames
+        rtss_limit_want(rtss_out);   // kept out (RTSS_OUT_*), or 0: RTSS's limit is cleared
         paced_hz = 0;
         return 0;
     }
@@ -320,11 +337,15 @@ uint64_t frame_step_cap_ns(void) {
         rt_log("frame rate: the game draws up to %.0f frames a second and frame generation shows %d for each (%.0f on "
                "screen)", hz, gen, hz * gen);
     }
+    // RTSS keeps the play limit through a movie and the pacer holds the movie (rtss_decide.h rtss_target): the movie's
+    // rate as the want rewrote RTSS's profile at each start and end, and with the pacer aside under RTSS no movie slot
+    // was kept, so each late frame put the picture behind the sound for good
+    int64_t play_mhz = (int64_t)(hz * 1000 + 0.5);
     if (movie_hz) hz = movie_hz;
     paced_hz = hz;
-    rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
-    if (rtss_limit_active()) return 0;
-    return (uint64_t)(1e9 / hz + 0.5);
+    rtss_limit_want(rtss_out ? rtss_out : play_mhz);
+    return rtss_pace_period(rtss_limit_active(), movie_hz, kern_now_ns(), gfx_window_hosted_ns(),
+                            (uint64_t)(1e9 / hz + 0.5), frame_step_ceiling_ns());
 }
 
 // The limit as it is set, for the performance overlay: the setting, the monitor's rate for "display", 60 at
@@ -404,7 +425,10 @@ static double ocarina_step_s(void) {
     return base * speed / 60.0;
 }
 
-static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight)
+static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight, frame_step_presents)
+
+// The game's presents so far, one per update of the game at any frame rate (input.c shake_stick counts its updates).
+uint64_t frame_step_presents(void) { return atomic_load_explicit(&guest_presents, memory_order_relaxed); }
 
 // The flight recorder's view of the step at a host present (flight.c, render thread): the newest step the patch page
 // holds in 60 Hz frames per update (set ostep; -1 without), the game's own step from its time manager in 60 Hz frames

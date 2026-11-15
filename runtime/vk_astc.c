@@ -487,7 +487,7 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 // only after that batch completed (vk_memory.c: completed batches go to the spare list), so the same handle means the
 // open batch, ordered by a barrier, or a finished one. g_lock held.
 static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns; } S;
-static uint64_t n_scratch_new, n_scratch_reuse;
+static uint64_t n_scratch_new, n_scratch_reuse, n_scratch_trim;
 
 // NX2NAVI_ASTC_SCRATCH_KEEP=1 (the default): the scratch outlives its upload batch. Every
 // batch goes to gfx_queue, so the reuse barrier at the start of the next batch's first chunk (vk_astc_record) orders it
@@ -558,6 +558,33 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
     VkBuffer out = S.buf;
     plat_mutex_unlock(&g_lock);
     return out;
+}
+
+// Every present (vk_texture.c vk_texstat_frame): a scratch grown past SCRATCH_MIN goes once no texture needed more for
+// SCRATCH_SHRINK_NS, without waiting for the next ASTC upload, which is when scratch_get makes it small again: in a
+// session of 2026-11-13 the decoder held 224 MiB for the 70 s after an area load and from a later load to the session's
+// end. Nothing is made here: the next request makes the usual scratch, as after scratch_get's own shrink. The buffer
+// is freed once the upload batches recorded so far completed (vk_defer_buffer_try), as there. Both locks are only
+// tried. scratch_get holds g_lock while VMA makes a buffer, up to 19 ms for a new block. The upload path takes
+// cmd_lock first (vk_memory.c vk_upload_begin) and g_lock inside it (vk_astc_record, scratch_get), so waiting for
+// cmd_lock while holding g_lock would deadlock with an upload, and waiting at all would hold the present for as long
+// as an upload flush waits for its fences. When either lock is busy the trim gives way; the next present tries again.
+// NX2NAVI_ASTC_SCRATCH_TRIM=0: the grown scratch stays until the next upload, as in 0.10.1.
+void vk_astc_scratch_trim(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("ASTC_SCRATCH_TRIM", "1") == 1;
+    if (!on || !scratch_keep()) return;
+    if (__atomic_load_n(&S.size, __ATOMIC_RELAXED) <= SCRATCH_MIN || !plat_mutex_trylock(&g_lock)) return;
+    VkCtx *c = vk_ctx();
+    if (S.buf && c && S.dev == c->device && S.size > SCRATCH_MIN && kern_now_ns() - S.big_ns > SCRATCH_SHRINK_NS) {
+        if (!vk_defer_buffer_try(S.buf, S.alloc)) {
+            plat_mutex_unlock(&g_lock);
+            return;
+        }
+        S.buf = VK_NULL_HANDLE, S.alloc = NULL, S.size = 0, S.cb = VK_NULL_HANDLE;
+        n_scratch_trim++;
+    }
+    plat_mutex_unlock(&g_lock);
 }
 
 // The shared scratch's size, for the log's VRAM breakdown (scratches still owned by an upload batch not counted).
@@ -762,9 +789,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     }
     if ((n_dispatch + (uint64_t)n) / 1024 != n_dispatch / 1024 || !n_dispatch) {
         rt_log("vk: ASTC: %llu regions, %.1f M texels decoded on the GPU so far; shared scratch %llu MiB, made %llu "
-               "times, reused %llu", (unsigned long long)(n_dispatch + (uint64_t)n), (double)n_texels / 1e6,
-               (unsigned long long)(S.size >> 20), (unsigned long long)n_scratch_new,
-               (unsigned long long)n_scratch_reuse);
+               "times, reused %llu, given back idle %llu", (unsigned long long)(n_dispatch + (uint64_t)n),
+               (double)n_texels / 1e6, (unsigned long long)(S.size >> 20), (unsigned long long)n_scratch_new,
+               (unsigned long long)n_scratch_reuse, (unsigned long long)n_scratch_trim);
         vk_astc_time_summary();
     }
     n_dispatch += (uint64_t)n;

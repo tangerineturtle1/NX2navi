@@ -41,8 +41,11 @@ typedef struct {
 typedef struct IpcSession IpcSession;
 typedef void (*IpcHandler)(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
 
-// One server object. Every kernel handle to it (the first one, CloneCurrentObject copies) holds a reference; the
-// last CloseHandle calls close(state).
+// One server object. Every kernel handle to it (the first one, CloneCurrentObject copies) holds a reference, and so
+// does a request on it while it runs; the last reference calls close(state). A domain's table holds one on each of
+// its objects, and each object one on its domain (held_root), until the client closes the object's id
+// (CloseVirtualHandle) or its last handle to the domain itself. ipc.c's domain lock guards objects, nobjects, subs
+// and dom_closed.
 struct IpcSession {
     const char *name;
     IpcHandler handler;
@@ -51,12 +54,16 @@ struct IpcSession {
     int32_t refs;
     int is_domain;                         // ConvertCurrentObjectToDomain ran: requests carry a domain header
     IpcSession *root;                      // the domain session every object id belongs to (objects share it)
-    IpcSession *objects[32];               // object 1 is this session, then what the service handed out
-    int nobjects;
+    IpcSession *objects[32];               // object 1 is this session, then what the service handed out; NULL: closed
+    int nobjects;                          // slots used so far (closed ones are given out again)
     uint32_t event;                        // readable event handed to the client (applet state changes)
+    IpcSession *held_root;                 // the domain this object holds a reference on (ipc_domain_add)
+    int32_t subs;                          // as a domain: the references its objects hold on it
+    int dom_closed;                        // as a domain: its client closed it and its table let the objects go
 };
 
-// Register an object inside a domain (1-based id returned, 0 when full).
+// Register an object inside a domain: the table takes the object's first reference (the caller's), the object one on
+// the domain. The 1-based id, 0 when the table is full or the domain closed.
 unsigned ipc_domain_add(IpcSession *domain, IpcSession *object);
 
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle

@@ -10,6 +10,9 @@ void stutter_map_init(void);
 // An area's load (perf.c perf_scene, from romfs.c): hitches from here on are counted in that area, and those within
 // SM_LOAD_NS of the load apart from play.
 void stutter_area(const char *name);
+// The texture pool began or ended making an area's textures (vk_exec_draw.c pool_loading): frames within SM_LOAD_NS of
+// it count as an area load's too, in the area of the last stutter_area.
+void stutter_load(void);
 // A draw met its pipeline (shader 0) or one of its shaders (shader 1) missing and the replay thread spent ns on it
 // before it was bound or skipped (vk_exec_draw.c, beside wait_note). vi, fi: the vertex (or mesh) and fragment shaders'
 // input ids, NULL when not known (still translating, or no fragment stage).
@@ -19,6 +22,10 @@ void stutter_miss(int shader, int mesh, const uint8_t *vi, const uint8_t *fi, ui
 void stutter_ready(int mesh, const uint8_t *vi, const uint8_t *fi, double ms, int recorded, int fresh, int fast);
 // Every present (perf.c ft_frame): d the frame's interval, part the time it went to by cause (names[i], n of them;
 // the last one is the part nothing recorded explains), cause the one the frame is charged to.
+// STUTTER_CAUSES: the number of causes, perf.c's FT_C_N (perf.c asserts it), which stutter_map.c cause_short and the
+// areas' counts are sized by; n is that many.
+#define STUTTER_CAUSES 10
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
                    int cause);
-void stutter_report(const char *tag);   // the map so far; every 10 minutes of play and at exit
+void stutter_report(const char *tag);   // the map so far; every 5 minutes of play, at a focus loss in play and at exit
+int stutter_report_as(const char *tag, int try_only);   // try_only 1: only when its lock is free (0: it was not, nothing written)

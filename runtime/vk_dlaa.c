@@ -35,6 +35,7 @@
 #include "vk_fg.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
+#include "vk_up_defer.h"
 #include "dlaa_mv_spv.h"
 #include "dlaa_sharpen_spv.h"
 
@@ -496,6 +497,7 @@ static struct {
         uint32_t min_w, min_h;
         uint64_t used;           // evals count when it last ran
         uint64_t feat_used;      // evals count when feat last ran: behind used while the size runs on another's
+        uint64_t feat_fence;     // the submission that last created or evaluated feat (vk_exec_recording_fence)
     } sizes[DLSS_SIZES], *last;  // last: the one the previous DLAA frame ran with
     struct Size *host;           // the one whose feature that frame ran on: last, or the DLSS mode's (range_host)
     int stepped;                 // this evaluation: another render size than the last one's, on the same feature
@@ -727,8 +729,171 @@ static int idle_free(void) {
     return m;
 }
 
-// The images and views of a size, then its feature. The device must be idle: free_size waits for it, vk_dlaa_release
-// has. Whatever was not made is skipped, so a half-made size goes the same way.
+// The upscalers' waits for the device to be idle before they free what the GPU may still use (vk_dlaa.c, vk_ffx.cpp,
+// vk_ffx4.cpp), with the queue lock held: the present's flip, the completion thread's hold release and every upload
+// submit wait as long. NX2NAVI_TRACE=perf names them "upscaler GPU waits" on a slow frame's line, together with
+// vk_upscaler_gpu_wait's timeline waits after a refused creation, which touch no queue.
+void vk_upscaler_device_idle(void) {
+    uint64_t t0 = perf_mark_begin();
+    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+    perf_mark_end(PERF_M_UPWAIT, t0, 0);
+}
+
+// A DLSS feature's release, timed as "upscaler releases" (NX2NAVI_TRACE=perf).
+static void feat_release(NgxHandle *f) {
+    uint64_t t0 = perf_mark_begin();
+    N.release(f);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
+}
+
+// ---- what the upscalers let go of while the GPU may still use it
+// A size's images and feature (a third scene size, a DLSS model change, a size unused for SIZE_STALE evaluations), the
+// features release_kept and stale_sizes release, a snapshot of the reactive mask, the HUD-less picture of another size,
+// prebloom's images, what retire_idle gives back, and FSR 3.1's and FSR 4's contexts (vk_ffx.cpp, vk_ffx4.cpp
+// context_for) were freed after a wait for the whole device to be idle, on the replaying thread with the queue lock
+// held: the present's flip, the completion thread's hold release and every upload submit waited as long, at each
+// pause-screen size, reload, window size, dynamic resolution step or mode change (16 to 45 ms in play together with a
+// DLSS feature's create). Nothing waits for them now:
+// - images only the replay uses go to vk_memory.c's deferred destruction (vk_defer_image, vk_defer_view), stamped with
+//   the submission being recorded, which comes after every submission that can name them;
+// - a DLSS feature goes into dead with the fence of the last submission that created or evaluated it (feat_fence) and
+//   is released once the GPU is past it, which is what NGX asks of a feature's release; on this thread, which makes
+//   every NGX call (NGX is not thread safe);
+// - an image frame generation can read at a present (a size's motion vectors, the HUD-less picture) goes into dead
+//   behind a present gate (FG_LATE_PRESENTS), and from there to the deferred destruction;
+// - FSR contexts go into lists of their own in vk_ffx.cpp and vk_ffx4.cpp, taken at the same points.
+// The lists are taken at every evaluation (evaluate), at every pass while none runs (retire_idle), and where something
+// is let go of (vk_upscaler_let_go). What still waits: a feature or context creation refused while ones let go of are
+// in flight waits for the GPU to pass those (vk_upscaler_gpu_wait), and a full list for the device (vk_upscaler_settle).
+// NX2NAVI_UPSCALER_IDLE_WAIT=1 waits for the device wherever something is let go of, as up to 0.10.1, but does not
+// bring 0.10.1 back exactly: what was let go of still goes through these lists and the deferred destruction, an image a
+// present reads keeps its present gate, what the submission being recorded names stays until it is done, and a refused
+// DLSS creation with features let go of still listed waits and tries again, where 0.10.1 turned DLAA off.
+enum { UPD_FEAT = 1, UPD_IMG, UPD_VIEW };   // dead's kinds: a DLSS feature, an image with its allocation (aux), a view
+static UpdList dead;   // DLAA's hook thread only (vk_dlaa_pass and what it runs), as evaluate's state
+// A vk_dlaa.c image frame generation can read at a present goes this many presents after it was let go of. present_image
+// (vk_backend.c) calls vk_dlaa_frame before it waits for the present thread to take the job before it, so 3 presents
+// on, the present job that last read it has been submitted and flipped; 1 more for a present from another thread than
+// the submitting one; and 4 more for frame generation that reads it during the flip on queues of its own (vk_dlssg.c:
+// inputs valid until the present), which no timeline value of ours covers. The deferred destruction then stamps it with
+// the submission being recorded, which comes after those presents.
+#define FG_LATE_PRESENTS 8
+
+// D.presents from the hook thread (vk_dlaa_frame counts it on the presenting thread).
+static uint64_t presents_now(void) { return __atomic_load_n(&D.presents, __ATOMIC_RELAXED); }
+
+// NX2NAVI_UPSCALER_IDLE_WAIT, read once: 1 waits for the device wherever an upscaler lets go of something.
+int vk_upscaler_idle_wait(void) {
+    static int m = -1;
+    if (m < 0) m = cfg_int("NX2NAVI_UPSCALER_IDLE_WAIT") == 1;
+    return m;
+}
+
+// One entry of dead, as upd_take hands it out, timed as "upscaler releases". teardown (vk_dlaa_release: the device is
+// idle and about to go): images and views are destroyed at once.
+static void dead_release(const UpdEntry *e, void *teardown) {
+    const VkCtx *c = vk_ctx();
+    uint64_t t0 = perf_mark_begin();
+    if (e->kind == UPD_FEAT) {
+        if (N.release) N.release((NgxHandle *)e->handle);
+    } else if (e->kind == UPD_VIEW) {
+        if (teardown) vkDestroyImageView(c->device, (VkImageView)e->handle, NULL);
+        else vk_defer_view((VkImageView)e->handle);
+    } else if (e->kind == UPD_IMG) {
+        if (teardown) vmaDestroyImage(c->vma, (VkImage)e->handle, (VmaAllocation)e->aux);
+        else vk_defer_image((VkImage)e->handle, (VmaAllocation)e->aux);
+    }
+    perf_mark_end(PERF_M_UPREL, t0, 0);
+}
+
+// What the upscalers let go of goes once the GPU is past it: DLSS's here, FSR's in vk_ffx.cpp and vk_ffx4.cpp.
+static void upscalers_drain(void) {
+    const uint64_t done = vk_sync_fence_done();
+    if (dead.n) upd_take(&dead, done, presents_now(), dead_release, NULL);
+    vk_ffx_dead_take(done);   // returns at once with both of its lists empty
+}
+
+// A wait for the device, then everything the upscalers let go of that a submission made so far names goes. An image a
+// present can read keeps its present gate: the device's idle does not cover a present still to come.
+void vk_upscaler_settle(void) {
+    const uint64_t issued = vk_sync_issued();   // read before the wait: every submission up to it is done after it
+    vk_upscaler_device_idle();
+    upd_take(&dead, issued, presents_now(), dead_release, NULL);
+    vk_ffx_dead_take(issued);
+}
+
+void vk_upscaler_let_go(void) {
+    if (vk_upscaler_idle_wait()) vk_upscaler_settle();
+    else upscalers_drain();
+}
+
+uint64_t vk_upscaler_gpu_wait(uint64_t v) {
+    const uint64_t issued = vk_sync_issued();
+    if (vk_upscaler_idle_wait()) {
+        vk_upscaler_device_idle();
+        return issued;
+    }
+    if (v > issued) v = issued;   // a submission still being recorded cannot finish while this thread records it
+    if (v <= vk_sync_fence_done()) return v;
+    uint64_t t0 = perf_mark_begin();
+    vk_queue_lock(), vk_queue_unlock();   // the replay's held submissions go to the queue (gfx_present.c vk_queue_lock)
+    // a wait on the timeline from the host touches no queue, so no queue's lock is needed (unlike the device's idle)
+    const VkCtx *c = vk_ctx();
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                              .pSemaphores = &c->timeline, .pValues = &v};
+    VkResult r = vkWaitSemaphores(c->device, &wi, 2000000000ull);
+    perf_mark_end(PERF_M_UPWAIT, t0, 0);
+    if (r == VK_SUCCESS) return v;
+    vk_device_lost_check(r, "the upscaler's wait for the GPU");
+    rt_log("dlaa: the wait for the GPU to pass submission %llu failed (%d): waiting for the device instead",
+           (unsigned long long)v, (int)r);
+    vk_upscaler_device_idle();
+    return issued;
+}
+
+static void dead_put(int kind, void *h, void *aux, uint64_t fence, uint64_t presents) {
+    if (upd_put(&dead, kind, h, aux, fence, presents)) return;
+    // Full, which the GPU's progress and the presents do not let happen: room after a wait for the device, and if a
+    // present gate still holds every entry, they all go as before this list, the device idle.
+    static int told;
+    if (told++ < 4) rt_log("dlaa: %d things DLSS let go of still wait for the GPU or a present: a wait for the device",
+                           UPD_SLOTS);
+    vk_upscaler_settle();
+    if (upd_put(&dead, kind, h, aux, fence, presents)) return;
+    upd_take_all(&dead, dead_release, NULL);
+    upd_put(&dead, kind, h, aux, fence, presents);
+}
+
+// A size let go of while the GPU may still use it: the images only the replay uses to the deferred destruction, the
+// motion vectors (frame generation's, D.fg_mv) behind the present gate, the feature once the GPU is past its last
+// create or evaluation. The entry is free at once.
+static void retire_size(struct Size *e) {
+    vk_defer_view(e->out_view), vk_defer_image(e->out, e->out_mem);
+    vk_defer_view(e->sharp_view), vk_defer_image(e->sharp, e->sharp_mem);
+    vk_defer_view(e->mask_view), vk_defer_image(e->mask, e->mask_mem);
+    for (int i = 0; i < 2; i++) {
+        vk_defer_view(e->chars_view[i]), vk_defer_image(e->chars[i], e->chars_mem[i]);
+        vk_defer_view(e->dist_view[i]), vk_defer_image(e->dist[i], e->dist_mem[i]);
+    }
+    const uint64_t gate = presents_now() + FG_LATE_PRESENTS;
+    dead_put(UPD_VIEW, e->mv_view, NULL, 0, gate);   // a view before its image: upd_take and vk_memory.c keep the order
+    dead_put(UPD_IMG, e->mv, e->mv_mem, 0, gate);
+    if (e->feat) dead_put(UPD_FEAT, e->feat, NULL, e->feat_fence, 0), feat_released = 1;
+    if (D.host == e) D.host = NULL;
+    memset(e, 0, sizeof *e);
+}
+
+// A size's feature alone (release_kept, stale_sizes), released once the GPU is past its last create or evaluation.
+// count: it counts as a release for release_kept's next call (feat_released).
+static void retire_feat(struct Size *s, int count) {
+    dead_put(UPD_FEAT, s->feat, NULL, s->feat_fence, 0);
+    s->feat = NULL;
+    if (count) feat_released = 1;
+}
+
+// The images and views of a size, then its feature. The device must be idle, or the GPU past every use of them:
+// vk_dlaa_release (teardown), idle_release (unused for IDLE_FREE_PRESENTS presents). Whatever was not made is
+// skipped, so a half-made size goes the same way.
 static void destroy_size(struct Size *e) {
     const VkCtx *c = vk_ctx();
     if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
@@ -745,14 +910,15 @@ static void destroy_size(struct Size *e) {
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
         if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
     }
-    if (e->feat && N.release) N.release(e->feat), feat_released = 1;
+    if (e->feat && N.release) feat_release(e->feat), feat_released = 1;
     if (D.host == e) D.host = NULL;
     memset(e, 0, sizeof *e);
 }
 
+// A third scene size takes the least recently used one's entry (size_for): its images may still be in flight.
 static void free_size(struct Size *e) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
-    destroy_size(e);
+    retire_size(e);
+    vk_upscaler_let_go();
 }
 
 // The entry for a scene and output size: its output (RGBA16F at the output size, written by DLSS, then blitted into
@@ -1410,7 +1576,8 @@ fail:
     return 0;
 }
 
-// A snapshot's images and views. The device must be idle: free_snap waits for it, vk_dlaa_release has.
+// A snapshot's images and views. The device must be idle (vk_dlaa_release), or the GPU never used them (snap_for's
+// half-made pair).
 static void destroy_snap(struct Snap *s) {
     const VkCtx *c = vk_ctx();
     if (s->before_view) vkDestroyImageView(c->device, s->before_view, NULL);
@@ -1420,9 +1587,16 @@ static void destroy_snap(struct Snap *s) {
     memset(s, 0, sizeof *s);
 }
 
+// The same for a snapshot the GPU may still use (only the replay reads it): to the deferred destruction.
+static void retire_snap(struct Snap *s) {
+    vk_defer_view(s->before_view), vk_defer_view(s->mask_view);
+    vk_defer_image(s->before, s->before_mem), vk_defer_image(s->mask, s->mask_mem);
+    memset(s, 0, sizeof *s);
+}
+
 static void free_snap(struct Snap *s) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
-    destroy_snap(s);
+    retire_snap(s);   // a fourth size: the evicted images may still be in flight
+    vk_upscaler_let_go();
 }
 
 static struct Snap *snap_for(VkCommandBuffer cb, uint32_t w, uint32_t h, VkFormat f) {
@@ -1437,7 +1611,7 @@ static struct Snap *snap_for(VkCommandBuffer cb, uint32_t w, uint32_t h, VkForma
     VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!image2d(w, h, f, u, &e->before, &e->before_mem, &e->before_view) ||
         !image2d(w, h, VK_FORMAT_R8_UNORM, u | VK_IMAGE_USAGE_STORAGE_BIT, &e->mask, &e->mask_mem, &e->mask_view)) {
-        free_snap(e);
+        destroy_snap(e);   // what was made of the pair, never used (an evicted one's images went above)
         return NULL;
     }
     VkImageMemoryBarrier2 ib[2];
@@ -1511,6 +1685,17 @@ static void hl_destroy(void) {
     D.hl_view = VK_NULL_HANDLE, D.hl = D.hl_srgb = VK_NULL_HANDLE;
 }
 
+// The same for a HUD-less picture the GPU may still use: D.hl, which a present copies for frame generation
+// (gfx_present.c hudless_record), behind the present gate; the sRGB copy, which only the replay uses, to the deferred
+// destruction.
+static void retire_hl(void) {
+    const uint64_t gate = presents_now() + FG_LATE_PRESENTS;
+    dead_put(UPD_VIEW, D.hl_view, NULL, 0, gate);
+    dead_put(UPD_IMG, D.hl, D.hl_mem, 0, gate);
+    vk_defer_image(D.hl_srgb, D.hl_srgb_mem);
+    D.hl_view = VK_NULL_HANDLE, D.hl = D.hl_srgb = VK_NULL_HANDLE;
+}
+
 // The device is idle here. Release NGX features and parameters before their Vulkan resources, then shut down NGX even
 // if initialization succeeded but the layout check failed. The Linux core's Shutdown1 takes an extra output pointer
 // compared with the SDK's public wrapper; it reports the number of devices still using NGX.
@@ -1568,6 +1753,7 @@ void vk_dlaa_release(void) {
 #ifndef _WIN32
     const VkCtx *c = vk_ctx();
     if (!c) return;
+    upd_take_all(&dead, dead_release, (void *)1);   // what was let go of: the features before NGX goes, the images at once
     for (int i = 0; i < 5; i++)
         if (D.sizes[i].feat) N.release(D.sizes[i].feat), D.sizes[i].feat = NULL;
     if (FG.feat) N.release(FG.feat);   // frame generation's feature and parameters (vk_ngxfg_evaluate), before NGX goes
@@ -1863,11 +2049,13 @@ static void query_vram(void) {
 }
 
 // Frees the sizes other than cur that no evaluation used for SIZE_STALE evaluations: the GPU finished with them long
-// ago (the CPU is never that many presents ahead), so their images and feature go at once. host is the size whose
-// feature cur ran on (cur itself, or the DLSS mode's: range_host), which stays as well. A size that is in use on
-// another's feature can still hold one of its own from before that other was made: unused as long, it goes alone.
+// ago (the CPU is never that many presents ahead), so their images and feature go at once (retire_size, the drain in
+// vk_upscaler_let_go). host is the size whose feature cur ran on (cur itself, or the DLSS mode's: range_host), which
+// stays as well. A size that is in use on another's feature can still hold one of its own from before that other was
+// made: unused as long, it goes alone.
 static void stale_sizes(const struct Size *cur, const struct Size *host) {
     if (!idle_free()) return;
+    int any = 0;
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
         if (s == host || !s->out) continue;
@@ -1875,32 +2063,43 @@ static void stale_sizes(const struct Size *cur, const struct Size *host) {
             rt_log("dlaa: the DLSS feature at %ux%u -> %ux%u went unused for %d frames: freed", s->w, s->h, s->ow, s->oh,
                    SIZE_STALE);
             if (D.last == s) D.last = NULL;
-            free_size(s);
+            retire_size(s), any = 1;
         } else if (s->feat && D.evals >= s->feat_used + SIZE_STALE) {
             rt_log("dlaa: the DLSS feature at %ux%u -> %ux%u went unused for %d frames while its size ran on another "
                    "size's: released", s->w, s->h, s->ow, s->oh, SIZE_STALE);
-            vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-            N.release(s->feat), s->feat = NULL, feat_released = 1;
+            retire_feat(s, 1), any = 1;
         }
     }
+    if (any) vk_upscaler_let_go();
 }
 
 // Before a feature is made: the features of the other sizes with a larger input go, or all of them (all: a feature was
 // released since the last creation, feat_released); their images stay. The GPU may still be running an evaluation of
-// theirs, so it finishes first, as in free_size.
+// theirs: those whose last submission it has passed are released here, before the creation, and the others once it
+// has (retire_feat, vk_upscaler_let_go), after it. None of them is evaluated again: its size makes a new one.
 static void release_kept(const struct Size *making, int all) {
     int n = 0;
+    NgxHandle *mine[DLSS_SIZES];   // this call's features, to tell them in dead from those let go of before
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
         if (s == making || !s->feat) continue;
         if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
-        if (!n++) vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-        N.release(s->feat), s->feat = NULL;
+        mine[n] = s->feat;
+        retire_feat(s, 0), n++;
         if (D.last == s) D.last = NULL;
         if (D.host == s) D.host = NULL;
     }
-    if (n) rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used", n,
-                  making->w, making->h, all ? "after a release" : "larger inputs");
+    if (!n) return;
+    vk_upscaler_let_go();
+    // this call's features still in dead: the GPU is not past their last frame (a feature goes into dead once and
+    // leaves it only through its release, and no feature is made in between, so a handle there is one of them)
+    int left = 0;
+    for (int i = 0; i < dead.n; i++)
+        for (int j = 0; j < n; j++) left += dead.e[i].kind == UPD_FEAT && dead.e[i].handle == (void *)mine[j];
+    char later[80] = "";
+    if (left) snprintf(later, sizeof later, "; %d of them once the GPU is past their last frame", left);
+    rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used%s", n,
+           making->w, making->h, all ? "after a release" : "larger inputs", later);
 }
 
 // The outer columns and rows of what a jittered pass draws into. The jitter moves the scene's viewport by under half a
@@ -2200,6 +2399,7 @@ static volatile int32_t size_changed;
 static void fg_only_frame(VkExec *ex, const VkExecTarget *dst);
 
 static void evaluate(VkExec *ex, const VkExecTarget *dst) {
+    upscalers_drain();   // once a frame while the upscaler or frame generation's inputs run: what the GPU is past goes
     if (D.fgo) {   // no upscaler: frame generation's inputs alone, at the same point of the frame
         fg_only_frame(ex, dst);
         return;
@@ -2213,7 +2413,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     vk_gpu_gap_note(VK_GAP_UPSCALER, (uint64_t)ow * oh);
     if (D.preset_dirty) {   // another model: features are created with it, so every size gets a new one
         for (int i = 0; i < DLSS_SIZES; i++)
-            if (D.sizes[i].out) free_size(&D.sizes[i]);
+            if (D.sizes[i].out) retire_size(&D.sizes[i]);
+        vk_upscaler_let_go();
         D.last = NULL, D.preset_dirty = 0;
     }
     struct Size *e = size_for(cb, w, h, ow, oh);
@@ -2230,8 +2431,10 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         }
         D.pre_at = at;
     }
-    // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
-    // checks below, which would send the rest of this function to DLSS's path without NGX after all.
+    // Read once: vk_dlaa_frame runs between replays under the submission lock (vk_backend.c frame_end: at the present,
+    // first thing in the next submission, or on the present thread before the frame's blit), but at the present with
+    // NX2NAVI_PRESENT_ORDER=0, where it can clear fsr_frame while this replay is between the checks below, which would
+    // send the rest of this function to DLSS's path without NGX after all.
     const int fsr = use_fsr();
     // The size whose DLSS feature this frame runs on: its own, or the DLSS mode's while that one takes this render size
     // (range_host). On another size's feature DLSS reads a sub-rectangle of this frame's render size from each input.
@@ -2256,6 +2459,21 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
+    // NX2NAVI_DLAA_JITTER_TEST=<x>,<y> (test, read once): the upscaler is told the jitter the scene was drawn with
+    // times these two factors. NVIDIA's DLSS guide gives no sign for the offsets against the projection's shift and
+    // says to find it by trying (8.4.1: its development library negates, halves or doubles an axis by a key): the
+    // picture of a still scene is sharp and stands still only with the right ones. The scene, the motion vectors and
+    // frame generation keep the real jitter.
+    static float jt[2] = {1.0f, 1.0f};
+    static int jt_read;
+    if (!jt_read) {
+        jt_read = 1;
+        const char *s = cfg_get("NX2NAVI_DLAA_JITTER_TEST");
+        if (s && *s && sscanf(s, "%f,%f", &jt[0], &jt[1]) == 2)
+            rt_log("dlaa: the upscaler is told the jitter times %g, %g (NX2NAVI_DLAA_JITTER_TEST, a test)", jt[0], jt[1]);
+        else jt[0] = jt[1] = 1.0f;
+    }
+    const float tjx = jx * jt[0], tjy = jy * jt[1];
     edge_fill(cb, t, z, D.jit_used);   // before the motion vectors read the depth
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // NX2NAVI_DLAA_MV=0: zero motion (test)
@@ -2287,7 +2505,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
                    fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
         VkFfxCamera fcam;
         if (!vk_dlaa_ffx_camera(&fcam)) memset(&fcam, 0, sizeof fcam);   // no camera this frame: FSR's fixed values
-        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, &fcam))
+        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, tjx, tjy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, &fcam))
             return dl_fail("FSR 3.1", 0);
         static int told;
         if (!told++) rt_log("dlaa: FSR 3.1 at %ux%u -> %ux%u (scene format %d, depth format %d)", w, h, ow, oh,
@@ -2300,8 +2518,6 @@ own_feature:
         // The feature is made for the size of its entry: this frame's own, or the larger one of the DLSS mode's, which
         // was released since (release_kept) and takes this frame's size as a sub-rectangle.
         const uint32_t fw = host->w, fh = host->h;
-        // NX2NAVI_TRACE=perf: the release of the kept features (a device idle wait) and the create, as one mark
-        uint64_t t0 = perf_mark_begin();
         if (idle_free() != 2) release_kept(host, feat_released);
         feat_released = 0;
         p_setu(p, "CreationNodeMask", 1);
@@ -2325,9 +2541,29 @@ own_feature:
         p_setu(p, "DLSS.Hint.Render.Preset.Balanced", (unsigned)pk);
         p_setu(p, "DLSS.Hint.Render.Preset.Performance", (unsigned)pm);
         p_setu(p, "DLSS.Hint.Render.Preset.UltraPerformance", (unsigned)pl);
+        // NX2NAVI_TRACE=perf: the create alone; the wait and the releases of release_kept have marks of their own
+        uint64_t t0 = perf_mark_begin();
         NgxResult r = N.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &host->feat);
         perf_mark_end(PERF_M_NGX, t0, 0);
+        const int inflight = !NGX_OK(r) || !host->feat ? upd_count(&dead, UPD_FEAT) : 0;
+        if (inflight) {
+            // Refused while features let go of are still in flight (release_kept, retire_size): their video memory, or
+            // NGX's refusal of a feature with the parameters of a live one. The GPU finishes with them, they go, and the
+            // creation is tried once more: the only wait left on this path, for those features, not for the device.
+            const NgxResult r0 = r;
+            const uint64_t w0 = plat_now_ns();
+            upd_take(&dead, vk_upscaler_gpu_wait(upd_max_fence(&dead)), presents_now(), dead_release, NULL);
+            const double waited = (plat_now_ns() - w0) / 1e6;
+            host->feat = NULL;
+            t0 = perf_mark_begin();
+            r = N.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &host->feat);
+            perf_mark_end(PERF_M_NGX, t0, 0);
+            rt_log("dlaa: DLSS feature creation refused (%08x) with %d released feature(s) still in flight: waited %.1f "
+                   "ms for them, %s", (unsigned)r0, inflight, waited,
+                   NGX_OK(r) && host->feat ? "made at the second try" : "refused again");
+        }
         if (!NGX_OK(r) || !host->feat) return dl_fail("DLSS feature creation", r);
+        host->feat_fence = vk_exec_recording_fence();   // NGX records the creation into cb
         D.reset = 1, D.steps_made += step;
         int q = perf_quality(fw, ow), pr = q == 0 ? pm : q == 3 ? pl : pk;
         rt_log("dlaa: DLSS feature created at %ux%u -> %ux%u, quality value %d, preset %c (scene format %d, depth format "
@@ -2344,8 +2580,8 @@ own_feature:
     p_setp(p, "Output", &ro);
     p_setp(p, "Depth", &rz);
     p_setp(p, "MotionVectors", &rm);
-    p_setf(p, "Jitter.Offset.X", jx);
-    p_setf(p, "Jitter.Offset.Y", jy);
+    p_setf(p, "Jitter.Offset.X", tjx);
+    p_setf(p, "Jitter.Offset.Y", tjy);
     p_setf(p, "Sharpness", 0.0f);
     p_seti(p, "Reset", D.reset);
     // One bias mask: the reactive one (NX2NAVI_DLSS_REACTIVE, a test) where it ran, else the characters' (mv_pass), else
@@ -2380,6 +2616,7 @@ own_feature:
     p_setf(p, "FrameTimeDeltaInMsec", frame_ms);
     c0 = timed ? kern_now_ns() : 0;
     NgxResult r = N.evaluate(cb, host->feat, p, NULL);
+    host->feat_fence = vk_exec_recording_fence();   // recorded into cb (a refusal too, for all this side knows)
     if (timed) T.cpu_ngx += kern_now_ns() - c0;
     if (!NGX_OK(r) && host != e) {
         // DLSS refused this render size on the feature of another, inside the range it reported (range_note). Every
@@ -2477,8 +2714,8 @@ static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32
     if (vk_hdr_native()) return;
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
-        hl_destroy();
+        retire_hl();   // the presents of the last frames may still read it
+        vk_upscaler_let_go();
     }
     if (!D.hl) {
         VkImageView v2 = VK_NULL_HANDLE;
@@ -2595,13 +2832,22 @@ static void pb_destroy(void) {
     memset(&PB, 0, sizeof PB);
 }
 
-// The two images at w x h, made again for another picture size (the old ones after the device is idle, as hudless).
+// The same for images the GPU may still use (only the replay reads them): to the deferred destruction. PB.used stays.
+static void retire_pb(void) {
+    vk_defer_view(PB.scene_view), vk_defer_view(PB.comp_view);
+    vk_defer_image(PB.scene, PB.scene_mem), vk_defer_image(PB.comp, PB.comp_mem);
+    const uint64_t used = PB.used;
+    memset(&PB, 0, sizeof PB);
+    PB.used = used;
+}
+
+// The two images at w x h, made again for another picture size (the old ones once the GPU is past them, as hudless).
 static int pb_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     PB.used = D.presents;
     if (PB.scene && PB.w == w && PB.h == h) return 1;
     if (PB.scene || PB.comp) {
-        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-        pb_destroy();
+        retire_pb();
+        vk_upscaler_let_go();
     }
     VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -2625,7 +2871,9 @@ static int pb_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2,
                            .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(cb, &di);
-    PB.w = w, PB.h = h;
+    // noted again once the new images exist, after any clear of PB above (retire_pb keeps it, pb_destroy would not):
+    // at 0, idle_release takes images this frame draws into for 600 presents unused and frees them at the next present
+    PB.w = w, PB.h = h, PB.used = D.presents;
     rt_log("dlaa: prebloom: the passes after the upscaler draw at %ux%u (two B10G11R11 images, %.0f MiB)", w, h,
            2.0 * w * h * 4 / 1048576.0);
     return 1;
@@ -2815,9 +3063,9 @@ void vk_dlaa_upscaler(VkExec *ex, VkImage out, VkFormat fmt, uint32_t w, uint32_
 // reach stayed for the process: the reactive mask's snapshots, the FSR 3.1 and FSR 4 upscale contexts, and the DLSS
 // sizes after a failure (dl_fail turns the upscaler off without the setting changing, so D.on stays set). They go
 // here, RETIRE_PRESENTS presents after the upscaler stopped running and frame generation stopped making inputs of its
-// own from a size (inputs_on), on the replay thread, which makes every evaluation, after a wait for the device to be
-// idle, as free_size does for a size it replaces. Switched on again, the upscaler makes them anew, as at its first
-// frame in a run.
+// own from a size (inputs_on), on the replay thread, which makes every evaluation, once the GPU is past them, as
+// free_size does for a size it replaces. Switched on again, the upscaler makes them anew, as at its first frame in a
+// run.
 #define RETIRE_PRESENTS 600
 static uint64_t retire_off_at;   // replay: D.presents when the upscaler stopped running
 static uint64_t retired_n;       // replay: times this gave memory back
@@ -2832,7 +3080,9 @@ static int up_holds(void) {
 }
 
 static void retire_idle(void) {
-    uint64_t now = __atomic_load_n(&D.presents, __ATOMIC_RELAXED);
+    uint64_t now = presents_now();
+    // no evaluation runs to take what the upscalers let go of (evaluate): it goes here once the GPU is past it
+    if (!inputs_on()) upscalers_drain();
     if (!idle_free()) return;   // as idle_release
     if (inputs_on()) {   // the upscaler runs, or frame generation alone makes its inputs from a size (D.fgo)
         retire_off_at = 0;
@@ -2840,13 +3090,13 @@ static void retire_idle(void) {
     }
     if (!retire_off_at) retire_off_at = now ? now : 1;
     if (now < retire_off_at + RETIRE_PRESENTS || !up_holds()) return;
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-    for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
+    for (int i = 0; i < SNAPS; i++) retire_snap(&R.s[i]);
     vk_ffx_release_idle();
     if (D.failed) {   // as idle_release does for a size: frame generation is handed nothing of one from here on
-        for (int i = 0; i < DLSS_SIZES; i++) destroy_size(&D.sizes[i]);
+        for (int i = 0; i < DLSS_SIZES; i++) retire_size(&D.sizes[i]);
         D.last = NULL, D.host = NULL, D.fg_fresh = 0, D.fg_mv_view = VK_NULL_HANDLE, D.fg_mv = (VkFfxImage){0};
     }
+    vk_upscaler_let_go();
     retired_n++;
     rt_log("dlaa: the upscaler has not run for %d presents (%s): its mask snapshots and FSR contexts%s are freed (%llu "
            "time(s)); made again when it runs", RETIRE_PRESENTS, D.failed ? "it failed" : "switched off",
@@ -2994,8 +3244,20 @@ static void dlss_mode(void) {
         bias_on = -1;
     }
     int b = dl_active();
-    if (b != bias_on)
-        bias_on = b, vk_sampler_dlss_bias(b ? res_dlss_lod_bias() + (jitter_on() ? JITTER_LOD_BIAS : 0.0f) : 0.0f);
+    if (b != bias_on) {
+        // NX2NAVI_DLSS_LOD_BIAS_TEST=<bias> (test, read once): this bias in the place of the rule's while an upscaler
+        // runs, 0 for none: what the rule's bias does to the picture is the difference between two runs.
+        static float test;
+        static int test_on = -1;
+        if (test_on < 0) {
+            const char *s = cfg_get("NX2NAVI_DLSS_LOD_BIAS_TEST");
+            test_on = s && *s;
+            if (test_on) test = (float)atof(s), rt_log("dlaa: texture LOD bias %g while an upscaler runs "
+                                                       "(NX2NAVI_DLSS_LOD_BIAS_TEST, a test)", test);
+        }
+        float rule = res_dlss_lod_bias() + (jitter_on() ? JITTER_LOD_BIAS : 0.0f);
+        bias_on = b, vk_sampler_dlss_bias(b ? (test_on ? test : rule) : 0.0f);
+    }
 }
 
 
@@ -3019,15 +3281,18 @@ static void preset_check(void) {
 // intact (Ultra Performance and DLAA). Measured by capturing every present over six mode changes, 2026-11-10: bad
 // frames 3 and 5 presents after the change, with every other setting the same. evaluate notes a scene of another size;
 // vk_dlaa_frame counts the presents since a setting last changed, so a game that draws two sizes in turn holds nothing.
-static int setting_presents;            // vk_dlaa_frame: presents left in which that counts as a mode change
+// setting_presents: presents left in which that counts as a mode change. vk_dlaa_frame sets and counts it down on the
+// thread that runs the frame's bookkeeping, vk_dlaa_resized_take clears it at the present (vk_backend.c frame_hold):
+// atomics.
+static int setting_presents;
 #define SETTING_PRESENTS 60
 
-// vk_backend.c frame_hold, each present after vk_dlaa_frame: 1 once when the scene took a new size after a setting
+// vk_backend.c frame_hold, at each present (that frame's vk_dlaa_frame may come one submission later,
+// vk_frame_owed.h): 1 once when the scene took a new size after a setting
 // changed. The previous picture then stays on screen over the frames described above.
 int vk_dlaa_resized_take(void) {
-    if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL) || !setting_presents) return 0;
-    setting_presents = 0;
-    return 1;
+    if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL)) return 0;
+    return __atomic_exchange_n(&setting_presents, 0, __ATOMIC_ACQ_REL) != 0;
 }
 
 // What DLSS holds while nothing uses it (NX2NAVI_DLSS_IDLE_FREE 1 or 2, the default 1). With the upscaler switched off
@@ -3064,7 +3329,7 @@ static void idle_release(void) {
             if (s->feat) {
                 rt_log("dlaa: the DLSS feature at %ux%u went unused for %d presents with the upscaler off: released; "
                        "its size's motion images stay for frame generation", s->w, s->h, IDLE_FREE_PRESENTS);
-                N.release(s->feat), s->feat = NULL, feat_released = 1;
+                feat_release(s->feat), s->feat = NULL, feat_released = 1;
             }
             if (D.host == s) D.host = NULL;
             continue;
@@ -3197,9 +3462,14 @@ void vk_dlaa_frame(void) {
     static unsigned cfg_seen;
     static int cfg_known;
     unsigned v = cfg_version();
-    D.presents++;
-    if (cfg_known && v != cfg_seen) setting_presents = SETTING_PRESENTS;
-    else if (setting_presents) setting_presents--;
+    __atomic_store_n(&D.presents, D.presents + 1, __ATOMIC_RELAXED);   // one writer; presents_now reads it unlocked
+    if (cfg_known && v != cfg_seen) {
+        __atomic_store_n(&setting_presents, SETTING_PRESENTS, __ATOMIC_RELAXED);
+    } else {   // down to 0, not past it: vk_dlaa_resized_take may clear it meanwhile
+        int s = __atomic_load_n(&setting_presents, __ATOMIC_RELAXED);
+        while (s > 0 &&
+               !__atomic_compare_exchange_n(&setting_presents, &s, s - 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    }
     cfg_seen = v, cfg_known = 1;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
     D.pre = D.comp = 0, D.comp_game = VK_NULL_HANDLE;   // the frame before was recorded up to its present

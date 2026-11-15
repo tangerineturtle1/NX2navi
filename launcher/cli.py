@@ -101,6 +101,12 @@ def run(a, ctx, held):
         return 0
 
     if a.cmd == 'update':
+        # The new version rebuilds the game (ContinueUpdateJob), which cannot replace a running exe: refused here
+        # before anything is downloaded, as the window's Updates row refuses (ui/app.py App.start_update)
+        gd = s.get('game_dir')
+        if gd and build.game_running(gd):
+            print('error: the game is running: close it first, the update rebuilds it', file=sys.stderr)
+            return 1
         check = jobs.CheckJob(ctx).run_inline()
         if check.result != 'ok' or not jobs.update_available(ctx, check.release):
             print(check.error or f'up to date: {ctx.version}')

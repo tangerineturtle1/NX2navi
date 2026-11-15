@@ -93,8 +93,6 @@ int vk_fg4_failed(void);                // ... it failed in this run, FSR 3.1's 
 int vk_fg4_active(void);                // ... its swapchain is in place
 const char *vk_fg4_name(void);          // ... the version the library runs here ("3.1.6", "4.0.2")
 int vk_texture_detail_auto(void);       // vk_texture.c: the texture detail auto picks on this card, 0 full to 2 low
-int vk_mesh_shader_native(void);        // vk_device.c: the GPU has mesh shaders (the mesh emulation does nothing)
-int vk_low_end_card(void);              // vk_device.c: no mesh shaders, or under 8 GiB of video memory
 int vk_exec_replay_workers_auto(const char **why);   // vk_exec.c: replay_workers = auto's count on this PC
 double frame_step_limit_hz(void);
 int frame_limit_adjustable(void);
@@ -878,6 +876,7 @@ static void row_fps_limit() {
     const char *note = rtss == 1   ? menu_text(UI_MENU_FPS_RTSS)
                        : rtss == 2 ? menu_text(UI_MENU_FPS_RTSS_READONLY)
                        : rtss == 3 ? menu_text(UI_MENU_FPS_RTSS_IGNORED)
+                       : rtss == 4 ? menu_text(UI_MENU_FPS_RTSS_TWO)
                                    : nullptr;
     opt_choice_list("NX2NAVI_FPS_LIMIT", UI_MENU_FPS_LIMIT, vals, names, n, UI_MENU_FPS_LIMIT_DESC, cur, note);
 }
@@ -1128,9 +1127,12 @@ static const char *hdr_note(void) {
     return note;
 }
 
-// HDR (vk_hdr.c), two kinds: the game's picture tone mapped to the display (1, one fixed look), switched on and off at
-// once, or the game's own HDR (native), which the game takes up at its start. The three brightness rows follow while
-// either is on.
+// HDR (vk_hdr.c), two kinds: the game's picture tone mapped to the display (1), switched on and off at once, or the
+// game's own HDR (native), which the game takes up at its start. The three brightness rows follow while either is on.
+// The tone mapped picture's own rows come after them (native HDR is the game's picture as it is): the tone mapper and
+// the gamma correction, which every tone mapper's picture gets, then the rows of the tone mapper chosen: none for the
+// game's curve, the grading rows of both others between the rows each has alone. All of them apply at once; their
+// defaults are one look (vk_hdr.c's head names it).
 static void row_hdr(void) {
     static const char *const values[] = {"0", "1", "native"};
     const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), menu_text(UI_MENU_HDR_TONEMAPPED), menu_text(UI_MENU_HDR_NATIVE)};
@@ -1139,6 +1141,35 @@ static void row_hdr(void) {
     opt_slider("NX2NAVI_HDR_PEAK_NITS", UI_MENU_HDR_PEAK, 400, 10000, UI_MENU_HDR_PEAK_DESC, 50, "%.0f nits");
     opt_slider("NX2NAVI_HDR_GAME_NITS", UI_MENU_HDR_GAME, 48, 500, UI_MENU_HDR_GAME_DESC, 1, "%.0f nits");
     opt_slider("NX2NAVI_HDR_UI_NITS", UI_MENU_HDR_UI, 48, 500, UI_MENU_HDR_UI_DESC, 1, "%.0f nits");
+    if (!strcmp(cfg_value("NX2NAVI_HDR"), "native")) return;
+    static const char *const curves[] = {"vanilla", "psychov35", "renodrt"};
+    static const char *const curve_names[] = {"Vanilla", "PsychoV35", "RenoDRT"};
+    opt_choice_list("NX2NAVI_HDR_TONEMAP", UI_MENU_HDR_TONEMAP, curves, curve_names, 3, UI_MENU_HDR_TONEMAP_DESC);
+    static const char *const gammas[] = {"off", "2.2", "2.4"};
+    const char *gamma_names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "2.2", "BT.1886 (2.4)"};
+    opt_choice_list("NX2NAVI_HDR_GAMMA", UI_MENU_HDR_GAMMA, gammas, gamma_names, 3, UI_MENU_HDR_GAMMA_DESC);
+    const char *curve = cfg_value("NX2NAVI_HDR_TONEMAP");
+    if (!strcmp(curve, "vanilla")) return;
+    const bool luminance = !strcmp(curve, "renodrt");   // else the observer-response mapper, as vk_hdr.c reads the setting
+    if (!luminance) {
+        static const char *const greys[] = {"render", "vanilla"};
+        static const char *const grey_names[] = {"Render", "Vanilla"};
+        opt_choice_list("NX2NAVI_HDR_MIDGRAY", UI_MENU_HDR_MIDGRAY, greys, grey_names, 2, UI_MENU_HDR_MIDGRAY_DESC);
+        opt_toggle("NX2NAVI_HDR_MATCH_SLOPE", UI_MENU_HDR_MATCH_SLOPE, UI_MENU_HDR_MATCH_SLOPE_DESC);
+        opt_slider("NX2NAVI_HDR_TONE_SLOPE", UI_MENU_HDR_TONE_SLOPE, 0, 100, UI_MENU_HDR_TONE_SLOPE_DESC, 1, "%.0f");
+        opt_slider("NX2NAVI_HDR_HUE_CLIP", UI_MENU_HDR_HUE_CLIP, 0, 100, UI_MENU_HDR_HUE_CLIP_DESC, 5, "%.0f %%");
+    }
+    opt_slider("NX2NAVI_HDR_EXPOSURE", UI_MENU_HDR_EXPOSURE, 0, 200, UI_MENU_HDR_EXPOSURE_DESC, 5, "%.0f %%");
+    opt_slider("NX2NAVI_HDR_HIGHLIGHTS", UI_MENU_HDR_HIGHLIGHTS, 0, 100, UI_MENU_HDR_HIGHLIGHTS_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_SHADOWS", UI_MENU_HDR_SHADOWS, 0, 100, UI_MENU_HDR_SHADOWS_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_CONTRAST", UI_MENU_HDR_CONTRAST, 0, 100, UI_MENU_HDR_CONTRAST_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_SATURATION", UI_MENU_HDR_SATURATION, 0, 100, UI_MENU_HDR_SATURATION_DESC, 1, "%.0f");
+    if (!luminance) return;
+    opt_slider("NX2NAVI_HDR_HIGHLIGHT_SAT", UI_MENU_HDR_HIGHLIGHT_SAT, 0, 100, UI_MENU_HDR_HIGHLIGHT_SAT_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_BLOWOUT", UI_MENU_HDR_BLOWOUT, 0, 100, UI_MENU_HDR_BLOWOUT_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_FLARE", UI_MENU_HDR_FLARE, 0, 100, UI_MENU_HDR_FLARE_DESC, 1, "%.0f");
+    opt_slider("NX2NAVI_HDR_HUE", UI_MENU_HDR_HUE, 0, 100, UI_MENU_HDR_HUE_DESC, 5, "%.0f %%");
+    opt_slider("NX2NAVI_HDR_GRADE", UI_MENU_HDR_GRADE, 0, 100, UI_MENU_HDR_GRADE_DESC, 5, "%.0f %%");
 }
 
 // DLSS frame generation's multiplier (NX2NAVI_FRAMEGEN_MULTIPLIER, vk_dlssg.c, at once): 2x, 3x or 4x as far as this
@@ -1470,7 +1501,6 @@ static void rows_saves(void) {
     if (line[0]) opt_text_str(line, warn);
 }
 
-static void rows_low_end(void);
 
 static void tab_game(float scale) {
     opt_begin("##game", scale);
@@ -1518,16 +1548,6 @@ static void tab_game(float scale) {
                             "of area: keep a copy of the save first.", on))
             opt_apply("NX2NAVI_DEBUG_MENU", on ? "0" : "1");
     }
-    // Last, as its own settings follow it while it is on (rows_low_end). cfg.c LOWEND: the defaults for older graphics
-    // cards, read at start.
-    // Offered on the cards it was written for (vk_low_end_card). On any other the row cannot turn the mode on; while
-    // the mode is on there (set earlier, or in nx2navi.ini) the row stays usable, to turn it off again.
-    if (!cfg_bool("NX2NAVI_LOW_END_GPU") && !cfg_low_end_active() && !vk_low_end_card())
-        opt_disable_next(UI_MENU_LOWEND_NOT_FOR_CARD);
-    opt_toggle("NX2NAVI_LOW_END_GPU", UI_MENU_LOW_END_GPU, UI_MENU_LOW_END_GPU_DESC);
-    // the mode's settings are read only while it is on (cfg.c LOWEND_ONLY), so their rows wait for the restart too
-    if (cfg_low_end_active()) rows_low_end();
-    else if (cfg_bool("NX2NAVI_LOW_END_GPU")) opt_text(UI_MENU_LOWEND_RESTART);
     opt_end();
 }
 
@@ -1736,78 +1756,6 @@ static void tab_controls(float scale) {
     binds_rows(scale);
     opt_end();
     binds_after_page();
-}
-
-// ---- the settings of the low-end GPU mode, under its switch in the Game tab while that is on (tab_game): each is read
-// where the code it sets reads it
-static void rows_low_end(void) {
-    opt_text(UI_MENU_LOWEND_INTRO);
-    opt_group(UI_MENU_LOWEND_MEMORY);
-    {   // vk_texture.c sweep_released
-        static const char *const values[] = {"", "512", "1024", "2048", "4096", "8192"};
-        const char *names[] = {menu_text(UI_MENU_AUTO), "512", "1024", "2048", "4096", "8192"};
-        opt_choice_list("NX2NAVI_TEX_RELEASED_MAX", UI_MENU_LOWEND_RELEASED, values, names, 6, UI_MENU_LOWEND_RELEASED_DESC);
-    }
-    opt_slider("NX2NAVI_MIRROR_HOT", UI_MENU_LOWEND_MIRROR_HOT, 0, 100, UI_MENU_LOWEND_MIRROR_HOT_DESC, 5, "%.0f %%");
-    {   // vk_device.c vram_heap_limits
-        static const char *const values[] = {"auto", "0"};
-        const char *names[] = {menu_text(UI_MENU_AUTO), menu_text(UI_MENU_OFF)};
-        opt_choice_list("NX2NAVI_VRAM_HEAP_LIMIT", UI_MENU_LOWEND_HEAP_LIMIT, values, names, 2, UI_MENU_LOWEND_HEAP_LIMIT_DESC);
-    }
-    {   // vk_vma_budget.c reserve_bytes
-        static const char *const values[] = {"512", "256", "768", "1024", "0"};
-        const char *names[] = {"512 MB", "256 MB", "768 MB", "1024 MB", menu_text(UI_MENU_OFF)};
-        opt_choice_list("NX2NAVI_VRAM_RESERVE_MB", UI_MENU_LOWEND_RESERVE, values, names, 5, UI_MENU_LOWEND_RESERVE_DESC);
-    }
-    {   // vk_memory.c upload_batch_cap
-        static const char *const values[] = {"128", "256", "512", "1024", "0"};
-        const char *names[] = {"128 MB", "256 MB", "512 MB", "1024 MB", menu_text(UI_MENU_LOWEND_NO_LIMIT)};
-        opt_choice_list("NX2NAVI_UPLOAD_BATCH_MB", UI_MENU_LOWEND_UPLOAD_BATCH, values, names, 5, UI_MENU_LOWEND_UPLOAD_BATCH_DESC);
-    }
-    opt_toggle("NX2NAVI_ASTC_SCRATCH_KEEP", UI_MENU_LOWEND_ASTC_KEEP, UI_MENU_LOWEND_ASTC_KEEP_DESC);
-    {   // vk_memory.c freeze_pass: submissions a region stays unwritten before it is frozen
-        static const char *const values[] = {"1800", "1200", "600", "60", "0"};
-        const char *names[] = {"1800", "1200", "600", "60", menu_text(UI_MENU_OFF)};
-        opt_choice_list("NX2NAVI_FREEZE_IDLE", UI_MENU_LOWEND_FREEZE, values, names, 5, UI_MENU_LOWEND_FREEZE_DESC);
-    }
-    {   // vk_sync.c res_mask: the result kinds the submit wait counts (31 all, 30 all but events)
-        static const char *const values[] = {"31", "30"};
-        const char *names[] = {menu_text(UI_MENU_LOWEND_RESULTS_ALL), menu_text(UI_MENU_LOWEND_RESULTS_NO_EVENTS)};
-        opt_choice_list("NX2NAVI_SUBMIT_FINISH_KINDS", UI_MENU_LOWEND_RESULTS, values, names, 2, UI_MENU_LOWEND_RESULTS_DESC);
-    }
-    opt_toggle("NX2NAVI_ZSTD_NATIVE", UI_MENU_LOWEND_ZSTD, UI_MENU_LOWEND_ZSTD_DESC);   // ov_zstd.c trusted
-    opt_group(UI_MENU_LOWEND_RENDER);
-    opt_toggle("NX2NAVI_REPLAY_ASYNC", UI_MENU_LOWEND_ASYNC, UI_MENU_LOWEND_ASYNC_DESC);   // vk_backend.c
-    const bool native = vk_mesh_shader_native() != 0;   // vk_exec_draw.c: the emulation only where the GPU lacks them
-    if (native) opt_disable_next(UI_MENU_LOWEND_MESH_NATIVE);
-    opt_toggle("NX2NAVI_MESH_EMULATION", UI_MENU_LOWEND_MESH_EMU, UI_MENU_LOWEND_MESH_EMU_DESC);
-    {   // vk_exec_draw.c foliage_skip
-        static const char *const values[] = {"full", "reduced", "off"};
-        const char *names[] = {menu_text(UI_MENU_LOWEND_FOLIAGE_FULL), menu_text(UI_MENU_LOWEND_FOLIAGE_REDUCED), menu_text(UI_MENU_OFF)};
-        opt_choice_list("NX2NAVI_FOLIAGE", UI_MENU_LOWEND_FOLIAGE, values, names, 3, UI_MENU_LOWEND_FOLIAGE_DESC);
-    }
-    if (native) opt_disable_next(UI_MENU_LOWEND_MESH_NATIVE);
-    opt_slider("NX2NAVI_MESH_EMU_MB", UI_MENU_LOWEND_MESH_MB, 64, 2048, UI_MENU_LOWEND_MESH_MB_DESC, 64, "%.0f MB");
-    if (native) opt_disable_next(UI_MENU_LOWEND_MESH_NATIVE);
-    opt_slider("NX2NAVI_MESH_EMU_TASKS", UI_MENU_LOWEND_MESH_TASKS, 4096, 65536, UI_MENU_LOWEND_MESH_TASKS_DESC, 4096, "%.0f");
-    if (native) opt_disable_next(UI_MENU_LOWEND_MESH_NATIVE);
-    opt_toggle("NX2NAVI_MESH_EMU_BATCH", UI_MENU_LOWEND_MESH_BATCH, UI_MENU_LOWEND_MESH_BATCH_DESC);   // vk_exec_draw.c
-    opt_toggle("NX2NAVI_TEX_CLOBBER", UI_MENU_LOWEND_CLOBBER, UI_MENU_LOWEND_CLOBBER_DESC);
-    static const UiTextId vec[] = {UI_MENU_OFF, UI_MENU_LOWEND_VEC_AUTO, UI_MENU_ON};   // gfx_shader.c patch_vec_index
-    opt_choice("NX2NAVI_VEC_INDEX_FIX", UI_MENU_LOWEND_VEC_INDEX, vec, 3, UI_MENU_LOWEND_VEC_INDEX_DESC);
-    opt_group(UI_MENU_LOWEND_BUILD);
-    // tools/make_game.py reads it from nx2navi.ini at the next Rebuild the Game (guest_opt_ini)
-    opt_toggle_value("NX2NAVI_GUEST_OPT", UI_MENU_LOWEND_GUEST_OPT, UI_MENU_LOWEND_GUEST_OPT_DESC, "2", "1",
-                     menu_text(UI_MENU_LOWEND_GUEST_OPT_NOTE));
-    opt_group(UI_MENU_LOWEND_DIAG);
-    opt_toggle("NX2NAVI_PASS_TIMES", UI_MENU_LOWEND_PASS_TIMES, UI_MENU_LOWEND_PASS_TIMES_DESC);   // vk_crumbs.c
-#ifdef _WIN32
-    {   // vk_dump.c: the keys it knows
-        static const char *const values[] = {"", "pause", "scrolllock", "insert", "f12"};
-        const char *names[] = {menu_text(UI_MENU_OFF), "Pause", "Scroll Lock", "Insert", "F12"};
-        opt_choice_list("NX2NAVI_DUMP_KEY", UI_MENU_LOWEND_DUMP_KEY, values, names, 5, UI_MENU_LOWEND_DUMP_KEY_DESC);
-    }
-#endif
 }
 
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,

@@ -1,0 +1,5 @@
+# Not kept in the repository (README.md, "In the repository"): the window's drawn pictures, the Triforce Setup a
+# release carries, and what make_handover.py writes.
+/bridge/launcher/art/
+/bridge/launcher/triforce/TriforceSetup.exe
+/release/

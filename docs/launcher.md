@@ -75,7 +75,10 @@ Customize Launcher (on the home screen) makes the look the player's own:
   Steam reads that file only when it starts and writes it back when it closes, so a running Steam is asked to close
   first and started again after. The shortcut runs the launcher's `pythonw.exe` on `data/steam_play.pyw`, which
   starts the launcher of `app/current.txt` with `--play`: the game starts as Play starts it, and the process waits
-  for it, so Steam counts the game as running while it is.
+  for it, so Steam counts the game as running while it is. Its end goes into the logs as Play's does, and a fatal
+  error or a crash gets a message box, as no window shows it. While the window or a command runs a job in the game
+  folder (the launcher folder's lock is held and `data/job-running.json` names the job), it does not start the
+  game, which would be the build that job is replacing, and a box says which job to wait for.
 
 The choices are `theme`, `custom_background`, `custom_panel`, `custom_buttons`, `background`, `background_dim`,
 `animations` and `sounds` in `data/launcher.json`.
@@ -513,7 +516,11 @@ stays playable and Rebuild the Game, or Begin Installation, goes on from the ste
    `tools/streamline_pin.py` pins. The script downloads that release once (cached in `toolchain/launcher-dl/`), checks
    the archive's size and sha256 and each file's sha256, and writes `dlssg-NOTICE.txt` with the two licence texts;
    `make_game.py` copies the whole set beside the game. `--streamline SDK` takes an SDK folder on disk instead (its
-   files must be the pinned ones).
+   files must be the pinned ones). The runtime takes a missing optional export for an older DLL and leaves that
+   feature out, Reflex's frame limit among them, so a DLL that lacks an export `runtime/dlssg/nx2_sl.h` declares fails
+   `tools/build_dlssg.py`, and the release stops on such a `--dlssg` DLL before anything is downloaded
+   (`make_launcher.py` `check_dlssg`; `make_kit.py` the same). `python tools/build_dlssg.py --check <dll>` makes that
+   check of a DLL built earlier.
 
    `--pgo FILE` puts an execution profile and its record in the release (`app/<version>/data`), and the prebuilt
    runtime is compiled with it; the release stops when the record names another `recomp/` than the checkout's, and
@@ -574,7 +581,9 @@ files), `start.pyw` on a version that cannot be imported (exit code 86 at once, 
 back to), a cut RomFS image and the free space, the object cache written while the compile runs and kept when it is
 cut, a RomFS step that does not repeat the lift, the update's duration text and the warm-up's bar, a damaged dump
 named by its file and an unexpected error by its message, the file check's result in its row and on home, the
-game's FATAL line after exit codes 70 and 71, the job count by free memory and the build's priority class, a line
+game's FATAL line after exit codes 70, 71 and 72, the copy the game's own Restart starts followed for its exit code
+and its FATAL line, an end with code 0 noted in the game's log when it has no line of the
+game's own end, the job count by free memory and the build's priority class, a line
 handler that raises and a log that cannot be written, one forced update check a minute and GitHub's reset time, a
 game folder with characters outside the Basic Multilingual Plane (its `modules.c` compiled when a C compiler is
 there), the file check at both piece sizes against the check as it was, the disk space of every step and the build

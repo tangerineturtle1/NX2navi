@@ -59,9 +59,56 @@ void rt_fatal_notes(void) {
 
 __attribute__((weak)) void fs_save_crash_wait(void) {}   // fs_host.c; builds without it (the unit checks) have no saves
 
+// The frame-time summary and the stutter map at a fatal error (perf.c); builds without perf.c (the unit checks) have
+// none.
+__attribute__((weak)) void perf_summary_flush_try(void) {}
+
+// HD rumble's neutral value before a failed run ends (input.c input_rumble_hd_stop); builds without input.c (the unit
+// checks) have no controller.
+__attribute__((weak)) void input_rumble_hd_stop(void) {}
+
+// The stop goes through SDL, which takes its own joystick lock: a crash on SDL's thread while it held that lock would
+// hold the ending thread there for good, and the process would never end. So it runs on a thread of its own, and the
+// ending thread waits for it at most 300 ms and never joins it. A controller left buzzing is the lesser harm.
+static volatile int32_t rumble_stopped;
+static void rumble_stop_main(void *arg) {
+    (void)arg;
+    input_rumble_hd_stop();
+    __atomic_store_n(&rumble_stopped, 1, __ATOMIC_RELEASE);
+}
+
+void rt_rumble_stop_bounded(void) {
+    if (!plat_thread_spawn(rumble_stop_main, NULL, "rumble stop", 0)) return;
+    for (int i = 0; i < 30 && !__atomic_load_n(&rumble_stopped, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(10);
+}
+
+// One end for a failed run. The platform layer calls the crash handler on every thread that faults, without
+// waiting for the others (platform/win32.c crash_veh, crash_filter), and a fatal error can come beside a crash from
+// the same bad state (an allocation that failed here, a null pointer read there). The later end cut the first report
+// where it was, together with its wait for a save Commit and RivaTuner's restore, and its own FATAL line and exit
+// code replaced the first (the launcher shows the last FATAL). Another thread now waits until the first end is done;
+// it logs nothing, since it may hold the log queue's lock, which the first report only tries. A first report that
+// hangs still ends: after 30 s the waiting thread ends the process with the first report's own code (a fatal error's
+// 70 or 72, the crash report's 71), so the launcher reads the end as the report says it.
+static volatile uint32_t ending_tid;   // the thread that reports, 0 before one does
+static volatile int32_t ending_code = 71;   // the code that report ends with, stored right after it took ending_tid
+
+int rt_ending_enter(int code) {
+    uint32_t me = plat_thread_id(), was = 0;
+    if (__atomic_compare_exchange_n(&ending_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&ending_code, code, __ATOMIC_RELEASE);
+        return 1;
+    }
+    if (was == me) return 0;
+    for (int i = 0; i < 3000; i++) plat_sleep_ms(10);
+    plat_terminate(__atomic_load_n(&ending_code, __ATOMIC_ACQUIRE));
+}
+
 // The fatal line, the report's notes and what has to be flushed, then the exit with `code`.
 static void fatal_end(int code, const char *fmt, va_list ap) __attribute__((noreturn));
 static void fatal_end(int code, const char *fmt, va_list ap) {
+    if (!rt_ending_enter(code)) plat_terminate(code);   // a fatal error inside this thread's own report: no second one
+    rt_log_ending();   // the report reaches the log file past its cap (main.c log_sink)
     rt_log_sync();   // main.c: the lines queued for the log thread, then these, written here
     rt_log_raw("FATAL: ", 7);
     rt_vlogf(fmt, ap);
@@ -75,12 +122,20 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded)
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
-    // RivaTuner Statistics Server's profile as it was: left with the game's limit in it, the next run would take that
-    // limit for the player's own (rtss_limit.c; it gives up after a second if the failing thread holds its lock)
-    rtss_limit_restore();
+    // RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps for it in
+    // rtss-profile.txt (rtss_limit.c rtss_limit_crash, as in main.c crash_handler), with no call into RTSS's library
+    // here; only where that line could not be written is it put back now, and never from RTSS's own thread
+    rtss_limit_crash();
+    rt_rumble_stop_bounded();   // a controller on HD rumble: nothing renews or stops its vibration after the end
+    // "frametime: at a fatal error" and the stutter map, the session's last period: after what a kill of the process
+    // must not lose, as in the orderly end (gfx_present.c rt_exit_steps); ft_stop waits up to 50 ms
+    perf_summary_flush_try();
     fflush(stdout);
     fflush(stderr);
-    _Exit(code);
+    // Not _Exit: in the C runtime it is ExitProcess, which stops the other threads wherever they are and then runs every
+    // library's detach on this thread. A driver's detach that faults there turned a fatal error's end into a crash
+    // report with another code (platform/win32.c plat_exit names one such detach), and one that hangs held the process.
+    plat_terminate(code);
 }
 
 void rt_fatal(const char *fmt, ...) {

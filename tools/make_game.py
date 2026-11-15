@@ -98,6 +98,7 @@ sys.path.insert(0, str(KIT / 'tools'))
 import nup  # noqa: E402
 import mod_files  # noqa: E402
 import prompt_art  # noqa: E402
+from check_content import GENERATED_MARKER  # noqa: E402
 
 TITLE_ID = 0x0400486024DEC000
 MAIN_BUILD_ID = 'e0f3ccfaf50065ae4ea01eb5aeb13b1a'   # main of game 1.1.1
@@ -642,8 +643,12 @@ def c_string(text):
 
 
 def modules_c(lift, out, gen):
+    """gen/modules.c: the lifted modules' table, the ExeFS's sha256 and this install's folders. It carries
+    GENERATED_MARKER, which tools/check_content.py refuses in a commit: it is derived from the game and names the
+    player's paths."""
     layout = json.loads((lift / 'layout.json').read_text(encoding='utf-8'))
-    L = ['#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
+    L = [f'/* {GENERATED_MARKER}: module table, written by tools/make_game.py modules_c. Do not edit or commit. */',
+         '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for m in layout:
         n = m['name']
         L += [f'extern const uint64_t {n}_fn_addrs[];', f'extern const GuestFn {n}_fn_ptrs[];',
@@ -1622,13 +1627,17 @@ def pgo_gen_record(out, clang, env):
     (raw / PGO_TRAINING).write_text(json.dumps(record, indent=1) + '\n', encoding='utf-8')
 
 
+# The values a switch (a row of runtime/cfg.c metas[] whose set is 0|1) reads as off, in any case (cfg.c switch_of).
+SWITCH_OFF = ('0', 'off', 'false', 'no')
+
+
 def guest_opt_ini(out):
-    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe (the low-end GPU rows of the menu's Game tab write it there)
-    when the environment does not set it: the next build of the game folder out takes it. Only while low_end_gpu = 1
-    is in the file too: the mode's settings count only with the mode on (runtime/cfg.c LOWEND_ONLY)."""
+    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe when the environment does not set it: the next build of the
+    game folder out takes it. The line counts by itself. Up to 0.10.1 it counted only while low_end_gpu was on in the
+    file too; that mode is gone (runtime/cfg.c lowend_set) and its settings are read like any other."""
     if os.environ.get('NX2NAVI_GUEST_OPT', '').strip():
         return
-    found, low = '', False
+    found = ''
     try:
         for line in (Path(out) / 'nx2navi.ini').read_text(encoding='utf-8', errors='replace').splitlines():
             key, eq, value = line.partition('=')
@@ -1636,11 +1645,9 @@ def guest_opt_ini(out):
             value = value.split('#')[0].split(';')[0].strip().strip('"')
             if eq and key in ('guest_opt', 'nx2navi_guest_opt') and value:
                 found = value
-            if eq and key in ('low_end_gpu', 'nx2navi_low_end_gpu'):
-                low = value not in ('', '0')
     except OSError:
         pass
-    if found and low:
+    if found:
         os.environ['NX2NAVI_GUEST_OPT'] = found
 
 
@@ -2183,20 +2190,37 @@ def note_cache_translator(out):
     os.replace(tmp, ids)
 
 
+def ini_choice(raw):
+    """The value of a setting with a set of values as runtime/cfg.c cfg_load reads it from nx2navi.ini, raw being the
+    text after '=': unless the whole value is in double quotes, it ends at the first blank followed by ';' or '#'
+    (cfg.c cut_comment); a value in double quotes then loses them."""
+    v = raw.strip()
+    if not (len(v) >= 2 and v[0] == v[-1] == '"'):
+        m = re.search(r'[ \t][;#]', raw)
+        if m:
+            v = raw[:m.start()].strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+
+
 def shader_carry(out):
     """Whether the game carries the shaders prepared before an update over (runtime/gfx_shader.c, NX2NAVI_SHADER_CARRY,
-    on unless the environment or nx2navi.ini sets it to 0) and there are some: shader-prepared.bin is written by a
-    finished preparation, and the cache must name the translator its translations are of (SHADER_IDS,
-    note_cache_translator), else the game has nothing to carry them over by."""
-    if os.environ.get('NX2NAVI_SHADER_CARRY', '').strip() == '0':
+    on unless set to 0, off, false or no) and there are some: shader-prepared.bin is written by a finished
+    preparation, and the cache must name the translator its translations are of (SHADER_IDS, note_cache_translator),
+    else the game has nothing to carry them over by. The switch is read as the game reads it (runtime/cfg.c): the
+    environment wins over nx2navi.ini and is taken as written; in the file the last line with a value wins, its
+    comment cut (ini_choice). Where this read differs from the game's, an update skips a preparation the game will not
+    carry over, or prepares what it would."""
+    v = os.environ.get('NX2NAVI_SHADER_CARRY', '').strip()
+    if not v:
+        try:
+            for line in (out / 'nx2navi.ini').read_text(encoding='utf-8-sig', errors='replace').splitlines():
+                k, eq, raw = line.strip().partition('=')
+                if eq and k.strip().upper().removeprefix('NX2NAVI_') == 'SHADER_CARRY' and ini_choice(raw):
+                    v = ini_choice(raw)
+        except OSError:
+            pass
+    if v.lower() in SWITCH_OFF:
         return False
-    try:
-        for line in (out / 'nx2navi.ini').read_text(encoding='utf-8-sig', errors='replace').splitlines():
-            k, eq, v = line.strip().partition('=')
-            if eq and k.strip().upper().removeprefix('NX2NAVI_') == 'SHADER_CARRY' and v.strip().strip('"') == '0':
-                return False
-    except OSError:
-        pass
     return (out / 'shader-prepared.bin').is_file() and bool(cache_identities(out))
 
 

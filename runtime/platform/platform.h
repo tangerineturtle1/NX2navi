@@ -17,7 +17,14 @@ typedef struct PlatThread PlatThread;
 typedef void (*PlatThreadFn)(void *arg);
 
 // Starts fn(arg) on a new thread named name (shown in debuggers and profilers; may be NULL). NULL on failure.
+// Keeps PLAT_STACK_GUARANTEE bytes of the calling thread's (or fiber's) stack for its own stack overflow: the crash
+// report then runs on them. The threads and fibers made here get it at their start; main calls it for its thread.
+#define PLAT_STACK_GUARANTEE 32768
+void plat_stack_guarantee(void);
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name);
+// The name the calling thread was made with here (plat_thread_new, plat_thread_spawn), NULL for a thread made
+// elsewhere; kept in the thread itself, so the crash report can read it with any lock held.
+const char *plat_thread_name(void);
 // The same with the stack size given: stack bytes reserved for the thread (0: PLAT_STACK_DEFAULT). The default is the
 // same on every OS, so a thread that fits on Windows fits elsewhere.
 #define PLAT_STACK_DEFAULT (16u << 20)
@@ -331,6 +338,10 @@ void plat_aligned_free(void *p);
 // ---- process
 _Noreturn void plat_exit(int code);       // ends the process at once: other threads stop, no atexit handlers run
 extern void (*plat_exit_hook)(void);      // called first by plat_exit when set (main.c: the queued log lines)
+// Ends the process at once with code, and nothing else: no exit hook, no stream flush, and no library's detach call
+// (ExitProcess and _Exit run every one). For the ends of a failed run (dispatch.c fatal_end, vk_device.c
+// lost_wait_exit), which have written their lines themselves and must not wait on a lock another thread holds.
+_Noreturn void plat_terminate(int code);
 int plat_setenv(const char *name, const char *value);    // value NULL removes it; 1 on success
 uint32_t plat_process_id(void);
 // CPU time of the process since it started (user and kernel), and wall time since it started, in ns; 0 when unknown.
@@ -392,6 +403,16 @@ int plat_file_private(const char *path);                  // only this account m
 typedef struct PlatAppend PlatAppend;
 PlatAppend *plat_append_open(const char *path);           // creates or truncates path; NULL on failure
 int plat_append_write(PlatAppend *f, const void *data, size_t n);   // 1 when all n bytes landed
+// An end the game did not ask for: ExitProcess (or exit()) called by a library, or by the runtime outside plat_exit and
+// plat_terminate. Windows calls the executable's TLS callback for it, with every other thread already stopped, and the
+// callback then writes what the log queue held (queued(&p, &n): the bytes as they stand, no lock) and one line with
+// the return addresses that led to the end into log. Nothing for plat_exit, plat_terminate, TerminateProcess from
+// outside, or after plat_exit_orderly (main returning from a tool mode). plat_exit_note_modules notes the loaded
+// modules, whose names the line gives the addresses (the callback may not ask the loader): at start and at a focus
+// loss. Windows only; elsewhere they do nothing.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n));
+void plat_exit_note_modules(void);
+void plat_exit_orderly(void);
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);
@@ -536,6 +557,15 @@ int plat_page_file_managed(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
+// The handles (Windows) or file descriptors (Linux) this process holds; 0 when unknown.
+uint32_t plat_handle_count(void);
+// The same by kind: Windows the object type of each handle (Event, Section, Thread, File...), Linux what each file
+// descriptor's link names (socket, pipe, an anon_inode kind, a /dev folder, file). Fills out with up to max kinds,
+// unsorted, and returns how many, -1 on failure; the kinds past max are counted in the last entry, named "(more
+// kinds)". Never opens, duplicates or names a handle. Windows reads the system's whole handle table into a buffer of a
+// few MiB kept between calls: one thread calls it at a time.
+typedef struct { char name[32]; uint32_t n; } PlatHandleKind;
+int plat_handle_census(PlatHandleKind *out, int max);
 // The C runtime's malloc heap in bytes, for the memory report (vk_memory.c system_log): what it took from the system
 // (committed) and what of that it handed out (used), and how many other heaps the process has (Windows: those DLLs made
 // with HeapCreate, the graphics driver's among them; their sizes are not asked, as a heap made without serialization
@@ -554,8 +584,12 @@ void plat_child_stop(PlatChild *c);                       // kills the child and
 // that must not slow the game down (gfx_shader.c, the carry pass).
 void plat_child_lower(PlatChild *c);
 int plat_child_write(PlatChild *c, const void *data, size_t n);   // 1 when all n bytes were written
+#ifndef PLAT_CHILD_READ_MS                                 // a check may build the child functions with a shorter one
 #define PLAT_CHILD_READ_MS 120000   // plat_child_read gives up on a child that sends nothing for this long
-long plat_child_read(PlatChild *c, void *buf, size_t cap);        // bytes read (at least 1); 0 or negative: pipe broke or timed out
+#endif
+// Bytes read (at least 1); 0 or -1 when the pipe broke (the child is gone); -2 when nothing came for PLAT_CHILD_READ_MS
+// while the child kept its end open (a child stuck on its input: asking it again would wait as long).
+long plat_child_read(PlatChild *c, void *buf, size_t cap);
 
 // ---- local IPC: a stream connection to another program of this machine, one listen location per name (Discord's
 // Rich Presence, discord_rpc.c). On Windows the named pipe \\.\pipe\<name>; on Linux the Unix domain socket

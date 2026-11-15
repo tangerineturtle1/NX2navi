@@ -109,8 +109,12 @@ static void alt_stack(void) {
 static __thread cpu_set_t cpu_rest;
 static __thread int cpu_rest_set;
 
+static __thread char thread_name[16];   // plat_thread_name: copied at the start, as a detached thread's struct may go
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
+    memcpy(thread_name, t->name, sizeof thread_name);
     alt_stack();
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
@@ -1927,6 +1931,15 @@ void plat_exit(int code) {
     _exit(code);
 }
 
+void plat_terminate(int code) { _exit(code); }
+
+// The note of an end the game did not ask for is the Windows executable's TLS callback (win32.c); nothing here.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) { (void)log, (void)queued; }
+void plat_exit_note_modules(void) {}
+void plat_exit_orderly(void) {}
+
+void plat_stack_guarantee(void) {}   // the crash report runs on the signal stack crash handling sets up
+
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
 }
@@ -2248,6 +2261,56 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     fclose(f);
 }
 
+uint32_t plat_handle_count(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    uint32_t n = 0;
+    for (struct dirent *e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return n ? n - 1 : 0;   // less the descriptor of this walk
+}
+
+// plat_handle_census: each descriptor's link, by kind: "socket:[N]" and "pipe:[N]" by their prefix, an anonymous
+// inode by its kind ("anon_inode:[eventfd]" is eventfd), a device by its /dev folder, any other path as file.
+int plat_handle_census(PlatHandleKind *out, int max) {
+    DIR *d = max > 0 ? opendir("/proc/self/fd") : NULL;
+    if (!d) return -1;
+    int n = 0, self = dirfd(d);
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.' || atoi(e->d_name) == self) continue;
+        char link[64], target[256], kind[32];
+        snprintf(link, sizeof link, "/proc/self/fd/%s", e->d_name);
+        ssize_t len = readlink(link, target, sizeof target - 1);
+        if (len < 0) continue;   // closed meanwhile
+        target[len] = 0;
+        if (!strncmp(target, "/dev/", 5)) {
+            size_t k = strcspn(target + 5, "/");
+            snprintf(kind, sizeof kind, "/dev/%.*s", (int)(k < 20 ? k : 20), target + 5);
+        } else if (target[0] == '/') {
+            snprintf(kind, sizeof kind, "%s", "file");
+        } else if (!strncmp(target, "anon_inode:", 11)) {
+            const char *k = target + 11 + (target[11] == '[');
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(k, "]"), k);
+        } else {
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(target, ":"), target);
+        }
+        int i = 0;
+        while (i < n && strcmp(out[i].name, kind)) i++;
+        if (i == n) {
+            if (n == max) {   // no room: the last entry takes the rest
+                i = max - 1;
+                snprintf(out[i].name, sizeof out[i].name, "%s", "(more kinds)");
+            } else {
+                snprintf(out[n].name, sizeof out[n].name, "%s", kind);
+                out[n++].n = 0;
+            }
+        }
+        out[i].n++;
+    }
+    closedir(d);
+    return n;
+}
+
 // glibc's mallinfo2 (2.33 and later) sums every arena: arena is what the arenas took with brk and mmap, hblkhd the
 // blocks mmapped one by one, uordblks what the arenas handed out. Other C libraries leave the figures unknown.
 void plat_heap_info(PlatHeapInfo *h) {
@@ -2544,13 +2607,14 @@ void plat_child_lower(PlatChild *c) {   // a higher nice value needs no privileg
 // A child that died makes the write fail with EPIPE; SIGPIPE is ignored for the process (main.c), as Windows has none.
 int plat_child_write(PlatChild *c, const void *data, size_t n) { return write_all(c->in, data, n); }
 
-// See win32.c plat_child_read: a child that never answers fails the read after PLAT_CHILD_READ_MS.
+// See win32.c plat_child_read: a child that never answers fails the read with -2 after PLAT_CHILD_READ_MS.
 long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     struct pollfd pf = {.fd = c->out, .events = POLLIN};
     int r;
     do r = poll(&pf, 1, PLAT_CHILD_READ_MS);
     while (r < 0 && errno == EINTR);
-    if (r <= 0) return -1;   // timed out or failed
+    if (!r) return -2;      // timed out
+    if (r < 0) return -1;   // failed
     ssize_t k;
     do k = read(c->out, buf, cap);
     while (k < 0 && errno == EINTR);

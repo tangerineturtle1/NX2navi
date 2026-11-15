@@ -2,6 +2,15 @@
 
 # NX2navi
 
+This fork's default branch is `add-built-in-cheat-manager`. Its custom builds retain the full launcher and
+update channel, built-in cheat manager, bomb arrows, spin controls and independent World map switches.
+The current integration includes upstream tag `v0.12.0`; that tag's game-source version remains `0.11.0`.
+Our custom update packages retain the rebuild and mod-management pages.
+
+Use [this fork's issues](https://github.com/BrutusBossNL/NX2navi/issues) for problems with these custom builds.
+Include the custom build version and the affected cheat, mod or integration behavior. Custom updates use the
+launcher's Preview channel with repository `BrutusBossNL/NX2navi`.
+
 **Join the official NX2navi update discord server: https://discord.com/invite/uf6gSrsPpq** 
 
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game
@@ -38,8 +47,11 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   display; in a window of another shape than the picture, frames are generated inside the picture only, so the black
   bars stay clean. The frame limit counts the frames the game draws, and frame generation adds its
   frames on top of it. The frame limit can also be
-  handed to RivaTuner Statistics Server
-- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu
+  handed to RivaTuner Statistics Server, which then limits the game in its place once it is seen holding the game;
+  the game paces movies itself, and takes the limit back while it is minimised and whenever RivaTuner is not seen
+  holding it; where frame generation or low latency keeps it out, the game says when a limit set in RivaTuner itself
+  holds the game as well
+- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu, and for the tone mapped picture the tone mapper, gamma correction, exposure, highlights, shadows, contrast and saturation
 - The game's known shaders prepared when the game is built, and the pipelines met in play built again in the
   background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
   still hold a frame, and a draw that must wait for its pipeline has it built on worker threads, never on the game's

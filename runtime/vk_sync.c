@@ -19,6 +19,7 @@
 #include "prof.h"
 #include "vk.h"
 #include "vk_lowlat.h"
+#include "vk_sync_hw.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
@@ -190,6 +191,14 @@ static int hold_max = -1;
 // NX2NAVI_WB_SPLIT=2 keeps the split with shadow storage too, to measure that fault.
 static VkSemaphore exec_tl;
 static uint64_t exec_sig;             // sub_lock: the newest value a submitted part signals on exec_tl
+
+// ---- a lost device in the timelines' values (vk_sync_hw.h)
+// The newest value any signal of the timeline (tl_hw) and of exec_tl (ex_hw) carries, noted before the signal can
+// happen: by hold_flush_locked before vkQueueSubmit2, by the host's own signals before vkSignalSemaphore. A value read
+// above the note ends the run as a lost device (timeline_beyond). Reaching those values is no proof the device lives:
+// a driver that reports every pending signal as done after a reset reads at or below the note, and the line an
+// occlusion query left unwritten logs (vk_exec_xfer.c oq_cb, vk_sync_state_text) shows which of the two a report had.
+static volatile uint64_t tl_hw, ex_hw;
 static int wb_split = -1;
 static int wb_results;                // the wait on exec_tl also runs the results the game reads (not with 3)
 
@@ -275,6 +284,14 @@ static void hold_flush_locked(VkCtx *c) {
         __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
         return;
     }
+    // every value this hand-over signals is noted before the queue can reach it ("a lost device in the timelines'
+    // values")
+    for (int i = 0; i < H.n; i++)
+        for (uint32_t k = 0; k < H.si[i].signalSemaphoreInfoCount; k++) {
+            const VkSemaphoreSubmitInfo *s = &H.si[i].pSignalSemaphoreInfos[k];
+            if (s->semaphore == c->timeline) sync_hw_raise(&tl_hw, s->value);
+            else if (s->semaphore == exec_tl) sync_hw_raise(&ex_hw, s->value);
+        }
     VkResult r = lost_at_due() ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
     if (r != VK_SUCCESS) {
         vk_mem_oom_report("replay submit", r);
@@ -471,11 +488,26 @@ static PlatMutex gtl_lock = PLAT_MUTEX_INIT;
 static const char *const gtl_names[GTL_KINDS] = {"replay parts", "mirror prologues", "pre-pass buffers", "upload batches",
                                                  "presents"};
 
+// The last timed pieces, for the line of a frame whose render thread waited long for the GPU (vk_gpu_parts_log): each
+// piece's hand-over to the queue, GPU start and end (plat_now_ns) and its kind (vk.h GTL_*). Every kind enters, through
+// vk_gtl_note_ns under gtl_lock: the replay's parts as the completion thread reads them, the upload batches when their
+// batch retires (vk_memory.c up_ts_read), the presents when their slot is used again (gfx_present.c pts_read). So the
+// entries are not in GPU order; the reader sorts what it takes. It takes the newest PART_RING / 2 entries, which the
+// writers do not reach before it has read them unless that many pieces end meanwhile (an area load adds hundreds of
+// upload batches).
+#define PART_RING 2048
+static struct { int64_t sub, sn, en; int kind; } part_ring[PART_RING];
+static volatile uint64_t part_n;
+
 static void vk_gtl_note_ns(int kind, int64_t call, int64_t sub, int64_t start, int64_t end) {
     if (!(rt_trace & RT_TRACE_PERF) || kind < 0 || kind >= GTL_KINDS || !sub || end < start) return;
     plat_mutex_lock(&gtl_lock);
     if (gtl_n < GTL_N) gtl[gtl_n++] = (GtlEv){kind, call ? call : sub, sub, start, end};
     else gtl_dropped++;
+    uint64_t pn = part_n;
+    part_ring[pn % PART_RING].sub = sub, part_ring[pn % PART_RING].sn = start;
+    part_ring[pn % PART_RING].en = end, part_ring[pn % PART_RING].kind = kind;
+    __atomic_store_n(&part_n, pn + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&gtl_lock);
 }
 
@@ -673,7 +705,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                 gfx_tl_note('G', (uint64_t)sn, (uint64_t)en, (uint64_t)sub);
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
                 int64_t q = (int64_t)ts_queue_ns[t->pair];
-                vk_gtl_note_ns(t->mirror, sub, q ? q : sub, sn, en);
+                vk_gtl_note_ns(t->mirror, sub, q ? q : sub, sn, en);   // also the parts' ring (vk_gpu_parts_log)
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
             if (e > from) {
@@ -689,6 +721,62 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     } else plat_inc64(&ts_missed);
     __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
     free(t);
+}
+
+// NX2NAVI_TRACE=perf (perf.c): a frame whose render thread waited 20 ms or more for GPU fences gets, at the next
+// present, a line of the timed parts that ended in its interval [t0, t1]: how many, the GPU time they took, the
+// longest ones with their kind and the time they waited in the queue, and the longest gap between two. In a session of
+// 2026-11-13 frames of 60-96 ms followed each area load by 2 to 6 frames, the render thread waiting 59-86 ms for the
+// GPU, and no line said which work the GPU did then. Read from the ring vk_gtl_note_ns fills, without its lock: nothing
+// here waits for the GPU or for another thread. "In the queue" is the time from a piece's hand-over to the queue to
+// its GPU start (for a replay part held by the submit batching, from the batch's hand-over, not from its submit call).
+typedef struct { int64_t sub, sn, en; int kind; } GpuPart;
+static int part_by_start(const void *a, const void *b) {
+    int64_t x = ((const GpuPart *)a)->sn, y = ((const GpuPart *)b)->sn;
+    return x < y ? -1 : x > y;
+}
+
+void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms) {
+    static uint32_t logged;
+    if (logged >= 400) return;
+    uint64_t n = __atomic_load_n(&part_n, __ATOMIC_ACQUIRE), from = n > PART_RING / 2 ? n - PART_RING / 2 : 0;
+    GpuPart *sel = malloc(sizeof *sel * (PART_RING / 2));
+    if (!sel) return;
+    int nsel = 0;
+    for (uint64_t i = from; i < n; i++) {   // those that ended in the interval, then in GPU order: the gaps need it
+        const typeof(part_ring[0]) *p = &part_ring[i % PART_RING];
+        if (p->en < (int64_t)t0 || p->en > (int64_t)t1 || p->en < p->sn) continue;
+        sel[nsel++] = (GpuPart){p->sub, p->sn, p->en, p->kind};
+    }
+    qsort(sel, (size_t)nsel, sizeof *sel, part_by_start);
+    struct { int64_t ns, q; int kind; } top[6] = {{0}};
+    static const char *const kn[GTL_KINDS] = {"part", "mirror copies", "pre-pass", "uploads", "present"};
+    uint64_t parts = 0, busy = 0, gap = 0;
+    int64_t prev_end = 0;
+    for (int i = 0; i < nsel; i++) {
+        const GpuPart *p = &sel[i];
+        int64_t ns = p->en - p->sn, q = p->sub && p->sn > p->sub ? p->sn - p->sub : 0;
+        parts++, busy += (uint64_t)ns;
+        if (prev_end && p->sn > prev_end && (uint64_t)(p->sn - prev_end) > gap) gap = (uint64_t)(p->sn - prev_end);
+        if (p->en > prev_end) prev_end = p->en;
+        for (int k = 0; k < 6; k++)
+            if (ns > top[k].ns) {
+                memmove(&top[k + 1], &top[k], sizeof top[0] * (size_t)(5 - k));
+                top[k].ns = ns, top[k].q = q, top[k].kind = p->kind;
+                break;
+            }
+    }
+    free(sel);
+    if (!parts) return;
+    logged++;
+    char line[700];
+    int o = snprintf(line, sizeof line, "perf: frame %llu: the GPU's timed parts that ended while the render thread waited "
+                     "%.1f ms for fences: %llu parts, %.1f ms of GPU time, the longest gap between two %.1f ms; the longest:",
+                     (unsigned long long)frame, fence_ms, (unsigned long long)parts, busy / 1e6, gap / 1e6);
+    for (int k = 0; k < 6 && top[k].ns && o < (int)sizeof line - 80; k++)
+        o += snprintf(line + o, sizeof line - (size_t)o, "%s %.1f ms (%s, %.1f ms in the queue)", k ? "," : "",
+                      top[k].ns / 1e6, top[k].kind >= 0 && top[k].kind < GTL_KINDS ? kn[top[k].kind] : "?", top[k].q / 1e6);
+    rt_log("%s", line);
 }
 
 // ---- frame timeline
@@ -850,6 +938,63 @@ WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint
     return 0;
 }
 
+// Without vk_exec.c (the probes): no submission is held back for an event.
+WEAK int vk_exec_held(void) { return 0; }
+
+// raw, read from the timeline whose signals hw notes: above every one of them the device is lost, and the run ends
+// here (vk_device_lost_check) after a line with the two values.
+static void timeline_beyond(const char *name, uint64_t raw, volatile uint64_t *hw, const char *where) {
+    uint64_t h = __atomic_load_n(hw, __ATOMIC_ACQUIRE);
+    if (!sync_hw_beyond(raw, h)) return;
+    rt_log("vk: the %s reads %llu, above every value its signals carry (%llu): the device is lost", name,
+           (unsigned long long)raw, (unsigned long long)h);
+    vk_device_lost_check(VK_ERROR_DEVICE_LOST, where);
+}
+
+void vk_sync_signal_note(uint64_t value) { sync_hw_raise(&tl_hw, value); }
+
+void vk_sync_check_timeline(const char *where) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->timeline || vk_device_is_lost()) return;
+    uint64_t raw = 0;
+    VkResult r = vkGetSemaphoreCounterValue(c->device, c->timeline, &raw);
+    vk_device_lost_check(r, where);
+    if (r == VK_SUCCESS) timeline_beyond("submissions' timeline", raw, &tl_hw, where);
+}
+
+// No lock: the thread that reports a lost device may hold any (vk_device.c device_fault_report).
+void vk_sync_state_text(char *o, size_t n) {
+    VkCtx *c = vk_ctx();
+    uint64_t tl = 0, ex = 0;
+    char a[32] = "nothing (unreadable)", b[32] = "nothing (unreadable)";
+    if (c && c->timeline && vkGetSemaphoreCounterValue(c->device, c->timeline, &tl) == VK_SUCCESS)
+        snprintf(a, sizeof a, "%llu", (unsigned long long)tl);
+    if (c && exec_tl && vkGetSemaphoreCounterValue(c->device, exec_tl, &ex) == VK_SUCCESS)
+        snprintf(b, sizeof b, "%llu", (unsigned long long)ex);
+    snprintf(o, n,
+             "submissions issued up to %llu, their side effects run up to %llu, handed to the queue up to %llu with %d "
+             "held back; the submissions' timeline reads %s of %llu signalled at most, the executed timeline %s of %llu; "
+             "%d submission(s) held for an event",
+             (unsigned long long)__atomic_load_n(&issued, __ATOMIC_ACQUIRE),
+             (unsigned long long)__atomic_load_n(&done, __ATOMIC_ACQUIRE),
+             (unsigned long long)__atomic_load_n(&queued_v, __ATOMIC_ACQUIRE), (int)__atomic_load_n(&held_n, __ATOMIC_ACQUIRE),
+             a, (unsigned long long)__atomic_load_n(&tl_hw, __ATOMIC_ACQUIRE), b,
+             (unsigned long long)__atomic_load_n(&ex_hw, __ATOMIC_ACQUIRE), vk_exec_held());
+}
+
+void vk_sync_lost_report(void) {
+    char t[512];
+    vk_sync_state_text(t, sizeof t);
+    rt_log("vk: when the device was lost: %s", t);
+}
+
+// The hang watch's reading (hang_watch.c): the newest value submitted and the newest done, without a lock or a device
+// call.
+void vk_sync_progress(uint64_t *issued_out, uint64_t *done_out) {
+    *issued_out = __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    *done_out = __atomic_load_n(&done, __ATOMIC_ACQUIRE);
+}
+
 static void completion_main(void *arg) {
     VkCtx *c = arg;
     __atomic_store_n(&cb_tid, plat_thread_id(), __ATOMIC_RELEASE);
@@ -882,9 +1027,13 @@ static void completion_main(void *arg) {
                 vk_device_lost_check(r, "the completion thread's read of the submissions' timeline");
                 rt_fatal("vk: the submissions' timeline could not be read (%d; device lost?)", (int)r);
             }
-            // Both calls may succeed on a lost device and give a value its submissions never reached. So before a
-            // new value counts, the device is asked once more with a call of its own (vk_device.c
-            // vk_device_lost_poll, which ends the run when it is lost).
+            // Both calls may succeed on a lost device and give a value its submissions never reached. A value above
+            // every one the timeline's signals carry ends the run ("a lost device in the timelines' values"); then,
+            // before a new value counts, the device is asked once more with a call of its own (vk_device.c
+            // vk_device_lost_poll, which ends the run when it is lost). That poll alone did not see the losses of the
+            // RX 6000 reports of 0.9.1 and 0.9.2: their callbacks ran for work the GPU never finished.
+            timeline_beyond("submissions' timeline", reached, &tl_hw, "the completion thread's read of the submissions' "
+                                                                      "timeline (a value no submission signals)");
             if (reached > __atomic_load_n(&done, __ATOMIC_ACQUIRE)) vk_device_lost_poll();
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
@@ -929,7 +1078,8 @@ static void completion_main(void *arg) {
             // The waiters go first (a fence wait, the frame's first submission, the acquire): freeing what the
             // finished submissions held (vk_mem_collect: upload batches, destroyed images, views and buffers, each
             // checked against the timeline itself) is nothing they read, and it takes cmd_lock, which the upload
-            // path holds, so done waited behind uploads.
+            // path holds, so done waited behind uploads. It only tries that lock (vk_mem_collect_try): an upload flush
+            // can hold it while it waits behind a present for the queue lock, and the next value's done waited too.
             uint64_t tv = __atomic_load_n(&tail_val, __ATOMIC_ACQUIRE);
             if (tv && reached >= tv) {   // the tail a wait went ahead of is through: how long it took from there
                 uint64_t d = kern_now_ns() - __atomic_load_n(&tail_t0, __ATOMIC_RELAXED), a = tail_ns;
@@ -941,7 +1091,7 @@ static void completion_main(void *arg) {
             plat_cond_broadcast(&cv_done);
             for (uint64_t v = reached - was > GW_RING ? reached - GW_RING + 1 : was + 1; v <= reached; v++) gw_mark(v, 2);
             plat_mutex_unlock(&st_lock);
-            vk_mem_collect();
+            vk_mem_collect_try();
             plat_mutex_lock(&st_lock);
         }
     }
@@ -963,6 +1113,8 @@ void vk_sync_start(void) {
         perf_gpu_stats = gpu_stats;
         uint64_t now = 0;
         vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
+        sync_hw_raise(&tl_hw, now > issued ? now : issued);   // before the restart's signal below
+        sync_hw_raise(&ex_hw, now > issued ? now : issued);   // the executed timeline below starts there
         if (issued > now) {   // a new device after vk_shutdown: values keep increasing for the front end
             VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline,
                                         .value = issued};
@@ -1330,6 +1482,8 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     if (vk_device_is_lost()) return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
     VkCtx *c = vk_ctx();
     plat_mutex_lock(&sub_lock);
+    vk_present_frames_owed();   // frames presented while another thread replayed close before this replay begins
+    if (n > 0 && !own) vk_sub_in_frame_publish();   // this submission's place in its frame, for the replay
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
@@ -1421,6 +1575,24 @@ uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg) 
     return submit(NULL, 0, &own);
 }
 
+int vk_sync_try_locked(void (*fn)(void)) {
+    if (!plat_mutex_trylock(&sub_lock)) return 0;
+    fn();
+    plat_mutex_unlock(&sub_lock);
+    return 1;
+}
+
+void vk_sync_locked(void (*fn)(void)) {
+    plat_mutex_lock(&sub_lock);
+    fn();
+    plat_mutex_unlock(&sub_lock);
+}
+
+// vk_backend.c's, which run the frames' bookkeeping (vk_frame_owed.h) and set the place in the frame of the submission
+// being recorded; builds without the back end have neither.
+WEAK void vk_present_frames_owed(void) {}
+WEAK void vk_sub_in_frame_publish(void) {}
+
 // st_lock held: p at the end of the queue *q.
 static void pending_push(Pending **q, int *head, int *n, int *cap, Pending p) {
     if (*head + *n == *cap) {
@@ -1493,7 +1665,7 @@ int vk_sync_recorded_wait(uint64_t value, uint64_t timeout_ns, int (*gpu_wait)(u
         rt_log("vk: the wait after a frame's first submission also waits for %s (NX2NAVI_SUBMIT_FINISH_RESULTS=%d)",
                res_mode == 2 ? "every submission before it" : res_mode ? "the newest submission up to it that hands the "
                "CPU results at its completion (events, counter reports, write-backs)" : "nothing more", res_mode);
-        gpu = rt_knob("SUBMIT_FINISH_GPU", "1") != 0;   // 0 with low_end_gpu = 1
+        gpu = rt_knob("SUBMIT_FINISH_GPU", "1") != 0;   // the low-end GPU mode set 0 up to 0.10.1
         rt_log("vk: the wait after a frame's first submission ends %s (NX2NAVI_SUBMIT_FINISH_GPU=%d)",
                gpu ? "when the GPU has run it" : "when the replay has submitted it, or the GPU has run it where it reads guest "
                "memory itself", gpu);
@@ -1623,6 +1795,14 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
         vk_device_lost_check(r, "the wait for a submission's commands");
         rt_fatal("vk: the wait for a submission's commands failed (%d; device lost?)", (int)r);
     }
+    if (r == VK_SUCCESS) {   // a lost device may end the wait too: the results below would be read from work never run
+        uint64_t raw = 0;
+        VkResult q = vkGetSemaphoreCounterValue(c->device, exec_tl, &raw);
+        vk_device_lost_check(q, "the read of the executed timeline");
+        if (q == VK_SUCCESS)
+            timeline_beyond("executed timeline", raw, &ex_hw, "the wait for a submission's commands (a value no part "
+                                                              "signals)");
+    }
     // The results the game reads, of this submission and of those before it, which the GPU ran first: here, not when
     // the completion thread gets to them behind the other side effects of the last frame's submissions.
     if (r == VK_SUCCESS && wb_results) results_run(value);
@@ -1734,6 +1914,7 @@ static uint64_t probe_lost_advance(VkCtx *c, volatile int32_t *ran) {
     uint64_t v = issued + 1;
     plat_mutex_unlock(&st_lock);
     vk_completion_add(v, probe_lost_cb, (void *)ran);
+    sync_hw_raise(&tl_hw, v);   // a host signal: noted before it ("a lost device in the timelines' values")
     VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline, .value = v};
     if (vkSignalSemaphore(c->device, &si) != VK_SUCCESS) return 0;
     plat_mutex_lock(&st_lock);

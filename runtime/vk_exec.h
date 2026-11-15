@@ -293,6 +293,9 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
 // value in memory, or the signals replayed so far), 0 when its signal has not been replayed yet.
 int vk_exec_wait_event(const void *payload);
 int vk_exec_event_met(const void *payload);   // the same test without counting
+// Any thread, without the replay's lock: the wait's condition on the value in memory now or the signals replayed so
+// far, whatever submission another thread is recording (vk_exec_held_ready). A decision only.
+int vk_exec_event_met_now(const void *payload);
 extern int vk_exec_signalled;                 // set by every replayed SignalEvent; vk_exec.c clears it
 // Events the CPU signals (vk_exec_xfer.c "events the CPU signals").
 void vk_exec_event_cpu(const void *event);    // any thread: nvnEventSignal is about to write the event's value
@@ -308,6 +311,8 @@ uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after t
 // signal met, and the sum of how many submissions later it came.
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+// The same from a thread that does not hold the submission lock (vk_sync.c sub_lock), under which it is written.
+static inline uint64_t vk_exec_submit_seq_now(void) { return __atomic_load_n(&vk_exec_submit_seq, __ATOMIC_RELAXED); }
 extern uint32_t vk_exec_brk;          // replay thread: bumped by every op that is not state or a draw (vk_exec.c op_linear)
 uint32_t vk_exec_brk_now(void);       // vk_exec_brk, or in a parallel group's chunk the chunk's own count
 int vk_exec_mesh_run(const void *cur, const void **out, int max);
@@ -319,8 +324,8 @@ void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame'
 // each holds, and the texture pool's sets (0 before it exists).
 typedef struct { uint64_t pools, spare, sets_each, tex_sets; } VkDescMem;
 void vk_exec_desc_mem(VkDescMem *d);
-int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
-int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
+int vk_exec_held(void);               // any thread: held submissions waiting for a signal (event order)
+int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held); any thread
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
 // sample DLSS's output vk_dlaa_swap_view in its place, so the game's scaling draw scales DLSS's picture.
 extern const VkTexImage *vk_dlaa_swap_img;

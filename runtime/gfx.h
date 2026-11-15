@@ -26,7 +26,12 @@ void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
 uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time of a tick (pacing)
 double gfx_window_refresh_hz(void);                        // refresh rate of the window's monitor; 0 unknown
+uint64_t gfx_window_hosted_ns(void);                       // kern_now_ns() of the newest host present; 0 before one
 int gfx_window_focused(void);
+// gfx_present.c: who holds the present, queue and window-start locks, read without taking them (the hang watch)
+typedef struct { uint32_t present, present_depth, queue, queue_depth, start; } GfxLockHolders;
+void gfx_lock_holders(GfxLockHolders *h);
+int gfx_window_in_front(void);   // the window has the focus and is not minimized: the game is expected to present
 int vk_hdr_native(void);   // NX2NAVI_HDR = native: the game's own HDR picture (vk_hdr.c)
 int gfx_picture_rect(float out[4]);   // where the last present put the picture, fractions of the swapchain (x, y, w, h); 0 before one
 
@@ -159,6 +164,8 @@ typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, co
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
+uint32_t gfx_shader_pool_short_seen(void);   // shaders in memory whose texture pool array has the earlier length, 32768
+                                             // (gfx_shader.c pool_short_note; vk_texture_register's warning)
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);
@@ -202,10 +209,12 @@ typedef struct {
     // first thing a frame does, the back end holds the frame's start here, before the input is sampled (vk_lowlat.c
     // vk_lowlat_frame_start). NULL: nothing to do.
     void (*input_read)(void);
-    // nvnQueuePresentTexture, with the pacer's period in ns (0: it holds nothing): 1 when the back end holds the next
-    // frame's start to that period itself (vk_lowlat.c vk_lowlat_pace, a driver's low-latency sleep), so the pacer
-    // waits for neither the present's slot nor the window image. NULL: never.
-    int (*frame_paced)(uint64_t period_ns);
+    // nvnQueuePresentTexture, with the pacer's period in ns (0: it holds nothing; also during a movie, whose slots only
+    // the pacer keeps): the period the pacer still holds, for both the present's slot and the window image. period_ns
+    // while nothing else holds the limit; less when the back end holds the next frame's start to the period itself:
+    // the game's ceiling (frame_rate.c frame_step_ceiling_ns) where Reflex holds it with DLSS Frame Generation
+    // (vk_dlssg.c vk_dlssg_pace), 0 where a driver's low-latency sleep does (vk_lowlat.c vk_lowlat_pace). NULL: never.
+    uint64_t (*frame_paced)(uint64_t period_ns);
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);

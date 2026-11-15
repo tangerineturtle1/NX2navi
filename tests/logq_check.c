@@ -296,9 +296,58 @@ int main(int argc, char **argv) {
     at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
-    // 9. logq_sync: what is queued is written before it returns, and later lines are written by their own thread. The
-    //    lines are logged together just before it, so the log thread is still gathering them (the clock says whether
-    //    this thread was in time for that): the batch a fatal error, a crash or the end of the process finds queued.
+    // 9. logq_flush: what is queued is written before it returns, inside the gathering time, and the queue stays on.
+    //    With the log thread stuck in a write (the test holds its io lock) it gives up within its bound and writes
+    //    nothing, and the line is written once the write is over.
+    uint64_t f0 = plat_now_ns();
+    for (int i = 0; i < 20; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 3 %d \n", i);
+        logq_write(line, (size_t)n);
+    }
+    early = out_n - at;
+    in_time = plat_now_ns() - f0 < LOGQ_GATHER_NS / 2;
+    logq_flush();
+    if (in_time) CHECK(!early, "%zu bytes were written before logq_flush, inside the gathering time", early);
+    CHECK(check_lines(at, next, &notes) == 20, "logq_flush returned before the queued lines were written");
+    CHECK(__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE), "logq_flush turned the queue off");
+    at = out_n;
+    plat_mutex_lock(&Q.io);
+    logq_write("t 3 20 \n", 8);
+    f0 = plat_now_ns();
+    logq_flush();
+    uint64_t gave_up = plat_now_ns() - f0;
+    size_t through = out_n - at;
+    plat_mutex_unlock(&Q.io);
+    settle();
+    CHECK(gave_up < 2000000000ull && !through, "logq_flush with the io lock taken: back after %.0f ms, %zu bytes written",
+          gave_up / 1e6, through);
+    CHECK(check_lines(at, next, &notes) == 1, "the line queued while logq_flush gave up");
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 9b. logq_nudge (a focus loss): the log thread writes what it gathers at once, not when the gathering time is up.
+    //     On a machine too busy to log and look within half that time the timing check is left out.
+    uint64_t n0 = plat_now_ns();
+    for (int i = 0; i < 10; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 4 %d \n", i);
+        logq_write(line, (size_t)n);
+    }
+    logq_nudge();
+    in_time = plat_now_ns() - n0 < LOGQ_GATHER_NS / 4;
+    for (int i = 0; i < 60000 && out_n == at; i++) plat_sleep_ms(1);
+    uint64_t nudged = plat_now_ns() - n0;
+    settle();
+    if (in_time) CHECK(nudged < LOGQ_GATHER_NS * 3 / 4, "the nudged batch came %.1f ms after its first line", nudged / 1e6);
+    CHECK(check_lines(at, next, &notes) == 10, "lines lost from a nudged batch");
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 10. logq_sync: what is queued is written before it returns, and later lines are written by their own thread. The
+    //     lines are logged together just before it, so the log thread is still gathering them (the clock says
+    //     whether this thread was in time for that): the batch a fatal error, a crash or the end of the process finds
+    //     queued.
     __atomic_store_n(&sink_ms, 20, __ATOMIC_RELEASE);
     uint64_t s0 = plat_now_ns();
     for (int i = 0; i < 50; i++) {

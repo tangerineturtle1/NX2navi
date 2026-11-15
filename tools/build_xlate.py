@@ -7,10 +7,11 @@ NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS i
 
 Next to the exe it writes nx2navi_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
 Program.cs, the csproj, the patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
-translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-only writes it for the exe already built
-(the caller vouches that the exe matches the sources).
+translator change re-keys the cache without a hand-made KEY_VERSION bump. Only a build writes it: the packaging scripts
+(make_launcher.py, make_release.py, make_appimage.py, make_kit.py) take a translator whose .id names this checkout's
+sources for one built from them (check_built), so no option writes an .id beside an exe it did not build.
 
-  python tools/build_xlate.py [--id-only] [--out DIR]
+  python tools/build_xlate.py [--out DIR]
 
 --out builds into DIR instead of build/xlate (a task build dir: nx2navi.exe takes the translator next to it).
 """
@@ -202,9 +203,43 @@ def write_identity(exe: Path) -> None:
     print(f"translator identity {ident[:16]} -> {exe.with_suffix('.id')}")
 
 
+def source_identity() -> str:
+    """The identity a translator built from this checkout's sources gets: the vendor tree copied and patched in a
+    temporary folder (prepare_sources) and hashed as the build hashes it (identity). identity() over a build folder
+    hashes the tree its last build prepared, so a patch or vendor change made since then would not show. Nothing is
+    compiled; it takes a few seconds and needs git on PATH (prepare_sources applies the patches with it)."""
+    import tempfile
+    global BUILD
+    old = BUILD
+    with tempfile.TemporaryDirectory(prefix="xlate-id-") as d:
+        BUILD = Path(d) / "xlate"
+        try:
+            prepare_sources()
+            return identity()
+        finally:
+            BUILD = old
+
+
+def check_built(folder: Path, exe: str = EXE) -> str | None:
+    """None when folder holds the translator exe and an nx2navi_xlate.id naming this checkout's sources
+    (source_identity); otherwise why not. The packaging scripts stop on the reason: 0.10.0 and 0.10.1 shipped the
+    0.9.2 translator (identity 4d051299) after tools/xlate/Program.cs had raised the texture pool to 40960 slots, so
+    their translations still clamped every pool handle to slot 32767 and the ground went see-through after some area
+    loads. exe: the file name on the release's OS (EXE is this machine's)."""
+    folder = Path(folder)
+    for name in (exe, "nx2navi_xlate.id"):
+        if not (folder / name).is_file():
+            return f"{folder / name} is missing: build the shader translator with tools/build_xlate.py --out {folder}"
+    have = (folder / "nx2navi_xlate.id").read_text(encoding="ascii", errors="replace").strip()
+    want = source_identity()
+    if have != want:
+        return (f"{folder}: its translator was built from other sources (identity {have[:16]}) than this checkout's "
+                f"({want[:16]}): build it again with tools/build_xlate.py --out {folder}")
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--id-only", action="store_true", help="write nx2navi_xlate.id for the exe already built")
     parser.add_argument("--out", type=Path, help="build directory instead of build/xlate")
     parser.add_argument("--llvm", type=Path, help="Linux: an LLVM directory whose bin/clang and lld link the exe")
     parser.add_argument("--sysroot", type=Path, help="Linux: link against this sysroot's glibc instead of the host's "
@@ -213,9 +248,6 @@ def main() -> None:
     if a.out:
         global BUILD
         BUILD = a.out.resolve()
-    if a.id_only:
-        write_identity(BUILD / EXE)
-        return
     started = time.time()
     dotnet = shutil.which("dotnet")
     if not dotnet:

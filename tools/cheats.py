@@ -40,11 +40,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'recomp'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flags  # noqa: E402
+from layout import FIRST_BASE  # noqa: E402
 from lifter import Lifter, Unsupported  # noqa: E402
 from nso import Nso  # noqa: E402
 from mod_files import cheat_files  # noqa: E402
 
-BASE = 0x7000000000   # main's base in the layout (recomp/layout.py); only pc-relative decoding sees it
+BASE = FIRST_BASE   # main's base: recomp/layout.py lays main out first (ORDER); only pc-relative decoding sees it
 NOP = 0xD503201F
 RET = 0xD65F03C0
 

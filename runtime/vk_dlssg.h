@@ -9,6 +9,9 @@ int vk_dlssg_early(void);    // before the instance exists: loads the DLL and St
 VkResult vk_dlssg_create_instance(const VkInstanceCreateInfo *ci, VkInstance *out);
 VkResult vk_dlssg_enumerate(VkInstance inst, uint32_t *n, VkPhysicalDevice *pd);   // through the interposer too
 PFN_vkVoidFunction vk_dlssg_instance_proc(VkInstance inst, const char *name);   // the interposer's, or NULL
+int vk_dlssg_interposed(void);   // Streamline's proxies are in use (until a device is made without them)
+// The device through the interposer; by the loader alone, with frame generation off for the run, when the card is not
+// an NVIDIA one or the interposer fails to make it.
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
 void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
 PFN_vkGetDeviceProcAddr vk_dlssg_dpa(void);   // Streamline's device entry points, or NULL when it is not in use
@@ -22,6 +25,10 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext);   // each present, before its command buffer is submitted
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
 void vk_dlssg_frame_start(void);    // the game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture): Reflex's sleep
+// The game presents (nvn_api_obj.c nvnQueuePresentTexture, through vk_backend.c vk_be_frame_paced) with the pacer's
+// period, 0 during a movie: 1 when Reflex holds the frame limit where the frame starts (dlssg_pace.h), so the pacer
+// keeps only the game's ceiling. Atomics only, no wait; 0 while DLSS-G does not run.
+int vk_dlssg_pace(uint64_t period_ns);
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it
 // its submissions went out (vk_backend.c: vk_be_present, or replay_main with asynchronous replay): the render-submit-end
 // marker; frame is gfx_counters.frames of its present, the same count

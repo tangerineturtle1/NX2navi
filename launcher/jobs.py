@@ -43,6 +43,18 @@ def interrupted(ctx):
     return left if isinstance(left, dict) and left.get('task') else None
 
 
+def running_job(ctx):
+    """The job writing into the game folder as MARKER says it ({'task', 'kind', 'game_dir', 'started'}), or None. The
+    marker stays. Only worth asking while another process holds the launcher folder's lock: one that a launcher
+    stopped in its job left behind reads the same (interrupted tells it and removes it)."""
+    try:
+        with open(ctx.layout.data / MARKER, encoding='utf-8') as f:
+            job = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return job if isinstance(job, dict) and job.get('task') else None
+
+
 def failure_line(e):
     """A failure in one line for the log: its kind, its message and what it came from."""
     cause = e.__cause__
@@ -512,7 +524,7 @@ class RebuildJob(Job):
     def run(self):
         self.ensure_tools('tools_update')
         layout = self.ctx.layout
-        if build.game_running(self.game_dir):
+        if build.game_running(self.game_dir, log=self.ctx.log):
             raise build.BuildError('the game is running: close it and try again')
         if build.can_rebuild(self.game_dir):
             args = build.rebuild_args(layout, self.game_dir, self.retune)

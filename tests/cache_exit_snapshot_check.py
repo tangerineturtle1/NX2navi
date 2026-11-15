@@ -47,6 +47,7 @@ static struct {
     int device, fold, feedback;
     const char *cache_path, *play_path;
     uint64_t saved[2], cache_loaded, play_loaded;
+    volatile uint64_t held[2];   // cache_save_one stores the data sizes here for the memory report
 } P;
 static void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared(m); }
 static void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared(m); }

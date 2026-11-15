@@ -30,6 +30,7 @@
 #include "perfmon.h"
 #include "prof.h"
 #include "prof_syms.h"
+#include "platform/platform.h"
 
 #define render_tid prof_render_tid
 #define main_tid prof_main_tid
@@ -407,10 +408,17 @@ int prof_sampler_start(void) {
     return 1;
 }
 
-// NX2NAVI_TRACE=perf (perf.c): the process's committed memory by kind, and outside the guest's address range the
-// allocations holding the most private memory, so a log shows what grows: guest memory, a heap, the graphics driver's
-// mappings or loaded images. A walk of the address space with VirtualQuery: tens of milliseconds, so only now and then.
+// NX2NAVI_MEM_CENSUS (perf.c census_check): the process's committed memory by kind, and the allocations of the process's
+// own memory holding the most, so a log shows what grows: the guest's memory, a heap, the graphics driver's mappings or
+// loaded images. One walk of the address space with VirtualQuery, tens of milliseconds, so only now and then; it also
+// counts the guest ranges' committed bytes (mem_guest_ranges), which mem_guest_census would walk a second time.
+// Kinds of committed memory: images and mapped views by type; of the private memory, the write-combined views (device
+// memory the driver maps into the process; Windows charges it to the process's commit), the guest's ranges, and the
+// rest, the process's own ("other private"). The driver places its views anywhere in the free address space, below
+// RT_ADDRESS_LIMIT too: with every private region under it counted as guest, "other private" was 0 MiB in all 33
+// censuses of a session (2026-11-13) and the guest's figure grew with the textures.
 #define CENSUS_TOP 12
+#define CENSUS_RANGES 16
 typedef struct { uint64_t base, bytes; DWORD protect; } CensusRun;
 
 static void census_keep(CensusRun *top, int *nt, const CensusRun *r) {   // top[] stays sorted, largest first
@@ -420,24 +428,37 @@ static void census_keep(CensusRun *top, int *nt, const CensusRun *r) {   // top[
     top[k] = *r;
 }
 
-void prof_commit_census(uint64_t frame) {
+int prof_commit_census(uint64_t frame, uint64_t *wc_out) {
     // Allocations by committed size: under 256 KiB, under 4 MiB, under 64 MiB, larger. A few large ones growing is a
     // pool or cache; many small ones is a stream of allocations that are not freed.
     static const uint64_t edge[3] = {256ull << 10, 4ull << 20, 64ull << 20};
     uint64_t bcount[4] = {0}, bbytes[4] = {0};
-    uint64_t t0 = GetTickCount64(), guest = 0, priv = 0, mapped = 0, image = 0, regions = 0;
+    uint64_t t0 = plat_now_ns(), guest = 0, priv = 0, wc = 0, mapped = 0, image = 0, regions = 0;
+    const char *gname[CENSUS_RANGES];
+    RtRange gr[CENSUS_RANGES];
+    uint64_t gcom[CENSUS_RANGES] = {0};
+    int ng = mem_guest_ranges(gname, gr, CENSUS_RANGES);
     CensusRun top[CENSUS_TOP], cur = {0};
     int nt = 0;
     MEMORY_BASIC_INFORMATION mi;
     for (uint8_t *a = NULL; VirtualQuery(a, &mi, sizeof mi) == sizeof mi; a = (uint8_t *)mi.BaseAddress + mi.RegionSize) {
         regions++;
         uint64_t base = (uint64_t)(uintptr_t)mi.AllocationBase, at = (uint64_t)(uintptr_t)mi.BaseAddress;
-        int committed = mi.State == MEM_COMMIT, outside = committed && mi.Type == MEM_PRIVATE && at >= RT_ADDRESS_LIMIT;
+        uint64_t end = at + mi.RegionSize, in_guest = 0;
+        int committed = mi.State == MEM_COMMIT, host = 0;
+        if (committed)   // the guest ranges' committed bytes, whatever the kind (the census mem_guest_census made)
+            for (int i = 0; i < ng; i++) {
+                uint64_t lo = at > gr[i].base ? at : gr[i].base, hi = end < gr[i].base + gr[i].size ? end : gr[i].base + gr[i].size;
+                if (hi > lo) gcom[i] += hi - lo, in_guest += hi - lo;
+            }
         if (committed) {
             if (mi.Type == MEM_IMAGE) image += mi.RegionSize;
             else if (mi.Type == MEM_MAPPED) mapped += mi.RegionSize;
-            else if (at < RT_ADDRESS_LIMIT) guest += mi.RegionSize;
-            else priv += mi.RegionSize;
+            else if (mi.Protect & PAGE_WRITECOMBINE) wc += mi.RegionSize;
+            else {
+                guest += in_guest < mi.RegionSize ? in_guest : mi.RegionSize;
+                if (in_guest < mi.RegionSize) priv += mi.RegionSize - in_guest, host = 1;
+            }
         }
         // An allocation's regions are contiguous: its run ends where the next allocation begins, reserved gaps inside
         // it (a heap segment's uncommitted tail) included.
@@ -446,20 +467,21 @@ void prof_commit_census(uint64_t frame) {
             bcount[k]++, bbytes[k] += cur.bytes;
             census_keep(top, &nt, &cur), cur.bytes = 0;
         }
-        if (outside) {
+        if (host) {
             if (!cur.bytes) cur.base = base, cur.protect = mi.AllocationProtect;
-            cur.bytes += mi.RegionSize;
+            cur.bytes += mi.RegionSize - in_guest;
         }
-        if (at + mi.RegionSize < at) break;   // the top of the address space
+        if (end < at) break;   // the top of the address space
     }
     if (cur.bytes) {
         int k = cur.bytes < edge[0] ? 0 : cur.bytes < edge[1] ? 1 : cur.bytes < edge[2] ? 2 : 3;
         bcount[k]++, bbytes[k] += cur.bytes;
         census_keep(top, &nt, &cur);
     }
-    rt_log("mem: commit census at frame %llu: guest %.0f MiB, other private %.0f MiB, mapped %.0f MiB, images %.0f MiB "
-           "(%llu regions walked in %llu ms)", (unsigned long long)frame, guest / 1048576.0, priv / 1048576.0,
-           mapped / 1048576.0, image / 1048576.0, (unsigned long long)regions, (unsigned long long)(GetTickCount64() - t0));
+    rt_log("mem: commit census at frame %llu: guest %.0f MiB, device memory views (write-combined) %.0f MiB, other "
+           "private %.0f MiB, mapped %.0f MiB, images %.0f MiB (%llu regions walked in %.1f ms)", (unsigned long long)frame,
+           guest / 1048576.0, wc / 1048576.0, priv / 1048576.0, mapped / 1048576.0, image / 1048576.0,
+           (unsigned long long)regions, (plat_now_ns() - t0) / 1e6);
     rt_log("mem:   other private by allocation size: under 256 KiB %llu allocations %.0f MiB, under 4 MiB %llu %.0f MiB, "
            "under 64 MiB %llu %.0f MiB, larger %llu %.0f MiB; the largest:",
            (unsigned long long)bcount[0], bbytes[0] / 1048576.0, (unsigned long long)bcount[1], bbytes[1] / 1048576.0,
@@ -467,6 +489,10 @@ void prof_commit_census(uint64_t frame) {
     for (int i = 0; i < nt; i++)
         rt_log("mem:   %#llx %.1f MiB committed (protect %#lx)", (unsigned long long)top[i].base, top[i].bytes / 1048576.0,
                (unsigned long)top[i].protect);
+    mem_guest_census_log(frame, gname, gcom, ng);
+    mem_lazy_heap_census(frame);
+    *wc_out = wc;
+    return 1;
 }
 
 // perf_present, every present: the frame the sampler's NX2NAVI_PROFILE_FRAMES window counts, and a NX2NAVI_PROFILE_SLOW

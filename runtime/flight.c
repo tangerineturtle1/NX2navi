@@ -32,7 +32,9 @@
 
 // Record columns after frame, time and interval: blocked time per PERF_* kind (us), then the counts.
 enum { C_SUBMITS, C_PASSES, C_DRAWS, C_DRAWS_SEEN, C_CLEARS, C_COPIES, C_DISPATCHES, C_XLATED, C_PERF0, C_N = C_PERF0 + PERF_CNT_N };
-static const char *const blocked_names[PERF_N] = {"pace_ms", "fence_ms", "drain_ms", "pipe_ms", "xlate_ms", "tex_ms", "astc_ms"};
+static const char *const blocked_names[] = {"pace_ms", "fence_ms", "drain_ms", "pipe_ms", "xlate_ms", "tex_ms", "astc_ms",
+                                            "handoff_ms"};
+_Static_assert(sizeof blocked_names / sizeof *blocked_names == PERF_N, "blocked_names follows the PERF_* list (host.h)");
 static const char *const count_names[C_N] = {
     "submits", "passes", "draws", "draws_seen", "clears", "copies", "dispatches", "shaders_xlated",
     // PERF_CNT_* order (host.h)

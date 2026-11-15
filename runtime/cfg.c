@@ -1,7 +1,10 @@
 ﻿// nx2navi.ini: file-backed defaults for the NX2NAVI_* environment variables (docs/controls.md, nx2navi.ini.example).
 // Format: "key = value" lines, '#' or ';' at the start of a line begins a comment, [sections] only group. A key is a
 // variable name without "NX2NAVI_" (an optional NX2NAVI_ prefix is accepted), case-insensitive. A value is the rest of the
-// line, trimmed, optionally in double quotes; an empty value counts as unset. The environment wins over the file.
+// line, trimmed, optionally in double quotes; an empty value counts as unset. For a setting with a set of values (a row
+// of metas[] with values), a blank followed by ';' or '#' starts a comment after the value too (cut_comment). A switch
+// (values 0|1) reads false, off and no as 0 and true, on and yes as 1 (switch_word). The environment wins over the
+// file.
 //
 // Live settings: cfg_set changes a value in memory (readers see the new pointer; the old string is kept, so a pointer
 // cfg_get handed out stays valid) and cfg_save writes only the changed keys back, keeping the rest of the file.
@@ -36,9 +39,13 @@ static int save_ok = 1;                         // the last cfg_save_to wrote (o
 static const char *const known[] = {
     "SPRINT_SPEED", "AIR_JUMPS", "SPIN_RANGE", "SPIN_CHARGE", "BOMB_ARROWS", "WORLD_SKULLTULAS", "WORLD_HEART_PIECES",
     "WORLD_GROTTOS", "WORLD_CHESTS", "WORLD_BEAN_PLOTS", "WORLD_FAIRIES", "WORLD_UPGRADES",
+    "SPRINT_PATCH", "SPIN_INSTANT_PATCH", "SPIN_RANGE_PATCH", "BOMB_ARROWS_PATCH", "BOMB_ARROWS_DEBUG",
+    "WORLD_MAP_PATCH", "WORLD_MAP_DEBUG",
     "CORES", "TM_DISPATCH", "NVN2_CS_TABLE", "SKIP_SHADERS", "MOVIE_DEBAND", "MOVIE_FPS", "MOVIE_SKIP", "MOVIE_OVERLAY", "MOVIES", "NPLN", "NVN2_PROGRAMS", "NVN_TRAP", "OCARINA_REALTIME", "ONESHOT_BUDGET", "ONESHOT_WAIT_MS", "OCARINA_STEP", "PHYSICS_STEPS", "PHYSICS_STEPS_FULL", "PICKUP_COUNT", "WATER_STEPS", "SOUND_STEPS", "FLOOR_PROBE", "FLOOR_SCAN", "FLOOR_WATCH", "FLOOR_CARRY", "MOVIE_PTS", "STEP_STEADY", "VI_HZ", "VI_VRR", "TIME_DUMP", "SHADER_DUMP", "SHOT_AFTER", "SHOT_DIR", "SHOT_EVERY",   // Switch 2 port: movie skip (romfs.c), NVN2 proc traps (nvn_procs.c)
+    "OCARINA_TIMING",
     "AA", "AA_LOG", "AB", "AMIIBO_DIR", "ANISO", "APP_POOL", "ASPECT", "ASPECT_PATCH", "ASSUME_FOCUS", "ASTC", "ASTC_BC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_CATCHUP", "AUDIO_CHANNELS", "AUDIO_DEVICE", "AUDIO_GAME_PRIO", "AUDIO_OFF", "AUDIO_PREFILL_MS", "AUDIO_RAMP", "AUDIO_STATS",
-    "BARRIER_GAME", "MESH_AHEAD", "MESH_FALLBACK", "MESH_FALLBACK_MB", "MESH_FALLBACK_WORKERS", "PROBE_MESHFB_DIR",
+    "AUDIO_STRICT",
+    "BARRIER_GAME", "MESH_AHEAD", "MESH_FALLBACK", "MESH_FALLBACK_MB", "MESH_FALLBACK_WORKERS", "MESH_FALLBACK_HOLD", "PROBE_MESHFB_DIR",
     "CAPTURE_AT", "CAPTURE_DIR", "CAPTURE_REPLAY", "CAPTURE_REPLAY_CAMERA",   // bug captures and their replays (bugcap.c)
     "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT", "BIND_LSTICK_DOWN", "BIND_LSTICK_LEFT",
     "BIND_LSTICK_RIGHT", "BIND_LSTICK_UP", "BIND_MINUS",
@@ -47,13 +54,12 @@ static const char *const known[] = {
     "BIND_SKIP", "BIND_STATS", "BIND_UP", "BIND_X", "BIND_Y",
     "BIND_ZL", "BIND_ZR", "BLOCK_VIEWS_3D", "CACHE_DIE", "CLOTH_REALTIME", "COLOR_BRIGHTNESS", "COMPUTE_KEEP", "COLOR_CONTRAST", "COLOR_GAMMA",
     "COLOR_PRESET", "COLOR_SATURATION", "CONTACT_DEBUG", "CONTACT_SHADOWS", "CORE_DIAG", "CRIT", "CRIT_OUT",
-    "DMABUF", "DMABUF_MB", "DRAW_CRUMBS", "GPA_LATE", "DESC_TEMPLATE", "DEVICE_PROFILE", "DISCORD_APP_ID", "DISCORD_IMAGE", "DISCORD_RPC", "DLAA", "DLAA_CAM_KEEP", "DLAA_CUT", "DLSS_IDLE_FREE", "DLAA_EDGE_FILL", "DLAA_AT_UPSCALER", "FFX_DEBUG", "FFX_KEYS", "FSR3_SHARPEN", "DLAA_JITTER", "DLAA_MV", "DLAA_MASKDEBUG", "DLAA_MVDEBUG", "DLAA_OBJMV", "DLAA_SURVEY", "DLAA_TARGET_KEEP", "DLAA_TIMES", "DLSS", "DLSS_CHAR_MASK", "DLSS_PRESET", "DLSS_PREBLOOM", "DLSS_RANGE", "DLSS_REACTIVE", "DUMP", "DUMP_BUF", "DUMP_DIR",
+    "DMABUF", "DMABUF_MB", "DRAW_CRUMBS", "GPA_LATE", "DESC_TEMPLATE", "DEVICE_PROFILE", "DISCORD_APP_ID", "DISCORD_IMAGE", "DISCORD_RPC", "DLAA", "DLAA_CAM_KEEP", "DLAA_CUT", "DLSS_IDLE_FREE", "DLAA_EDGE_FILL", "DLAA_AT_UPSCALER", "FFX_DEBUG", "FFX_KEYS", "FSR3_SHARPEN", "DLAA_JITTER", "DLAA_JITTER_TEST", "DLSS_LOD_BIAS_TEST", "DLAA_MV", "DLAA_MASKDEBUG", "DLAA_MVDEBUG", "DLAA_OBJMV", "DLAA_SURVEY", "DLAA_TARGET_KEEP", "DLAA_TIMES", "DLSS", "DLSS_CHAR_MASK", "DLSS_PRESET", "DLSS_PREBLOOM", "DLSS_RANGE", "DLSS_REACTIVE", "DUMP", "DUMP_BUF", "DUMP_DIR",
+    "UPSCALER_IDLE_WAIT",
     "DUMP_LOG", "DUMP_RAW", "DUMP_SHADERS", "DUMP_FILE", "DS3", "LOG_CS_BINDS", "LOG_TEX_FLAGS", "LOG_MESH", "MESH", "POOL", "NATIVE_TENSOR", "LOG_RCOND", "LOG_RT_SIZES", "DUMP_WHITE", "DUMP_AFTER", "DUMP_MOVIE", "SUBMIT_FINISH", "ACQUIRE_WAIT", "CRASH_FILTER_GUARD", "CS_FALLBACK", "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES", "GPU_TIMELINE",
-    "FFX_PIPE_CACHE", "FLIGHT_SPIKE_MS", "STUTTER_MAP", "PAR_JOBS", "PIPE_RELEASE", "FLIGHT_THUMBS", "FLIGHT_EVERY", "FLIGHT_FLASH", "FLIGHT_FLASH_DIFF", "FLIGHT_FLASH_CELLS", "FLUSH_SPAN", "FLUSH_UPLOAD", "FOG_CULL", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FG_MULT", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FRAMEGEN_MULTIPLIER", "FREEZE_IDLE", "FREEZE_ASYNC", "FREEZE_BUDGET_US", "FREE_CORES",
+    "FFX_PIPE_CACHE", "FLIGHT_SPIKE_MS", "FREEZE_QUIET_MS", "FREEZE_LOAD_HOLD_MS", "STUTTER_MAP", "PAR_JOBS", "PIPE_RELEASE", "FLIGHT_THUMBS", "FLIGHT_EVERY", "FLIGHT_FLASH", "FLIGHT_FLASH_DIFF", "FLIGHT_FLASH_CELLS", "FLUSH_SPAN", "FLUSH_UPLOAD", "FOG_CULL", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FG_MULT", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FRAMEGEN_MULTIPLIER", "FREEZE_IDLE", "FREEZE_ASYNC", "FREEZE_BUDGET_US", "FREE_CORES",
     "FULLSCREEN", "FXAA", "GAME_ASPECT", "GAME_RES", "GPA", "GPA_EMPTY", "GPA_TWIN", "GPA_TWIN_MAX_KB", "MIRROR_CAPTURE_KB", "WB_SKIP_MB", "GPL", "GPL_DRAW_BUILD", "GPL_FEEDBACK", "GPL_MESH", "PIPE_AHEAD", "PIPE_FAST_WORKERS", "PIPE_FRAME_WAIT_MS", "PIPE_LINK_DRAW_MS", "PIPE_SKIP_STEADY", "DRAW_WRITERS_WAIT", "PROG_LEAD", "GPU", "GPU_INDEX", "GPU_PASSES", "GPU_NAME", "HDR",
     "HDR_GAME_NITS", "HDR_LIVE", "HEAP_LAZY", "HDR_PEAK_NITS", "HDR_UI_NITS",
-    // retired: the HDR look's settings of earlier versions, now fixed (vk_hdr.c, shaders/hdr_tonemap.frag); read by
-    // nothing, listed so that a file which still sets them logs no unknown key
     "HDR_BLOWOUT", "HDR_CONTRAST", "HDR_EXPOSURE", "HDR_FLARE", "HDR_GAMMA", "HDR_GRADE", "HDR_HIGHLIGHT_SAT",
     "HDR_HIGHLIGHTS", "HDR_HUE", "HDR_HUE_CLIP", "HDR_MATCH_SLOPE", "HDR_MIDGRAY", "HDR_SATURATION", "HDR_SHADOWS",
     "HDR_TONEMAP", "HDR_TONE_SLOPE", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
@@ -63,12 +69,14 @@ static const char *const known[] = {
     "SKIN_MOTION",   // vk_skin_motion.inc
     "MVOBJ_ALL", "MVOBJ_BANKS", "MVOBJ_EQUAL", "MVOBJ_EXACT", "MVOBJ_EXEC", "MVOBJ_NOC4", "MVOBJ_ONLY", "MVOBJ_TIMES", "MVPREV_CHECK", "MVPREV_GROW", "MVPREV_SKIP", "MVPREV_TRUST", "MV_CHECK",
     "MV_SURVEY",
-    "PIPE_SEED_BOOT", "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_LAYOUT", "PACE_HZ", "PASS_CRUMBS", "PATCH_OUTPUT", "PATCH_RES_FIXED", "PATCH_SCENE", "PATCH_WIDE_ASPECT", "PATCH_WIDE_HUD", "PATCH_WIDE_MOVIE", "PATCH_WIDE_OUT", "PATCH_FREECAM", "PATCH_OCCLUSION_OFF", "PATCH_WIDE_SAVE", "PATCH_WIDE_SCENE", "PCSS", "PCSS_K", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPELINE_CACHE_MAX_MB", "PIPELINE_CACHE_PLAY", "PIPELINE_CACHE_PLAY_MB", "PIPE_BINARIES", "PIPE_BINARIES_MAX_MB", "PIPE_FEEDBACK", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SEED", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POWER_FULL", "TEX_SAME", "TEX_SAME_BIG", "TEX_FLAT3D", "TEX_KEEP_TAKEN", "TEX_STALE_KEPT", "PRESENT_HELD", "HELD_SYNC",
+    "HANDLE_CENSUS",
+    "PIPE_SEED_BOOT", "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_LAYOUT", "PACE_HZ", "PASS_CRUMBS", "PATCH_OUTPUT", "PATCH_RES_FIXED", "PATCH_SCENE", "PATCH_WIDE_ASPECT", "PATCH_WIDE_HUD", "PATCH_WIDE_MOVIE", "PATCH_WIDE_OUT", "PATCH_FREECAM", "PATCH_OCCLUSION_OFF", "PATCH_WIDE_SAVE", "PATCH_WIDE_SCENE", "PCSS", "PCSS_K", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPELINE_CACHE_MAX_MB", "PIPELINE_CACHE_PLAY", "PIPELINE_CACHE_PLAY_MB", "PIPE_BINARIES", "PIPE_BINARIES_MAX_MB", "PIPE_FEEDBACK", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SEED", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POWER_FULL", "TEX_SAME", "TEX_SAME_BIG", "TEX_FLAT3D", "TEX_KEEP_TAKEN", "TEX_RATE_LOW", "TEX_HARD_ORDER", "TEX_STALE_KEPT", "ASTC_SCRATCH_TRIM", "PRESENT_HELD", "HELD_SYNC",
+    "PRESENT_ORDER",
     "PREPARE_PIPELINES", "PREWARM_FULL", "PREWARM_FULL_S", "PREWARM_WAIT_MS", "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES", "PROFILE_REPLAY", "PROFILE_SLOW",
     "POOL_FAST", "POOL_GROUP", "POOL_GROUP_CHECK", "POOL_PRESNAP", "POOL_PRESNAP_RUNS",
     "SUBMIT_FINISH_GPU", "SVC_WAITS", "SNAP_WIDEN", "SUBMIT_FINISH_RESULTS", "SUBMIT_FINISH_KINDS", "FOLIAGE", "MIRROR_STAGE", "FLUSH_SKIP_CLEAN", "MIRROR_HOT", "MESH_EMULATION", "MESH_EMU_MB", "MESH_EMU_TASKS", "MESH_EMU_BATCH", "GUEST_OPT", "LOG_TEX_NEW", "DUMP_KEY", "VEC_INDEX_FIX", "PASS_TIMES",
     "PROFILE_MAIN", "PROFILE_RENDER", "PROMPTS", "PUSH_SKIP", "PUSH_STAGE", "RDOC", "RDOC_DIR", "RDOC_DLL", "REALTIME", "REC_END", "REEXEC",
-    "REFLEX", "LOW_LATENCY", "RENDER_SCALE", "REPLAY_ASYNC", "REPLAY_PIPE", "REPLAY_RUNS", "REPLAY_SMALL", "TAIL_EARLY", "REPLAY_WORKERS", "RTSS", "RTSS_ENUM", "SCENE_SHARE",
+    "REFLEX", "REFLEX_LIMIT", "LOW_LATENCY", "RENDER_SCALE", "REPLAY_ASYNC", "REPLAY_PIPE", "REPLAY_RUNS", "REPLAY_SMALL", "TAIL_EARLY", "REPLAY_WORKERS", "RTSS", "RTSS_ENUM", "SCENE_SHARE",
     "PRESNAP_PLACE",
     "REPLAY_CHECK", "RESOLVE_CHECK", "RESTART_WAIT", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
     "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RSTICK_DEADZONE", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_HD", "RUMBLE_HD_MS", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SHADER_CACHE",
@@ -78,16 +86,23 @@ static const char *const known[] = {
     "SWKBD_ANSWER",
     "SET_AT", "SWKBD_TEST", "TAA", "DBG_TEST", "DEBUG_MENU", "MENU_TEST_DEBUG", "FSR4", "FSR4_FG", "FG4_VERSION", "FG4_SWAPCHAIN", "TEST_PAD", "TEST_PAD_AT", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "DEPTH_INIT_INLINE", "DEPTH_ALIAS_LOG", "TEX_DISUSE", "TEX_DISUSE_EVICT", "TEX_GEN_UNDO", "TEX_MEMO", "TEX_VRAM_PRESSURE", "TEX_RELEASED_MB", "TEX_RELEASED_MAX", "TEX_RELEASED_HOLD", "TEX_REUSE", "TEX_SPLIT_FILL", "TEX_COMMIT_FREE_MB", "TEX_PROC_COMMIT_MB", "TEX_EVICT", "TEX_COMMIT_EVICT", "MIRROR_EVICT", "VRAM_BUDGET_MB", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "EVO_TRACE", "EVENT_AT_SYNC", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NAN_PRESERVE", "VK_NOOPT", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECONVERGE", "VK_NAN_BITS", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS", "WATER_PROJECTIVE",
-    "WAIT_WATCH_S", "WALK_KEY", "WALK_SCALE", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WB_NO_REUP", "WB_MERGE_MAX", "WB_PROBE", "WB_SPLIT", "WB_LAZY", "WB_LAZY_CHUNK", "WB_LAZY_TOUCH", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
+    "WAIT_WATCH_S", "WALK_KEY", "WALK_SCALE", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WB_NO_REUP", "WB_MERGE_MAX", "WB_PROBE", "WB_SPLIT", "WB_LAZY", "WB_LAZY_CHUNK", "WB_LAZY_TOUCH", "WB_LAZY_UNLOCKED", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
     "UPLOAD_BATCH_MB", "VRAM_HEAP_LIMIT", "VRAM_RESERVE_MB", "TEX_CLOBBER", "LOW_END_GPU",
     "ZSTD_CHECK", "ZSTD_NATIVE",
     "BIND_REUSE", "DYN_DELTA", "STG_ARENA", "SUBMIT_BATCH", "SUBMIT_THREAD", "ASTC_GPU_DESWIZZLE", "ASTC_SCRATCH_KEEP", "ASTC_ARENA", "ASTC_BC1",
     "TEXUP_LOG_MS", "DYN_RES", "DYN_RES_TARGET", "DYN_RES_STEP", "TEXTURE_DETAIL", "VRAM_USE",   // vram_use: the removed Video memory use row, read by nothing
     "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET", "POOL_CREATE_MS", "POOL_FINI_IDLE", "POOL_LOAD_BACKLOG", "POOL_LOAD_MS",
     "VMA_BLOCK_MB", "SYNC_WAKE_ALL", "LOG_ASYNC", "DEVICE_LOST_AT", "STAGING_FAIL_AT", "VRAM_BALLAST_MB",
+    "GEN_SEED",
+    "COPY_RETIRE",
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
+    // developer switches read with cfg_get, rt_knob or vk_caps.c env_u32, without a menu row (tests/cfg_rows_check.py)
+    "AUDIO_DUMP", "DEFER_STAMP", "DEPTH_TWIN", "DLAA_ZFIT", "DUMP_SKIP_RUNS", "DUMP_TEX", "DUMP_UBO", "EVENT_ORDER",
+    "GATHER_BIAS", "PIN_SWEEP", "REC_CHECK", "REC_DELAY_US", "REG_ORDER", "SHADOW", "ZERO_LOCALS",
+    // hang_watch.c: the hang watch's seconds
+    "HANG_WATCH_S",
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
     "COOP", "COOP_BETA", "COOP_NAME", "COOP_SERVER", "COOP_PORT", "COOP_ROOM", "COOP_AUTO", "COOP_DROP",
@@ -105,7 +120,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"WORLD_GROTTOS", "cheats"}, {"WORLD_CHESTS", "cheats"}, {"WORLD_BEAN_PLOTS", "cheats"},
     {"WORLD_FAIRIES", "cheats"}, {"WORLD_UPGRADES", "cheats"},
     {"SPIN_RANGE", "cheats"}, {"SPIN_CHARGE", "cheats"}, {"SPRINT_SPEED", "cheats"}, {"AIR_JUMPS", "cheats"},
-    // the low-end GPU mode's rows in the menu's Game tab (ui/menu.cpp rows_low_end)
+    // the settings the low-end GPU mode had rows for up to 0.10.1 (lowend_set, below)
     {"TEX_RELEASED_MAX", "performance"}, {"MIRROR_HOT", "performance"}, {"FREEZE_IDLE", "performance"}, {"SUBMIT_FINISH_KINDS", "performance"}, {"FOLIAGE", "performance"},
     {"ZSTD_NATIVE", "performance"},
     {"VRAM_HEAP_LIMIT", "performance"}, {"VRAM_RESERVE_MB", "performance"}, {"UPLOAD_BATCH_MB", "performance"}, {"MESH_EMULATION", "performance"},
@@ -115,7 +130,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"FPS_LIMIT", "frame rate"}, {"FPS60", "frame rate"}, {"RTSS", "frame rate"},
     {"REALTIME", "frame rate"}, {"CLOTH_REALTIME", "frame rate"}, {"HIGHFPS_FIX", "frame rate"},
     {"PHYSICS_STEPS", "frame rate"}, {"PICKUP_COUNT", "frame rate"}, {"WATER_STEPS", "frame rate"},
-    {"SOUND_STEPS", "frame rate"}, {"FLOOR_CARRY", "frame rate"},
+    {"SOUND_STEPS", "frame rate"}, {"FLOOR_CARRY", "frame rate"}, {"OCARINA_TIMING", "frame rate"},
     {"MOVIE_PTS", "frame rate"}, {"STEP_STEADY", "frame rate"},
     {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"},
     {"GPU_INDEX", "display"}, {"MONITOR", "display"}, {"OUTPUT_RES", "display"}, {"GAME_ASPECT", "display"}, {"GAME_RES", "display"}, {"RENDER_SCALE", "display"}, {"UPSCALER", "display"},
@@ -124,10 +139,15 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_PRESET", "display"},
     {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_LIVE", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
-    {"HDR_UI_NITS", "display"}, {"SHADOW_RES", "display"},
+    {"HDR_UI_NITS", "display"}, {"HDR_GAMMA", "display"}, {"HDR_TONEMAP", "display"}, {"HDR_EXPOSURE", "display"},
+    {"HDR_HIGHLIGHTS", "display"}, {"HDR_SHADOWS", "display"}, {"HDR_CONTRAST", "display"}, {"HDR_SATURATION", "display"},
+    {"HDR_HIGHLIGHT_SAT", "display"}, {"HDR_BLOWOUT", "display"}, {"HDR_FLARE", "display"}, {"HDR_HUE", "display"},
+    {"HDR_GRADE", "display"}, {"HDR_MIDGRAY", "display"}, {"HDR_MATCH_SLOPE", "display"}, {"HDR_TONE_SLOPE", "display"},
+    {"HDR_HUE_CLIP", "display"}, {"SHADOW_RES", "display"},
     {"DLAA", "display"}, {"FSR4", "display"}, {"FSR4_FG", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_IDLE_FREE", "display"}, {"DLSS_RANGE", "display"}, {"DLSS_PREBLOOM", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"}, {"AA", "display"},
+    {"UPSCALER_IDLE_WAIT", "display"},
     {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"}, {"FG_MULT", "display"}, {"SKIN_MOTION", "display"},
-    {"LOW_LATENCY", "display"},
+    {"LOW_LATENCY", "display"}, {"REFLEX_LIMIT", "display"},
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
@@ -137,6 +157,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"MENU_LANG", "language"}, {"LANG", "language"}, {"OPERATION_MODE", "language"}, {"TEXT_SPEED", "language"},
     {"VOLUME", "audio"}, {"AUDIO_CHANNELS", "audio"}, {"AUDIO_DEVICE", "audio"}, {"MICROPHONE", "audio"}, {"MENU_SOUND_VOLUME", "audio"},
     {"AUDIO_RAMP", "audio"}, {"AUDIO_CATCHUP", "audio"},
+    {"AUDIO_STRICT", "audio"},
     {"MOTION", "input"}, {"SPRINT_BUTTON", "input"}, {"SPRINT_MODE", "input"}, {"RUMBLE_STRENGTH", "input"}, {"RUMBLE_CURVE", "input"}, {"RUMBLE_TRIGGERS", "input"}, {"RUMBLE_HD", "input"}, {"DS3", "input"},
     {"PAD_LAYOUT", "input"}, {"PROMPTS", "input"}, {"STICK_DEADZONE", "input"}, {"LSTICK_DEADZONE", "input"}, {"RSTICK_DEADZONE", "input"},
     {"STICK_SENS", "input"}, {"DEBUG_MENU", "input"},
@@ -154,7 +175,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"DYN_DELTA", "performance"}, {"STG_ARENA", "performance"}, {"SUBMIT_BATCH", "performance"}, {"SUBMIT_THREAD", "performance"},
     {"BUILD_FREE_MB", "performance"}, {"BUILD_RESERVE_MB", "performance"}, {"MEM_NEED_MB", "diagnostics"},
     {"ASTC_GPU_DESWIZZLE", "performance"}, {"ASTC_SCRATCH_KEEP", "performance"}, {"ASTC_ARENA", "performance"}, {"ASTC_BC1", "performance"}, {"POOL_CREATE_BUDGET", "performance"},
-    {"POOL_CREATE_MS", "performance"}, {"POOL_FINI_IDLE", "performance"}, {"FREEZE_BUDGET_US", "performance"}, {"POOL_LOAD_BACKLOG", "performance"}, {"POOL_LOAD_MS", "performance"},
+    {"POOL_CREATE_MS", "performance"}, {"POOL_FINI_IDLE", "performance"}, {"FREEZE_BUDGET_US", "performance"}, {"FREEZE_QUIET_MS", "performance"}, {"FREEZE_LOAD_HOLD_MS", "performance"}, {"POOL_LOAD_BACKLOG", "performance"}, {"POOL_LOAD_MS", "performance"},
     {"TIMER_1MS", "performance"}, {"PIPE_WAIT", "performance"}, {"PIPE_SKIP", "performance"}, {"ONESHOT_BUDGET", "performance"},
     {"PIPE_FRAME_WAIT_MS", "performance"}, {"PIPE_SKIP_STEADY", "performance"}, {"DRAW_WRITERS_WAIT", "performance"},
     {"CACHE_DIE", "performance"}, {"ONE_PER_CORE", "performance"},
@@ -171,10 +192,15 @@ static const struct { const char *key, *section; } sections[] = {
     {"VK_NAN_PRESERVE", "performance"}, {"VK_NAN_BITS", "performance"},
     {"DRAW_CRUMBS", "diagnostics"}, {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"PASS_CRUMBS", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"}, {"STUTTER_MAP", "diagnostics"}, {"PAR_JOBS", "performance"}, {"PIPE_RELEASE", "performance"},
     {"FLIGHT_FLASH", "diagnostics"}, {"FLIGHT_FLASH_DIFF", "diagnostics"}, {"FLIGHT_FLASH_CELLS", "diagnostics"},
-    {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"MEM_CENSUS", "diagnostics"}, {"WB_NO_REUP", "diagnostics"}, {"WB_PROBE", "diagnostics"}, {"WB_SPLIT", "performance"}, {"SHADOW_BULK_WRITE", "performance"}, {"WB_LAZY", "performance"}, {"HEAP_LAZY", "performance"}, {"BARRIER_GAME", "performance"}, {"MESH_AHEAD", "performance"}, {"MESH_FALLBACK", "performance"}, {"MESH_FALLBACK_MB", "performance"}, {"MESH_FALLBACK_WORKERS", "performance"}, {"WB_LAZY_TOUCH", "diagnostics"}, {"WB_LAZY_CHUNK", "performance"}, {"FLUSH_UPLOAD", "diagnostics"}, {"GPA_TWIN_MAX_KB", "diagnostics"}, {"MIRROR_CAPTURE_KB", "diagnostics"}, {"WB_SKIP_MB", "diagnostics"},
+    {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"MEM_CENSUS", "diagnostics"}, {"WB_NO_REUP", "diagnostics"}, {"WB_PROBE", "diagnostics"}, {"WB_SPLIT", "performance"}, {"SHADOW_BULK_WRITE", "performance"}, {"WB_LAZY", "performance"}, {"HEAP_LAZY", "performance"}, {"BARRIER_GAME", "performance"}, {"MESH_AHEAD", "performance"}, {"MESH_FALLBACK", "performance"}, {"MESH_FALLBACK_MB", "performance"}, {"MESH_FALLBACK_WORKERS", "performance"}, {"MESH_FALLBACK_HOLD", "performance"}, {"WB_LAZY_TOUCH", "diagnostics"}, {"WB_LAZY_UNLOCKED", "diagnostics"}, {"WB_LAZY_CHUNK", "performance"}, {"FLUSH_UPLOAD", "diagnostics"}, {"GPA_TWIN_MAX_KB", "diagnostics"}, {"MIRROR_CAPTURE_KB", "diagnostics"}, {"WB_SKIP_MB", "diagnostics"},
     {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"},
     {"WAIT_WATCH_S", "diagnostics"},
+    {"PRESENT_ORDER", "diagnostics"},
+    {"HANDLE_CENSUS", "diagnostics"},
+    {"HANG_WATCH_S", "diagnostics"},
     {"VMA_BLOCK_MB", "diagnostics"}, {"DEVICE_LOST_AT", "diagnostics"}, {"STAGING_FAIL_AT", "diagnostics"}, {"VRAM_BALLAST_MB", "diagnostics"},
+    {"GEN_SEED", "diagnostics"},
+    {"COPY_RETIRE", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
 };
@@ -220,6 +246,9 @@ static const CfgMeta metas[] = {
     {"SCENE_SHARE", "0.75", "0..1", LIVE},
     {"DLAA", "0", "0|1", LIVE}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"DLSS_IDLE_FREE", "1", "0|1|2", RESTART}, {"TAA", "dlss", "dlss|fsr3", LIVE},   // vk_dlaa.c fsr3
+    // vk_dlaa.c vk_upscaler_idle_wait: 1 waits for the device to be idle wherever an upscaler lets go of something, as up
+    // to 0.10.1 (what was let go of still goes once the GPU is past it, behind its present gate)
+    {"UPSCALER_IDLE_WAIT", "0", "0|1", RESTART},
     {"DLSS_RANGE", "0", "0|1", RESTART},   // vk_dlaa.c range_on: one DLSS feature for the render sizes of a mode
     {"DLSS_PREBLOOM", "0", "0|1", LIVE},   // vk_dlaa.c prebloom_run: DLSS or FSR 3.1 before the bloom, not after the tonemap
     {"FSR4", "0", "0|1", LIVE},   // vk_ffx.cpp vk_ffx_fsr4
@@ -228,6 +257,9 @@ static const CfgMeta metas[] = {
     {"FRAMEGEN_MULTIPLIER", "2", "2|3|4", LIVE},   // vk_dlssg.c: frames on screen per rendered frame with DLSS
     // the same where DLSS's frame generation runs through NGX itself (gfx_present.c ng_multiplier): 2x to 6x or dynamic
     {"FG_MULT", "2", "2|3|4|5|6|dynamic", LIVE},
+    // vk_dlssg.c limit_allowed: with DLSS Frame Generation, Reflex holds the frame limit where each frame starts; 0 leaves
+    // it to the game's own limiter
+    {"REFLEX_LIMIT", "1", "0|1", LIVE},
     {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"FXAA", "1", "0|1", LIVE},
     // vk_skin_motion.inc skin_enabled: motion vectors of their own for every skinned character, not the player alone
     {"SKIN_MOTION", "1", "0|1", RESTART},
@@ -241,13 +273,23 @@ static const CfgMeta metas[] = {
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", "0", "-30..30", LIVE},
     {"COLOR_CONTRAST", "100", "70..150", LIVE}, {"COLOR_SATURATION", "100", "50..200", LIVE},
     {"COLOR_GAMMA", "1", "0.8..1.2", LIVE},
-    // HDR output (vk_hdr.c): on and off apply at once (the HDR tonemap is spliced into the game's as shaders load
-    // whatever is set, vk_hdr_armed); native is the game's own and is asked for once, at start
-    // (vk_hdr_needs_restart). HDR_LIVE = 0 leaves the HDR path out of a run that starts with HDR off. The look is
-    // fixed: only the three whites are settings.
+    // HDR output (vk_hdr.c): on, off, the tone mapper and its grading apply at once (the HDR tonemap is spliced into
+    // the game's as shaders load whatever is set, vk_hdr_armed); native is the game's own and is asked for once, at
+    // start (vk_hdr_needs_restart). HDR_LIVE = 0 leaves the HDR path out of a run that starts with HDR off.
+    // The grading sliders: 50 leaves the picture as it is, exposure in percent. HDR_GAMMA is the display the present
+    // shows the picture as, with every tone mapper; off shows the sRGB code as it decodes, the dark tones lighter.
     {"HDR", "0", "0|1|native", LIVE}, {"HDR_LIVE", "1", "0|1", RESTART},
     {"HDR_PEAK_NITS", "1000", "400..10000", LIVE}, {"HDR_GAME_NITS", "203", "48..500", LIVE},
-    {"HDR_UI_NITS", "203", "48..500", LIVE},
+    {"HDR_UI_NITS", "203", "48..500", LIVE}, {"HDR_GAMMA", "2.2", "off|2.2|2.4", LIVE},
+    {"HDR_TONEMAP", "psychov35", "vanilla|psychov35|renodrt", LIVE}, {"HDR_EXPOSURE", "100", "0..200", LIVE},
+    // the observer-response mapper's: where scene grey lands, its slope there matched to the game's curve, that slope
+    // (50 unchanged) and how much of the game's hue bend at its clamp bright colours get
+    {"HDR_MIDGRAY", "vanilla", "render|vanilla", LIVE}, {"HDR_MATCH_SLOPE", "1", "0|1", LIVE},
+    {"HDR_TONE_SLOPE", "50", "0..100", LIVE}, {"HDR_HUE_CLIP", "50", "0..100", LIVE},
+    {"HDR_HIGHLIGHTS", "50", "0..100", LIVE}, {"HDR_SHADOWS", "50", "0..100", LIVE}, {"HDR_CONTRAST", "50", "0..100", LIVE},
+    {"HDR_SATURATION", "50", "0..100", LIVE}, {"HDR_HIGHLIGHT_SAT", "50", "0..100", LIVE},
+    {"HDR_BLOWOUT", "0", "0..100", LIVE}, {"HDR_FLARE", "0", "0..100", LIVE}, {"HDR_HUE", "100", "0..100", LIVE},
+    {"HDR_GRADE", "100", "0..100", LIVE},
     {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
     {"SHADOW_RES", "game", "game|256|512|768|1024|1536|2048", RESTART},
     {"SHADOW_SCALE", "1", "1..4", RESTART}, {"SHADOW_COMPARE", "1", "0|1", RESTART},   // vk_texture.c
@@ -272,6 +314,8 @@ static const CfgMeta metas[] = {
     // the set ofollow of patches-v111.txt (frame_rate.c floor_carry_store): a moving floor carries a character above
     // 100 fps as at 60
     {"FLOOR_CARRY", "1", "0|1", RESTART},
+    // the set orecord of patches-v111.txt: the ocarina recorder's clock keeps each frame's fraction above 60 fps
+    {"OCARINA_TIMING", "1", "0|1", RESTART},
     // frame_rate.c floor_probe: lines about Link on a moving floor (0 off, 1 = 4000 lines, or a count)
     {"FLOOR_PROBE", "0", NULL, RESTART},
     // frame_rate.c floor_scan: finds the moving floor under Link in guest memory (0 off, 1 = 20000 lines, or a count)
@@ -288,6 +332,9 @@ static const CfgMeta metas[] = {
     {"MICROPHONE", "1", "0|1", RESTART},   // ov_audio_input.c mic_on: 0 refuses the game's input streams
     {"AUDIO_RAMP", "1", "0|1", RESTART},   // audio_mixer.c accumulate_ramp: a changed volume is reached across the frame
     {"AUDIO_CATCHUP", "1", "0|1", RESTART},   // audren.c render_thread: frames owed after a stall are rendered and dropped
+    // audren.c audio_bad: 1 ends the process at the first game audio value the renderer cannot use, as 0.10.1 did for
+    // most of them (a limiter time that is not a number and a negative mix buffer count end it too)
+    {"AUDIO_STRICT", "0", "0|1", RESTART},
     // sprint.c: the sprint button (b the game's B, l3 the left stick's click) and toggle or hold; the Controls tab's
     // Sprint rows (1.1.1)
     {"SPRINT_BUTTON", "off", "off|b|l3", LIVE}, {"SPRINT_MODE", "toggle", "toggle|hold", LIVE},
@@ -318,11 +365,14 @@ static const CfgMeta metas[] = {
     {"TAIL_EARLY", "1", "0|1", RESTART},
     {"REPLAY_SMALL", "0", "0..63", RESTART},   // vk_exec.c group_start
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
-    // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds
-    {"DYN_RES", "0", "0|1", LIVE}, {"DYN_RES_TARGET", "16.7", "1..100", LIVE}, {"DYN_RES_STEP", "45", "8..600", LIVE},
+    // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds (under 1: the
+    // frame limit's frame time), holding each step DYN_RES_STEP 60 Hz frames of the clock
+    {"DYN_RES", "0", "0|1", LIVE}, {"DYN_RES_TARGET", "0", "0..100", LIVE}, {"DYN_RES_STEP", "45", "8..600", LIVE},
     // the recording thread: a core of its own (auto: with 12 or more logical processors) and the highest priority
     // (vk_exec.c rec_claim)
-    {"RECORDER_CORE", "0", "auto|0|1", RESTART}, {"RECORDER_PRIO", "1", "0|1", RESTART}, {"REPLAY_TIME", "0", "0|1", RESTART}, {"LOCK_TIME", "0", "0|1", RESTART}, {"POOL_CREATE_BUDGET", "16", "1..4096", RESTART}, {"POOL_CREATE_MS", "6", "0..100", RESTART}, {"POOL_FINI_IDLE", "0", "0|1", RESTART}, {"FREEZE_BUDGET_US", "1000", "0..100000", RESTART}, {"POOL_LOAD_BACKLOG", "512", "0..65536", RESTART}, {"POOL_LOAD_MS", "50", "1..1000", RESTART},
+    {"RECORDER_CORE", "0", "auto|0|1", RESTART}, {"RECORDER_PRIO", "1", "0|1", RESTART}, {"REPLAY_TIME", "0", "0|1", RESTART}, {"LOCK_TIME", "0", "0|1", RESTART}, {"POOL_CREATE_BUDGET", "16", "1..4096", RESTART}, {"POOL_CREATE_MS", "6", "0..100", RESTART}, {"POOL_FINI_IDLE", "0", "0|1", RESTART}, {"FREEZE_BUDGET_US", "1000", "0..100000", RESTART}, {"POOL_LOAD_BACKLOG", "512", "0..65536", RESTART},
+    // vk_memory.c freeze_pass: the backoff's quiet time and the hold around area loads
+    {"FREEZE_QUIET_MS", "5000", "0..60000", RESTART}, {"FREEZE_LOAD_HOLD_MS", "3000", "0..30000", RESTART}, {"POOL_LOAD_MS", "50", "1..1000", RESTART},
     // held submissions handed to the queue together (vk_sync.c, submit batching)
     {"SUBMIT_BATCH", "4", "1..16", RESTART},
 #ifdef _WIN32
@@ -340,9 +390,12 @@ static const CfgMeta metas[] = {
     {"DRAW_WRITERS_WAIT", "1", "0|1", RESTART},   // vk_exec_draw.c writers_wait_on
     {"PREPARE_PIPELINES", "all", "0|mesh|all", RESTART},   // vk_pipeline.c seed_pipelines
     // vk_device.c: task and mesh programs through compute passes (vk_exec_draw.c "mesh fallback"); auto: on a device
-    // without mesh shaders. The megabytes are the buffers the passes write (vk_mesh_fb.c).
+    // without mesh shaders and on AMD's Windows driver for RDNA 1 and 2 (vk_mesh_path.h). The megabytes are the
+    // buffers the passes write (vk_mesh_fb.c).
     {"MESH_FALLBACK", "auto", "auto|0|1", RESTART}, {"MESH_FALLBACK_MB", "128", "16..4096", RESTART},
     {"MESH_FALLBACK_WORKERS", "auto", "auto|1|2|3|4", RESTART},   // vk_exec_draw.c mfb_worker_count
+    // vk_exec_draw.c mfb_hold_role: a list's depth-only draw waits for its colour draw's pipeline
+    {"MESH_FALLBACK_HOLD", "1", "0|1", RESTART},
     {"PIPE_AHEAD", "1", "0|1", RESTART},        // vk_exec.c vk_exec_ahead, vk_pipeline.c vk_pipeline_hint
     {"LINE_WIDTH", "1", "0|1", RESTART},        // vk_pipeline.c key_lines
     {"POOL_SHOWN_FIRST", "1", "0|1", RESTART},  // vk_texture.c shown_take
@@ -384,7 +437,7 @@ static const CfgMeta metas[] = {
     // it for the idle seconds; 0 keeps every shader's SPIR-V plain
     {"SHADER_COMPRESS", "1", "0|1", RESTART},
     {"SHADER_COMPRESS_IDLE_S", "30", "1..3600", RESTART},
-    // the low-end GPU mode's rows in the menu's Game tab (ui/menu.cpp rows_low_end)
+    // the settings the low-end GPU mode had rows for up to 0.10.1 (lowend_set, below): each is read by itself now
     {"TEX_RELEASED_MAX", "", NULL, RESTART},   // vk_texture.c released_max: "" by the video memory budget, else 1..16384
     {"MIRROR_HOT", "0", "0..1000", RESTART}, {"FREEZE_IDLE", "1800", "0..100000", RESTART},
     {"SUBMIT_FINISH_KINDS", "31", "0..31", RESTART},   // vk_sync.c res_mask
@@ -402,9 +455,10 @@ static const CfgMeta metas[] = {
     {"ASTC", "auto", "auto|gpu|native|cpu", RESTART}, {"MEMORY", "auto", "auto|import|mirror|verify", RESTART},
     {"TEX_ALIAS", "1", "0|1", RESTART}, {"DEPTH_INIT_INLINE", "1", "0|1", RESTART}, {"DEPTH_ALIAS_LOG", "0", "0|1", RESTART}, {"TEX_DISUSE", "1", "0|1|2", RESTART}, {"TEX_DISUSE_EVICT", "0", "0|1", RESTART}, {"TEX_GEN_UNDO", "1", "0|1", RESTART}, {"TEX_REUSE", "1", "0|1", RESTART}, {"TEX_SPLIT_FILL", "1", "0|1|2", RESTART}, {"TEX_VRAM_PRESSURE", "80", "0..100", RESTART},
     // vk_texture.c drop_aged: seconds a released texture is kept unused (vk_tex_release.h)
-    {"TEX_RELEASED_HOLD", "180", "0..900", RESTART}, {"ASTC_BC", "", "0|1", RESTART}, {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
+    {"TEX_RELEASED_HOLD", "60", "0..900", RESTART}, {"ASTC_BC", "", "0|1", RESTART}, {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
     {"TEX_CLOBBER", "0", "0|1", RESTART},
-    {"LOW_END_GPU", "0", "0|1", RESTART},   // LOWEND below
+    // the switch of the low-end GPU mode, which is gone: still a known key, and it does nothing (lowend_set, below)
+    {"LOW_END_GPU", "0", "0|1", RESTART},
     {"STG_ARENA", "1", "0|1", RESTART}, {"ASTC_GPU_DESWIZZLE", "1", "0|1", RESTART},
     {"ASTC_SCRATCH_KEEP", "1", "0|1", RESTART}, {"ASTC_ARENA", "1", "0|1", RESTART},   // vk_astc.c scratch_get, vk_texture.c astc_arena
     // render fixes
@@ -432,10 +486,16 @@ static const CfgMeta metas[] = {
     {"PIPE_RELEASE", "1", "0|1", RESTART},
     // flight.c "The flash trigger": on or off, and flight_flash.h flash_test's two thresholds
     {"FLIGHT_FLASH", "1", "0|1", RESTART}, {"FLIGHT_FLASH_DIFF", "24", "4..255", RESTART}, {"FLIGHT_FLASH_CELLS", "3", "1..144", RESTART},
-    {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART}, {"MEM_CENSUS", "0", "0|1", RESTART}, {"WB_NO_REUP", "1", "0|1", RESTART}, {"WB_PROBE", "0", "0|1", RESTART}, {"WB_SPLIT", "1", "0|1|2|3", RESTART}, {"WB_LAZY", WB_LAZY_DEFAULT, "0|1", RESTART}, {"HEAP_LAZY", "0", "0|1", RESTART}, {"WB_LAZY_TOUCH", "0", "0..16", RESTART}, {"WB_LAZY_CHUNK", "0", "0|1", RESTART}, {"FLUSH_UPLOAD", "0", "0|1", RESTART}, {"GPA_TWIN_MAX_KB", "0", "0..1048576", RESTART},
+    {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART}, {"MEM_CENSUS", "0", "0|1", RESTART}, {"WB_NO_REUP", "1", "0|1", RESTART}, {"WB_PROBE", "0", "0|1", RESTART}, {"WB_SPLIT", "1", "0|1|2|3", RESTART}, {"WB_LAZY", WB_LAZY_DEFAULT, "0|1", RESTART}, {"HEAP_LAZY", "0", "0|1", RESTART}, {"WB_LAZY_TOUCH", "0", "0..16", RESTART}, {"WB_LAZY_CHUNK", "0", "0|1", RESTART}, {"WB_LAZY_UNLOCKED", "1", "0|1", RESTART}, {"FLUSH_UPLOAD", "0", "0|1", RESTART}, {"GPA_TWIN_MAX_KB", "0", "0..1048576", RESTART},
     {"MIRROR_CAPTURE_KB", "0", "0..1048576", RESTART}, {"WB_SKIP_MB", "0", "0..4096", RESTART},   // vk_memory.c capture_cap, wb_skip
     {"WB_MERGE_MAX", "32", "1..256", RESTART}, {"TEXUP_LOG_MS", "0", "0..60000", RESTART},   // vk_texture.c vk_texstat_frame
     {"WAIT_WATCH_S", "0", "0..3600", RESTART},   // kernel.c wait_watch: a lock or thread-end wait this long is logged; 0 off
+    // vk_backend.c present_order_on: a frame's bookkeeping between two replays (vk_frame_owed.h); 0 at the present
+    {"PRESENT_ORDER", "1", "0|1", RESTART},
+    // perf.c hc_main: with NX2NAVI_TRACE=perf, the process's handles by kind when their count grew
+    {"HANDLE_CENSUS", "0", "0|1", RESTART},
+    // hang_watch.c: a report when no frame is shown with the window in front, or the GPU does not finish, this long; 0 off
+    {"HANG_WATCH_S", "20", "0..600", RESTART},
     {"VMA_BLOCK_MB", "64", "16..256", RESTART},   // vk_headroom.c vk_vma_block_size
     // vk_texture.c compact_on: idle textures move out of sparsely used blocks of video memory; the free space inside
     // the blocks from which a pass starts, and the bytes moved per frame (also the largest texture that moves)
@@ -446,11 +506,15 @@ static const CfgMeta metas[] = {
     {"DRAW_CRUMBS", "0", "0|1", RESTART},   // vk_crumbs.c draw marks: a mark at each change of shaders inside a pass
     {"STAGING_FAIL_AT", "0", "0..1000000000", RESTART},   // vk_memory.c staging_fail_now: a test of give_back
     {"VRAM_BALLAST_MB", "0", "0..131072", RESTART},   // vk_memory.c vk_mem_ballast: a test of a smaller card
+    // vk_memory.c gen_seed: a test that starts the page write generations at this value (at most 2^62)
+    {"GEN_SEED", "0", "0..4611686018427387904", RESTART},
     // mem_budget.h: a test that pretends the video memory or the system memory is that many MiB, for the levels the
     // owners that give memory back go by; 0 as it is
     {"MEM_BUDGET_TEST_VRAM_MB", "0", "0..1048576", RESTART},
     {"MEM_BUDGET_TEST_RAM_MB", "0", "0..1048576", RESTART},
     {"DEVICE_LOST_AT", "0", "0..1000000000", RESTART},   // vk_sync.c lost_at_due: a test of the lost device's end
+    // nvn_api_cmd.c retire_pass: counts the recording copies whose control memory the game reused; frees nothing
+    {"COPY_RETIRE", "0", "0|1", RESTART},
     {"INPUT_RECORD", "", NULL, RESTART},
 };
 
@@ -495,10 +559,20 @@ const char *cfg_unknown_keys(int *count) {
     return unknown_keys;
 }
 
+// The table holds CFG_MAX_KEYS keys and keeps none past them: a file's later keys were not read, and a menu change was
+// lost, without a word (every cheat ever switched keeps a line, cheats.c cheats_set). A line says so once per load, and
+// once a run for the changes (cfg_set, cfg_reset, migrate).
+static int full_load_told, full_set_told;
+
+static void full_set(const char *key, const char *what) {
+    if (!full_set_told++) rt_log("cfg: the settings table is full (%d keys): %s %s", CFG_MAX_KEYS, key, what);
+}
+
 static void clear(void) {
     for (int i = 0; i < n_entries; i++) free(entries[i].key), free(entries[i].value);
     n_entries = 0;
     unknown_keys[0] = 0, n_unknown = unknown_cut = 0;
+    full_load_told = 0;
 }
 
 static char *trim(char *s) {
@@ -514,8 +588,47 @@ static char *norm_key(char *key) {
     return strncmp(key, PREFIX, PREFIX_LEN) ? key : key + PREFIX_LEN;
 }
 
+static int entry_line[CFG_MAX_KEYS];   // the file line each entry's value came from (cfg_load's check_values)
+
+// ---- a comment after a value (cfg_load)
+// "pace_smooth = 0 ; off" kept the comment in the value, which cfg_bool read as on, and "fps_limit = 144 # monitor"
+// gave 60. For a key whose row has a set of values (numbers, ranges, words: none has a blank followed by ';' or '#')
+// the value ends at the first blank followed by ';' or '#' in the text after '=' ("key = ; note" is empty), and the
+// line is logged once at load. Free text keeps the whole value: a row without a set (window_size, monitor,
+// audio_device) and a key without a row (mods_dir, pipeline_cache, the bindings), where a path or a name may hold
+// " #". So does a value in double quotes. The menu's save writes a changed key's line again without its comment
+// (cfg_save_to), the same way every time. At most CHECK_LINES lines per load, then a count (check_end).
+#define CHECK_LINES 16
+static int cuts;
+
+// raw: the text after '=' as written; returns the value trimmed, cut at its comment when key has a set of values.
+static char *cut_comment(const char *key, char *raw, int line) {
+    char *v = trim(raw);
+    size_t n = strlen(v);
+    if (n >= 2 && v[0] == '"' && v[n - 1] == '"') return v;
+    const CfgMeta *m = cfg_meta(key);
+    if (!m || !m->values) return v;
+    char *c = raw;
+    while (*c && !((*c == ' ' || *c == '\t') && (c[1] == ';' || c[1] == '#'))) c++;
+    if (!*c) return v;
+    char note[160];
+    snprintf(note, sizeof note, "%s", c + 1);
+    *c = 0;
+    v = trim(raw);
+    if (++cuts <= CHECK_LINES) {
+        char low[64];
+        size_t k = 0;
+        for (; key[k] && k < sizeof low - 1; k++) low[k] = (char)tolower((unsigned char)key[k]);
+        low[k] = 0;
+        rt_log("cfg: nx2navi.ini line %d: %s = '%s', and '%s' after it is a comment", line, low, v, note);
+    }
+    return v;
+}
+
+// value: the text after '=' as written (cut_comment trims it).
 static void add(char *key, char *value, int line) {
     key = norm_key(key);
+    value = cut_comment(key, value, line);
     size_t vl = strlen(value);
     if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') value[vl - 1] = 0, value++;
     if (!*key) return;
@@ -528,10 +641,95 @@ static void add(char *key, char *value, int line) {
         if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
             free(entries[i].value);
             entries[i].value = strdup(value);
+            entry_line[i] = line;
             return;
         }
-    if (n_entries == CFG_MAX_KEYS) return;
+    if (n_entries == CFG_MAX_KEYS) {
+        if (!full_load_told++)
+            rt_log("cfg: nx2navi.ini has more than %d keys: line %d (%s) and the new keys after it are not read",
+                   CFG_MAX_KEYS, line, key);
+        return;
+    }
+    entry_line[n_entries] = line;
     entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
+}
+
+// ---- values outside their rows' sets, logged at load (the values are read as they are written, a comment after a
+// value of a row with a set cut first, cut_comment)
+// Hand-edited files had values no consumer takes, and nothing said so: "sharpness = 250" is past 0..100. Only the
+// sets that are the consumers' own are checked: 0|1 (with the words switch_word reads), ranges lo..hi, and lists of
+// words. A list with a number in it is the menu's presets, and its consumer takes more (fps_limit any rate from 30 to
+// 240, render_scale 25..400), so it is left alone. A list of words names the menu's choices; a consumer may take more
+// (dlss_preset any letter a..m), so the line says no more than that. A ';' or '#' after a blank is still named where it
+// stays in the value: a free-text row's value, and the environment's. At most CHECK_LINES lines per load, then a count.
+static int misfits;
+static int switch_of(const char *v);
+
+// NULL when v fits the set, else what the log line says of it (in buf).
+static const char *misfit(const char *set, const char *v, char *buf, size_t cap) {
+    if (!strcmp(set, "0|1")) return switch_of(v) < 0 ? "is not 0, 1, on, off, true, false, yes or no" : NULL;
+    const char *dots = strstr(set, "..");
+    if (dots && !strchr(set, '|')) {
+        char lo_s[32], *end;   // the low end apart: strtod would take "0." of "0..100" for a number
+        size_t ln = (size_t)(dots - set);
+        if (!ln || ln >= sizeof lo_s) return NULL;
+        memcpy(lo_s, set, ln), lo_s[ln] = 0;
+        double lo = strtod(lo_s, &end);
+        if (*end) return NULL;
+        double hi = strtod(dots + 2, &end);
+        if (end == dots + 2 || *end) return NULL;
+        // any number: some rows with whole ends take fractions (dyn_res_target 16.7 in 0..100)
+        double x = strtod(v, &end);
+        if (end != v && !*end && x == x && x >= lo && x <= hi) return NULL;
+        snprintf(buf, cap, "is not a number in %s", set);
+        return buf;
+    }
+    for (const char *m = set; *m;) {   // a member that is a number: the menu's presets, not checked
+        char *end;
+        size_t n = strcspn(m, "|");
+        strtod(m, &end);
+        if (end == m + n) return NULL;
+        m += n + (m[n] == '|');
+    }
+    for (const char *m = set; *m;) {
+        size_t n = strcspn(m, "|");
+        if (strlen(v) == n && !strncasecmp(m, v, n)) return NULL;
+        m += n + (m[n] == '|');
+    }
+    snprintf(buf, cap, "is none of the menu's choices %s", set);
+    return buf;
+}
+
+// key: upper case without the prefix; line 0: the value comes from the environment.
+static void check_value(const char *key, const char *v, int line) {
+    const CfgMeta *m = cfg_meta(key);
+    if (!m) return;
+    char buf[160];
+    const char *bad = m->values ? misfit(m->values, v, buf, sizeof buf) : NULL;
+    int comment = strstr(v, " ;") || strstr(v, " #") || strstr(v, "\t;") || strstr(v, "\t#");
+    if (!bad && !comment) return;
+    if (++misfits > CHECK_LINES) return;
+    char low[64], where[96];
+    size_t n = 0;
+    for (; key[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)key[n]);
+    low[n] = 0;
+    if (line) snprintf(where, sizeof where, "nx2navi.ini line %d: %s", line, low);
+    else snprintf(where, sizeof where, "the environment's " PREFIX "%s", key);
+    rt_log("cfg: %s = '%s' %s%s%s", where, v, bad ? bad : "", bad && comment ? "; " : "",
+           comment ? "a ';' or '#' after the value is part of it (a comment goes on a line of its own)" : "");
+}
+
+static void check_end(void) {
+    if (misfits > CHECK_LINES)
+        rt_log("cfg: %d more values outside their settings' choices are not listed", misfits - CHECK_LINES);
+    if (cuts > CHECK_LINES) rt_log("cfg: %d more comments after a value are not listed", cuts - CHECK_LINES);
+    misfits = cuts = 0;
+}
+
+static void check_values(void) {
+    for (int i = 0; i < n_entries; i++)
+        if (entries[i].value && entry_line[i]) check_value(entries[i].key, entries[i].value, entry_line[i]);
+    check_end();
 }
 
 // 0.1.9 had the Xbox prompts as a pad layout: pad_layout = xbox_prompts is pad_layout = nintendo with prompts = xbox.
@@ -547,7 +745,10 @@ static void migrate(void) {
     free(layout->value);
     layout->value = strdup("nintendo");
     layout->dirty = 1;
-    if (!prompts && n_entries < CFG_MAX_KEYS) entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
+    if (!prompts && n_entries < CFG_MAX_KEYS)
+        entry_line[n_entries] = 0, entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
+    else if (!prompts)
+        full_set("PROMPTS", "= xbox is not kept");
     rt_log("cfg: nx2navi.ini pad_layout = xbox_prompts is read as pad_layout = nintendo and prompts = %s",
            prompts ? prompts->value : "xbox");
 }
@@ -602,7 +803,7 @@ int cfg_load(const char *path) {
             if (!eq) rt_log("cfg: nx2navi.ini line %d: no '=' in '%s'", line, s);
             else {
                 *eq = 0;
-                add(trim(s), trim(eq + 1), line);
+                add(trim(s), eq + 1, line);
             }
         }
         if (!eol) break;
@@ -610,6 +811,7 @@ int cfg_load(const char *path) {
     }
     free(data);
     migrate();
+    check_values();   // after migrate: a value it rewrites is checked as the game reads it
     return 1;
 }
 
@@ -652,52 +854,19 @@ static int on_steam_deck(void) {
 
 static const char *raw_get(const char *name);
 
-// low_end_gpu = 1 in nx2navi.ini (NX2NAVI_LOW_END_GPU): defaults for the keys the player does not set, as the device
-// profile gives them. They turn on what was written for older graphics cards and ones short of video memory or bus
-// bandwidth, and measured on a Radeon RX 580: mesh shaders run as compute where the card has none (vk_pipeline.c
-// mesh_emu_on), a texture read after another image drew over its pool memory gets memory of its own (vk_texture.c
-// mark_clobbered), game memory is copied for the GPU while the replay records and the game's wait after a frame's
-// first submission ends once the replay has submitted it (vk_memory.c stage_on, vk_sync.c vk_sync_recorded_wait),
-// texture checks share their write-watch queries (vk_memory.c snap_widen_n), video memory stays within the heaps'
-// budgets (vk_device.c vram_heap_limits, vk_vma_budget.c), large upload batches go to the queue early (vk_memory.c
-// vk_upload_end) and pools the game refills every frame stay in system memory (vk_memory.c hot_check). Without the
-// key each of these keeps what 0.9.1 did. Asynchronous replay (vk_backend.c, NX2NAVI_REPLAY_ASYNC) is not among them:
-// it can show a dark or flickering frame now and then, so the mode leaves it off and its row under the mode's switch
-// turns it on for a player who wants it.
-static const struct { const char *key, *value; } LOWEND[] = {
-    {"MESH_EMULATION", "1"}, {"TEX_CLOBBER", "1"}, {"MIRROR_STAGE", "1"}, {"SUBMIT_FINISH_GPU", "0"}, {"SNAP_WIDEN", "8"},
-    {"VRAM_HEAP_LIMIT", "auto"}, {"VRAM_RESERVE_MB", "512"}, {"UPLOAD_BATCH_MB", "256"}, {"MIRROR_HOT", "25"},
-};
-// The keys that count only while the mode is on (LOWEND_ONLY): without it each reads as unset, whatever the settings
-// file or the environment says, so nothing of the mode acts unless a player turned it on. The menu shows their rows
-// only then (ui/menu.cpp rows_low_end). Keys the game had before the mode (replay_async, freeze_idle, zstd_native,
-// tex_released_max, astc_scratch_keep) are not among them.
-static const char *const LOWEND_ONLY[] = {
-    "MESH_EMULATION", "MESH_EMU_MB", "MESH_EMU_TASKS", "MESH_EMU_BATCH", "TEX_CLOBBER", "MIRROR_STAGE", "MIRROR_HOT",
-    "SUBMIT_FINISH_GPU", "SUBMIT_FINISH_RESULTS", "SUBMIT_FINISH_KINDS", "SNAP_WIDEN", "VRAM_HEAP_LIMIT",
-    "VRAM_RESERVE_MB", "UPLOAD_BATCH_MB", "FOLIAGE", "FLUSH_SKIP_CLEAN", "VEC_INDEX_FIX", "GUEST_OPT", "PASS_TIMES",
-    "DUMP_KEY", "LOG_TEX_NEW", "SVC_WAITS",
-};
-static int lowend_only(const char *key) {
-    for (size_t i = 0; i < sizeof LOWEND_ONLY / sizeof *LOWEND_ONLY; i++)
-        if (!strcasecmp(LOWEND_ONLY[i], key)) return 1;
-    return 0;
-}
-static int lowend = -1;
-static int lowend_of(void) {
-    int p = __atomic_load_n(&lowend, __ATOMIC_ACQUIRE);
-    if (p >= 0) return p;
+// low_end_gpu (NX2NAVI_LOW_END_GPU) was the switch of the low-end GPU mode up to 0.10.1. With it on, nine keys got
+// other defaults (mesh shaders run as compute where the card has none, a texture read after another image drew over
+// its pool memory given memory of its own, game memory copied for the GPU while the replay records, video memory kept
+// within the heaps' budgets, large upload batches sent early, pools the game refills every frame kept in system
+// memory), and those keys and a dozen more were read only while it was on. The mode is gone. Its switch is still a
+// known key, so that an old file's line is no unknown one, and does nothing. Each of its keys is read like any other,
+// with the default of its row or of its reader: a value a player set by hand counts, and a file that sets none runs
+// the game as it runs for everyone else. cfg_init says so once while the switch is on.
+// Read through raw_get, which skips switch_word, so the words are taken here as cfg_bool takes them: "low_end_gpu =
+// off" is off, and any value that is not 0 or one of the off words is on.
+static int lowend_set(void) {
     const char *set = raw_get(PREFIX "LOW_END_GPU");
-    p = set && *set && strcmp(set, "0") != 0;
-    __atomic_store_n(&lowend, p, __ATOMIC_RELEASE);
-    return p;
-}
-int cfg_low_end_active(void) { return lowend_of(); }
-static const char *lowend_value(const char *key) {
-    if (lowend_of())
-        for (size_t i = 0; i < sizeof LOWEND / sizeof *LOWEND; i++)
-            if (!strcasecmp(LOWEND[i].key, key)) return LOWEND[i].value;
-    return NULL;
+    return set && *set && switch_of(set) != 0;
 }
 
 static int profile_of(void) {
@@ -722,15 +891,36 @@ static const char *raw_get(const char *name) {
     return NULL;
 }
 
+// A switch written as a word: 0 for false, off and no, 1 for true, on and yes (any case); -1 for anything else but 0
+// and 1, which give themselves.
+static int switch_of(const char *v) {
+    static const char *const word[] = {"false", "off", "no", "true", "on", "yes"};
+    if (!strcmp(v, "0") || !strcmp(v, "1")) return v[0] - '0';
+    for (int i = 0; i < 6; i++)
+        if (!strcasecmp(v, word[i])) return i >= 3;
+    return -1;
+}
+
+// The value of a switch (a row whose set is 0|1) written as a word, as "0" or "1" for every reader: cfg_bool, rt_knob
+// and the readers that compare with "0" (frame_rate.c frame_step_cap_ns for rtss) or parse a number (cfg_int).
+// "fullscreen = false" and "rtss = off" were on, read as anything but "0". Other values and other rows are handed on
+// as they are.
+static const char *switch_word(const char *name, const char *v) {
+    if (!v || !strcmp(v, "0") || !strcmp(v, "1")) return v;
+    int on = switch_of(v);
+    if (on < 0) return v;
+    const CfgMeta *m = cfg_meta(name);
+    return m && m->values && !strcmp(m->values, "0|1") ? (on ? "1" : "0") : v;
+}
+
 static const char *cfg_get_now(const char *name) {
     const char *v = raw_get(name);
     if (strncmp(name, PREFIX, PREFIX_LEN)) return v;
-    if (!lowend_of() && lowend_only(name + PREFIX_LEN)) return NULL;   // the mode is off: its settings are not read
-    if (v) return v;
+    if (v) return switch_word(name, v);
     if (profile_of())
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
-    return lowend_value(name + PREFIX_LEN);
+    return NULL;
 }
 
 // Whether name's value comes from the player (the environment or nx2navi.ini), not a profile or the table.
@@ -764,6 +954,8 @@ void cfg_set(const char *name, const char *value) {
     } else if (n < CFG_MAX_KEYS) {
         entries[n] = (CfgEntry){strdup(key), strdup(value), 1, 0};
         __atomic_store_n(&n_entries, n + 1, __ATOMIC_RELEASE);
+    } else {
+        full_set(key, "is not kept");
     }
     __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&set_lock);
@@ -781,7 +973,10 @@ int cfg_reset(const char *const *keys, int n) {
         int i = 0;
         while (i < n_entries && strcmp(entries[i].key, name)) i++;
         if (i == n_entries) {   // no value in memory ("key =" in the file): the line still has to go
-            if (i == CFG_MAX_KEYS) continue;
+            if (i == CFG_MAX_KEYS) {
+                full_set(name, "keeps its line in the file");
+                continue;
+            }
             entries[i] = (CfgEntry){strdup(name), NULL, 0, 1};
             __atomic_store_n(&n_entries, i + 1, __ATOMIC_RELEASE);
         } else if (entries[i].value) {
@@ -830,8 +1025,6 @@ const char *cfg_default(const char *key) {
     if (profile_of())
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name)) return DECK[i].value;
-    const char *low = lowend_value(name);
-    if (low) return low;
     const CfgMeta *m = cfg_meta(key);
     return m ? m->def : NULL;
 }
@@ -879,9 +1072,11 @@ static const char *cfg_memo_get(const char *name, int kind) {
 const char *cfg_get(const char *name) { return cfg_memo_get(name, 0); }
 const char *cfg_value(const char *name) { return cfg_memo_get(name, 1); }
 
-// The row's default as a number, for a set value that does not parse.
+// The row's default as a number, for a set value that does not parse; 0 for a key without a row, whose set value
+// cfg_value hands out without one (tests/cfg_rows_check.py keeps such reads guarded).
 static double default_number(const char *name) {
-    return strtod(cfg_meta(name)->def, NULL);
+    const CfgMeta *m = cfg_meta(name);
+    return m ? strtod(m->def, NULL) : 0;
 }
 
 double cfg_double(const char *name) {
@@ -898,7 +1093,11 @@ int cfg_int(const char *name) {
     return end == v || *end ? (int)default_number(name) : (int)l;
 }
 
-int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
+// Off for "0" and for false, off and no in any case (switch_of), also for a key whose row is not 0|1; on otherwise.
+int cfg_bool(const char *name) {
+    const char *v = cfg_value(name);
+    return strcmp(v, "0") != 0 && switch_of(v) != 0;
+}
 
 // ---- the restart-only settings' values at start (cfg_init), which the running game keeps using whatever the menu sets
 // later: cfg_pending compares against them, so the menu says "after restart" only while a restart would change
@@ -1249,14 +1448,20 @@ static void load_ini(void) {
 
 void cfg_init(void) {
     load_ini();
-    __atomic_store_n(&lowend, -1, __ATOMIC_RELEASE);   // asked before the file was read: decided again (lowend_of)
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++) {   // the environment's values, as the file's (cfg_load)
+        char var[80];
+        snprintf(var, sizeof var, PREFIX "%s", metas[i].key);
+        const char *e = getenv(var);
+        if (e && *e) check_value(metas[i].key, e, 0);
+    }
+    check_end();
     if (profile_of())
         rt_log("cfg: device profile Steam Deck: defaults for the keys nx2navi.ini does not set (NX2NAVI_DEVICE_PROFILE=desktop "
                "turns it off)");
-    if (lowend_of())
-        rt_log("cfg: low_end_gpu = 1: the settings for older graphics cards are on for the keys nx2navi.ini does not set "
-               "(mesh shaders as compute, video memory budgets, staged uploads and the shorter wait for the GPU, frames "
-               "prepared on their own thread)");
+    if (lowend_set())
+        rt_log("cfg: low_end_gpu is on, and the low-end GPU mode was removed in 0.11.0: the line does nothing, and the game "
+               "runs as it does without it. The mode's single settings (mesh_emulation, tex_clobber, foliage, "
+               "vram_reserve_mb and the others) still count where nx2navi.ini or the environment sets them");
     start_values();
 }
 

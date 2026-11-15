@@ -1,5 +1,6 @@
-/* The mixer's volume ramps (runtime/audio_mixer.c accumulate_ramp, audio_mixer_render) and what it owes the device
-   after a stall (ring_pull, audio_mixer_owed), with the rest of the runtime stubbed. No game data and no audio device:
+/* The mixer's volume ramps (runtime/audio_mixer.c accumulate_ramp, audio_mixer_render), what it owes the device
+   after a stall (ring_pull, audio_mixer_owed) and the device change events (change_event_of, audio_channels_live),
+   with the rest of the runtime stubbed. No game data and no audio device:
    NX2NAVI_AUDIO=none mixes without opening one, and the device's requests are made by hand. Each voice plays a wave
    buffer of one constant sample, so a mix buffer holds the gain the voice went in with, sample by sample. */
 #include "../runtime/audio_mixer.c"
@@ -22,9 +23,25 @@ void rt_fatal(const char *fmt, ...) {
     exit(2);
 }
 uint64_t kern_now_ns(void) { return 1; }
-uint32_t kern_event_new(void) { return 1; }
-uint32_t kern_event_readable(uint32_t writable) { return writable; }
-void kern_event_signal(uint32_t writable) { (void)writable; }
+/* kernel events: numbered from 1; which were closed, signalled, and how many readable ends were handed out */
+static int events_made, readables, closed[64], signalled[64], signal_closed;
+static volatile uint32_t *race_kind;   /* set: the next kern_event_new lets "another thread" win that kind first */
+uint32_t kern_event_new(void) {
+    if (race_kind) {
+        volatile uint32_t *k = race_kind;
+        race_kind = NULL;
+        uint32_t other = kern_event_new();
+        change_event_list(other);
+        *k = other;
+    }
+    return (uint32_t)++events_made;
+}
+uint32_t kern_event_readable(uint32_t writable) { readables++; return writable; }
+void kern_event_signal(uint32_t writable) {
+    if (writable < 64 && closed[writable]) signal_closed++;
+    if (writable < 64) signalled[writable]++;
+}
+void kern_handle_close(uint32_t h) { if (h < 64) closed[h] = 1; }
 void *ipc_guest(uint64_t addr, uint64_t size) { (void)size; return (void *)(uintptr_t)addr; }
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state)) {
     (void)name, (void)handler, (void)state, (void)close;
@@ -34,8 +51,9 @@ void ipc_unimplemented(const IpcSession *s, const IpcRequest *rq) { (void)s, (vo
 void ipc_out(IpcResponse *rs, const void *p, uint32_t n) { (void)rs, (void)p, (void)n; }
 const void *ipc_arg(const IpcRequest *rq, uint32_t off, uint32_t n) { (void)rq, (void)off, (void)n; exit(2); }
 void menu_sound_mix(float *out, uint32_t frames, int channels, int rate) { (void)out, (void)frames, (void)channels, (void)rate; }
-const char *cfg_get(const char *name) { return !strcmp(name, "NX2NAVI_AUDIO") ? "none" : NULL; }
-const char *cfg_value(const char *name) { return !strcmp(name, "NX2NAVI_AUDIO_CHANNELS") ? "stereo" : "default"; }
+static const char *audio_mode = "none", *channels_setting = "stereo";
+const char *cfg_get(const char *name) { return !strcmp(name, "NX2NAVI_AUDIO") ? audio_mode : NULL; }
+const char *cfg_value(const char *name) { return !strcmp(name, "NX2NAVI_AUDIO_CHANNELS") ? channels_setting : "default"; }
 int cfg_bool(const char *name) {
     if (!strcmp(name, "NX2NAVI_AUDIO_RAMP")) return ramp_setting;
     printf("unexpected setting %s\n", name);
@@ -44,7 +62,11 @@ int cfg_bool(const char *name) {
 double cfg_double(const char *name) { (void)name; return 100; }
 unsigned cfg_version(void) { return 1; }
 int audio_buffer_empty(const AudrenWaveBuffer *b) { return !b->address || !b->size || b->end <= b->start; }
-/* no effects in these renderers */
+/* no effects in these renderers, and no value the mixer leaves out (audren.c audio_bad: counted, none expected) */
+static int bad_calls;
+void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) { (void)r, (void)kind, (void)fmt; bad_calls++; }
+const char *audio_effect_invalid(unsigned type, const void *param) { (void)type, (void)param; return NULL; }
+const char *audio_reverb_invalid(const Reverb3dParam *p) { (void)p; return NULL; }
 AudioEffectDsp *audio_effect_create(unsigned type, const void *param, unsigned revision) { (void)type, (void)param, (void)revision; return NULL; }
 void audio_effect_free(AudioEffectDsp *s) { (void)s; }
 void audio_effect_update(AudioEffectDsp *s, const void *param) { (void)s, (void)param; }
@@ -356,12 +378,64 @@ static void catch_up(void) {
     renderer_close(r);
 }
 
+/* The device's, the two notifications' and the virtual device manager's change events: one event per kind however
+   often the game asks, a readable end per request, and a channel change signals each once. Two first requests at once:
+   the loser's event is closed and never signalled. */
+static void change_events_once(void) {
+    int made0 = events_made, read0 = readables;
+    static const unsigned device_cmds[] = {4, 11, 12, 15, 17};
+    for (int round = 0; round < 10; round++) {
+        for (unsigned i = 0; i < sizeof device_cmds / sizeof *device_cmds; i++) {
+            IpcRequest rq = {.cmd = device_cmds[i]};
+            IpcResponse rs = {0};
+            audio_device_handler(NULL, &rq, &rs);
+            CHECK(rs.ncopy == 1 && rs.copy[0], "command %u hands out a readable event", device_cmds[i]);
+        }
+        IpcRequest rq = {.cmd = 500};
+        IpcResponse rs = {0};
+        virtual_device_manager_handler(NULL, &rq, &rs);
+        CHECK(rs.ncopy == 1 && rs.copy[0], "the virtual device manager hands out a readable event");
+    }
+    CHECK(events_made - made0 == 4, "one event per kind: %d made for 60 requests", events_made - made0);
+    CHECK(readables - read0 == 60, "a readable end per request (%d)", readables - read0);
+    CHECK(atomic_load(&n_change_events) == 4, "four events listed (%d)", atomic_load(&n_change_events));
+    /* a lost race: the loser closes its own event, which is not listed */
+    int listed = atomic_load(&n_change_events);
+    static volatile uint32_t raced;
+    race_kind = &raced;
+    uint32_t got = change_event_of(&raced);
+    CHECK(got == raced && !closed[got], "the loser takes the winner's event");
+    CHECK(closed[events_made], "the loser closes its own event");
+    CHECK(atomic_load(&n_change_events) == listed + 1, "only the winner's event is listed");
+    /* a channel change signals every listed event once, never a closed one */
+    channels_setting = "stereo";
+    audio_channels_live();
+    CHECK(output_channels() == 2, "stereo decided");
+    audio_mode = "sdl", channels_setting = "5.1";
+    audio_channels_live();
+    int n = atomic_load(&n_change_events), once = 0;
+    for (int i = 0; i < n && i < 16; i++) once += signalled[change_events[i]] == 1;
+    CHECK(once == n, "a channel change signals each listed event once (%d of %d)", once, n);
+    CHECK(!signal_closed, "no closed event is signalled");
+    /* a slot counted whose handle is not stored yet (a kind's first request on another thread): skipped, never
+       signalled as handle 0, which the kernel answers with a fatal error */
+    atomic_fetch_add(&n_change_events, 1);
+    channels_setting = "stereo";
+    audio_channels_live();
+    CHECK(output_channels() == 2, "back to stereo");
+    CHECK(!signalled[0], "a slot not stored yet is skipped (handle 0 signalled %d times)", signalled[0]);
+    CHECK(signalled[change_events[0]] == 2, "the listed events are signalled again (%d)", signalled[change_events[0]]);
+    audio_mode = "none", channels_setting = "stereo";
+}
+
 int main(void) {
     voice_into_mix();
     voice_into_splitter();
     mix_into_splitter();
     ramps_off();
     catch_up();
+    change_events_once();
+    CHECK(!bad_calls, "the mixer left %d values of these renderers out", bad_calls);
     printf("audio_mixer_check: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

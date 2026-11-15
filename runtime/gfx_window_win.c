@@ -485,6 +485,27 @@ int gfx_window_monitor_size(int *w, int *h) {
     return 1;
 }
 
+// The window's close runs on a thread of its own: gfx_window_closed saves the settings, the caches and the saves and
+// ends the process, which takes seconds while pipeline builds run (vk_pipeline_save_exit waits up to 5 s for them). On
+// the window thread the window stopped answering meanwhile; after 5 s Windows showed it as not responding, and an
+// "End task" there killed the process in the middle of its saves. The window is hidden as the end starts, so a window
+// that still answers does not invite a second close (one would find the end under way: gfx_present.c rt_exit_begin).
+static volatile int32_t g_exit_started;
+
+static void exit_main(void *arg) {
+    (void)arg;
+    gfx_window_closed();
+}
+
+// The end's thread, NULL when the end had started already or runs here (no thread could be made).
+static PlatThread *exit_start(HWND h) {
+    if (plat_xchg32(&g_exit_started, 1)) return NULL;
+    ShowWindow(h, SW_HIDE);
+    PlatThread *t = plat_thread_new(exit_main, NULL, "exit");
+    if (!t) gfx_window_closed();
+    return t;
+}
+
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
@@ -568,6 +589,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ACTIVATEAPP: {
         int in = w != 0;
+        // The end's own hide (exit_start, which sets g_exit_started first on this thread) deactivates the window: no
+        // player's focus loss. Taken as one, the present thread's next present wrote the session's report for the whole
+        // run and started a new period (perf.c perf_focus_lost), so "frametime: exit" covered only the frames since.
+        if (!in && __atomic_load_n(&g_exit_started, __ATOMIC_ACQUIRE)) return 0;
         gfx_window_focus_changed(in);
         if (in && g_fs_pending) {
             g_fs_pending = 0;
@@ -576,13 +601,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_ENDSESSION:
-        // Windows is shutting down, restarting or logging off: it ends the process after this message without a
-        // WM_CLOSE, so the close path runs here (the settings menu's pending save, RTSS's profile, a save Commit in
-        // flight); gfx_window_closed does not return
-        if (w) gfx_window_closed();
+        // Windows is shutting down, restarting or logging off: it ends the process once this message returns, without a
+        // WM_CLOSE, so the close's end runs (the settings menu's pending save, RTSS's profile, a save Commit in flight)
+        // and this thread waits for it here; the end does not return
+        if (w) {
+            PlatThread *t = exit_start(h);
+            if (t) plat_thread_join(t);
+            for (;;) plat_sleep_ms(1000);   // a close had started the end already
+        }
         return 0;
     case WM_CLOSE:
-        gfx_window_closed();
+        exit_start(h);
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     }

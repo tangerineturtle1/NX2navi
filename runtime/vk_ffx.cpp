@@ -21,12 +21,14 @@
 #include "third_party/ffx_api/ffx_api.h"
 #include "third_party/ffx_api/ffx_upscale.h"
 #include "third_party/ffx_api/vk/ffx_api_vk.h"
+#include "vk_up_defer.h"
 
 extern "C" {
 #include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "vk.h"
+#include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_fg.h"
 }
@@ -119,35 +121,59 @@ ffxReturnCode_t create_counted(ffxContext *ctx, ffxCreateContextDescHeader *desc
 // each dispatch and without that flag, preceded an access violation in AMD's driver inside FSR 4's dispatch at the
 // first frame after a switch from 67 % to 100 % (vk_ffx4.cpp keeps its contexts the same way). With the game's dynamic
 // resolution on (NX2NAVI_DYN_RES, dynres.c), whose steps change the render size every few seconds, one context with
-// that flag takes them all. A context of another render size goes once no command buffer can still hold it
-// (UP_RECENT), so a switch keeps at most two of an output size for a few frames, and the game's second scenes, of
-// another output size, keep their own. When all slots are taken, the least recently used one is destroyed for the new
-// size once the GPU is idle, as vk_dlaa.c free_size does for DLSS.
+// that flag takes them all. A context of another render size goes once it is not among the recent ones (UP_RECENT), so
+// a switch keeps at most two of an output size for a few frames, and the game's second scenes, of another output size,
+// keep their own. When all slots are taken, the least recently used one goes for the new size. A context that goes is
+// let go of (retire_up) and destroyed once the GPU is past the submission of its last upscale (g_dead, vk_dlaa.c "what
+// the upscalers let go of"), without a wait for the device; a creation refused while some are still in flight waits
+// for the GPU to pass them, and tries once more once they are destroyed (context_for).
 struct Up {
     ffxContext ctx = nullptr;
     uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
     bool drs = false;                          // made for dynamic resolution (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)
     uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
     uint64_t vram = 0;                         // its video memory as the library reported it at its creation, 0 not told
+    uint64_t fence = 0;                        // the submission of its last upscale (vk_exec_recording_fence), 0 none
 } U[4];
 uint64_t up_tick;
-// A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
-// GPU does not cover it: a frame makes one or two calls (the scene, and a second scene after it), so this is a few
-// frames back.
+// The contexts used in the last few calls stay: a frame makes one or two calls (the scene, and a second scene after
+// it), so this is a few frames back. That is the policy only: a context that goes waits for the GPU through its fence,
+// also when the command buffer that names it is not submitted yet.
 const uint64_t UP_RECENT = 8;
 // A context no upscale used for this long goes (trim): FSR 3.1's after a switch to FSR 4, and a second scene's (the
-// pause screen's) a while after it closed. Unused that long, no command buffer names it.
+// pause screen's) a while after it closed.
 const uint64_t UP_IDLE_NS = 90ull * 1000000000ull;
 
-void destroy_up(Up *u, const char *why) {
-    rt_log("ffx: the FSR 3.1 context for %ux%u (render sizes up to %ux%u) destroyed: %s", u->ow, u->oh, u->mw, u->mh, why);
-    A.destroy(&u->ctx, nullptr);
+// The contexts let go of, destroyed once the GPU is past their last upscale (vk_ffx_dead_take). Only the thread that
+// makes the upscales (vk_dlaa.c's pass hooks) touches it; vk_ffx_release at teardown.
+UpdList g_dead;
+const int DEAD_CTX = 3;   // its one kind
+
+void dead_release(const UpdEntry *e, void *) {
+    uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: "upscaler releases"
+    ffxContext c = (ffxContext)e->handle;
+    A.destroy(&c, nullptr);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
+}
+
+void retire_up(Up *u, const char *why) {
+    rt_log("ffx: the FSR 3.1 context for %ux%u (render sizes up to %ux%u) let go of (destroyed once the GPU is past its "
+           "last upscale): %s", u->ow, u->oh, u->mw, u->mh, why);
+    if (!upd_put(&g_dead, DEAD_CTX, u->ctx, nullptr, u->fence, 0)) {
+        // full, which the GPU's progress does not let happen: room after a wait for the device, or else all of them go
+        // as before this list, the device idle
+        vk_upscaler_settle();
+        if (!upd_put(&g_dead, DEAD_CTX, u->ctx, nullptr, u->fence, 0)) {
+            upd_take_all(&g_dead, dead_release, nullptr);
+            upd_put(&g_dead, DEAD_CTX, u->ctx, nullptr, u->fence, 0);
+        }
+    }
     *u = Up();
 }
 
 void trim(uint64_t now_ns) {
     for (Up &u : U)
-        if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) destroy_up(&u, "no upscale used it for 90 s");
+        if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) retire_up(&u, "no upscale used it for 90 s");
 }
 
 FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
@@ -192,12 +218,11 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         if (u.ctx && u.ow == ow && u.oh == oh && u.drs == drs && (drs ? w <= u.mw && h <= u.mh : w == u.mw && h == u.mh))
             found = &u;
     const VkCtx *c = vk_ctx();
-    int waited = 0;
-    for (Up &u : U)   // the contexts of this output size for another render size, once no command buffer holds them
-        if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT) {
-            if (!waited++) vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // their work may be in flight
-            destroy_up(&u, "the render size changed");
-        }
+    int gone = 0;
+    for (Up &u : U)   // the contexts of this output size for another render size, once they are not recent
+        if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT)
+            retire_up(&u, "the render size changed"), gone++;   // their work may be in flight
+    if (gone) vk_upscaler_let_go();
     if (found) {
         found->used = up_tick, found->used_ns = now;
         return found;
@@ -211,8 +236,8 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
-        destroy_up(lru, "its slot went to another output size");
+        retire_up(lru, "its slot went to another output size");   // its work may still be in flight
+        vk_upscaler_let_go();
         slot = lru;
     }
     if (!slot) return nullptr;
@@ -235,6 +260,20 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     d.maxUpscaleSize = {ow, oh};
     d.fpMessage = message;
     ffxReturnCode_t r = create_counted(&slot->ctx, &d.header);
+    if (r != FFX_API_RETURN_OK && vk_ffx_dead_fence()) {
+        // Refused while contexts let go of (this file's and FSR 4's) are still in flight: most often their video
+        // memory, which a wait for the device freed before the creation up to 0.10.1. The GPU finishes with them
+        // (vk_upscaler_gpu_wait: those submissions only, not the device), they go, and the creation is tried once
+        // more, as vk_ffx4.cpp context_for and vk_dlaa.c evaluate do, rather than the upscaler failing for the run.
+        const ffxReturnCode_t r0 = r;
+        const uint64_t w0 = plat_now_ns();
+        const int gone2 = vk_ffx_dead_take(vk_upscaler_gpu_wait(vk_ffx_dead_fence()));
+        const double waited = (double)(plat_now_ns() - w0) / 1e6;
+        if (gone2) slot->ctx = nullptr, r = create_counted(&slot->ctx, &d.header);
+        rt_log("ffx: FSR 3.1 context creation refused (%u) with contexts let go of still in flight: waited %.1f ms for "
+               "the GPU, %d destroyed, %s", (unsigned)r0, waited, gone2,
+               !gone2 ? "not tried again" : r == FFX_API_RETURN_OK ? "made at the second try" : "refused again");
+    }
     if (r != FFX_API_RETURN_OK) {
         rt_log("ffx: FSR 3.1 context creation for %ux%u (render sizes up to %ux%u) failed (%u)", ow, oh, mw, mh, (unsigned)r);
         slot->ctx = nullptr;
@@ -313,8 +352,18 @@ extern "C" int vk_ffx_fsr4(void) { return cfg_bool("NX2NAVI_FSR4") && vk_ffx4_av
 extern "C" int vk_ffx_trim_idle(uint64_t recent) {
     int n = 0;
     for (Up &u : U)
-        if (u.ctx && up_tick - u.used >= recent) destroy_up(&u, "room for an FSR 4 context"), n++;
+        if (u.ctx && up_tick - u.used >= recent) retire_up(&u, "room for an FSR 4 context"), n++;
     return n;
+}
+
+extern "C" int vk_ffx_dead_take(uint64_t done) {
+    int n = g_dead.n ? upd_take(&g_dead, done, UINT64_MAX, dead_release, nullptr) : 0;
+    return n + vk_ffx4_dead_take(done);
+}
+
+extern "C" uint64_t vk_ffx_dead_fence(void) {
+    uint64_t a = upd_max_fence(&g_dead), b = vk_ffx4_dead_fence();
+    return a > b ? a : b;
 }
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
@@ -368,6 +417,7 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.cameraFovAngleVertical = cam && cam->fov_y > 0 ? cam->fov_y : 1.0f;
     d.viewSpaceToMetersFactor = cam && cam->meters > 0 ? cam->meters : 1.0f;
     ffxReturnCode_t r = A.dispatch(&u->ctx, &d.header);
+    u->fence = vk_exec_recording_fence();   // recorded into cb (a refusal too, for all this side knows)
     if (r != FFX_API_RETURN_OK) {
         static int told;
         if (told++ < 8) rt_log("ffx: FSR 3.1 dispatch failed (%u)", (unsigned)r);
@@ -438,25 +488,28 @@ extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDes
     return A.ok ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
-// The upscaler is off (vk_dlaa.c retire_idle; the device is idle): FSR 3.1's and FSR 4's upscale contexts go, made again
-// at the next upscale. Frame generation's contexts are not these.
+// The upscaler is off (vk_dlaa.c retire_idle): FSR 3.1's and FSR 4's upscale contexts are let go of, made again at the
+// next upscale; the caller's vk_upscaler_let_go frees them once the GPU is past them. Frame generation's contexts are
+// not these.
 extern "C" int vk_ffx_holds(void) {
     for (Up &u : U)
         if (u.ctx) return 1;
     return vk_ffx4_holds();
 }
 extern "C" void vk_ffx_release_idle(void) {
-    vk_ffx4_release();
+    vk_ffx4_release_idle();
     if (!A.ok) return;
     for (Up &u : U)
-        if (u.ctx) destroy_up(&u, "the upscaler is off");
+        if (u.ctx) retire_up(&u, "the upscaler is off");
 }
 
+// Teardown and the probe: the device is idle.
 extern "C" void vk_ffx_release(void) {
     vk_ffx4_release();
     if (!A.ok) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u.ctx = nullptr;
+    upd_take_all(&g_dead, dead_release, nullptr);
 }
 
 // The memory report's FSR figures (vk_memory.c outside_log): the video memory of the upscaling contexts that exist,

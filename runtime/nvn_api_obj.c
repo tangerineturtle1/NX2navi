@@ -16,6 +16,7 @@
 #include "nvn_api.h"
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
+#include "prof.h"
 #include "platform/platform.h"
 
 // ---------- Descriptor pools
@@ -827,11 +828,19 @@ NVN_API(nvnWindowAcquireTexture) {
     NVN_BLOCKING();
     int idx = o->active ? o->next++ % o->active : 0;
     *out = idx;
+    // The frame timing's waits count on the presenting thread (perf.c perf_end); a game may acquire on another, whose
+    // wait here perf_end_any adds to the next present. One line names both threads once the first present is known.
+    static volatile int32_t named;
+    if (prof_render_tid && !named && !plat_xchg32(&named, 1)) {
+        uint32_t tid = plat_thread_id();
+        rt_log("nvn: the game acquires its window images on thread %u and presents on thread %u%s", tid,
+               prof_render_tid, tid == prof_render_tid ? "" : ": the acquire's waits count for the next present");
+    }
     uint64_t at = idx < 4 ? o->avail[idx] : 0;
     if (at) {
         uint64_t p0 = perf_begin();
         sleep_until(at);
-        perf_end(PERF_PACE, p0);
+        perf_end_any(PERF_PACE, p0);
     }
     // On the Switch the image comes back only after the display has shown it, which needs the GPU to have finished the
     // frame drawn into it, so the CPU never runs more than the swapchain's depth ahead of the GPU. Here the pacer frees
@@ -846,13 +855,9 @@ NVN_API(nvnWindowAcquireTexture) {
     }
     uint64_t *fe = img_fence_of(o, idx), want = fe ? *fe : 0;
     if (acq_wait == 2) want = last_present_fence;
-    if (acq_wait && want) {
+    if (acq_wait && want) {   // the back end's wait counts it as a fence wait (vk_sync.c vk_sync_fence_wait), not pacing
         const GfxBackend *b = gfx_backend();
-        if (b->fence_done() < want) {
-            uint64_t p0 = perf_begin();
-            b->fence_wait(want, UINT64_MAX);
-            perf_end(PERF_PACE, p0);
-        }
+        if (b->fence_done() < want) b->fence_wait(want, UINT64_MAX);
     }
     if (gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
@@ -891,11 +896,17 @@ NVN_API(nvnQueuePresentTexture) {
     }
     if (hitch_every && o->presents % (uint64_t)hitch_every == 0) plat_wait_ns((uint64_t)hitch_ms * 1000000);
     uint64_t period = present_period(o), now = kern_now_ns();
-    // A driver's low-latency sleep (vk_lowlat.c) holds the next frame to the period where the frame starts, before
-    // its pad read, so this pacer holds nothing: the present goes out as soon as it is drawn and the image is free at
-    // once. A wait here as well would be a second one, after the picture is drawn. Not while a movie plays: its slots
-    // are kept through a late frame (pace), which only this pacer does, so the back end is told there is no period.
-    if (gfx_backend()->frame_paced && gfx_backend()->frame_paced(frame_step_movie_hz() > 0 ? 0 : period)) period = 0;
+    // A driver's low-latency sleep (vk_lowlat.c) or Reflex with DLSS Frame Generation (vk_dlssg.c) holds the next frame
+    // to the period where the frame starts, before its pad read, so this pacer holds at most the game's ceiling: the
+    // present goes out as soon as it is drawn and the image is free again at once, or a ceiling's period after its
+    // slot. A wait here as well would be a second one, after the picture is drawn. Not while a movie plays: its slots
+    // are kept through a late frame (pace), which only this pacer does, so the back end is told there is no period and
+    // the pacer keeps the movie's.
+    if (gfx_backend()->frame_paced) {
+        int movie = frame_step_movie_hz() > 0;
+        uint64_t held = gfx_backend()->frame_paced(movie ? 0 : period);
+        if (!movie) period = held;
+    }
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;

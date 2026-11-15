@@ -165,6 +165,7 @@ typedef struct Pipe {
     uint8_t optimised;                 // graphics: its pipeline is the whole build that replaced a fast link (fast_retire)
     uint32_t used_min;                 // pipe_minute when a draw or dispatch last looked it up; 0 none in this run
     uint64_t t_miss;                   // graphics: when a draw first missed it (ns), 0 once it is usable (ready_note)
+    uint64_t rel_fence;                // taken out by pressure_release: destroyed once this value is done (release_drain)
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -314,6 +315,39 @@ static void pb_rewrite(const PbHeader *hd) {   // an empty file with this driver
     PB.file_size = f ? sizeof *hd : 0;
 }
 
+// Indexes the records of f (len bytes) after its header: per record its type, key and offset. Returns the offset
+// after the last whole record, which is len unless the file ends inside a record (an append the process did not
+// finish) or holds a malformed one.
+static uint64_t pb_index(FILE *f, uint64_t len) {
+    uint64_t good = sizeof(PbHeader);
+    for (;;) {
+        uint32_t head[3];
+        uint8_t key[PB_KEY];
+        if (pb_seek(f, (int64_t)good, SEEK_SET) || fread(head, sizeof head, 1, f) != 1 || head[2] > PB_KEY ||
+            head[0] < PB_HEAD || (head[1] != PB_BLOB && head[1] != PB_PIPE) || fread(key, PB_KEY, 1, f) != 1 ||
+            good + 4 + head[0] > len)
+            break;
+        if (pb_insert(pb_hash(head[1], key, head[2]), good, head[0])) {
+            if (head[1] == PB_PIPE) PB.pipes++;
+            else PB.blobs++;
+        }
+        good += 4 + (uint64_t)head[0];
+    }
+    return good;
+}
+
+// The length of the file at path (len bytes) to go on with after pb_index found its whole records ending at good: len
+// when they fill it. When it ends inside a record (the process ended during an append, or a disk filled) or holds a
+// malformed one, the records from there on are dropped and the file is cut back to good, so that appends go on after
+// the whole records before it. 0 when it cannot be cut, and the file starts empty.
+static uint64_t pb_keep(const char *path, uint64_t good, uint64_t len) {
+    if (good == len) return len;
+    if (!plat_file_truncate(path, good)) return 0;
+    rt_log("vk_pipeline: pipeline binaries: %s ends inside a record or holds a malformed one at byte %llu; %llu bytes "
+           "from there dropped", path, (unsigned long long)good, (unsigned long long)(len - good));
+    return good;
+}
+
 // Opens pipeline-binaries.bin and indexes its records (cache_load, before P.cache).
 static void pb_init(VkCtx *c) {
     if (!c->has_pipeline_binary || !P.cache_path[0]) return;
@@ -347,24 +381,16 @@ static void pb_init(VkCtx *c) {
         pb_seek(f, 0, SEEK_SET);
         if (fread(&hd, sizeof hd, 1, f) != 1 || memcmp(&hd, &want, sizeof hd)) why = "written by another driver, GPU or version";
         else if (cap && len > cap) why = "over NX2NAVI_PIPE_BINARIES_MAX_MB";
-        else {
-            good = sizeof hd;
-            for (;;) {   // index: per record its type, key and offset
-                uint32_t head[3];
-                uint8_t key[PB_KEY];
-                if (fread(head, sizeof head, 1, f) != 1 || head[2] > PB_KEY || head[0] < PB_HEAD ||
-                    (head[1] != PB_BLOB && head[1] != PB_PIPE) || fread(key, PB_KEY, 1, f) != 1 || good + 4 + head[0] > len)
-                    break;
-                if (pb_insert(pb_hash(head[1], key, head[2]), good, head[0])) {
-                    if (head[1] == PB_PIPE) PB.pipes++;
-                    else PB.blobs++;
-                }
-                good += 4 + (uint64_t)head[0];
-                if (pb_seek(f, (int64_t)good, SEEK_SET)) break;
-            }
-            if (good != len) why = "cut short (a record half written)";
-        }
+        else good = pb_index(f, len);
         fclose(f);
+    }
+    // A file that ends inside a record (the process ended during an append, or a disk filled) or holds a malformed
+    // record: the whole records before it stay, and the file is cut back to them so that appends go on from there.
+    // Only when it cannot be cut does it start empty.
+    if (f && !why) {
+        uint64_t kept = pb_keep(PB.path, good, len);
+        if (kept) len = kept;
+        else why = "ends inside a record or holds a malformed one, and it cannot be cut back to its whole records";
     }
     if (why || !f) {   // start empty: the index is dropped and the file rewritten
         if (f) rt_log("vk_pipeline: pipeline binaries: %s %s (%.0f MB); starting empty", PB.path, why, len / 1048576.0);
@@ -392,8 +418,8 @@ static uint8_t *pb_read(uint32_t type, const uint8_t *key, uint32_t ks, uint32_t
         size_t at = (size_t)(s->off - PB.file_size) + 4;
         ok = at + s->size <= PB.pend_n;
         if (ok) memcpy(head, PB.pend + at, s->size);
-    } else {
-        ok = !pb_seek(PB.rf, (int64_t)(s->off + 4), SEEK_SET) && fread(head, s->size, 1, PB.rf) == 1;
+    } else {   // rf is NULL only after pb_flush could not open the file again
+        ok = PB.rf && !pb_seek(PB.rf, (int64_t)(s->off + 4), SEEK_SET) && fread(head, s->size, 1, PB.rf) == 1;
     }
     uint32_t t, k;
     if (ok) memcpy(&t, head, 4), memcpy(&k, head + 4, 4);
@@ -526,8 +552,17 @@ static void pb_flush(void) {
         int ok = f && fwrite(PB.pend, PB.pend_n, 1, f) == 1;
         if (f) ok = !fclose(f) && ok;
         if (ok) PB.file_size += PB.pend_n;
-        else rt_log("vk_pipeline: pipeline binaries: cannot append to %s; this run's binaries stay in memory", PB.path);
         if (ok) PB.pend_n = 0;
+        if (!ok) {
+            // Part of the append may be in the file (a full disk): the file is cut back to file_size, where the index
+            // places the pending records, or the next append would land after those bytes. The read handle is closed
+            // meanwhile, since plat_file_truncate opens the file alone.
+            if (PB.rf) fclose(PB.rf);
+            int cut = plat_file_truncate(PB.path, PB.file_size);
+            PB.rf = fopen(PB.path, "rb");
+            rt_log("vk_pipeline: pipeline binaries: cannot append to %s; this run's binaries stay in memory%s", PB.path,
+                   cut ? "" : " (and the file cannot be cut back to its whole records)");
+        }
     }
     plat_mutex_unlock(&PB.lock);
 }
@@ -1038,7 +1073,7 @@ static VkPipelineCreateFlags noopt_flag_for(int mesh);
 
 static void mesh_lib_init(const VkCtx *c) {
     const char *why = !c->has_mesh_shader ? "this GPU has no mesh shaders"
-                    : c->mesh_fallback ? "mesh draws go through the mesh fallback (mesh_fallback = 1)"
+                    : c->mesh_fallback ? "mesh draws go through the mesh fallback (vk_device.c, mesh_fallback)"
                     : !vk_caps.gpl ? "the graphics pipeline library is off"
                     : !cfg_bool("NX2NAVI_GPL_MESH") ? "NX2NAVI_GPL_MESH=0"
                     : noopt_flag_for(1) != noopt_flag_for(0) ? "they alone are built without the driver's optimiser "
@@ -3005,10 +3040,9 @@ static Layout *layout_get(Bindings *B) {
 // mesh stages' bindings are visible to the compute stage (they run as compute pipelines of this layout), the
 // fragment stage's stay; push constants (MESH_EMU_PC_BYTES) for the compute stages and the generated vertex shader;
 // set 0 gets a template per bind point. Caller holds P.lock.
-static int mesh_emu_on(void) {
-    static int on = -1;
-    if (on < 0) on = rt_knob("MESH_EMULATION", "0");
-    return on;
+static int mesh_emu_on(void) {   // decided with the mesh fallback at device creation (vk_mesh_path.h)
+    const VkCtx *c = vk_ctx();
+    return c && c->mesh_emulation;
 }
 
 static Layout *layout_get_emu(Bindings *B) {
@@ -3379,11 +3413,14 @@ static int is_src1(unsigned f) { return f >= NVN_BLEND_FUNC_SRC1_COLOR && f <= N
 // ("No fault detected", a timeout) minutes into play on RX 6600 to RX 6950 XT cards in every version from 0.6.0 to
 // 0.9.2, with the pipeline library on or off and the lazy write-back on or off. Where the reports' pass marks name a
 // pass the GPU was in, twelve logs of five reporters, it is a pass whose first draw is a mesh pipeline (mesh shader
-// ba4302f1 with fragment shader f64a96dd in nine, the one-draw pass of 1bbdb17e with 6cc3a476 in three); the five
-// logs of 0.9.1 and 0.9.2 stop between the compute dispatch before such a pass and the pass. No reporter ran with
-// the optimiser off, so that it is the cause is not shown: it is the one suspect the marks leave, it costs shader
-// speed in those pipelines and not the picture, and NX2NAVI_VK_NOOPT=0 gives the optimised ones back. The flag is
-// part of what the driver's cache keys a pipeline by, so those pipelines are built once more after the change.
+// ba4302f1 with fragment shader f64a96dd in nine, the one-draw pass of 1bbdb17e with 6cc3a476 in three). The logs of
+// 0.9.1 and 0.9.2 end with the game's dispatch of cs d7566eb1 finished and nothing after it marked: the group of draws
+// that followed was recorded by the replay workers, whose passes have no marks, so which draw of it hung is not known.
+// No reporter ran with the optimiser off, so that it is the cause is not shown: it costs shader speed in those
+// pipelines and not the picture, and NX2NAVI_VK_NOOPT=0 gives the optimised ones back. The flag is part of what the
+// driver's cache keys a pipeline by, so those pipelines are built once more after the change.
+// Since then that driver draws mesh programs through the mesh fallback by default (vk_mesh_path.h), and no mesh
+// pipeline is built there: this applies with mesh_fallback = 0 alone, as the 0.10.x way to compare against.
 static VkPipelineCreateFlags noopt_flag_for(int mesh) {
     static int on = -1;
     if (on < 0) {
@@ -4508,7 +4545,8 @@ static struct {
     uint32_t built, failed, promoted;
     uint32_t gate_ended;               // boot builders the memory gate ended (warm_builder)
     double t0;                         // now_ms() when the prebuild started
-    double until;                      // now_ms() after which the boot builders stop (comment at prewarm_run); 0 none
+    int prep;                          // t0 is the preparation's start (seed_pipelines), not the ready device's
+    double until;                     // now_ms() after which the boot builders stop (comment at prewarm_run); 0 none
 } K = {.io = PLAT_MUTEX_INIT};
 
 static uint64_t rec_hash(const KeyRec *r) {
@@ -4724,7 +4762,14 @@ static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 // by themselves: how many became usable through a fast link, and after how long.
 #define READY_SLOW_MS 50.0
 #define READY_LOGS 48
-static void ready_note(Pipe *p, int fast) {
+static void ready_note(Pipe *p, int fast, const VkPipeState *s) {
+    // A pipeline goes into pipeline-keys.bin once a draw can use it, so at its fast link too: recorded only when its
+    // optimised build had finished (job_build), the pipelines met in the last seconds of a session were lost. A session
+    // of 2026-11-13 met 46 late pipelines in adult Kokiri Forest and ended about 2 s later; 23 of them never reached the
+    // file, and with it the shared pipeline list (tools/pipeline_list.py merge). keys_note takes each record once.
+    // s is the state the caller built p from: a job whose optimised build failed is gone (job_build clears p->job and
+    // records nothing) before a queued fast link makes p usable, and that link is recorded from s.
+    if (fast && (p->job ? !p->job->prebuild : 1)) keys_note(p->job ? &p->job->s : s);
     if (!p->t_miss) return;
     double ms = (double)(plat_now_ns() - p->t_miss) / 1e6;
     p->t_miss = 0;
@@ -4761,8 +4806,8 @@ static void ready_note(Pipe *p, int fast) {
 }
 
 static void prebuild_report(void) {
-    rt_log("vk_pipeline: prebuild done: %u built, %u failed, %u asked for by a draw first; %.0f ms after the device was "
-           "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
+    rt_log("vk_pipeline: prebuild done: %u built, %u failed, %u asked for by a draw first; %.0f ms after %s", K.built,
+           K.failed, K.promoted, now_ms() - K.t0, K.prep ? "the preparation started" : "the device was ready");
 }
 
 static void job_lower(Job *j);
@@ -4778,7 +4823,7 @@ static void u_run(LibJob *lj) {
             VkPipeline f = gpl_link(&lj->s, &lj->k, lj->l, 1, &final);   // releases P.lock while linking
             if (f && !p->info.pipeline) {
                 p->fast = p->info.pipeline = f;
-                ready_note(p, 1);
+                ready_note(p, 1, &lj->s);
                 job_lower(p->job);   // its job now only does the optimised build
             } else if (f) {
                 vkDestroyPipeline(P.device, f, NULL);   // the job published one meanwhile
@@ -4846,7 +4891,7 @@ static void lib_worker(void *arg) {
         VkPipeline f = gpl_link(&j->s, &j->k, p->lay, 1, &final);   // releases P.lock while building
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f, P.g.wlinks++, P.g.flinks++;
-            ready_note(p, 1);
+            ready_note(p, 1, &j->s);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
             vkDestroyPipeline(P.device, f, NULL);
@@ -5027,27 +5072,44 @@ static void fast_retire(Pipe *p) {
 // each one's compiled code in video memory until it is destroyed. In a 4K session with DLSS and frame generation the
 // device-local memory outside the allocator was 4.2 GB with 6,300 graphics pipelines alive, 3,589 of them not drawn
 // once in that run. On a card short of video memory those are the cheapest thing to give back: no draw has recorded
-// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget (vk_mem_vram,
-// which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH graphics pipelines that
-// no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them with their entries once
-// the GPU is past the submission being recorded and one more (as fast_retire). A draw that needs one later misses it as
-// it would a pipeline never built (pipe_miss): its stage libraries link it, or the look-ahead queued them
-// (vk_pipeline_hint), and its optimised build comes from the pipeline cache, which still holds it.
+// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget
+// (vk_mem_vram_live, which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH
+// graphics pipelines that no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them
+// with their entries once the GPU is past the submission being recorded and one more (as fast_retire), at most
+// RELEASE_DRAIN a tick (release_drain). Not on the completion thread: a value counts as done only after its callbacks
+// ran (vk_sync.c completion_main), so a batch of destroys there held every fence wait of the drawing threads. A draw that
+// needs one later misses it as it would a pipeline never built (pipe_miss): its stage libraries link it, or the
+// look-ahead queued them (vk_pipeline_hint), and its optimised build comes from the pipeline cache, which still holds it.
 // Only entries no lookup reached go (used_min 0; pipe_minute is set before the first lookup, ensure_init), so no draw's
 // memo (vk_exec_draw.c, the PM context) nor any caller holds their VkPipeInfo. Not taken: mesh pipelines (without
 // stage libraries their build is long), entries building or with a link queued, failed ones, and compute pipelines.
 // The next pass logs the device-local use then and now, so a log says what a batch gave back.
-// NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0.
+// The use counts the free space inside the allocator's blocks as free, as the texture evictions do (vk_texture.c
+// sweep_pressure): the driver's figure (vk_mem_vram) counts it as used, so with free blocks it could stay over the line
+// while pipelines went, and every pass would give back another batch until no unused pipeline was left.
+// NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0, and so does NX2NAVI_TEX_VRAM_PRESSURE=0,
+// which keeps the textures from giving way for video memory.
 #define RELEASE_EVERY_MS 5000
 #define RELEASE_BATCH 256
+#define RELEASE_DRAIN 64   // destroyed per autosave tick (500 ms) at most: faster than RELEASE_BATCH per RELEASE_EVERY_MS
 static uint64_t rel_total, rel_batches;
 static uint64_t rel_used0;   // device-local use (MiB) when the last batch went; 0 none to report
+// Entries out of the table, linked through next in the order they went (so by rel_fence), until release_drain
+// destroys them. Only the autosave thread touches the list (pressure_release, release_drain): no lock.
+static Pipe *rel_head, *rel_tail;
 
-static void released_destroy_cb(void *arg) {   // the completion thread: the entry is out of the table since its batch
-    Pipe *p = arg;
-    if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
-    free(p->bindings);
-    free(p);
+// The autosave thread, each tick: destroys the released entries whose fence the GPU is past. None after a device loss
+// (vk_device.c vk_device_lost_check): the device is not called any more.
+static void release_drain(void) {
+    if (!rel_head || vk_device_is_lost()) return;
+    uint64_t done = vk_sync_fence_done();
+    for (int i = 0; i < RELEASE_DRAIN && rel_head && rel_head->rel_fence <= done; i++) {
+        Pipe *p = rel_head;
+        if (!(rel_head = p->next)) rel_tail = NULL;
+        if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
+        free(p->bindings);
+        free(p);
+    }
 }
 
 // Caller holds P.lock.
@@ -5065,17 +5127,22 @@ static void pressure_release(uint64_t now) {
     if (on < 0) {
         on = cfg_bool("NX2NAVI_PIPE_RELEASE");
         pct = cfg_int("NX2NAVI_TEX_VRAM_PRESSURE");
-        if (pct <= 0 || pct > 100) pct = 80;
+        if (pct < 0 || pct > 100) pct = 80;
         if (!on) rt_log("vk_pipeline: every pipeline stays for the run, also while video memory is short (NX2NAVI_PIPE_RELEASE=0)");
+        else if (!pct) {   // 0 turns the textures' giving way off (vk_texture.c sweep_pressure): the pipelines' too
+            on = 0;
+            rt_log("vk_pipeline: every pipeline stays for the run, also while video memory is short "
+                   "(NX2NAVI_TEX_VRAM_PRESSURE=0)");
+        }
     }
     if (!on || now - last < RELEASE_EVERY_MS) return;
     last = now;
     uint64_t used = 0, budget = 0;
-    int exact = 0;
-    if (!vk_mem_vram(&used, &budget, &exact) || !budget) return;
+    if (!vk_mem_vram_live(&used, &budget) || !budget) return;
     if (rel_used0) {
-        rt_log("vk_pipeline: device-local memory in use %llu MiB when the last batch of unused pipelines went, %llu MiB "
-               "now", (unsigned long long)rel_used0, (unsigned long long)(used >> 20));
+        rt_log("vk_pipeline: device-local memory in use (free space inside the allocator's blocks not counted) %llu MiB "
+               "when the last batch of unused pipelines went, %llu MiB now", (unsigned long long)rel_used0,
+               (unsigned long long)(used >> 20));
         rel_used0 = 0;
     }
     if (used * 100 < budget * (uint64_t)pct) return;
@@ -5091,13 +5158,19 @@ static void pressure_release(uint64_t now) {
     uint64_t at = vk_sync_issued() + 2;
     plat_mutex_unlock(&P.lock);
     if (!n) return;
-    for (int i = 0; i < n; i++) vk_completion_add(at, released_destroy_cb, gone[i]);
+    for (int i = 0; i < n; i++) {
+        gone[i]->rel_fence = at, gone[i]->next = NULL;
+        if (rel_tail) rel_tail->next = gone[i];
+        else rel_head = gone[i];
+        rel_tail = gone[i];
+    }
     rel_total += (uint64_t)n, rel_batches++;
     rel_used0 = used >> 20;
     if (rel_batches <= 16 || !(rel_batches & (rel_batches - 1)))
-        rt_log("vk_pipeline: video memory in use %llu of %llu MiB (over %d%%): %d graphics pipelines no draw used in this "
-               "run given back, %llu in %llu batches so far; a draw that needs one builds it again from the pipeline "
-               "cache (NX2NAVI_PIPE_RELEASE)", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), pct, n,
+        rt_log("vk_pipeline: video memory in use %llu of %llu MiB (over %d%%, free space inside the allocator's blocks not "
+               "counted): %d graphics pipelines no draw used in this run given back, %llu in %llu batches so far; a draw "
+               "that needs one builds it again from the pipeline cache (NX2NAVI_PIPE_RELEASE)",
+               (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), pct, n,
                (unsigned long long)rel_total, (unsigned long long)rel_batches);
 }
 
@@ -5109,7 +5182,7 @@ static void job_build(Job *j, int lowrun) {
     VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
     plat_mutex_lock(&P.lock);
     if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
-    ready_note(j->p, 0);
+    ready_note(j->p, 0, &j->s);
     if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
     j->p->building = 0;
     j->p->job = NULL;
@@ -5193,7 +5266,7 @@ static void pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
-                ready_note(j->p, 1);
+                ready_note(j->p, 1, &j->s);
                 plat_cond_broadcast(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
@@ -5251,7 +5324,8 @@ static void workers_drain(void) {
     A.low = A.low_tail = NULL;
     for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
         n = j->next;
-        j->b->job = NULL, j->b->building = 0;
+        if (j->b) j->b->job = NULL, j->b->building = 0;   // a draw's fast link (link_queue) names its pipeline, not a library
+        if (j->p) j->p->link_queued = 0;
         free(j);
     }
     U.head = U.tail = NULL;
@@ -5621,7 +5695,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
-            ready_note(p, 1);
+            ready_note(p, 1, s);
             job_lower(p->job);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
@@ -5705,7 +5779,7 @@ static void warm_builder(void *arg) {
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
-        ready_note(j->p, 0);
+        ready_note(j->p, 0, &j->s);
         if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
         j->p->building = 0;
         j->p->job = NULL;
@@ -6031,8 +6105,9 @@ static void prewarm_run(void) {
         // (NX2NAVI_MESH_EMULATION) it is a vertex pipeline and its compute stages (pipe_miss: layout_get_emu), built
         // here like the others: left to the first draw, each took 113-830 ms on an RX 580 and the draws waiting for it
         // were skipped (22 of the 48 pipelines missed entering Kokiri Forest, 0.9.1), frames held back or shown without
-        // them.
-        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader && !mesh_emu_on()) {
+        // them. With the mesh fallback on a device that has mesh shaders (vk_mesh_path.h: AMD's driver for RDNA 1 and
+        // 2) none is built either: no mesh draw uses one, and that driver is not to compile them.
+        if (is_mesh(&s) && (vk_ctx()->mesh_fallback || (!vk_ctx()->has_mesh_shader && !mesh_emu_on()))) {
             dropped++;
             continue;
         }
@@ -8322,6 +8397,7 @@ static int seed_pipelines(const char *dir) {
     uint32_t queued = 0, dropped = 0, known = 0, other = 0, mesh = 0, no_mesh = 0;
     plat_mutex_lock(&P.lock);
     uint32_t built0 = K.built, failed0 = K.failed;
+    K.t0 = t0, K.prep = 1;   // prebuild_report's start: this mode never runs prewarm_run, which sets it in play
     K.loading = 1;
     for (size_t i = 0; i < n; i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
@@ -8338,7 +8414,7 @@ static int seed_pipelines(const char *dir) {
             other++;
             continue;
         }
-        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader) {   // this GPU draws no mesh pipeline
+        if (is_mesh(&s) && (!vk_ctx()->has_mesh_shader || vk_ctx()->mesh_fallback)) {   // no mesh draw uses one
             no_mesh++;
             continue;
         }
@@ -8840,7 +8916,7 @@ static int save_with(uint32_t wait_ms, int exiting) {
                (unsigned long long)P.g.ready_fresh);
         // The mesh pipelines by themselves: with stage libraries the first two numbers follow each other and the
         // times are a link's; without (the start's line says why) none is linked and the time is a whole build's.
-        if (vk_ctx()->has_mesh_shader)
+        if (vk_ctx()->has_mesh_shader && !vk_ctx()->mesh_fallback)
             rt_log("vk_pipeline: gpl: mesh pipelines (%s): %llu fast links (avg %.2f ms, max %.2f ms); the %llu a draw "
                    "missed were usable after avg %.1f ms, longest %.0f ms, %llu of them through a fast link (the others "
                    "after their whole build); their libraries made in this run: %llu of task and mesh stages (avg %.1f "
@@ -8901,6 +8977,10 @@ void vk_pipeline_save_exit(void) {
     save_with(SAVE_WAIT_MS, 1);
 }
 
+// An orderly end before the guest starts that saves no pipelines (cheats.c's rebuild exit): the boot's journal closed
+// as vk_pipeline_save_exit closes it, so the next start does not take the end for a driver crash in the library warm.
+void vk_pipeline_boot_abandon(void) { journal_close(); }
+
 // The memory report's figure for the pipeline caches the driver keeps in process memory (vk_pipeline_mem): the size of
 // each cache's data, asked once a minute here on the autosave thread, and by every save (cache_save_one). The size is
 // asked as the save asks it, at a moment no build runs into either cache (cache_rw, tried once and never waited for),
@@ -8931,6 +9011,7 @@ static void autosave_once(void) {
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     __atomic_store_n(&pipe_minute, minute_now(), __ATOMIC_RELAXED);
+    release_drain();         // the pipelines given back earlier that the GPU is done with
     pressure_release(now);   // while video memory is short: the pipelines no draw used go
     if (now - last_sizes >= SIZES_EVERY_MS && (P.cache || P.play)) last_sizes = now, cache_sizes_ask();
     if (now - last_keys >= 2000) {
@@ -9241,8 +9322,9 @@ int vk_pipeline_selftest(void) {
     return ok ? 0 : 1;
 }
 
-// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the pipeline table's entries with their pipelines and fast links (never
-// evicted), layouts, stage libraries, the job queues and the pipeline-keys.bin set. A walk of the hash chains under P.lock
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the pipeline table's entries with their pipelines and fast links (only
+// pressure_release takes entries out, while video memory is short), layouts, stage libraries, the job queues and the
+// pipeline-keys.bin set. A walk of the hash chains under P.lock
 // held shared: the workers' inserts and a draw's memo miss wait for it (well under a millisecond).
 void vk_pipeline_sizes(PerfSizes *s) {
     uint64_t ent = 0, built = 0, fast = 0, libn = 0, libb = 0, lq = 0;

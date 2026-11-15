@@ -34,6 +34,11 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
 
 - The SDK boundary is at the `nn::*` function level: threads and synchronisation, IPC, memory, fs/RomFS, time,
   account, applet, hid, audio renderer and effects run as host code. Only `audren:u` and `sm:` are real IPC services.
+  A value in the game's RequestUpdate no longer ends the process (`audren.c` `audio_bad`); OpenAudioRenderer's
+  parameters and the request's buffer descriptors still do. An update whose sections do not match the renderer is
+  refused whole with 0x5299, which the SDK hands back to the game, and a record, effect or sink whose values the
+  renderer cannot use is left out, passed through or skipped, with one log line per kind. `NX2NAVI_AUDIO_STRICT=1`
+  ends the process there instead, for bug reports.
 - Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`). Gamepads and audio output: SDL3 (every
   connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Movies: a host VP9
   decoder over libvpx replaces the SDK's `movie::Decoder` (`runtime/ov_movie.c`).
@@ -91,6 +96,16 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   queues"); a CPU signal counts for a submission only when it came before the copies above were taken, and a
   submission it comes too late for goes on at once in one of its own (`vk_exec_xfer.c`, "events the CPU signals").
   `NX2NAVI_EVO_TRACE=1` logs the order every frame was replayed in.
+- Several submitting threads. The game submits from several threads and presents from one of them. Their replays take
+  turns on the submission lock (`vk_sync.c`). The state a present closes for the frame (the DLSS state, the motion
+  tables, the frame count conditional draws go by) is reset between two replays: by the present when the lock is free,
+  else first thing in the next submission or by the present thread before the frame's blit, whichever comes first
+  (`vk_frame_owed.h`, `NX2NAVI_PRESENT_ORDER`). A present held for event-ordered work is put out once and in order by
+  whichever thread's submission finds its work done (`vk_present_held.h`); submitting threads only try its lock, and
+  the presenting thread waits for it only while another thread puts a held present out. A recording two threads
+  submit at once gets a copy of its own for the second, for its deferred binds (`nvn_submit_guard.h`). Held work is
+  asked about without the lock from a published copy (`vk_evo_peek.h`). The log counts the overlaps with
+  `NX2NAVI_TRACE=perf` ("enters a submit ... while"), and at exit what they cost ("frame bookkeeping: ...").
 - Driver data. The NVN driver keeps a per-stage constant bank (c0). The back end fills it as the driver does: storage
   and uniform tables, push constants and, for NVN 2 compute, the dispatch's group counts in bytes 0-0xb.
 - Storage buffers the shaders reach through pointer tables in memory are bound at the address the table holds
@@ -125,13 +140,17 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   a crash, which skips the prebuild or the variants, or a start that was closed or stopped, which skips nothing.
   `NX2NAVI_PREWARM_WAIT_MS` caps the whole wait, after which the rest finishes in the background.
 - Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
-  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
-  lists the translators it holds translations of, and a shader the new translator has not translated yet uses the
-  previous one's for the whole session, so neither the start nor play waits for a translation the update caused.
-  After the boot prewarm a background pass on its own translator process at idle priority, which waits while the game
-  translates, translates every stored program again for the next start, then deletes the old translations (a pruned
-  copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator refuses keeps its
-  old translation. `--prepare-shaders` still translates everything with the current translator.
+  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt` lists
+  the translators it holds translations of, and a shader the new translator has not translated yet uses the previous
+  one's for the whole session, so neither the start nor play waits for a translation the update caused. Except a
+  previous translation that indexes the texture pool with the earlier length (32768 entries, the 0.9.2 translator's),
+  which would read slot 32767 for every texture numbered from 32768 up (`runtime/gfx_shader.c` `carry_usable`): such a
+  shader is translated again, in the boot prewarm when the boot names it, otherwise at first use (its draws are skipped
+  meanwhile; a compute dispatch waits for the translation). A program the current translator fails keeps even such a
+  translation (`carry_last`). After the boot prewarm a background pass on its own translator process at idle priority,
+  which waits while the game translates, translates every stored program again for the next start, then deletes the old
+  translations (a pruned copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator
+  refuses keeps its old translation. `--prepare-shaders` still translates everything with the current translator.
 - Shader disk reads in play: a draw's shader that is in the disk cache but not in memory is read on the render thread
   within a budget of 1/8 of the wall time (2 ms at once), and past it by three loader threads while its draws are
   skipped as for a translation (`runtime/gfx_shader.c` `load_budget`). Opening a loose file is what costs (5.6 ms a
@@ -145,15 +164,18 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   ring of Vulkan `{x, y, z}` records filled on the GPU. The copy cannot be recorded inside a pass, so the first such
   draw of a pass fills the records of the mesh draws that follow it too, and the pass is not cut at each of them
   (`runtime/vk_exec_draw.c` `mesh_ring_entry`).
-- Mesh fallback (`mesh_fallback`: `auto` on a device without the extension, `1` on any device for testing): the task
-  and mesh stages run as compute dispatches and the result is drawn as ordinary triangles.
+- Mesh fallback (`mesh_fallback`: `auto` on a device without the extension and on AMD's Windows driver for RDNA 1 and
+  2, where native mesh pipelines lost the device in play, `1` on any device for testing, `0` never;
+  `runtime/vk_mesh_path.h`): the task and mesh stages run as compute dispatches and the result is drawn as ordinary
+  triangles.
   - The modules come from the translations the shader cache already holds, not from the translator
     (`runtime/mesh_fb.c`): a translated task or mesh module is the program as a compute function over shared memory
     plus an entry function that hands that memory to the mesh pipeline, and the fallback replaces the entry function
     by one that copies the memory into a storage buffer. The translator, its identity and every cache key stay as
     they are, so a device with mesh shaders keeps its shaders and never sees these modules, and a device without
     needs no other cache or prepared shader list.
-  - A draw is: its record (the workgroup count, copied on the GPU when the game's record holds it); the task
+  - A draw is: its record (the workgroup count, copied on the GPU when the game's record holds it, then cut to what
+    the buffers hold by `shaders/meshfb_clamp.comp`, so a garbage count cannot launch work past them); the task
     dispatch, which writes each task workgroup's payload into the task buffer; a scan (`shaders/meshfb_scan.comp`)
     that lists the mesh workgroups the tasks started, in task order, and writes their number into the record; the
     mesh dispatch, which writes each workgroup's vertex lines and primitive bytes into its slot of the mesh buffer;
@@ -167,6 +189,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     they are ready (`mesh_fallback_workers`, auto: one for each 4 logical processors, 1 to 4, so a place's programs,
     which all arrive in its first frames, are not made one after the other); they are not recorded for the next start,
     where the pipeline cache makes them quick.
+  - The game draws a culled list of grass or leaves twice from one indirect record, depth first and colour after, and
+    the depth draw's smaller program is ready first. While the colour draw is skipped for its modules or pipeline,
+    the depth draw of the same record is skipped too (`mfb_hold_role`, `mesh_fallback_hold`): alone it left the
+    list's depth in the scene with nothing drawn over it, and the sky's colour showed through the ground.
     Not carried: the far shadow cascades' coarser shading rate, a draw's first workgroup other than 0, and more
     workgroups in one draw than one compute dispatch may have.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
@@ -225,17 +251,94 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
   holds the HDR picture relative to the HUD's white (the function gets the values the curve takes, and the scene
-  before the game's exposure gain with that gain, which it anchors mid grey on); the game's FSR 1 pass loses its output
-  clamp; the present reads the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ
-  for an HDR10 swapchain, showing the picture as a display of gamma 2.2 would (the game is graded for one: decoded as
-  its sRGB encode, the darkest tones would sit far above black). The look is fixed; the settings are the peak, game and
-  HUD whites.
+  before the game's exposure gain with that gain, which its default tone mapper anchors mid grey on); the game's FSR 1
+  pass loses its output clamp; the present reads the float picture in place of the window texture and
+  `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain, showing the picture as a display of gamma 2.2 would (the
+  game is graded for one: decoded as its sRGB encode, the darkest tones would sit far above black). The settings are
+  the peak, game and HUD whites, the tone mapper (`NX2NAVI_HDR_TONEMAP`: the observer-response mapper, the game's own
+  curve or the luminance mapper), what each tone mapper takes, the grading sliders and the gamma correction
+  (`NX2NAVI_HDR_GAMMA`, with every tone mapper); they travel in five vec4 the support buffer gains, and at their
+  defaults the shader leaves every grading step out.
   `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
   The menu switches between off and `1` during a run: the splice, the HDR extensions and the settings in the support
   buffer are there from the start whatever is set (`vk_hdr_armed`), the spliced tonemap returns the game's SDR result
   while the swapchain is SDR, and a change of the setting makes the swapchain again in the other format
   (`gfx_present.c` `window_settings_live`). Only `native` waits for a restart, as the game asks about the display
   once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
+- Frame pacing (`nvn_api_obj.c` `nvnQueuePresentTexture` and `pace`, `frame_rate.c` `frame_step_cap_ns`,
+  `vk_backend.c` `present_main`): the frame limit (`NX2NAVI_FPS_LIMIT`, live) counts the frames the game draws.
+  Ocarina steps by the clock, so the pacer holds the frames to the limit alone: at most `LIMIT_FREE_MAX_HZ` (240, also
+  for "unlimited"), and while a movie plays at the movie's rate (`movie_cap_hz`, `NX2NAVI_MOVIE_FPS`). Each game
+  present gets a slot one period after the one before: an early frame waits for it, a frame late by less than a period
+  keeps the phase, a later one starts again from now, and while a movie plays the slots are kept through a lateness of
+  up to a second (`MOVIE_CATCHUP_NS`). The game's present returns at once; the present thread blits the picture,
+  waits until the slot (`wait_until`, with `pace_smooth`'s floor of seven eighths of the recent interval, off with
+  frame generation) and presents under the present and queue locks (`gfx_present.c` `flip_locked`). A window image is
+  free again one period after its slot, and its acquire also waits for the GPU to finish the image's previous frame
+  (`NX2NAVI_ACQUIRE_WAIT`); `frame_step_present` gives `ocarina_step` the slot times, snapped to the paced rate within
+  3%.
+- One limiter is the goal: the driver's low latency (`vk_lowlat.c`), Reflex with DLSS Frame Generation (`vk_dlssg.c`),
+  RivaTuner Statistics Server (`rtss_limit.c`) or the game's pacer holds the frame limit, and the log's "frame rate:"
+  and "lowlat:" lines name the one in charge. The pacer is the fallback wherever the other limiter's hold is not
+  proven: before the first host present, while a movie plays (the pacer keeps the movie's slots, which no other
+  limiter knows), once no picture went out for 200 ms (a minimised window, `frame_hold`), for the rest of the run once
+  the frames show the other limiter letting them through faster than the limit (for RTSS also once it was not seen
+  holding them for 30 s), and after any failure. While RTSS or Reflex holds the limit the pacer keeps only the
+  240-frame ceiling the game's code needs (`rtss_decide.h` `rtss_pace_period`, `frame_rate.c` `frame_step_ceiling_ns`).
+  Frame generation keeps RTSS out (it would count the generated frames); with AMD's frame generation the game's pacer
+  holds the drawn frames beside it. The exceptions as they stand: `pace_smooth` still waits on the present thread while
+  RTSS holds the limit; at a play limit equal to a movie's rate (60, the default, for the game's 60 fps movies) RTSS's
+  profile keeps that limit and RTSS holds the movie beside the pacer; once RTSS hooks the game with the limit in its
+  profile it holds the frames beside the pacer until it is seen holding them, for 30 s at most, after which the
+  profile goes back for the run; and a limit set in RTSS itself
+  still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
+  frame rate row of the menu point out, and the same where RTSS is out of it for the run because its profile cannot be
+  written, its hooks library does not load or it never showed its hold, which the log points out the same way (the
+  menu shows the administrator note for the first, nothing for the second and that RivaTuner does not limit the game
+  for the third).
+- RivaTuner Statistics Server (`rtss_limit.c`, `NX2NAVI_RTSS`, restart; its decisions in `rtss_decide.h`): the game's
+  first present starts a thread that looks RTSS up (`InstallDir` under `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`,
+  `RTSSHooks64.dll`) and reads its shared memory (`RTSSSharedMemoryV2`) every 500 ms. While RTSS runs, the limit goes
+  into RTSS's profile for the executable (`Profiles\<exe>.cfg`, through the hooks library's profile calls, read back
+  from the saved file; a fractional rate over a denominator where RTSS knows one, else rounded down to whole frames)
+  once the first picture went out and the limit stayed the same for two polls, so a want that flips (low latency at a
+  swapchain rebuild) writes nothing. A movie leaves the play limit in the profile; only a play limit below the movie's
+  rate gives the profile no limit for the movie's length, so that RTSS does not hold the movie below its rate. Above
+  the movie's rate RTSS lets the frames the pacer sends at once after a late frame through faster than the movie runs;
+  at the movie's own rate (a limit of 60) whether RTSS spaces them out, and the picture falls behind the sound, is not
+  measured. The pacer stands aside (`rtss_limit_active`) only once RTSS is seen holding the game: it lists the
+  process with its Vulkan presents, has read the profile (its update flag clear) and measured a period of the game's
+  frames lately, no movie plays and a picture went out within 200 ms. The pacer keeps the limit while RTSS does not run
+  or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be written
+  (no administrator rights), the hooks library does not load, or RTSS's own frame count of the game is above 1.05
+  times the limit in three new periods in a row (a period RTSS no longer moves counts neither way), or RTSS lists the
+  game with the limit while pictures go out for 60 polls in a row (30 s) and never shows its hold (no Vulkan presents
+  seen, the profile not read, no period measured); the menu names the first and the last two of these. Frame
+  generation, the
+  driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held before
+  the run changed it, and while RTSS is kept out its thread does not load the hooks library (but for the one restore
+  below at the start) and only reads RTSS's own settings for the game; a later limit (frame generation or low latency
+  switched off) loads it and hands RTSS the limit as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the
+  run. While RTSS lists the game the log names those
+  settings (limit, frame time limit, scanline sync, display sync, Reflex sleep, passive wait) once per change. Every
+  orderly exit puts the profile back as it was before the run (`rtss_limit_restore`), and no want reaches it after
+  that. What the profile held is also kept in `rtss-profile.txt` next to the executable, one line per profile, written
+  before the run's first change of it, taking each later value before the profile does, and removed once the profile
+  is back: a start that finds a line left by a run that did not close (a kill, a hang, the device-lost watchdog, a
+  crash or a fatal error) puts that profile back first (`left_start`), unless the player changed it since; frame
+  generation and low latency, which keep RTSS out, have the hooks library loaded for that one restore, and a start with
+  `NX2NAVI_RTSS=0` leaves the profile and the line as they are and says so in the log. A crash and a fatal error
+  (`rtss_limit_crash`) make no call into RTSS's library while the line is in the file; where the file could not be
+  written they put the profile back as an orderly exit does, never from RTSS's own thread, which may hold the lock
+  that takes. A file that cannot be written or read leaves the run as before, with a line in the log, and the lines of
+  other executables in it as they are; profiles that versions before the file left with the game's limit cannot be
+  told from the player's own.
+- Measuring pacing: `NX2NAVI_TRACE=present` logs a line per picture (the host present's interval, the game's present
+  interval, the wait for the slot and how far past it the present went), `NX2NAVI_TRACE=perf` each wait's share of the
+  frame ("bound:"), and `tools/perf_summary.py` condenses both. Both measure before the host present, so a wait RTSS
+  adds inside it does not show there: PresentMon is the reference for what reached the screen. Compare runs with the
+  same executable name, cache state and save, and keep `trace` off when counting hitches; `NX2NAVI_MEM_CENSUS` and
+  the memory report every 3600 frames are the runtime's own hitches.
 - Low latency (`vk_lowlat.c`, `NX2NAVI_LOW_LATENCY`, off by default): the graphics driver holds each frame's start, so
   the pad is read as late as the picture's time allows and no finished picture waits. NVIDIA's mode runs through
   `VK_NV_low_latency2`: the window's swapchain is made with the latency mode, the frame sleeps in the driver before its
@@ -246,7 +349,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   limit and the pacer holds nothing (`nvn_api_obj.c` `nvnQueuePresentTexture`, `vk_lowlat_pace`); the pacer takes the
   limit back while a movie plays, while no present goes out, and for the rest of the run when the frames show that the
   driver does not hold it. DLSS Frame Generation brings its own low latency (`vk_dlssg.c`), and the direct path is off
-  in such a run; NVIDIA's is also off while another frame generation presents the frames.
+  in such a run; NVIDIA's is also off while another frame generation presents the frames. There Reflex's sleep holds
+  the frame limit the same way, through Streamline's frame limit (`nx2_sl.cpp` `nx2sl_reflex2`), with the same
+  exceptions, a DLL older than that export and a limit Streamline refuses besides (`vk_dlssg.c` `vk_dlssg_pace`,
+  `dlssg_pace.h`); the pacer stands aside only once Streamline took the limit and keeps the game's ceiling of 240
+  (`frame_rate.c` `frame_step_ceiling_ns`). Since the SDK does not say whether the driver's interval counts the frames
+  the game draws or every frame on screen, the frames are checked: about the multiplier periods apart switches Reflex
+  to the period over the multiplier once, and the same again or frames too soon give the limit to the pacer for the
+  run. `NX2NAVI_REFLEX_LIMIT=0` (live) leaves the limit to the pacer, as before Reflex's frame limit was used.
   The device gets the drivers' extensions only in a run that starts with the setting on (`vk_device.c`
   `create_device`): turning it on takes a restart, and with it off the device is made as it was before the mode.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
@@ -280,16 +390,22 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   tables, the texture cache and its decode temporaries, the log queue, the flight recorder), the data of the driver's
   pipeline caches (asked once a minute on the autosave thread) and the rest;
   `mem: growth` names what grew by more than 64 MiB since the report before and since the first report in play. Every
-  ten minutes of play and at exit, `mem: growth ranking` ranks the categories by their growth since play began and
-  marks those that only climbed (`mem_growth.h`).
+  two minutes of play, when the window loses the focus in play and at exit, `mem: growth ranking` ranks the categories
+  by their growth since play began and marks those that only climbed (`mem_growth.h`).
 - Released textures by age: the game releases a texture when what uses it leaves the view and takes it back when that
   returns; the cache keeps the released image so that the take-back finds it. In play the take-backs came within a
-  minute of the release or never, so a released texture goes once it has gone unused for a hold of three minutes, six
+  minute of the release or never, so a released texture goes once it has gone unused for a hold of one minute, two
   for content only the GPU made (`vk_texture.c` `drop_aged`, `vk_tex_release.h`, `tex_released_hold`). The size bound
-  (a quarter of the video memory budget) stays as the safety net for a burst of area changes, and young textures may
-  pass it, up to twice it, while the card and the system's commit have room. Times are wall seconds from a clock of
+  (a thirty-second of the video memory budget, 384 MiB to 1 GiB) is what the cache costs in video memory: the
+  allocator's blocks go back to the driver only when empty, so what the released textures hold at their fullest
+  stays in use for the session. Young textures may pass it, up to twice it, while the card and the system's commit
+  have room. Times are wall seconds from a clock of
   the presents, not present counts. What a switched-off upscaler or SMAA held is freed after it has gone unused for a
-  while (`vk_dlaa.c` `idle_release`, `vk_fsr.c` `idle_note`, `vk_aa.c` `work_idle`).
+  while (`vk_dlaa.c` `idle_release`, `vk_fsr.c` `idle_note`, `vk_aa.c` `work_idle`). What DLSS or FSR lets go of at
+  a change of size or mode (a network, an FSR context, a work image) goes once the GPU is past the last submission that
+  used it, and an image frame generation reads at a present some presents later, without a wait for the device on the
+  replaying thread (`vk_dlaa.c` "what the upscalers let go of", `vk_up_defer.h`; `upscaler_idle_wait = 1` waits for
+  the device at each such change as before, and the freeing keeps these gates).
 - Translated shaders at rest: the shader memory cache keeps every shader for the whole session, but a shader's SPIR-V
   is read only while modules are made of it. A background thread compresses (zstd, checked by decoding it) the SPIR-V
   of each shader no reader used for `shader_compress_idle_s` seconds (30) and frees the plain copy; a reader pins it

@@ -306,12 +306,12 @@ def build_llvm(out):
 def check_translator():
     """Stop on a translator older than the sources. build/xlate is built by hand and only copied here (the Linux release
     builds its own), so without a rebuild a translator change reaches no Windows release, and nothing fails: the runtime
-    sends job fields the old exe ignores, as happened to gather_bias."""
-    idf = MAIN_ROOT / 'build' / 'xlate' / 'nx2navi_xlate.id'
-    have = idf.read_text(encoding='ascii').strip() if idf.is_file() else 'none'
-    want = build_xlate.identity()
-    if have != want:
-        sys.exit(f'build/xlate has translator {have[:16]}, the sources are {want[:16]}: run tools/build_xlate.py')
+    sends job fields the old exe ignores, as happened to gather_bias. The identity it must have is that of this
+    checkout's sources prepared afresh (build_xlate.check_built), not build_xlate.identity() over build/xlate, which
+    hashes the tree its last build prepared and so matches a translator built before a patch changed."""
+    reason = build_xlate.check_built(MAIN_ROOT / 'build' / 'xlate', 'nx2navi_xlate.exe')
+    if reason:
+        sys.exit(reason)
 
 
 def build_bin(out):

@@ -162,6 +162,30 @@ typedef struct {
 } ServerVoice;
 enum { SV_STOPPED, SV_STARTED, SV_PAUSED, SV_STOPPING };
 
+// A RequestUpdate this host refuses (audren.c update_check, audio_mixer.c audio_mixer_routing_check and
+// audio_mixer_mix_layout_check): audio module 153, description 41, the update's sections do not match the renderer.
+// The SDK's RequestUpdateAudioRenderer hands it back to its caller (as it does descriptions 42 and 43) and aborts on
+// any other result; the game ignores it and sends its next update. Nothing of a refused update is applied.
+#define AUDREN_R_INVALID_UPDATE 0x5299u
+
+// Kinds of game value this host cannot use (audren.c audio_bad), one per site; each is logged once per renderer.
+enum {
+    // the RequestUpdate is refused
+    AB_UPD_BUFFERS, AB_UPD_SMALL, AB_UPD_TOTAL, AB_UPD_BEHAVIOR, AB_UPD_POOLS, AB_UPD_CHANNELS, AB_UPD_VOICES,
+    AB_UPD_EFFECTS, AB_UPD_SINKS, AB_UPD_OVERRUN, AB_UPD_UNCONSUMED, AB_UPD_OUTPUT,
+    AB_SPL_HEADER, AB_SPL_MAGIC, AB_SPL_INFO_OVERRUN, AB_SPL_INFO, AB_SPL_PADDING, AB_DEST_OVERRUN, AB_DEST_MAGIC,
+    AB_SPL_SIZE, AB_MIX_DIRTY, AB_MIX_SIZE, AB_MIX_LAYOUT,
+    // one record of the update is left out, the rest is applied
+    AB_CHANNEL_ID, AB_VOICE_ID, AB_WAVE_INDEX, AB_VOICE_FILTER, AB_SPL_ID, AB_SPL_DEST_REF, AB_DEST_ID,
+    AB_DEST_FILTER, AB_MIX_ID,
+    // one effect or sink is passed through or skipped
+    AB_LIMITER_SIZE, AB_LIMITER_CHANNELS, AB_LIMITER_PARAMS, AB_LIMITER_INDEX, AB_DELAY_PARAMS, AB_REVERB_PARAMS,
+    AB_COMPRESSOR_PARAMS, AB_DSP_CHANNELS, AB_DSP_INDEX, AB_R3D_PARAMS, AB_R3D_CHANNELS, AB_R3D_INDEX,
+    AB_AUX_SIZE, AB_AUX_ADDRESS, AB_AUX_INDEX, AB_CAPTURE_SIZE, AB_CAPTURE_ADDRESS, AB_CAPTURE_INDEX,
+    AB_BUFMIX_COUNT, AB_BUFMIX_INDEX, AB_SINK_PARAMS, AB_SINK_ADDRESS, AB_SINK_INDEX,
+    AB_KINDS
+};
+
 typedef struct AudioRenderer {
     AudrenParameter param;
     PlatMutex lock;
@@ -179,18 +203,49 @@ typedef struct AudioRenderer {
     AudrenEffectIn *effects;
     AudrenChannelIn *channels;
     void *mixer;
+    uint8_t strict;                  // NX2NAVI_AUDIO_STRICT (OpenAudioRenderer): audio_bad ends the process
+    uint8_t bad_seen[AB_KINDS];      // audio_bad: the kinds logged so far (atomic exchange; any thread)
+    uint64_t bad_count;              // audio_bad: times a value was left out (per update or per render pass) or an
+                                     // update refused (atomic)
+    uint64_t refused, refused_run;   // updates refused, and refused in a row (the thread that sends RequestUpdate)
 } AudioRenderer;
+
+// A value the game sent that this host cannot use: the caller refuses the update or leaves the one record, effect or
+// sink out. Logs the first of each kind per renderer, with the game frame, and counts every one; with
+// NX2NAVI_AUDIO_STRICT=1 it ends the process instead, as most of these values did before 0.11.0. Any thread; takes no
+// lock but the log's.
+void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+// audio_bad for a refused RequestUpdate, as an expression that gives AUDREN_R_INVALID_UPDATE.
+#define AUDIO_REFUSE(r, kind, fmt, ...)                                                                                \
+    (audio_bad((r), (kind),                                                                                            \
+               "RequestUpdate refused with %#x: " fmt "; the renderer goes on with the last update it took",           \
+               AUDREN_R_INVALID_UPDATE, ##__VA_ARGS__),                                                                \
+     AUDREN_R_INVALID_UPDATE)
 
 // IAudioRendererManager, served under "audren:u" (ipc.c's service table).
 void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
 long audren_renderers_live(void);      // renderers whose render tick runs
 
-// Mixer interface (audio_mixer.c). Every call but open/close/set_running runs with r->lock held.
+// Mixer interface (audio_mixer.c). Every call runs with r->lock held except open, close and set_running, the render
+// thread's audio_mixer_pace_ns, audio_mixer_owed and audio_mixer_out_stats (audren.c render_thread and stats_report
+// call them without it), and audio_mixer_routing_check. The render thread's three touch only atomics and state that
+// only the render thread changes: device_check and channels_switch, which close and open the output stream, run on
+// that thread too, and audio_mixer_close runs after renderer_close has joined it. audio_mixer_routing_check runs on the
+// game's update thread before it takes the lock and reads only the renderer's fixed counts and the game's input.
 void audio_mixer_open(AudioRenderer *r);
 void audio_mixer_set_running(AudioRenderer *r, int running);
 void audio_mixer_close(AudioRenderer *r);
+// Before an update is applied, without the renderer lock: the framing of the splitter and mix sections in the layout
+// of `revision`. 0, or AUDREN_R_INVALID_UPDATE (logged through audio_bad).
+uint32_t audio_mixer_routing_check(AudioRenderer *r, uint32_t revision, const uint8_t *splitters,
+                                   uint32_t splitter_bytes, const uint8_t *mixes, uint32_t mix_bytes, int mix_count);
+// Renderer lock held, before the update is applied: the mixes in use, as the update leaves them, fit the renderer's
+// mix buffers (audio_mixer_render lays them out one after another). 0, or AUDREN_R_INVALID_UPDATE.
+uint32_t audio_mixer_mix_layout_check(AudioRenderer *r, const uint8_t *mixes, uint32_t mix_bytes, int mix_count);
+// After both checks passed. A record whose ids the renderer does not have is left out (audio_bad).
 void audio_mixer_update_routing(AudioRenderer *r, const uint8_t *splitters, uint32_t splitter_bytes,
                                 const uint8_t *mixes, uint32_t mix_bytes, int mix_count);
+// An enabled effect whose parameters the DSP cannot use is passed through by audio_mixer_render (audio_bad).
 void audio_mixer_update_effects(AudioRenderer *r);
 void audio_mixer_effect_result(AudioRenderer *r, int id, void *output, unsigned size);
 uint32_t audio_mixer_sink_written(AudioRenderer *r, int id);

@@ -27,13 +27,13 @@ HEAD = re.compile(r'stutter map \(([^)]*)\): ([\d.]+) min of play in (\d+) areas
 AREA = re.compile(r'stutter map:   (.+?): ([\d.]+) min at (\d+) fps; hitches (\d+) \(([\d.]+) a minute(.*?)\), worst '
                   r'([\d.]+) ms \(frame (\d+)\); over 25 ms (\d+); after its loads (\d+); draws that met a pipeline '
                   r'missing (\d+), a shader (\d+), ([\d.]+) ms on the replay thread')
-CAUSE = re.compile(r'; (\w+) (\d+), ([\d.]+) ms avg')
+CAUSE = re.compile(r'; ([\w-]+) (\d+), ([\d.]+) ms avg')   # hand-off has a hyphen
 PIPES = re.compile(r'stutter map: (\d+) pipelines draws met missing: (\d+) that this install had recorded before .*?, '
                    r'(\d+) new to it, (\d+) with a shader translated in play, (\d+) still translating when met')
 PIPE = re.compile(r'stutter map:   (mesh|vertex) (\S+)/(\S+) first met in (.+?): (\d+) draws met it missing, (\d+) its '
                   r'shader, ([\d.]+) ms on the replay thread; usable after (\d+) ms at most \((\d+) times\); (.*)$')
 HITCH = re.compile(r'stutter: frame (\d+) at ([\d.]+) s, ([\d.]+) ms \(frames about ([\d.]+) ms\) in (.+?)(, after its '
-                   r'load)?: .*?\(charged to (\w+)\)')
+                   r'load)?: .*?\(charged to ([\w-]+)\)')
 
 
 def read_log(path):

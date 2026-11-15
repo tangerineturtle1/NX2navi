@@ -10,20 +10,26 @@
 // 60 or 30 fps after 140 is a slower rate, not a run of hitches, and the median takes the new rate within 16 frames.
 // The decision waits two presents; the line and the counts carry what the frame itself waited for. Frames within
 // SM_LOAD_NS of an area's load count apart, as the load's: an area load shows as a few long frames that are not a
-// stutter in play.
+// stutter in play. An area load is the game's (stutter_area) or the texture pool's (stutter_load: the pool makes an
+// area's textures, vk_exec_draw.c pool_loading), which comes without the game's when it streams the next area in.
+// Consecutive long frames are one episode, a hitch counted once with their summed time: a change of pace is a run of
+// more than SM_EPISODE_MAX long frames none of which stands out from the ones after it, and an episode ends at its
+// last frame that stood out once more than SM_EPISODE_MAX such frames follow that one. Three frames of 87, 91 and
+// 96 ms after an area load (2026-11-13) each counted as a change of pace before, as each was followed by one as long.
 //
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
-// fence, pacing, replay, unattributed), with the draws that met a pipeline or a shader missing between the previous
-// present and this one (stutter_miss, from the replay thread). Each hitch gets a "stutter:" line, at most
-// SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every SM_REPORT_NS of play and at exit,
-// "stutter map" lines rank the areas by their hitches and the pipelines by the time draws lost to them, each with
-// whether this install had recorded it before (the pipeline list or an earlier run) and whether one of its shaders was
-// translated in play rather than prepared.
+// fence, pacing, hand-off, replay, census, report, unattributed), with the draws that met a pipeline or a shader
+// missing between the previous present and this one (stutter_miss, from the replay thread). Each hitch gets a
+// "stutter:" line, at most SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every
+// SM_REPORT_NS of play, when the window loses the focus in play (perf.c session_report) and at exit, "stutter map"
+// lines rank the areas by their hitches and the pipelines by the time draws lost to them, each with whether this
+// install had recorded it before (the pipeline list or an earlier run) and whether one of its shaders was translated
+// in play rather than prepared.
 //
 // Threads: stutter_area runs on the game's loading threads, stutter_miss on the replay thread, stutter_ready on the
 // pipeline workers (under vk_pipeline.c's P.lock; sm_lock is taken inside it and never takes it), stutter_frame and
 // the periodic report on the present thread. The area table's play counts belong to the present thread; the rest is
-// under sm_lock.
+// under sm_lock. A report copies the map under sm_lock and sorts and logs the copy without it.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +42,7 @@
 int stutter_map_on;
 
 #define SM_AREAS 128                       // areas kept by name; later ones share the last slot
-#define SM_CAUSES 8
+#define SM_CAUSES STUTTER_CAUSES           // perf.c's FT_C_N, which perf.c asserts
 #define SM_LOAD_NS 3000000000ull           // after an area load, frames count as the load's for this long
 #define SM_HITCH_MIN_NS 12000000.0         // a hitch is at least this long...
 #define SM_HITCH_ANY_NS 25000000ull        // ...and any frame over this is one
@@ -45,11 +51,12 @@ int stutter_map_on;
 #define SM_MEDIAN_N 32                     // frames the median is taken over
 #define SM_AFTER 2                         // frames after a candidate that must be shorter...
 #define SM_AFTER_RATIO 1.5                 // ...by this factor
+#define SM_EPISODE_MAX 8                   // a run of long frames up to this long is an episode, longer a new pace
 #define SM_PIPES 4096                      // pipelines kept for the ranking (open addressing)
 #define SM_RING 256                        // draws that met something missing, between two presents
 #define SM_LINES_MAX 4000
 #define SM_LINES_PER_S 5
-#define SM_REPORT_NS 600000000000ull       // the map every 10 minutes of play
+#define SM_REPORT_NS 300000000000ull       // the map every 5 minutes of play
 #define SM_TOP_AREAS 40
 #define SM_TOP_PIPES 40
 
@@ -92,11 +99,23 @@ static uint64_t t_first, t_report, line_sec, lines_in_sec, lines, frames_seen, p
 // draws that met something missing then), its area and what it is charged to.
 typedef struct {
     char line[1400];
-    uint64_t frame, d, after_max;
+    uint64_t frame, d, after_max, med;
+    double t_s;            // seconds since the first frame
     int area, load, cause, after;
+    int tail;              // where the line's text after its head ("stutter: frame ... in <area>[, after its load]:") starts
 } Cand;
 static Cand cand[SM_AFTER + 1];
 static int n_cand;
+// The episode being gathered: decided candidates of consecutive frames, the first one's line and area (cand_decide).
+static struct {
+    Cand first;
+    uint64_t last, total;   // the last frame in it; the frames' summed intervals
+    int n, hitch, open;     // frames in it; one of them stood out from the frames after it (or was over the sure line)
+    uint64_t hit_last, hit_total;   // the episode up to its last frame that stood out: that frame, the summed intervals
+    int hit_n;                      // and the frames to it (0: none stood out)
+} ep;
+static int pace_run;        // more than SM_EPISODE_MAX long frames, none standing out: a new pace, until it ends
+static uint64_t pace_last;
 
 void stutter_map_init(void) {
     stutter_map_on = cfg_bool("NX2NAVI_STUTTER_MAP");
@@ -114,6 +133,10 @@ static uint32_t id4(const uint8_t *id) {
 }
 
 static uint64_t key_of(const uint8_t *vi, const uint8_t *fi) { return (uint64_t)id4(vi) << 32 | id4(fi); }
+
+void stutter_load(void) {
+    if (stutter_map_on) __atomic_store_n(&load_at, kern_now_ns(), __ATOMIC_RELAXED);
+}
 
 void stutter_area(const char *name) {
     if (!stutter_map_on || !name || !*name) return;
@@ -229,10 +252,12 @@ static uint64_t median_recent(void) {
     return v[n / 2];
 }
 
-// A candidate the SM_AFTER frames after it have been seen for: a hitch, counted and its line logged, or a change of
-// pace (the frames after it as long), left out.
-static void cand_decide(const Cand *c, uint64_t now) {
-    if (c->d <= SM_HITCH_SURE_NS && (double)c->after_max * SM_AFTER_RATIO >= (double)c->d) {
+// The episode ends: a hitch with its frames' summed time, counted in its first frame's area and charged to that frame's
+// cause, and its line logged; a single frame that did not stand out from the ones after it is a change of pace.
+static void episode_close(uint64_t now) {
+    ep.open = 0;
+    const Cand *c = &ep.first;
+    if (!ep.hitch && ep.n < 2) {
         paced_out++;
         return;
     }
@@ -240,15 +265,52 @@ static void cand_decide(const Cand *c, uint64_t now) {
     if (c->load) a->load_hitch++;
     else {
         a->hitch++;
-        if (c->cause >= 0 && c->cause < SM_CAUSES) a->by_cause[c->cause]++, a->cause_ns[c->cause] += c->d;
-        if (c->d > a->worst_ns) a->worst_ns = c->d, a->worst_frame = c->frame;
+        if (c->cause >= 0 && c->cause < SM_CAUSES) a->by_cause[c->cause]++, a->cause_ns[c->cause] += ep.total;
+        if (ep.total > a->worst_ns) a->worst_ns = ep.total, a->worst_frame = c->frame;
     }
     uint64_t sec = (now - t_first) / 1000000000ull;
     if (sec != line_sec) line_sec = sec, lines_in_sec = 0;
     if (lines >= SM_LINES_MAX || lines_in_sec >= SM_LINES_PER_S) return;
-    rt_log("%s", c->line);
+    if (ep.n == 1) rt_log("%s", c->line);
+    else   // the head with the episode's time; the parts and the draws are its first frame's
+        rt_log("stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:%s; an episode of %d frames to frame "
+               "%llu, %.1f ms the first, the parts above the first frame's", (unsigned long long)c->frame, c->t_s,
+               ep.total / 1e6, c->med / 1e6, areas[c->area].name, c->load ? ", after its load" : "", c->line + c->tail,
+               ep.n, (unsigned long long)ep.last, c->d / 1e6);
     lines++, lines_in_sec++;
     if (lines == SM_LINES_MAX) rt_log("stutter: the last such line of this run; the map's counts go on");
+}
+
+// A candidate the SM_AFTER frames after it have been seen for: it stands out (a hitch) or the frames after it are as
+// long (paced). It joins the episode of the frame before it, or starts one. More than SM_EPISODE_MAX paced frames
+// after the episode's last frame that stood out (or from its start, when none did) are a change of pace: they and the
+// paced frames right after them are left out, and an episode with a frame that stood out ends at that frame and is
+// counted. At 40 fps or less every frame is over SM_HITCH_ANY_NS and so a candidate: without the cut at the last frame
+// that stood out, the first hitch took in every frame after it until the rate rose, and a 30 fps session counted one
+// hitch seconds long in place of its five.
+static void cand_decide(const Cand *c, uint64_t now) {
+    int paced = c->d <= SM_HITCH_SURE_NS && (double)c->after_max * SM_AFTER_RATIO >= (double)c->d;
+    if (pace_run) {
+        if (paced && c->frame == pace_last + 1) {
+            paced_out++, pace_last = c->frame;
+            return;
+        }
+        pace_run = 0;
+    }
+    if (ep.open && c->frame == ep.last + 1) {
+        ep.last = c->frame, ep.total += c->d, ep.n++;
+        if (!paced) ep.hitch = 1, ep.hit_n = ep.n, ep.hit_last = c->frame, ep.hit_total = ep.total;
+        if (ep.n - ep.hit_n > SM_EPISODE_MAX) {
+            paced_out += (uint64_t)(ep.n - ep.hit_n);
+            if (ep.hitch) ep.n = ep.hit_n, ep.last = ep.hit_last, ep.total = ep.hit_total, episode_close(now);
+            else ep.open = 0;
+            pace_run = 1, pace_last = c->frame;
+        }
+        return;
+    }
+    if (ep.open) episode_close(now);
+    ep.first = *c, ep.last = c->frame, ep.total = c->d, ep.n = 1, ep.hitch = !paced, ep.open = 1;
+    ep.hit_n = !paced, ep.hit_last = c->frame, ep.hit_total = paced ? 0 : c->d;
 }
 
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
@@ -271,6 +333,7 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
         memmove(&cand[i], &cand[i + 1], (size_t)(n_cand - i - 1) * sizeof cand[0]);   // at most two others
         n_cand--;
     }
+    if (ep.open && frame > ep.last + SM_AFTER) episode_close(now);   // the frame after its last was no candidate
     uint64_t med = median_recent();
     recent[frames_seen % SM_MEDIAN_N] = d;
     frames_seen++;
@@ -283,9 +346,10 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
         Cand *c = &cand[n_cand++];
         c->frame = frame, c->d = d, c->after_max = 0, c->after = 0, c->area = ai, c->cause = cause;
         c->load = now - __atomic_load_n(&load_at, __ATOMIC_RELAXED) < SM_LOAD_NS;
+        c->med = med, c->t_s = (now - t_first) / 1e9;
         int o = snprintf(c->line, sizeof c->line, "stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:",
-                         (unsigned long long)frame, (now - t_first) / 1e9, d / 1e6, med / 1e6, a->name,
-                         c->load ? ", after its load" : "");
+                         (unsigned long long)frame, c->t_s, d / 1e6, med / 1e6, a->name, c->load ? ", after its load" : "");
+        c->tail = o < (int)sizeof c->line ? o : (int)sizeof c->line - 1;
         for (int k = 0; k < n && o < (int)sizeof c->line - 40; k++)
             if (part[k] >= 500000) o += snprintf(c->line + o, sizeof c->line - (size_t)o, " %s %.1f", names[k], part[k] / 1e6);
         if (cause >= 0 && cause < n && o < (int)sizeof c->line - 40)
@@ -300,32 +364,97 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
     }
 }
 
-static const char *const cause_short[SM_CAUSES] = {"pipeline", "translation", "texture", "fence", "pacing", "replay",
-                                                   "unattributed", "?"};
+// In the order of perf.c's causes (FT_C_*); "hand-off" is the wait for the present thread to take the previous picture,
+// "census" NX2NAVI_MEM_CENSUS's walk of the address space, "report" the memory report on the presenting thread.
+static const char *const cause_short[SM_CAUSES] = {"pipeline", "translation", "texture", "fence", "pacing", "hand-off",
+                                                   "replay", "census", "report", "unattributed"};
 
 static int area_cmp(const void *x, const void *y) {
-    const Area *a = &areas[*(const int *)x], *b = &areas[*(const int *)y];
+    const Area *a = *(const Area *const *)x, *b = *(const Area *const *)y;
     uint64_t ka = a->hitch + a->load_hitch, kb = b->hitch + b->load_hitch;
     if (ka != kb) return ka < kb ? 1 : -1;
     return a->ns < b->ns ? 1 : a->ns > b->ns ? -1 : 0;
 }
 
 static int pipe_cmp(const void *x, const void *y) {
-    const Pipe *a = *(Pipe *const *)x, *b = *(Pipe *const *)y;
+    const Pipe *a = *(const Pipe *const *)x, *b = *(const Pipe *const *)y;
     double ka = a->wait_ns / 1e6 + a->ready_max, kb = b->wait_ns / 1e6 + b->ready_max;
     return ka < kb ? 1 : ka > kb ? -1 : 0;
 }
 
-void stutter_report(const char *tag) {
-    if (!stutter_map_on) return;
-    plat_mutex_lock(&sm_lock);
-    uint64_t hitch = 0, load = 0, ns = 0, cause[SM_CAUSES] = {0};
-    int order[SM_AREAS], na = n_areas;
-    for (int i = 0; i < na; i++) {
-        order[i] = i;
-        hitch += areas[i].hitch, load += areas[i].load_hitch, ns += areas[i].ns;
-        for (int c = 0; c < SM_CAUSES; c++) cause[c] += areas[i].by_cause[c];
+// At the exit: the hitches in the run's last frames, which cand_decide and episode_close would have counted had the
+// run gone on: the open episode, and the candidates still waiting for their next frames (the last two frames, three
+// in a run of long ones). A waiting candidate counts as one that did not stand out unless it is over SM_HITCH_SURE_NS
+// (a hitch whatever follows), and joins the episode of the frame before it as cand_decide joins it. Added to the
+// exit's printed totals only, and only read: the exit's report runs on another thread (perf.c perf_summary_flush, from
+// the window's close or the game's exit) while the presenting thread, which owns this state, may still be in
+// stutter_frame; a race there miscounts these last frames at worst. Other reports leave them to the next one.
+static void exit_tail(uint64_t *hitch, uint64_t *load, uint64_t *cause) {
+    int n = ep.open ? ep.n : 0, hit = ep.hitch, paced = pace_run, at_load = ep.first.load, why = ep.first.cause;
+    int nc = n_cand < SM_AFTER + 1 ? n_cand : SM_AFTER + 1;
+    uint64_t last = ep.open ? ep.last : pace_last;
+    for (int i = 0; i <= nc; i++) {
+        const Cand *c = i < nc ? &cand[i] : NULL;
+        int sure = c && c->d > SM_HITCH_SURE_NS;
+        if (c && c->frame == last + 1) {
+            last = c->frame;
+            if (n) {   // it joins the episode
+                n++, hit |= sure;
+                if (!hit && n > SM_EPISODE_MAX) n = 0, paced = 1;   // a change of pace
+                continue;
+            }
+            if (paced && !sure) continue;   // the change of pace goes on
+        }
+        if (n && (hit || n >= 2)) {
+            if (at_load) ++*load;
+            else {
+                ++*hitch;
+                if (why >= 0 && why < SM_CAUSES) cause[why]++;
+            }
+        }
+        n = 0, paced = 0;
+        if (c) n = 1, hit = sure, at_load = c->load, why = c->cause, last = c->frame;
     }
+}
+
+// The map as a report reads it: copied under sm_lock, then sorted and logged without it. The replay thread
+// (stutter_miss) and the pipeline workers (stutter_ready, inside vk_pipeline.c's P.lock, which the draw path takes too)
+// wait for sm_lock, and a report sorts up to SM_PIPES entries and logs about 85 lines.
+typedef struct {
+    Area areas[SM_AREAS];
+    Pipe pipes[SM_PIPES];
+    const Area *order[SM_AREAS];
+    const Pipe *list[SM_PIPES];
+} MapCopy;
+
+// try_only: sm_lock is only tried (a fatal error's summary, perf.c perf_summary_flush_try, on a thread that may
+// hold it); 0 when it was held and nothing was written.
+int stutter_report_as(const char *tag, int try_only) {
+    if (!stutter_map_on) return 1;
+    MapCopy *m = malloc(sizeof *m);
+    if (!m) {
+        rt_log("stutter map (%s): no memory for the report", tag);
+        return 1;
+    }
+    if (!try_only) plat_mutex_lock(&sm_lock);
+    else if (!plat_mutex_trylock(&sm_lock)) {
+        free(m);
+        return 0;
+    }
+    int na = n_areas;
+    memcpy(m->areas, areas, (size_t)na * sizeof *areas);
+    uint32_t np = 0, lost = pipes_lost;
+    for (uint32_t i = 0; i < SM_PIPES; i++)
+        if (pipes[i].used) m->pipes[np++] = pipes[i];
+    uint64_t rlost = ring_lost;
+    plat_mutex_unlock(&sm_lock);
+    uint64_t hitch = 0, load = 0, ns = 0, cause[SM_CAUSES] = {0};
+    for (int i = 0; i < na; i++) {
+        m->order[i] = &m->areas[i];
+        hitch += m->areas[i].hitch, load += m->areas[i].load_hitch, ns += m->areas[i].ns;
+        for (int c = 0; c < SM_CAUSES; c++) cause[c] += m->areas[i].by_cause[c];
+    }
+    if (!strcmp(tag, "exit")) exit_tail(&hitch, &load, cause);
     char line[1400];
     int o = snprintf(line, sizeof line, "stutter map (%s): %.1f min of play in %d areas; %llu hitches in play and %llu "
                      "after area loads; %llu long frames were a change of pace (the frames after them as long), not "
@@ -334,9 +463,9 @@ void stutter_report(const char *tag) {
     for (int c = 0; c < SM_CAUSES; c++)
         if (cause[c]) o += snprintf(line + o, sizeof line - (size_t)o, " %s %llu", cause_short[c], (unsigned long long)cause[c]);
     rt_log("%s", line);
-    qsort(order, (size_t)na, sizeof order[0], area_cmp);
+    qsort(m->order, (size_t)na, sizeof m->order[0], area_cmp);
     for (int k = 0; k < na && k < SM_TOP_AREAS; k++) {
-        const Area *a = &areas[order[k]];
+        const Area *a = m->order[k];
         if (!a->frames) continue;
         o = snprintf(line, sizeof line, "stutter map:   %s: %.1f min at %.0f fps; hitches %llu (%.2f a minute",
                      a->name, a->ns / 6e10, a->ns ? a->frames * 1e9 / a->ns : 0.0, (unsigned long long)a->hitch,
@@ -352,33 +481,34 @@ void stutter_report(const char *tag) {
                       (unsigned long long)a->shader_misses, a->miss_ns / 1e6);
         rt_log("%s", line);
     }
-    static Pipe *list[SM_PIPES];
-    uint32_t np = 0, nrec = 0, nnew = 0, nfresh = 0, nunknown = 0;
-    for (uint32_t i = 0; i < SM_PIPES; i++)
-        if (pipes[i].used) {
-            list[np++] = &pipes[i];
-            if (!pipes[i].key) nunknown++;
-            else if (pipes[i].ready_n) nrec += pipes[i].recorded, nnew += !pipes[i].recorded;
-            nfresh += pipes[i].fresh;
-        }
-    qsort(list, np, sizeof list[0], pipe_cmp);
+    uint32_t nrec = 0, nnew = 0, nfresh = 0, nunknown = 0;
+    for (uint32_t i = 0; i < np; i++) {
+        const Pipe *p = m->list[i] = &m->pipes[i];
+        if (!p->key) nunknown++;
+        else if (p->ready_n) nrec += p->recorded, nnew += !p->recorded;
+        nfresh += p->fresh;
+    }
+    qsort(m->list, np, sizeof m->list[0], pipe_cmp);
     rt_log("stutter map: %u pipelines draws met missing: %u that this install had recorded before (its prebuild had not "
            "come to them), %u new to it, %u with a shader translated in play, %u still translating when met; %u not "
            "kept (table full), %llu draws not seen by a present (ring full); the %d that cost the most:",
-           np, nrec, nnew, nfresh, nunknown, pipes_lost, (unsigned long long)ring_lost, SM_TOP_PIPES);
+           np, nrec, nnew, nfresh, nunknown, lost, (unsigned long long)rlost, SM_TOP_PIPES);
     for (uint32_t k = 0; k < np && k < SM_TOP_PIPES; k++) {
-        const Pipe *p = list[k];
+        const Pipe *p = m->list[k];
         char v[9], f[9];
         hex8(v, (uint32_t)(p->key >> 32), p->key >> 32 != 0);
         hex8(f, (uint32_t)p->key, 1);
         rt_log("stutter map:   %s %s/%s first met in %s: %llu draws met it missing, %llu its shader, %.1f ms on the "
                "replay thread; usable after %.0f ms at most (%llu times); %s%s",
-               p->mesh ? "mesh" : "vertex", v, (uint32_t)p->key ? f : "none", areas[p->area].name,
+               p->mesh ? "mesh" : "vertex", v, (uint32_t)p->key ? f : "none", m->areas[p->area].name,   // copied: area < na
                (unsigned long long)p->misses, (unsigned long long)p->shader_misses, p->wait_ns / 1e6, p->ready_max,
                (unsigned long long)p->ready_n,
                !p->key ? "its shaders still translating" : !p->ready_n ? "not seen ready" : p->recorded ? "recorded before"
                                                                                                         : "new to this install",
                p->fresh ? ", a shader translated in play" : "");
     }
-    plat_mutex_unlock(&sm_lock);
+    free(m);
+    return 1;
 }
+
+void stutter_report(const char *tag) { stutter_report_as(tag, 0); }

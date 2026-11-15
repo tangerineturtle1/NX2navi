@@ -16,6 +16,21 @@ typedef struct {
 typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
 // vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
 float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
+// vk_dlaa.c: a wait for the device to be idle, the queue lock held, before an upscaler frees what the GPU may still
+// use (NX2NAVI_TRACE=perf: "upscaler GPU waits", with vk_upscaler_gpu_wait's)
+void vk_upscaler_device_idle(void);
+// vk_dlaa.c "what the upscalers let go of while the GPU may still use it", on the thread that makes the upscalers'
+// calls (vk_dlaa.c's pass hooks):
+int vk_upscaler_idle_wait(void);   // NX2NAVI_UPSCALER_IDLE_WAIT: 1 waits for the device wherever one lets go of something
+// After something was let go of: what the GPU is past goes (with NX2NAVI_UPSCALER_IDLE_WAIT=1 after a wait for the
+// device, vk_upscaler_settle).
+void vk_upscaler_let_go(void);
+// A wait for the device, then everything let go of that a submission made so far names goes (a present gate stays).
+void vk_upscaler_settle(void);
+// A refused creation: waits, without the device's idle, until the GPU is past timeline value v (no further than the
+// submissions made so far) and returns the value it is past; with NX2NAVI_UPSCALER_IDLE_WAIT=1, or when that wait
+// fails, a wait for the device.
+uint64_t vk_upscaler_gpu_wait(uint64_t v);
 
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
@@ -29,13 +44,18 @@ int vk_ffx_framegen_available(void);
 // frame's camera. 0 on failure (the caller falls back as it does when DLSS fails).
 int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                    const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam);
-void vk_ffx_release(void);   // before the device goes away
-// The upscale contexts of FSR 3.1 and FSR 4 (vk_dlaa.c retire_idle, the device idle): any held, and give them back.
+void vk_ffx_release(void);   // before the device goes away (the device idle)
+// The upscale contexts of FSR 3.1 and FSR 4 (vk_dlaa.c retire_idle): any held, and let them all go (the caller's
+// vk_upscaler_let_go frees them once the GPU is past them).
 int vk_ffx_holds(void);
 void vk_ffx_release_idle(void);
-// FSR 3.1's contexts that no upscale used in the last `recent` calls, destroyed with the device idle (the caller waited
-// for it): room for an FSR 4 context whose creation failed. Their count.
+// FSR 3.1's contexts that no upscale used in the last `recent` calls, let go of: room for an FSR 4 context whose
+// creation failed, whose caller makes their memory free (vk_ffx_dead_take after vk_upscaler_gpu_wait). Their count.
 int vk_ffx_trim_idle(uint64_t recent);
+// The FSR 3.1 and FSR 4 contexts let go of: those whose last upscale's submission is at most done are destroyed (their
+// count); the highest such submission among those left (0: none).
+int vk_ffx_dead_take(uint64_t done);
+uint64_t vk_ffx_dead_fence(void);
 // The device's functions as the library is given them (ffxCreateBackendVKDesc.vkDeviceProcAddr): its pipeline creates
 // go through the runtime's pipeline caches (vk_pipeline.c vk_pipeline_create_foreign; NX2NAVI_FFX_PIPE_CACHE=0: not).
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_ffx_proc_addr(VkDevice dev, const char *name);
@@ -51,6 +71,9 @@ int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImag
                     const VkFfxCamera *cam);   // as vk_ffx_upscale
 void vk_ffx4_release(void);
 int vk_ffx4_holds(void);   // an FSR 4 upscale context is made
+void vk_ffx4_release_idle(void);   // every FSR 4 upscale context let go of (vk_ffx_release_idle)
+int vk_ffx4_dead_take(uint64_t done);   // FSR 4's part of vk_ffx_dead_take
+uint64_t vk_ffx4_dead_fence(void);      // FSR 4's part of vk_ffx_dead_fence
 int vk_ffx4_failed(void);         // it failed three times in a row: FSR 3.1 serves until vk_ffx4_retry
 void vk_ffx4_retry(void);         // the menu chose FSR 4 again: try it anew after such failures
 void vk_ffx4_trim(uint64_t now_ns);   // at each upscale: FSR 4's contexts unused for a while go

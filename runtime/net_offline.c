@@ -333,7 +333,11 @@ static void ov_clock_task_ctor(Cpu *c) { *(void **)arg_p(c, 0) = NULL; }
 static void ov_task_dtor(Cpu *c) {
     void **slot = arg_p(c, 0);
     if (slot && *slot) {
-        free(*slot);   // the bound SystemEventType's kernel handles stay (as for any undestroyed guest event)
+        HostTask *t = *slot;
+        // The event lives in this record: its entry in the system-event table goes back before the record is freed,
+        // or the table would count it live for the rest of the run (kernel.c kern_unbind_system_event)
+        if (t->bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)t->event);
+        free(t);
         *slot = NULL;
     }
 }

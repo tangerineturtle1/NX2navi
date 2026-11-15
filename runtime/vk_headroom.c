@@ -83,8 +83,7 @@ static int spare_type(const VkCtx *c, uint32_t type) {
 uint64_t vk_headroom_held(void) { return (uint64_t)__atomic_load_n(&H.held, __ATOMIC_RELAXED); }
 
 static void VKAPI_PTR on_allocate(VmaAllocator a, uint32_t type, VkDeviceMemory m, VkDeviceSize size, void *user) {
-    (void)a, (void)m, (void)size, (void)user;
-    perf_mark_add(PERF_M_DEVMEM, 0, size);   // NX2NAVI_TRACE=perf: every block and dedicated allocation VMA makes
+    (void)a, (void)m, (void)size, (void)user;   // the trace's mark of the allocation, with its time: vk_device.c timed_alloc
     if (!H.on || type >= 64) return;
     if (plat_thread_id() == H.tid) {
         plat_inc64(&H.made);
@@ -126,7 +125,16 @@ static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {
     VmaBudget b[VK_MAX_MEMORY_HEAPS];
     vmaGetHeapBudgets(c->vma, b);
     const VmaBudget *h = &b[c->mem_props.memoryTypes[type].heapIndex];
-    return h->budget && h->usage + 2 * block <= h->budget / 100 * 85;
+    if (!h->budget || h->usage + 2 * block > h->budget / 100 * 85) return 0;
+    // A budget taken as smaller for a test (NX2NAVI_VRAM_BUDGET_MB, vk_mem_vram) is what the mirrors and the textures
+    // go by; measured against the driver's budget alone, a capped run kept its spare blocks where the card it stands
+    // for keeps none. Only then: without a cap the heap's own figure above decides, heap by heap.
+    uint64_t all = 0, used, capped;
+    int exact;
+    for (uint32_t i = 0; i < c->mem_props.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+        if (c->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) all += b[i].budget;
+    if (vk_mem_vram(&used, &capped, &exact) && capped < all && used + 2 * block > capped / 100 * 85) return 0;
+    return 1;
 }
 
 static void drop_anchor(const VkCtx *c, uint32_t type) {

@@ -29,6 +29,10 @@ _Static_assert(offsetof(AudrenCompressorParam,status)==52,"compressor wire layou
 _Static_assert(sizeof(AudrenBufferMixParam)==148,"buffer-mix wire layout");
 _Static_assert(sizeof(AudrenBiquadEffectV1)==24 && sizeof(AudrenBiquadEffectV2)==40,"biquad wire layouts");
 typedef struct AudioEffectDsp AudioEffectDsp;
+/* Why the game's parameter block `param` of a delay (3), reverb (4) or compressor (9) cannot be used, as a constant
+   string, or NULL when it can (and for any other type). create and update end the process on such a block, so the
+   caller asks first. */
+const char *audio_effect_invalid(unsigned type, const void *param);
 AudioEffectDsp *audio_effect_create(unsigned type, const void *param, unsigned revision);
 void audio_effect_free(AudioEffectDsp *s);
 void audio_effect_update(AudioEffectDsp *s, const void *param);

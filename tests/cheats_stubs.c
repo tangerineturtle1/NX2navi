@@ -41,4 +41,7 @@ void rt_patch_switch(int set, int on) { (void)set; (void)on; abort(); }
 void *rt_patch_page(void) { abort(); }
 void prof_write(void) { abort(); }
 void rtss_limit_restore(void) { abort(); }
+int rt_exit_begin(void) { abort(); }
+void vk_pipeline_prewarm_marker_clear(void) { abort(); }
+void vk_pipeline_boot_abandon(void) { abort(); }
 void input_poll(uint64_t *keys, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) { (void)keys; (void)lx; (void)ly; (void)rx; (void)ry; abort(); }

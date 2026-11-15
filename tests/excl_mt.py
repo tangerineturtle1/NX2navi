@@ -1,7 +1,10 @@
 """Multithreaded test of the exclusive monitor helpers in cpu.h (ldxN/stxN, ldxp128/stxp128).
 
-- ABA: thread A loads X exclusively, thread B changes X->Y->X with its own exclusive pairs, then A's store exclusive
-  must fail. Checked for the 32-bit, 64-bit and 128-bit pair forms, plus a control where B touches nothing.
+- A changed value: thread A loads X exclusively, thread B changes X to Y with its own exclusive pair, then A's store
+  exclusive must fail. Checked for the 32-bit, 64-bit and 128-bit pair forms, plus a control where B touches nothing.
+- A value changed and changed back (ABA): B changes X to Y and back to X, and A's store exclusive succeeds. The monitor
+  is a compare-and-swap of the value loaded (runtime/cpu.h, "exclusive monitor"), so it does not see this case, where
+  the console's monitor would fail the store; the check holds the helpers to what they are.
 - Contention: N threads increment one counter with load/store-exclusive retry loops; the total must be exact.
 
 Needs no game files. Usage: excl_mt.py [--runtime DIR] [--threads N] [--iters K]
@@ -30,14 +33,15 @@ static int fails;
 static void wait_step(int s) { while (__atomic_load_n(&step, __ATOMIC_ACQUIRE) != s) {} }
 static void set_step(int s) { __atomic_store_n(&step, s, __ATOMIC_RELEASE); }
 
-// Thread B: X -> Y -> X with exclusive pairs of the given width (0 = do nothing, the control).
-static int aba_width;
+// Thread B: aba_changes exclusive stores of the given width (0 = do nothing, the control): one changes X to Y, two
+// change it to Y and back to X.
+static int aba_width, aba_changes;
 static void *aba_b(void *arg) {
     (void)arg;
     Cpu c = {0};
     uint64_t a = (uint64_t)(uintptr_t)cell;
     wait_step(1);
-    for (int k = 0; aba_width && k < 2; k++) {
+    for (int k = 0; aba_width && k < aba_changes; k++) {
         for (;;) {
             if (aba_width == 32) { uint32_t v = (uint32_t)ldx32(&c, a); if (!stx32(&c, a, v ^ 0x5a5a5a5au)) break; }
             else if (aba_width == 64) { uint64_t v = ldx64(&c, a); if (!stx64(&c, a, v ^ 0x5a5a5a5a5a5a5a5aull)) break; }
@@ -48,13 +52,14 @@ static void *aba_b(void *arg) {
     return 0;
 }
 
-static void aba_case(int width, int expect_fail) {
+static void aba_case(int width, int changes, int expect_fail) {
     pthread_t t;
     Cpu c = {0};
     uint64_t a = (uint64_t)(uintptr_t)cell;
     cell[0] = 0x1111222233334444ull;
     cell[1] = 0x5555666677778888ull;
     aba_width = width;
+    aba_changes = changes;
     set_step(0);
     pthread_create(&t, 0, aba_b, 0);
     uint32_t st;
@@ -76,7 +81,8 @@ static void aba_case(int width, int expect_fail) {
     }
     pthread_join(t, 0);
     int want = expect_fail != 0;
-    printf("aba width %3d: stx status %u, want %d %s\n", width, st, want, st == (uint32_t)want ? "ok" : "FAIL");
+    printf("aba width %3d, %d change%s: stx status %u, want %d %s\n", width, changes, changes == 1 ? "" : "s", st, want,
+           st == (uint32_t)want ? "ok" : "FAIL");
     if (st != (uint32_t)want) fails++;
 }
 
@@ -112,10 +118,15 @@ static void inc_case(int width) {
 int main(int argc, char **argv) {
     nthreads = atoi(argv[1]);
     iters = atoi(argv[2]);
-    aba_case(0, 0);
-    aba_case(32, 1);
-    aba_case(64, 1);
-    aba_case(128, 1);
+    aba_case(0, 0, 0);
+    aba_case(32, 1, 1);
+    aba_case(64, 1, 1);
+    aba_case(128, 1, 1);
+    // The monitor is a compare-and-swap of the value loaded (runtime/cpu.h, "exclusive monitor"): a value changed and
+    // changed back is not seen, and the store exclusive succeeds where the console's monitor would fail it.
+    aba_case(32, 2, 0);
+    aba_case(64, 2, 0);
+    aba_case(128, 2, 0);
     inc_case(32);
     inc_case(64);
     inc_case(128);

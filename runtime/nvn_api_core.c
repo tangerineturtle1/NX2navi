@@ -64,7 +64,12 @@ static void ov_memcpy(Cpu *c) {
 }
 HOST_OVERRIDE("memcpy", ov_memcpy);
 
-__attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, int n) { (void)handles, (void)n; }
+__attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n) {
+    memcpy(out, handles, sizeof *out * (size_t)n);
+}
+__attribute__((weak)) void nvn_submit_done(const uint64_t *handles, const uint64_t *out, int n) {
+    (void)handles, (void)out, (void)n;
+}
 __attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     memcpy(out, handles, sizeof *out * (size_t)n);
 }
@@ -705,9 +710,11 @@ static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 // core given up (section 2.2), or queued for the replay thread (NX2NAVI_REPLAY_ASYNC, vk_backend.c); the newest fence
 // value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
 // for both.
-// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once. The
-// synchronous replay's front end (vk_backend.c submit_sync, vk_be_present's held present, nvn_submits_in_frame) takes
-// no lock of its own, so it relies on one thread at a time; this tells a run whether that holds.
+// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once, which
+// happens in play (at area changes). With the replay on the submitting threads they take turns where it matters:
+// replays on the submission lock (vk_sync.c sub_lock), a frame's bookkeeping at its present between two replays
+// (vk_frame_owed.h), a held present put out by one thread and in order (vk_present_held.h), and a second submission of
+// a recording in flight on a clone of its own (nvn_submit_guard.h). An overlap line counts; it is not a fault.
 void nvn_call_note(int present, uintptr_t q, int enter) {
     if (!(rt_trace & RT_TRACE_PERF)) return;
     static volatile int32_t inside;
@@ -747,7 +754,7 @@ NVN_API(nvnQueueSubmitCommands) {
     NVN_BLOCKING();
     nvn_call_note(0, (uintptr_t)q, 1);
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
-    q->submits++;
+    __atomic_add_fetch(&q->submits, 1, __ATOMIC_RELAXED);   // two of the game's threads may submit on one queue at once
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
@@ -762,10 +769,16 @@ NVN_API(nvnQueueSubmitCommands) {
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
-        nvn_submit_prepare(h, n);
+        // Another of the game's threads may submit the same recording meanwhile: a second submission in flight gets a
+        // clone of its own to resolve and replay (nvn_api_cmd.c nvn_submit_prepare), freed after (nvn_submit_done).
+        uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
+        if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
+        nvn_submit_prepare(h, hs, n);
         gfx_submit_queue = (uintptr_t)q;
-        f = gfx_backend()->submit(h, n);
+        f = gfx_backend()->submit(hs, n);
         gfx_submit_queue = 0;
+        nvn_submit_done(h, hs, n);
+        if (hs != local) free(hs);
     }
     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}

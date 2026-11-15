@@ -208,10 +208,12 @@ static GpGap gp_gaps[GP_GAPS];
 static uint32_t gp_ngaps, gp_gap_from = UINT32_MAX, gp_gap_kinds, gp_part = UINT32_MAX;
 static int gp_in_mark;                                // between a mark's start and its end
 static uint64_t gp_kind_n[VK_GAP_N], gp_kind_units[VK_GAP_N];
-static const char *const gp_kind_names[VK_GAP_N] = {
+static const char *const gp_kind_names[] = {
     "buffer copies", "buffer to texture copies", "texture to buffer copies", "texture copies", "buffer fills",
     "texture clears", "target clears", "the temporal upscaler", "write-back merges", "write-back copies",
-    "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies"};
+    "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies",
+    "groups of draws the replay workers recorded, whose passes have no marks"};
+_Static_assert(sizeof gp_kind_names / sizeof gp_kind_names[0] == VK_GAP_N, "a name for every VK_GAP_* kind");
 static VkQueryPool gp_pool, gp_prims;   // gp_prims: mesh primitives generated per pass (with meshShaderQueries)
 static VkQueryPool gp_stats;            // fragment shader invocations per pass
 static int gp_state, gp_phase, gp_capture;   // state 0 not set up, 1 on, -1 off; phase 0 idle, 1 capturing, 2 waiting
@@ -612,7 +614,7 @@ VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
     uint32_t id = ++seq;
     if (!id) id = ++seq;   // 0 means no mark
     VkPassMark *m = &ring[id & (VK_PASS_MARKS - 1)];
-    m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX;
+    m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX, m->mesh = m->mesh_ind = 0;
     m->gap = gap_now, gap_now = 0;   // what was recorded between the mark before and this one
     // timed unless the slot's previous mark is still waiting to be read (its queries are not reset yet)
     if (pt_pool) pt_timed[id & (VK_PASS_MARKS - 1)] = !pt_timed[id & (VK_PASS_MARKS - 1)] ? 1 : 2;
@@ -673,13 +675,19 @@ static void describe_mark(uint32_t id, char *o, size_t size) {
     if (n < size) n += (size_t)snprintf(o + n, size - n, ", depth format %d", (int)m->depth);
     if (n >= size) return;
     if (m->draws == UINT32_MAX)
-        snprintf(o + n, size - n, ", still recording; first draw vs %016llx fs %016llx", shader_id(m->first[0]),
-                 shader_id(m->first[1]));
+        n += (size_t)snprintf(o + n, size - n, ", still recording; first draw vs %016llx fs %016llx", shader_id(m->first[0]),
+                              shader_id(m->first[1]));
     else if (!m->draws)
-        snprintf(o + n, size - n, ", no draws");
+        n += (size_t)snprintf(o + n, size - n, ", no draws");
     else
-        snprintf(o + n, size - n, ", %u draws; first vs %016llx fs %016llx, last vs %016llx fs %016llx", m->draws,
-                 shader_id(m->first[0]), shader_id(m->first[1]), shader_id(m->last[0]), shader_id(m->last[1]));
+        n += (size_t)snprintf(o + n, size - n, ", %u draws; first vs %016llx fs %016llx, last vs %016llx fs %016llx",
+                              m->draws, shader_id(m->first[0]), shader_id(m->first[1]), shader_id(m->last[0]),
+                              shader_id(m->last[1]));
+    // The mesh draws among them: the RX 6000 losses whose marks named a pass were in passes that start with one, and
+    // whether a pass held any (and how many took their count from the GPU) is what tells such a loss from another.
+    if (n < size && (m->mesh || m->mesh_ind))
+        snprintf(o + n, size - n, "; %u mesh draws, %u of them with the GPU's count", (unsigned)m->mesh + m->mesh_ind,
+                 (unsigned)m->mesh_ind);
 }
 
 void vk_pass_marks_format(const char *source, uint32_t started, uint32_t finished, char *o, size_t size) {

@@ -73,7 +73,9 @@ typedef struct VkCtx {
         lists_low_latency,                  // the driver lists one of the two, left out: the run started with the mode off
         has_mesh_queries;                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
     int mesh_fallback;                      // task and mesh programs run as compute passes and are drawn from buffers
-                                            // (mesh_fallback: auto without has_mesh_shader; vk_exec_draw.c "mesh fallback")
+                                            // (mesh_fallback: auto as vk_mesh_path.h decides; vk_exec_draw.c "mesh fallback")
+    int mesh_emulation;                     // they are drawn by the mesh emulation (mesh_emulation = 1 where
+                                            // vk_mesh_path.h lets it act; vk_exec_draw.c, vk_pipeline.c)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. NX2NAVI_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -129,6 +131,14 @@ static inline int vk_device_is_lost(void) { return __atomic_load_n(&vk_lost, __A
 // signals), and ends the run through vk_device_lost_check when it is. The completion thread calls it before it runs
 // callbacks: a lost device may report the submissions' timeline as reached (vk_sync.c completion_main).
 void vk_device_lost_poll(void);
+// vk_sync.c "a lost device in the timelines' values": a host signal of VkCtx.timeline notes its value first; a read of
+// the timeline above every value its signals carry ends the run as a lost device (vk_sync_check_timeline, any thread,
+// `where` for the fatal line). vk_sync_state_text: the submissions' values and the two timelines' readings, one line
+// without a lock; vk_sync_lost_report logs it (vk_device.c device_fault_report).
+void vk_sync_signal_note(uint64_t value);
+void vk_sync_check_timeline(const char *where);
+void vk_sync_state_text(char *o, size_t n);
+void vk_sync_lost_report(void);
 
 // ---- GPU breadcrumbs (vk_crumbs.c): with VK_AMD_buffer_marker, each crumb has the GPU write its code into host memory
 // twice, when the command processor reaches it and when all work before it has finished. After a lost device the two
@@ -166,6 +176,7 @@ typedef struct {
     uint32_t gp;                        // NX2NAVI_GPU_PASSES: the timestamp pair of this mark plus one; 0 none
     uint32_t layer;                     // NX2NAVI_GPU_PASSES: the first layer of the depth target (a shadow cascade)
     uint32_t gap;                       // bits of VK_GAP_*: what the replay recorded between the mark before and this one
+    uint16_t mesh, mesh_ind;            // a pass's mesh draws, with a count and with the GPU's (DrawMeshTasksIndirect)
 } VkPassMark;
 void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAVI_GPU_PASSES, GPU time per pass and dispatch
 // NX2NAVI_GPU_PASSES also times what a part of a submission spends outside its passes and dispatches (vk_crumbs.c, "the
@@ -176,7 +187,9 @@ void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAV
 enum {
     VK_GAP_COPY_B2B, VK_GAP_COPY_B2T, VK_GAP_COPY_T2B, VK_GAP_COPY_T2T, VK_GAP_CLEAR_BUF, VK_GAP_CLEAR_TEX,
     VK_GAP_CLEAR_TARGET, VK_GAP_UPSCALER, VK_GAP_WB_MERGE, VK_GAP_WB_COPY, VK_GAP_TWIN, VK_GAP_POOL_MARKS,
-    VK_GAP_MESH_RING, VK_GAP_BC_BACK, VK_GAP_N
+    VK_GAP_MESH_RING, VK_GAP_BC_BACK,
+    VK_GAP_GROUP,   // a group of draws the replay workers recorded (vk_exec.c group_start): passes without marks
+    VK_GAP_N
 };
 void vk_gpu_passes_part(VkCommandBuffer cb, int end);
 // Result points (NX2NAVI_GPU_PASSES): the submission whose parts follow (vk_sync.c), a result just recorded (VK_RES_*
@@ -258,9 +271,9 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
 void vk_hdr_luminance_stats(const uint8_t *in, int stride, const int rect[4], int a2r, float out[7]);
 void vk_hdr_release(void);
 void vk_hdr_images_release(void);   // the swapchain has no HDR: the encode's images go (waits for the device)   // before the device goes away
-// The support buffer's HDR settings, a vec4 at 1440 (vk_exec_draw.c support_fill; read by the game's tonemap with
+// The support buffer's HDR settings, five vec4 at 1440 (vk_exec_draw.c support_fill; read by the game's tonemap with
 // shaders/hdr_tonemap.frag spliced in, vk_hdr.c tonemap_splice).
-void vk_hdr_support(float out[4]);
+void vk_hdr_support(float out[20]);
 // vk_contact.c: screen-space contact shadows on the game's composed scene colour (NX2NAVI_CONTACT_SHADOWS)
 int vk_contact_strength(void);   // percent, 0 = off
 void vk_contact_release(void);   // before the device goes away
@@ -488,6 +501,7 @@ void vk_mem_lost_report(void);                    // a line with the video memor
 float vk_mem_device_used_mb(void);                // device-local memory this process holds (the driver's budget
                                                   // figure), MB; -1 without VK_EXT_memory_budget. Any thread.
 void vk_mem_stage_log(const char *stage);         // one line after a boot stage: device memory, process commit
+void vk_mem_rank_log(const char *when);           // the growth ranking now, "when" leading its minutes of play
 void vk_mem_exit_log(void);                       // at the process's end: the memory report's growth ranking of the
                                                   // session (vk_memory.c growth_take), once it reached play
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
@@ -515,11 +529,11 @@ int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
 uint64_t vk_mem_gen(void);
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
-// *now is the generation to pass next time.
-int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+// *now is the generation to pass next time. Generations are 64 bits and do not wrap; 0 is never handed out.
+int vk_mem_changed(uint64_t addr, uint64_t size, uint64_t since, uint64_t *now);
 // The same answer from per-epoch write-watch snapshots of 2 MiB regions: no system call once the regions were queried in
 // this epoch (a guest submission). For checks that may see writes made during the epoch one epoch late.
-int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch, uint64_t *now);
 void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked);   // since the last call
 
 // Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket
@@ -555,6 +569,8 @@ void vk_defer_view(VkImageView view);
 void vk_defer_free(void *p);
 int vk_exec_image_gone(VkImage image);   // texture lock held: the replay's views of image go with it; returns how many
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+// As vk_defer_buffer without waiting: 0 when another thread holds the upload lock, and nothing is deferred.
+int vk_defer_buffer_try(VkBuffer buf, VmaAllocation alloc);
 // ---- ASTC (vk_astc.c). NX2NAVI_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
@@ -586,6 +602,7 @@ void vk_texture_split_counts(uint64_t *copies, uint64_t *fills);
 VkDeviceSize vk_astc_region_bytes(const VkAstcRegion *r, uint32_t bw, uint32_t bh);   // source bytes the region reads
 void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
 uint64_t vk_astc_scratch_bytes(void);                          // the decoder's shared scratch now
+void vk_astc_scratch_trim(void);                               // each present: a grown scratch idle for 5 s goes
 // NX2NAVI_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
 void vk_astc_time_enable(int on);
 int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
@@ -594,6 +611,7 @@ void vk_astc_release(void);             // vk_device.c, before the device goes: 
 void vk_mem_note_submit(uint64_t timeline_value);  // vk_sync.c: after each submit that signals ctx->timeline with this value
 void vk_mem_oom_report(const char *what, VkResult r);   // logs heaps and upload batches after an out-of-memory failure
 void vk_mem_collect(void);                         // frees what has completed
+void vk_mem_collect_try(void);                     // the same, unless the upload lock is busy (completion thread)
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
 void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every memory and texture object
@@ -785,10 +803,10 @@ int vk_texture_slot_retry_locked(int id);
 // have changed), 0 when a closer look is due (vk_mem_changed_snap).
 void vk_mem_gen_lock_shared(void);
 void vk_mem_gen_unlock_shared(void);
-int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch);
 // The same check's reason when it fails: 1 a region without this epoch's snapshot yet, 2 one untracked, 3 one written
 // since, 4 nothing to check (no size, beyond the regions); 0 unchanged.
-int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch);
 // The lock exclusively, for the snapshot of the regions of [addr, addr+size) that have none in epoch yet (the number of
 // write-watch queries it took).
 void vk_mem_gen_lock(void);
@@ -842,11 +860,17 @@ typedef struct { uint64_t mem, block_size, bytes; uint32_t type; } VkBlockRow;
 // their sizes and the textures and rows in them; the textures that could move to another block or be dropped (marks 0:
 // the texture pool's marks do not tell which textures are sampled, and none counts as movable); the blocks at most half
 // full by what is listed, and those of them that hold nothing but such textures, which are what a compaction could
-// give back to the driver.
+// give back to the driver. kept: the other half-full blocks in which something listed stays, by what stays there
+// (VK_HOLES_KINDS kinds, in order: a VRAM mirror, a texture whose content only the GPU made, a texture sampled lately,
+// a texture that cannot move for another reason): kept_with counts the blocks with that kind in them, kept_only those
+// where nothing else stays.
+#define VK_HOLES_KINDS 4
 typedef struct {
     uint32_t type, marks, blocks, sparse, emptiable;
     uint64_t block_bytes, tex_bytes, other_bytes, move_bytes, drop_bytes;
     uint64_t sparse_bytes, sparse_listed, emptiable_bytes, emptiable_move, emptiable_drop;
+    uint32_t kept, kept_with[VK_HOLES_KINDS], kept_only[VK_HOLES_KINDS];
+    uint64_t kept_bytes, kept_only_bytes[VK_HOLES_KINDS];
 } VkTexHoles;
 void vk_texture_holes(const VkBlockRow *other, int nother, VkTexHoles *h);
 // Texture compaction (NX2NAVI_TEX_COMPACT; vk_texture.c "the pass"): idle textures move out of sparsely used blocks
@@ -879,6 +903,16 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_ex
 // The probes (--probe-vkmem's table parts, the lost-device probe): one submission whose commands the caller records
 // itself where the replay would, with the submission lock, the memory prologue and the fence of any other.
 uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg);
+// Runs fn() under the submission lock when it is free now and returns 1; returns 0 at once, without running it, when
+// another thread holds the lock (vk_backend.c present_image: a frame's bookkeeping never waits for another replay).
+int vk_sync_try_locked(void (*fn)(void));
+// Runs fn() under the submission lock, waiting for it. For the present thread only, which is not one of the game's
+// threads and waits for the lock for its blit's submission anyway (vk_backend.c present_frame_closed: a frame's
+// bookkeeping still owed runs before the frame's blit).
+void vk_sync_locked(void (*fn)(void));
+// vk_backend.c (vk_frame_owed.h): the bookkeeping of the frames presented while another thread held the submission
+// lock. vk_sync.c submit calls it right after taking the lock, before its replay; a no-op without the back end.
+void vk_present_frames_owed(void);
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 // The executed timeline (vk_sync.c): a submission's own commands are through the GPU, its write-backs maybe not yet.
@@ -935,9 +969,15 @@ VkCommandBuffer vk_sync_cut(void);
 // sub_ns (plat_now_ns), its timestamps start and end (ticks of the graphics queue). vk_gtl_log: the gaps of the pieces
 // noted since the last call, over frames frames, in the log.
 enum { GTL_PART, GTL_MIRROR, GTL_PRE, GTL_UPLOAD, GTL_PRESENT, GTL_KINDS };
+// NX2NAVI_TRACE=perf: the timed GPU parts that ended in [t0, t1] (plat_now_ns), the interval of a frame whose render
+// thread waited fence_ms for fences (perf.c perf_present), in one line (vk_sync.c)
+void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms);
 void vk_gtl_note(int kind, uint64_t sub_ns, uint64_t start_tick, uint64_t end_tick);
 void vk_gtl_log(uint64_t frame, int frames);
 extern int vk_sub_in_frame;   // replay: the submission being recorded is the frame's n-th (0 the first; vk_backend.c)
+// vk_sync.c submit, sub_lock held, for a submission with commands: vk_sub_in_frame takes the place in its frame the
+// submitting thread noted for it (vk_backend.c vk_be_submit, replay_main).
+void vk_sub_in_frame_publish(void);
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
@@ -1055,6 +1095,7 @@ void vk_pipeline_prewarm(void);
 // Ends the boot prebuild's crash marker (vk_pipeline.c, "boot prebuild crash marker"): boot_wait calls it when it lets
 // the game start while the prewarm goes on, so a crash in play is not taken for one in the boot's builds.
 void vk_pipeline_prewarm_marker_clear(void);
+void vk_pipeline_boot_abandon(void);   // an end before the guest starts that saves nothing: the boot's journal closed
 // boot_wait calls it when it lets the game start while the prewarm goes on: the builders of the whole warm after a
 // driver change (vk_pipeline.c bf_decide) go on as in play, at idle priority and in the background's numbers.
 void vk_pipeline_prewarm_detach(void);

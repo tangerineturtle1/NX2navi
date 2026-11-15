@@ -63,6 +63,11 @@ typedef struct {
     PlatCond conv;           // a decoded picture arrived, a slot freed, or quit
     Decoded cq[CQMAX];
     int cqh, cqn;
+    // The convert thread's deband planes (16-bit Y, U and V, plane_room samples of luma), kept from picture to picture
+    // and made again only for a larger one: made per picture they were 6.2 MB of fresh pages each at 1080p, 60 times a
+    // second. finalize frees them once the convert thread is joined.
+    uint16_t *y16, *u16, *v16;
+    size_t plane_room;
     Dav1dContext *dav1d;
     uint8_t in_ev[0x40], out_ev[0x40];   // nn::os::SystemEventType each
     int in_bound, out_bound;
@@ -357,8 +362,23 @@ static void movie_oom_log(int w, int h) {
     if (plat_xchg32(&drops, 1) == 0) rt_log("movie: out of memory for a %dx%d frame: dropped (later drops not logged)", w, h);
 }
 
-// One dav1d picture (8- or 10-bit 4:2:0) -> NV12 with 8-bit samples, and its RGBA; decoder thread
-static int make_picture(const Dav1dPicture *pic, Picture *p) {
+// The Video's deband planes for a w x h picture (convert thread). 0: no memory for them; the frame is then dropped
+// as for any allocation of a picture, and no planes are kept.
+static int planes_for(Video *v, int w, int h) {
+    size_t px = (size_t)w * h;
+    if (px <= v->plane_room) return 1;
+    free(v->y16), free(v->u16), free(v->v16);
+    v->y16 = malloc(px * 2), v->u16 = malloc(px / 2), v->v16 = malloc(px / 2);
+    v->plane_room = px;
+    if (v->y16 && v->u16 && v->v16) return 1;
+    free(v->y16), free(v->u16), free(v->v16);
+    v->y16 = v->u16 = v->v16 = NULL;
+    v->plane_room = 0;
+    return 0;
+}
+
+// One dav1d picture (8- or 10-bit 4:2:0) -> NV12 with 8-bit samples, and its RGBA; convert thread
+static int make_picture(Video *v, const Dav1dPicture *pic, Picture *p) {
     int w = pic->p.w, h = pic->p.h, hbd = pic->p.bpc > 8, sh = pic->p.bpc - 8;
     if (pic->p.layout != DAV1D_PIXEL_LAYOUT_I420) {
         static volatile int32_t logged;
@@ -395,11 +415,14 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
         // planes and writes the dithered NV12 rows. Reading the decoder's planes instead of an NV12 copy of them gives
         // the same samples, and nothing reads the frame while it is written, so each stripe finishes its rows alone:
         // one round of threads per frame instead of two, and no single-threaded copy before it.
-        uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
-        if (!Y16 || !U16 || !V16) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
-        Stripe base = {2, 0, 0, w, h, o, Y16, U16, V16, NULL, pic->data[0], pic->data[1], pic->data[2], ys, cs};
+        if (!planes_for(v, w, h)) {
+            free(o);
+            movie_oom_log(w, h);
+            return 0;
+        }
+        Stripe base = {2, 0, 0, w, h, o, v->y16, v->u16, v->v16, NULL, pic->data[0], pic->data[1], pic->data[2],
+                       ys, cs};
         run_stripes(base);
-        free(Y16), free(U16), free(V16);
         *p = (Picture){o, NULL, w, h, pic->m.timestamp, 0};
         return 1;
     }
@@ -417,27 +440,26 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
         }
     }
     // debanded planes (NX2NAVI_MOVIE_DEBAND=0 keeps the decoded ones), then the overlay's RGBA or the dithered NV12
+    if (!deband_on && !rgba) {
+        *p = (Picture){o, NULL, w, h, pic->m.timestamp, 0};
+        return 1;
+    }
     {
-        uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
-        if (!Y16 || !U16 || !V16) {
-            free(Y16), free(U16), free(V16), free(o), free(rgba);
+        if (!planes_for(v, w, h)) {
+            free(o), free(rgba);
             movie_oom_log(w, h);
             return 0;
         }
+        uint16_t *Y16 = v->y16, *U16 = v->u16, *V16 = v->v16;
         Stripe base = {0, 0, 0, w, h, o, Y16, U16, V16, rgba};
         if (deband_on) {
             run_stripes(base);
-        } else if (!rgba) {
-            free(Y16), free(U16), free(V16);
-            *p = (Picture){o, rgba, w, h, pic->m.timestamp, 0};
-            return 1;
         } else {
             for (size_t i = 0; i < (size_t)w * h; i++) Y16[i] = (uint16_t)(o[i] * 16);
             for (size_t i = 0; i < (size_t)w * h / 4; i++) U16[i] = (uint16_t)(uv[2 * i] * 16), V16[i] = (uint16_t)(uv[2 * i + 1] * 16);
         }
         base.phase = 1;
         run_stripes(base);
-        free(Y16), free(U16), free(V16);
     }
     *p = (Picture){o, rgba, w, h, pic->m.timestamp, 0};
     return 1;
@@ -505,7 +527,7 @@ static void convert_thread(void *arg) {
         } else {
             uint64_t t0 = plat_now_ns();
             Picture p;
-            int ok = make_picture(&d.pic, &p);
+            int ok = make_picture(v, &d.pic, &p);
             t_make_ns += plat_now_ns() - t0;
             n_made++;
             dav1d_picture_unref(&d.pic);
@@ -600,6 +622,9 @@ static void stop_thread(Video *v) {
 
 static void finalize(Video *v) {
     stop_thread(v);
+    free(v->y16), free(v->u16), free(v->v16);   // the convert thread, their only user, has been joined
+    v->y16 = v->u16 = v->v16 = NULL;
+    v->plane_room = 0;
     plat_mutex_lock(&v->codec);
     if (v->dav1d) dav1d_close(&v->dav1d);
     plat_mutex_unlock(&v->codec);
@@ -615,9 +640,15 @@ static void ov_ctor(Cpu *c) { *(Video **)arg_p(c, 0) = NULL; }
 static void ov_dtor(Cpu *c) {
     Video **slot = arg_p(c, 0);
     if (!slot || !*slot) return;
-    finalize(*slot);
-    set_live(*slot, 0);
-    free(*slot);   // the bound events' kernel handles stay, as for any guest event never destroyed
+    Video *v = *slot;
+    finalize(v);
+    set_live(v, 0);
+    // The decoder and convert threads are joined, so nothing signals the events now: they are destroyed and leave the
+    // kernel's table of system events before their memory goes (kernel.c kern_unbind_system_event). Kept, each
+    // decoder left two dead entries and their kernel handles, and a long session filled the table.
+    if (v->in_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->in_ev);
+    if (v->out_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->out_ev);
+    free(v);
     *slot = NULL;
     gfx_movie_stop();
 }
@@ -757,6 +788,15 @@ static void ov_decode(Cpu *c) {
         if (skip_ns >= 0) rt_log("movie: movies end after %.1f s (NX2NAVI_MOVIE_SKIP)", skip_ns / 1e9);
     }
     plat_mutex_lock(&v->lock);
+    // Finalize on another thread may have closed the decoder since the test above. finalize takes v->lock after it
+    // clears v->dav1d, so read here under v->lock it is either still set (the sample is queued before finalize's
+    // clear_queues, which drops it, and ov_finalize or the destructor then clears live) or already NULL: no sample
+    // makes a finalized decoder live again, which would hold the movie frame rate cap (frame_rate.c movie_cap_hz).
+    if (!v->dav1d) {
+        plat_mutex_unlock(&v->lock);
+        ret_x(c, 0);
+        return;
+    }
     if (skip_ns >= 0 && v->eos_queued) {   // after the early end: what the demuxer still sends is dropped
         plat_mutex_unlock(&v->lock);
         ret_x(c, 0);

@@ -399,3 +399,26 @@ site world_map main 20934c 94032691 95325ed5
 site world_map main 207760 39516e69 39516e69 953265cc
 site world_map main 203af0 94001a3c 953274e4
 site world_map main 2032ac 94033eb9 953276f1
+
+# The ocarina recorder's clock: the ocarina manager (its update main+0x17bad0, the vtable slot at main+0x4ba19a8)
+# keeps at +0x265fc of its object the length of the current note or rest in 60 Hz frames, and adds trunc(frames per
+# update), the time manager's +0x10, to it at four sites (fcvtzu w8, s0): main+0x32926c8 and main+0x3293410 in two of
+# the manager's update states (main+0x3292690, main+0x32932b0), main+0x3296b08 and main+0x3296da4 in its recording
+# function (main+0x3296840, modes 10 and 13 at +0x230). At each recorded note the length goes into the recording as a
+# word of its own (twice the length, into +0x300 or +0x498, left out when it is 0) and the clock starts again; the
+# clock stops at 360 frames, and at 120 while +0x271 is set, and a recording ends once the float timer at +0x244
+# passes min(clock + 60, 420) frames (main+0x329285c). Below one frame per update the cut is 0: above 60 fps the clock
+# stood still, so recordings lost their rests, the clock's limits never came and the end of a recording came at a
+# fixed 60 frames of that timer; at the 40 and 45 fps limits it counted one a frame. Each site carries the fraction to
+# the next on the patch page's +264: s16 = step + fraction, the fraction becomes max(s16 - trunc(s16), 0) and
+# w8 = trunc(s16), so the clock counts 60 a second at any frame rate, and a step of exactly one or two frames gives
+# what the game computes with the fraction left at 0. A step that is NaN, negative or infinite gives the game's cut and
+# leaves the fraction 0. Only the manager's update runs the four sites, so the page word needs no lock.
+# main+0x3296840 returns through x30 without saving it, so these sites cannot call the page. x8 is each site's own
+# result; s16, s17 and s18 are used nowhere in the three functions, s0 keeps the step, and no word reads or writes the
+# flags.
+set orecord NX2NAVI_OCARINA_TIMING 1
+site orecord main 32926c8 1e390008 @page:x8 bd410910 1e302810 1e25c211 1e313a11 2f00e412 1e326a31 bd010911 1e390208   # fcvtzu w8, s0 -> adrp x8, page; ldr s16, [x8, #264]; fadd s16, s0, s16; frintz s17, s16; fsub s17, s16, s17; movi d18, #0; fmaxnm s17, s17, s18; str s17, [x8, #264]; fcvtzu w8, s16
+site orecord main 3293410 1e390008 @page:x8 bd410910 1e302810 1e25c211 1e313a11 2f00e412 1e326a31 bd010911 1e390208   # the same at the other three sites
+site orecord main 3296b08 1e390008 @page:x8 bd410910 1e302810 1e25c211 1e313a11 2f00e412 1e326a31 bd010911 1e390208
+site orecord main 3296da4 1e390008 @page:x8 bd410910 1e302810 1e25c211 1e313a11 2f00e412 1e326a31 bd010911 1e390208

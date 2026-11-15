@@ -34,7 +34,11 @@ struct PlatThread {
     PlatThreadFn fn;
     void *arg;
     volatile int32_t state;   // 0 running and owned by its maker, 1 detached, 2 its function has returned
+    char name[32];
 };
+
+static __thread char thread_name[32];   // plat_thread_name: copied at the start, as a detached thread's struct may go
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
 
 // What a thread made here keeps for itself is given back when its function returns: the handles below (the sleep
 // timer of plat_wait_ns, the events of plat_file_pread and plat_file_pwrite), what the other files keep per thread
@@ -44,8 +48,21 @@ struct PlatThread {
 // ExitThread jumps back to the thread's start).
 static void thread_handles_close(void);
 
+// A stack overflow leaves the faulting thread a guard page's worth of stack, about 12 KiB of which a crash handler
+// gets, and the report (main.c crash_handler) needs more: rt_log's 2 KiB buffers, the frame walk, and during the
+// boot's builds a file write first (plat_file_write's frame is about 4 KiB). It faulted again inside the report, and
+// the process ended with no FATAL line (the audit's probe: a 16 MiB-reserve thread recursing in 1 KiB frames). With
+// 32 KiB kept back, the probe's report ran whole with room to spare. The guarantee belongs to the running fiber, so
+// fiber_start asks for it too. Each thread and fiber commits that much more of its stack.
+void plat_stack_guarantee(void) {
+    ULONG g = PLAT_STACK_GUARANTEE;
+    SetThreadStackGuarantee(&g);
+}
+
 static DWORD WINAPI thread_main(LPVOID p) {
     PlatThread *t = p;
+    plat_stack_guarantee();
+    memcpy(thread_name, t->name, sizeof thread_name);
     t->fn(t->arg);
     plat_thread_end_run();
     thread_handles_close();
@@ -62,6 +79,7 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
+    if (name) snprintf(t->name, sizeof t->name, "%s", name);
     t->h = CreateThread(NULL, stack ? stack : PLAT_STACK_DEFAULT, thread_main, t,
                         CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->h) { free(t); return NULL; }
@@ -336,6 +354,7 @@ void plat_fiber_unself(void) {
 
 static void WINAPI fiber_start(void *p) {
     PlatFiber *f = p;
+    plat_stack_guarantee();   // a guest fiber's stack is its own (kernel.c kern_fiber_init)
     f->fn(f->arg);
 }
 
@@ -1251,6 +1270,7 @@ int plat_crash_filter_reassert(char *who, size_t n) {
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
 // waits and exits with the child's code.
 void plat_reexec(void) {
+    plat_exit_orderly();   // this process ends with ExitProcess below, on purpose
     fprintf(stderr, "[host] memory: a fixed region is taken; re-running the process\n");
     fflush(stdout);
     fflush(stderr);
@@ -1319,13 +1339,22 @@ static DWORD con_mode;
 static void (*con_close)(const char *what);
 static volatile LONG con_closing;
 
+// fs_host.c: a save Commit under way finishes first, 2 s at most and without a lock; builds without it have no saves
+__attribute__((weak)) void fs_save_crash_wait(void) {}
+
 // Runs on a thread the system starts for the event. A close returns only when on_close does, which it must not.
 static BOOL WINAPI con_ctrl(DWORD ev) {
     const char *what = ev == CTRL_CLOSE_EVENT ? "closed" : ev == CTRL_C_EVENT ? "Ctrl+C"
                      : ev == CTRL_BREAK_EVENT ? "Ctrl+Break" : NULL;
-    // log-off and shutdown reach a process with a window as WM_ENDSESSION (gfx_window_win.c), not here; a second event
-    // while on_close runs takes the default path, which ends the process at once
-    if (!what || !con_close || InterlockedExchange(&con_closing, 1)) return FALSE;
+    // log-off and shutdown reach a process with a window as WM_ENDSESSION (gfx_window_win.c), not here
+    if (!what || !con_close) return FALSE;
+    if (InterlockedExchange(&con_closing, 1)) {
+        // A second event while on_close runs: the player wants out now. Left to the default handler, its ExitProcess
+        // cut a save Commit in flight and ran every library's detach; the Commit finishes first, and the process ends
+        // with the code the default handler gives (STATUS_CONTROL_C_EXIT).
+        fs_save_crash_wait();
+        plat_exit((int)0xC000013Au);
+    }
     con_close(what);
     return TRUE;
 }
@@ -1362,6 +1391,7 @@ int plat_stderr_write(const void *p, size_t n) {
 void (*plat_exit_hook)(void);
 
 void plat_exit(int code) {
+    plat_exit_orderly();
     if (plat_exit_hook) plat_exit_hook();
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
@@ -1379,6 +1409,125 @@ void plat_exit(int code) {
     TerminateProcess(GetCurrentProcess(), (UINT)code);
     ExitProcess((UINT)code);   // not reached
 }
+
+void plat_terminate(int code) {
+    plat_exit_orderly();
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code);   // not reached
+}
+
+// ---- an end the game did not ask for (plat_exit_note_setup)
+// Two runs of 2026-11-13 ended seconds after a focus loss with exit code 0, no crash event and no line of their own: an
+// ExitProcess by a module in the process, or a kill from outside, could not be told apart. ExitProcess stops every
+// other thread and then calls each module's detach, the executable's TLS callbacks included; TerminateProcess calls
+// none. The callback runs under the loader lock with the other threads gone, so any lock they held stays held: it
+// uses no C runtime (no formatting, allocation or streams: their locks), does not ask the loader (RtlPcToFileHeader
+// takes its module lock) and names addresses from the module list noted earlier. RtlCaptureStackBackTrace and
+// WriteFile take no lock of the process.
+#define EN_MODS 384
+typedef struct { uintptr_t base, size; char name[40]; } EnMod;
+static EnMod en_mods[2][EN_MODS];
+static int en_n[2];
+static volatile LONG en_cur = -1;   // the table the callback reads, -1 none yet
+static PlatMutex en_lock = PLAT_MUTEX_INIT;   // the writers of the tables (start, focus losses)
+static PlatAppend *volatile en_log;
+static void (*volatile en_queued)(const char **p, size_t *n);
+static volatile LONG en_orderly;
+
+void plat_exit_orderly(void) { InterlockedExchange(&en_orderly, 1); }
+
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) {
+    en_queued = queued;
+    en_log = log;
+}
+
+// Each module's size comes from its own image header and its name from GetModuleFileNameA. GetModuleInformation and
+// GetModuleBaseNameA each walk the whole module list through ReadProcessMemory, so a note took about 27 ms with 290
+// modules, on the window thread at every focus loss; this takes about 0.3 ms. The header is read through
+// ReadProcessMemory too, which fails for a module unloaded since EnumProcessModules where a plain read would fault.
+void plat_exit_note_modules(void) {
+    HMODULE m[EN_MODS];
+    DWORD need = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), m, sizeof m, &need)) return;
+    int n = (int)(need / sizeof m[0] < EN_MODS ? need / sizeof m[0] : EN_MODS), k = 0;
+    plat_mutex_lock(&en_lock);
+    int t = InterlockedCompareExchange(&en_cur, 0, 0) == 0 ? 1 : 0;   // the table the callback does not read
+    for (int i = 0; i < n; i++) {
+        unsigned char hdr[1024];
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), m[i], hdr, sizeof hdr, &got) || got != sizeof hdr) continue;
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)hdr;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+            (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > sizeof hdr)
+            continue;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(hdr + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+        char path[MAX_PATH];
+        DWORD len = GetModuleFileNameA(m[i], path, sizeof path);
+        if (len >= sizeof path) len = sizeof path - 1;
+        path[len] = 0;
+        const char *name = path;
+        for (DWORD j = 0; j < len; j++)
+            if (path[j] == '\\' || path[j] == '/') name = path + j + 1;
+        EnMod *e = &en_mods[t][k++];
+        e->base = (uintptr_t)m[i], e->size = nt->OptionalHeader.SizeOfImage;
+        snprintf(e->name, sizeof e->name, "%s", name);
+    }
+    en_n[t] = k;
+    InterlockedExchange(&en_cur, t);
+    plat_mutex_unlock(&en_lock);
+}
+
+static size_t en_put(char *o, size_t at, size_t cap, const char *s) {
+    while (*s && at < cap) o[at++] = *s++;
+    return at;
+}
+
+static size_t en_hex(char *o, size_t at, size_t cap, uintptr_t v) {
+    char d[18];
+    int n = 0;
+    do d[n++] = "0123456789abcdef"[v & 15], v >>= 4; while (v);
+    at = en_put(o, at, cap, "0x");
+    while (n && at < cap) o[at++] = d[--n];
+    return at;
+}
+
+// An executable gets DLL_PROCESS_DETACH only as the process ends (its reserved argument is NULL there all the same).
+static void NTAPI exit_note_tls(PVOID h, DWORD reason, PVOID reserved) {
+    (void)h, (void)reserved;
+    PlatAppend *log = en_log;
+    if (reason != DLL_PROCESS_DETACH || en_orderly || !log) return;
+    const char *q = NULL;
+    size_t qn = 0;
+    void (*queued)(const char **, size_t *) = en_queued;
+    if (queued) queued(&q, &qn);
+    if (q && qn) plat_append_write(log, q, qn);
+    char line[2048];
+    size_t at = en_put(line, 0, sizeof line - 1, "[host] exit: the process is ending through ExitProcess, not one of "
+                                                 "the game's own ends; the calls that led to it:");
+    void *f[32];
+    USHORT n = RtlCaptureStackBackTrace(1, 32, f, NULL);
+    LONG t = en_cur;
+    for (USHORT i = 0; i < n; i++) {
+        uintptr_t a = (uintptr_t)f[i];
+        const EnMod *m = NULL;
+        for (int k = 0; t >= 0 && k < en_n[t] && !m; k++)
+            if (a - en_mods[t][k].base < en_mods[t][k].size) m = &en_mods[t][k];
+        at = en_put(line, at, sizeof line - 1, " ");
+        if (m && m->name[0]) {
+            at = en_put(line, en_put(line, at, sizeof line - 1, m->name), sizeof line - 1, "+");
+            a -= m->base;
+        }
+        at = en_hex(line, at, sizeof line - 1, a);
+    }
+    line[at++] = '\n';
+    plat_append_write(log, line, at);
+}
+// The callback in the executable's TLS callback list (the .CRT$XL* sections), which the TLS directory the image has
+// for its thread-local variables points to; _tls_used is that directory.
+__attribute__((section(".CRT$XLB"), used)) PIMAGE_TLS_CALLBACK plat_exit_note_cb = exit_note_tls;
+extern const IMAGE_TLS_DIRECTORY _tls_used;
+__attribute__((used)) static const void *volatile exit_note_tls_dir = &_tls_used;
 
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's
 // own calls update. An empty value removes the variable.
@@ -2183,6 +2332,111 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
         *resident = pm.WorkingSetSize, *private_bytes = pm.PrivateUsage;
 }
 
+uint32_t plat_handle_count(void) {
+    DWORD n = 0;
+    return GetProcessHandleCount(GetCurrentProcess(), &n) ? (uint32_t)n : 0;
+}
+
+// plat_handle_census: the system's handle table (NtQuerySystemInformation, class 64, the extended handle information)
+// filtered by this process's id, and the object types' names from NtQueryObject's ObjectTypesInformation, whose entries
+// carry the type index the table uses (Windows 8.1 and later). The table holds every process's handles; a census took
+// 1.5-4.7 ms over 3.6 MiB of it on the development PC.
+typedef struct {
+    PVOID object;
+    ULONG_PTR pid, handle;
+    ULONG access;
+    USHORT backtrace, type;
+    ULONG attributes, reserved;
+} HcEntry;
+typedef struct {
+    ULONG_PTR n, reserved;
+    HcEntry e[1];
+} HcTable;
+typedef struct {
+    USHORT len, max;
+    PWSTR buf;
+} HcName;
+typedef struct {   // one entry of ObjectTypesInformation; its name's characters follow it
+    HcName name;
+    ULONG totals[13];   // object and handle counts, pool use, their high-water marks, invalid attributes: not read
+    GENERIC_MAPPING mapping;
+    ULONG valid_access;
+    BOOLEAN security, maintain;
+    UCHAR index;
+    CHAR reserved;
+    ULONG pool, paged, nonpaged;
+} HcType;
+
+static void hc_type_names(char names[256][32]) {
+    typedef LONG(NTAPI * Qo)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    Qo qo = nt ? (Qo)(void *)GetProcAddress(nt, "NtQueryObject") : NULL;
+    if (!qo) return;
+    size_t cap = 1u << 16;
+    uint8_t *buf = NULL;
+    LONG st = -1;
+    for (int tries = 0; tries < 6; tries++, cap *= 2) {
+        uint8_t *b = realloc(buf, cap);
+        if (!b) break;
+        buf = b;
+        ULONG need = 0;
+        st = qo(NULL, 3, buf, (ULONG)cap, &need);   // ObjectTypesInformation
+        if (st != (LONG)0xC0000004L) break;          // not STATUS_INFO_LENGTH_MISMATCH: done, or failed
+    }
+    if (st >= 0 && buf) {
+        ULONG count = *(ULONG *)buf;
+        const uint8_t *p = buf + sizeof(void *), *end = buf + cap;   // the count, then entries at pointer alignment
+        for (ULONG i = 0; i < count && p + sizeof(HcType) <= end; i++) {
+            const HcType *t = (const HcType *)p;
+            WideCharToMultiByte(CP_UTF8, 0, t->name.buf, t->name.len / 2, names[t->index], 31, NULL, NULL);
+            p += sizeof(HcType) + ((t->name.max + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
+        }
+    }
+    free(buf);
+}
+
+int plat_handle_census(PlatHandleKind *out, int max) {
+    typedef LONG(NTAPI * Qsi)(ULONG, PVOID, ULONG, PULONG);
+    static char names[256][32];
+    static int named;
+    static void *table;
+    static size_t cap;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    Qsi qsi = nt ? (Qsi)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+    if (!qsi || max <= 0) return -1;
+    if (!named) hc_type_names(names), named = 1;
+    LONG st = -1;
+    for (int tries = 0; tries < 6; tries++) {
+        if (!table && !(table = malloc(cap = 4u << 20))) return -1;
+        ULONG need = 0;
+        st = qsi(64, table, (ULONG)cap, &need);   // SystemExtendedHandleInformation
+        if (st != (LONG)0xC0000004L) break;       // the table outgrew the buffer: a larger one
+        size_t want = need > cap ? need + (1u << 20) : cap * 2;
+        void *b = realloc(table, want);
+        if (!b) return -1;
+        table = b, cap = want;
+    }
+    if (st < 0) return -1;
+    uint32_t count[256] = {0};
+    const HcTable *t = table;
+    ULONG_PTR pid = GetCurrentProcessId();
+    for (ULONG_PTR i = 0; i < t->n && offsetof(HcTable, e) + (i + 1) * sizeof(HcEntry) <= cap; i++)
+        if (t->e[i].pid == pid) count[t->e[i].type & 255]++;
+    int n = 0;
+    for (int k = 0; k < 256; k++) {
+        if (!count[k]) continue;
+        if (n == max) {   // no room: the last entry takes the rest
+            snprintf(out[max - 1].name, sizeof out[0].name, "%s", "(more kinds)");
+            out[max - 1].n += count[k];
+            continue;
+        }
+        if (names[k][0]) snprintf(out[n].name, sizeof out[0].name, "%s", names[k]);
+        else snprintf(out[n].name, sizeof out[0].name, "type %d", k);
+        out[n++].n = count[k];
+    }
+    return n;
+}
+
 // The UCRT's malloc takes its memory from the heap _get_heap_handle names (the process heap); HeapSummary sums it. The
 // other heaps are only counted: one made with HEAP_NO_SERIALIZE has no lock to take.
 void plat_heap_info(PlatHeapInfo *h) {
@@ -2279,15 +2533,16 @@ int plat_child_write(PlatChild *c, const void *data, size_t n) {
 }
 
 // A child that stays alive but never answers (a translator stuck on one program) used to block the reader for good,
-// and with it the draw or dispatch waiting for that shader: after PLAT_CHILD_READ_MS without a byte the read fails,
-// and the caller stops the child (gfx_shader.c svc_request). The pipe is anonymous, so readiness is polled.
+// and with it the draw or dispatch waiting for that shader: after PLAT_CHILD_READ_MS without a byte the read fails
+// with -2, apart from the -1 of a broken pipe, and the caller stops the child without sending the request again
+// (gfx_shader.c svc_request). The pipe is anonymous, so readiness is polled.
 long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     ULONGLONG t0 = GetTickCount64();
     for (unsigned spins = 0;; spins++) {
         DWORD avail = 0;
         if (!PeekNamedPipe(c->out, NULL, 0, NULL, &avail, NULL)) return -1;   // broken: the child exited
         if (avail) break;
-        if (GetTickCount64() - t0 > PLAT_CHILD_READ_MS) return -1;
+        if (GetTickCount64() - t0 > PLAT_CHILD_READ_MS) return -2;
         Sleep(spins < 50 ? 0 : 1);
     }
     DWORD got = 0;

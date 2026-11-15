@@ -62,3 +62,10 @@ void rt_fatal_code(int code, const char *fmt, ...) __attribute__((noreturn, form
 // needs none. At most four; adding one twice keeps one. rt_fatal_notes runs them, once per process.
 void rt_fatal_note_add(void (*fn)(void));
 void rt_fatal_notes(void);
+// The one end of a failed run: the fatal error (rt_fatal) and the crash report (main.c crash_handler) call it first,
+// with the code they end the process with. 1 for the first caller, which reports and ends the process; 0 for that
+// thread again (a failure inside its own report), which ends at once with its code; any other thread waits, logging
+// nothing, until the process ends, and after 30 s ends it with the first caller's code.
+int rt_ending_enter(int code);
+// HD rumble stopped before a failed run ends, on a thread of its own that the caller waits for 300 ms at most.
+void rt_rumble_stop_bounded(void);

@@ -225,6 +225,21 @@ def fake_repo(folder, damage=None):
     (folder / 'ucrt64.db').write_bytes(tar_bytes(entries))
 
 
+def compiled_sleeper(exe, ms, code):
+    """exe compiled from a C program that sleeps ms milliseconds and exits with code, with the ucrt64 clang or a clang
+    on PATH; False without one. It stands in for the game under a name that no game runner watches."""
+    cc = next((c for c in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')) if c and Path(c).is_file()),
+              None)
+    if not cc:
+        return False
+    exe = Path(exe)
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    src = exe.with_suffix('.c')
+    src.write_text(f'#include <windows.h>\nint main(void) {{ Sleep({ms}); return {code}; }}\n', encoding='utf-8')
+    subprocess.run([cc, '-O1', '-o', str(exe), str(src)], check=True, capture_output=True, timeout=300)
+    return True
+
+
 def fake_fast_repo(folder, clang_version='1.0-1'):
     """The CLANG64 packages toolchain.FAST_PACKAGES names, in folder/clang64."""
     folder = folder / 'clang64'
@@ -364,6 +379,32 @@ class PlayerIniTest(Tmp):
         self.assertEqual(ini.read_bytes(), PLAYER_INI + b'\r\n\r\n[discord]\r\ndiscord_rpc = 0\r\n')
         gameini.put(self.tmp, 'discord', 'discord_rpc', '1')
         self.assertEqual(ini.read_bytes(), PLAYER_INI + b'\r\n\r\n[discord]\r\ndiscord_rpc = 1\r\n')
+
+    def test_a_comment_after_a_value_as_the_game_reads_it(self):
+        """runtime/cfg.c cut_comment: for a key whose row has a set of values (choices=True), a blank followed by ';'
+        or '#' starts a comment, "key = ; note" has no value, and a value in double quotes keeps its text; free text,
+        the mods folder and lists the launcher writes, keeps the whole value. tests/cfg_parse_check.py has the same
+        lines for the game."""
+        ini = self.tmp / 'nx2navi.ini'
+        body = (b'[frame rate]\r\npace_smooth = 0 ; off\r\nfps_limit = 144 # my monitor\r\nvk_present = fifo\t; x\r\n'
+                b'aspect = ; later\r\ndlss_preset = "k ; quoted"\r\n[mods]\r\nmods_dir = D:\\My Mods #2\r\n'
+                b'mods_disabled = a #1|b ; c\r\n')
+        ini.write_bytes(body)
+        for key, want in (('pace_smooth', '0'), ('fps_limit', '144'), ('vk_present', 'fifo'), ('aspect', ''),
+                          ('dlss_preset', 'k ; quoted')):
+            self.assertEqual(gameini.get(self.tmp, key, choices=True), want, key)
+        self.assertEqual(gameini.get(self.tmp, 'fps_limit'), '144 # my monitor')
+        self.assertEqual(gameini.get(self.tmp, 'mods_dir'), 'D:\\My Mods #2')
+        self.assertEqual(gameini.get(self.tmp, 'mods_disabled'), 'a #1|b ; c')
+        from launcher import mods
+        self.assertEqual(mods._names(self.tmp, 'MODS_DISABLED'), ['a #1', 'b ; c'])
+        # a key's line that has only a comment has no value as the game reads it: the change goes on the line before
+        ini.write_bytes(b'vk_present = fifo\r\nvk_present = ; later\r\n')
+        gameini.put(self.tmp, 'display', 'vk_present', 'mailbox', choices=True)
+        self.assertEqual(ini.read_bytes(), b'vk_present = mailbox\r\nvk_present = ; later\r\n')
+        ini.write_bytes(b'pace_smooth = 0 ; off\r\n')   # the line is written again whole, as the game's menu writes it
+        gameini.put(self.tmp, 'performance', 'pace_smooth', '1', choices=True)
+        self.assertEqual(ini.read_bytes(), b'pace_smooth = 1\r\n')
 
     def test_the_older_installer_changes_the_language_line_only(self):
         """installer/ini.py sets the language, in the older installer's last step at every install and update: the
@@ -1079,7 +1120,7 @@ class BackgroundUpdateTest(Tmp):
         self.game = str(self.tmp / 'game')
         self.running = False   # what build.game_running answers: a copy of the game the launcher did not start
         saved = build.game_running
-        build.game_running = lambda game_dir, exe='ocarina.exe': self.running
+        build.game_running = lambda game_dir, exe='ocarina.exe', log=None: self.running
         self.addCleanup(setattr, build, 'game_running', saved)
         self.restarts = []
 
@@ -2863,6 +2904,55 @@ class MakeGameTest(Tmp):
         (out / 'nx2navi.ini').write_text('[performance]\nNX2NAVI_SHADER_CARRY = "0"\n')
         self.assertFalse(self.mg.shader_carry(out))
 
+    def test_shader_carry_reads_the_switch_as_the_game(self):
+        """shader_carry reads NX2NAVI_SHADER_CARRY as runtime/cfg.c does: 0, off, false and no in any case are off, a
+        comment after a blank is cut unless the value is in double quotes, the file's last line with a value wins and
+        the environment wins over the file. A line the game reads as off and this as on would skip a preparation the
+        game does not make up for."""
+        out = self.tmp / 'game'
+        (out / 'shader-cache').mkdir(parents=True)
+        (out / 'shader-prepared.bin').write_bytes(b'x')
+        (out / 'shader-cache' / 'identities.txt').write_text('# translators\n' + 'ab' * 32 + '\n')
+        ini = out / 'nx2navi.ini'
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_SHADER_CARRY'}
+        with mock.patch.dict(os.environ, env, clear=True):
+            for text, carry in (('shader_carry = off\n', False), ('shader_carry = FALSE\n', False),
+                                ('shader_carry = no\n', False), ('shader_carry = 0 ; note\n', False),
+                                ('shader_carry = 0\t# note\n', False), ('shader_carry = 1 # on\n', True),
+                                ('shader_carry = on\n', True), ('shader_carry = "0 ; quoted"\n', True),
+                                ('shader_carry = 0\nshader_carry = on\n', True),
+                                ('shader_carry = on\nshader_carry = off\n', False),
+                                ('shader_carry = 0\nshader_carry = ; nothing\n', False)):
+                ini.write_text(text)
+                self.assertEqual(self.mg.shader_carry(out), carry, text)
+            ini.write_text('shader_carry = 0\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': '1'}):
+                self.assertTrue(self.mg.shader_carry(out))   # the environment wins over the file
+            ini.write_text('shader_carry = 1\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': 'Off'}):
+                self.assertFalse(self.mg.shader_carry(out))
+
+    def test_guest_opt_from_the_ini_counts_without_the_low_end_mode(self):
+        """guest_opt_ini takes guest_opt from nx2navi.ini by itself. Up to 0.10.1 it needed low_end_gpu on in the file;
+        that mode is gone, and a low_end_gpu line of any value changes nothing. The environment's value stays."""
+        out = self.tmp / 'game'
+        out.mkdir()
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_GUEST_OPT'}
+        for low in ('', 'low_end_gpu = 1\n', 'low_end_gpu = yes\n', 'low_end_gpu = 0\n', 'low_end_gpu = off\n',
+                    'low_end_gpu = 0 ; note\n'):
+            (out / 'nx2navi.ini').write_text('guest_opt = 2\n' + low)
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.mg.guest_opt_ini(out)
+                self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '2', low)
+        (out / 'nx2navi.ini').write_text('low_end_gpu = 1\n')
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertIsNone(os.environ.get('NX2NAVI_GUEST_OPT'))   # no guest_opt line: nothing is set
+        (out / 'nx2navi.ini').write_text('guest_opt = 2\n')
+        with mock.patch.dict(os.environ, dict(env, NX2NAVI_GUEST_OPT='1'), clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '1')   # the environment wins over the file
+
     def test_cache_from_before_carrying_names_its_translator(self):
         """Before a new translator goes beside the game, a shader cache with no identities.txt gets one naming the
         translator still there, in the form runtime/gfx_shader.c reads (ids_parse): '#' lines, then 64 hex digits."""
@@ -3101,6 +3191,9 @@ class MakeGameTest(Tmp):
             (out / 'exefs' / name).write_bytes(b'x')
         (lift / 'layout.json').write_text(json.dumps([{'name': 'main'}]))
         text = self.mg.modules_c(lift, out, gen).read_text(encoding='utf-8')
+        import check_content
+        self.assertIn(check_content.GENERATED_MARKER, text.splitlines()[0])
+        self.assertIn('generated from game code', check_content.problems_for(gen / 'modules.c'))   # refused in a commit
         for half in ('\\ud83e', '\\ud842'):   # the first surrogate halves of the two characters
             self.assertNotIn(half, text.lower())
         want = 'const char rt_default_exefs[] = "' + str(out / 'exefs').replace('\\', '\\\\') + '";'
@@ -4126,6 +4219,23 @@ class LockTest(Tmp):
         self.assertIn(f'error: the launcher window (process {other.pid}', err.getvalue())
         self.assertIn('try again', err.getvalue())
 
+    def test_the_command_line_update_refuses_while_the_game_runs(self):
+        """`update` rebuilds the game after it switched versions: started while the game runs, it would leave the new
+        version with the old build. It refuses before it downloads anything, as the window's Updates row does."""
+        import argparse
+        from launcher import cli
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp / 'game')}
+        err = io.StringIO()
+        with mock.patch('launcher.cli.build.game_running', return_value=True) as running, \
+                mock.patch('launcher.cli.jobs.CheckJob') as check, \
+                mock.patch('launcher.cli.jobs.UpdateDownloadJob') as download, contextlib.redirect_stderr(err):
+            self.assertEqual(cli.run(argparse.Namespace(cmd='update'), ctx, mock.MagicMock()), 1)
+        running.assert_called_once_with(str(self.tmp / 'game'))
+        check.assert_not_called()
+        download.assert_not_called()
+        self.assertIn('error: the game is running', err.getvalue())
+
 
 # ---------------------------------------------------------------- the icon
 
@@ -4331,6 +4441,47 @@ class SavesTest(unittest.TestCase):
         self.assertFalse(build.game_running(self.game))
         self.assertFalse(saves.game_running(self.game))
         self.assertTrue(os.access(exe, os.W_OK))
+
+    @unittest.skipUnless(os.name == 'nt', 'the running check is Windows only')
+    def test_only_a_sharing_violation_is_a_running_game(self):
+        """A running exe refuses a write open with a sharing violation (32); access denied (5) on an exe that is not
+        read-only (an access list, Controlled Folder Access) is no running game, and is logged when asked."""
+        exe = self.game / 'ocarina.exe'
+        exe.write_bytes(b'MZ')
+        answers = []
+        with mock.patch('launcher.build._write_open_error', side_effect=lambda p: answers.pop(0)) as opened:
+            answers[:] = [32]
+            self.assertTrue(build.game_running(self.game))
+            answers[:] = [0]
+            self.assertFalse(build.game_running(self.game))
+            answers[:] = [5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertIn('cannot be opened for writing (access denied)', lines[0])
+            self.assertEqual(opened.call_count, 3)
+            os.chmod(exe, stat.S_IREAD)                    # read-only: cleared, then the open is tried again
+            answers[:] = [5, 32]
+            self.assertTrue(build.game_running(self.game))
+            self.assertTrue(os.access(exe, os.W_OK))
+            os.chmod(exe, stat.S_IREAD)
+            answers[:] = [5, 5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(answers, [])
+        self.assertEqual(build._write_open_error(exe), 0)   # the real call on a file nothing holds
+        sleeper = self.game / 'sleeper.exe'                 # and on a running exe
+        if not compiled_sleeper(sleeper, 3000, 0):
+            self.skipTest('needs a C compiler')
+        proc = winsys.start_game(sleeper)
+        try:
+            self.assertEqual(build._write_open_error(sleeper), build.ERROR_SHARING_VIOLATION)
+            self.assertTrue(build.game_running(self.game, exe='sleeper.exe'))
+        finally:
+            proc.kill()
+            proc.wait(10)
+        self.assertFalse(build.game_running(self.game, exe='sleeper.exe'))
 
     def test_read_only_files_import_writable(self):
         acct = saves.account_dir(self.game)
@@ -5062,20 +5213,100 @@ class SteamTest(Tmp):
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:
-            from launcher.ui.app import App
+            from launcher.ui import app
         except ImportError as e:
             self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
         a = mock.MagicMock()
         a.settings = {'game_dir': str(self.tmp)}
-        a.game_proc = mock.MagicMock(returncode=0)
-        a.game_proc.poll.return_value = 0                              # the process started here has ended
-        with mock.patch('launcher.ui.app.saves.game_running', return_value=True):
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time())
+        a.game_run.proc.poll.return_value = 0                         # the process started here has ended
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=None) as copy:
             App.watch_game(a)                                          # but the restarted game runs from the same exe
+        copy.assert_called_once_with(self.tmp / 'ocarina.exe', skip=11)
         a.root.deiconify.assert_not_called()
         a.root.after.assert_called_once()
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         a.root.deiconify.assert_called_once()
+
+    def test_the_restarted_copy_is_followed_for_its_exit_code(self):
+        """The game's Restart ends the process the launcher started with code 0 and starts the exe again: the launcher
+        follows that copy (winsys.game_copy) and reports the code it ends with, and its FATAL line."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+        log.write_text('[host] gfx: window closed; restarting\n', encoding='utf-8')
+        a = mock.MagicMock()
+        a.message = ''
+        a.settings = {'game_dir': str(self.tmp)}
+        a.install_staged.return_value = False
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+        a.game_run.proc.poll.return_value = 0
+        copy = mock.MagicMock(returncode=None, pid=12, ended=False)
+        copy.poll.return_value = None
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=copy):
+            App.watch_game(a)                                          # the copy is found and followed
+            App.watch_game(a)                                          # it runs: no further look for one
+        self.assertIs(a.game_run.proc, copy)
+        a.root.deiconify.assert_not_called()
+        log.write_text('[host] boot\nFATAL: vk: the GPU device was lost (seen at: q). The run ends here\n',
+                       encoding='utf-8')                               # the copy's own log (main.c log_open)
+        copy.returncode = 72
+        copy.poll.return_value = 72
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+            App.watch_game(a)
+        a.ctx.log.assert_called_once_with('the game ended with code 72 after restarting itself; its log says: FATAL: '
+                                          'vk: the GPU device was lost (seen at: q). The run ends here')
+        self.assertIn('(code 72): vk: the GPU device was lost', a.message)
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertIsNone(a.game_run)
+
+    def test_a_restarted_copy_that_could_not_be_followed_ends_with_its_code_unknown(self):
+        """A copy the launcher could not find (it ended before the next look): its code is not known, so neither
+        launcher.log nor the game's log says code 0, and its FATAL line is still shown."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+
+        def run(text):
+            log.write_text(text, encoding='utf-8')
+            a = mock.MagicMock()
+            a.message = ''
+            a.settings = {'game_dir': str(self.tmp)}
+            a.install_staged.return_value = False
+            a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+            a.game_run.proc.poll.return_value = 0
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                    mock.patch('launcher.ui.app.winsys.game_copy', return_value=None):
+                App.watch_game(a)
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+                App.watch_game(a)
+            return a
+
+        a = run('[host] log: x\n[host] perf: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; the exit code of its last run is '
+                                          'not known')
+        self.assertEqual(a.message, '')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn('[launcher] the game ended with code unknown (the game had restarted itself;', text)
+        self.assertNotIn('code 0', text)
+        a = run('[host] log: x\nFATAL: fs: another copy of the game is running\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: fs: another '
+                                          'copy of the game is running')
+        self.assertIn("A copy started by the game's Restart ended with a fatal error: fs: another copy", a.message)
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))   # the FATAL line says it already
 
     def test_the_games_settings_file_is_left_alone_while_it_runs(self):
         """The game writes nx2navi.ini when a menu setting changes, so the launcher's Discord Status switch (the one
@@ -5108,22 +5339,188 @@ class WhilePlayingTest(Tmp):
         self.assertEqual(gameini.get(game, 'MODS_DISABLED'), '')
         self.assertIn('Quit the game first', a.mods_message)
 
-    def ended(self, code, log_text):
-        """watch_game after the game ended with code, its log holding log_text; (the stand-in window, the log)."""
-        from launcher.ui.app import App
+    def ended(self, code, log_text, started=None):
+        """watch_game after the game ended with code, its log holding log_text; started is the time Play started it,
+        a minute ago unless given; (the stand-in window, the log)."""
+        from launcher.ui.app import App, GameRun
         log = self.tmp / 'logs' / 'nx2navi.log'
         log.parent.mkdir(exist_ok=True)
         if log_text is not None:
             log.write_text(log_text, encoding='utf-8')
         a = mock.MagicMock()
+        a.message = ''
         a.settings = {'game_dir': str(self.tmp)}
         a.game_dir.return_value = str(self.tmp)
-        a.game_proc = mock.MagicMock(returncode=code)
-        a.game_proc.poll.return_value = code
+        proc = mock.MagicMock(returncode=code)
+        proc.poll.return_value = code
+        a.game_run = GameRun(proc, str(self.tmp), time.time() - 60 if started is None else started)
         a.install_staged.return_value = False
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         return a, log
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows processes')
+    def test_a_game_copy_is_found_by_its_exe_file(self):
+        """winsys.game_copy finds a running process by its image file, not by its name, and reads the code it ended
+        with after it ended. A sleeper compiled here stands in for the game, under a name that no game runner
+        watches."""
+        mine, other = self.tmp / 'mine' / 'sleeper.exe', self.tmp / 'other' / 'sleeper.exe'
+        if not compiled_sleeper(mine, 4000, 72):
+            self.skipTest('needs a C compiler')
+        other.parent.mkdir()
+        shutil.copy(mine, other)
+        proc = winsys.start_game(mine)
+        try:
+            copy = winsys.game_copy(mine)
+            self.assertIsNotNone(copy)
+            self.assertEqual(copy.pid, proc.pid)
+            self.assertIsNone(copy.poll())
+            self.assertIsNone(winsys.game_copy(mine, skip=proc.pid))
+            self.assertIsNone(winsys.game_copy(other))          # the same name in another folder: another install
+            upper = winsys.game_copy(Path(str(mine).upper()))   # Windows paths ignore case
+            self.assertEqual(upper.pid, proc.pid)
+            proc.wait(30)
+            self.assertEqual(upper.poll(), 72)
+            self.assertEqual(copy.poll(), 72)
+            self.assertTrue(copy.ended)
+            self.assertIsNone(copy.handle)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+
+    def test_a_lost_device_shows_the_games_fatal_line(self):
+        """Exit code 72 (runtime/vk_device.c vk_device_lost_check) follows a FATAL line as 70 and 71 do; when its
+        watchdog ended the run before that line, the code's own text says what happened."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        fatal = 'vk: the GPU device was lost (seen at: q). The run ends here'
+        a, log = self.ended(72, f'[host] x\nFATAL: {fatal}\n[host] fatal: memory commit: this process 9000 MB\n')
+        self.assertEqual(a.message, f'The game ended with a fatal error (code 72): {fatal}. Its log is '
+                                    'logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with(f'the game ended with code 72; its log says: FATAL: {fatal}')
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertTrue(app.exit_code_text(72).startswith('72 (the graphics device was lost'))
+        a, _ = self.ended(72, '[host] vk: device fault: none\n')
+        self.assertIn('The game ended with code 72 (the graphics device was lost', a.message)
+
+    def test_a_fatal_line_after_code_0_is_the_restarted_copys(self):
+        """No process of the game writes a FATAL line and exits with 0: after code 0 such a line is a copy's that the
+        game's Restart started and that ended before the launcher saw it, and the player is told. A log older than
+        the start is an earlier run's and tells nothing."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] x\nFATAL: vk: the GPU device was lost (seen at: x)\n')
+        self.assertEqual(a.message, "A copy started by the game's Restart ended with a fatal error: vk: the GPU device "
+                                    'was lost (seen at: x). Its log is logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: vk: the GPU '
+                                          'device was lost (seen at: x)')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        old = time.time() - 3600
+        log.write_text('FATAL: an earlier run started without the launcher\n', encoding='utf-8')
+        os.utime(log, (old, old))
+        a, _ = self.ended(0, None, started=time.time())
+        self.assertEqual(a.message, '')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+
+    def test_a_log_cut_at_its_cap_says_nothing_of_its_end(self):
+        """A log that reached its 64 MiB cap (runtime/main.c log_sink) wrote its end lines to stderr only: it is
+        not taken for a run without its own end."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] perf: x\n[host] log: the file reached 64 MiB, the rest of this run goes to '
+                               'stderr only\n')
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+
+    def play_from_steam(self, code, log_text, lock_held=False):
+        """play_only (--play, the Steam shortcut) for a game that ends with code, its log then holding log_text, with
+        the launcher folder's lock held by another process when lock_held; (the context, the stand-in for tell, the
+        log). self.start_game is the stand-in for winsys.start_game."""
+        from launcher.ui import app
+        (self.tmp / 'ocarina.exe').write_bytes(b'MZ')
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir(exist_ok=True)
+        log.write_text(log_text, encoding='utf-8')
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp)}
+        ctx.layout = self.layout
+        proc = mock.MagicMock(returncode=code, pid=5)
+        proc.poll.return_value = code
+        told = []
+
+        def tell(text):   # what the logs hold when the box comes, which waits for OK
+            told.append((text, log.read_text(encoding='utf-8'), list(ctx.log.call_args_list)))
+        held = mock.patch('launcher.ui.app.locks.FileLock', side_effect=locks.Busy('the launcher window is using x')) \
+            if lock_held else contextlib.nullcontext()
+        with mock.patch('launcher.ui.app.winsys.start_game', return_value=proc) as self.start_game, \
+                mock.patch('launcher.ui.app.saves.game_running', return_value=False), \
+                mock.patch('launcher.ui.app.mods.prepare', return_value=[]), \
+                mock.patch('launcher.ui.app.build.can_rebuild', return_value=False), \
+                mock.patch('launcher.ui.app.time.sleep'), \
+                mock.patch('launcher.ui.app.tell', side_effect=tell), held:
+            self.assertEqual(app.play_only(ctx), 0)
+        return ctx, told, log
+
+    def test_play_from_steam_waits_for_a_job_in_the_game_folder(self):
+        """The Steam shortcut does not start the game while the window or a command runs a job in the game folder
+        (another process holds the launcher folder's lock, and the job's marker is there): the game would be the build
+        the job replaces. A marker that a stopped launcher left, with the lock free, stops nothing, nor does the window
+        open without a job."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        marker = self.layout.data / jobs.MARKER
+        marker.write_text(json.dumps({'task': 'the rebuild of the game', 'kind': 'rebuild'}), encoding='utf-8')
+        ctx, told, _ = self.play_from_steam(0, '[host] x\n', lock_held=True)
+        self.start_game.assert_not_called()
+        self.assertEqual([t[0] for t in told],
+                         ['NX2navi is busy with the rebuild of the game. Start the game when it is done.'])
+        ctx.log.assert_called_once_with('play from Steam: not started: the launcher is busy with the rebuild of the '
+                                        'game')
+        self.assertTrue(marker.is_file())                              # the job's marker stays
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n')
+        self.start_game.assert_called_once()                          # the lock is free: the marker is a leftover
+        self.assertEqual(told, [])
+        marker.unlink()
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n', lock_held=True)
+        self.start_game.assert_called_once()                          # the window is open, with no job
+        self.assertEqual(told, [])
+
+    def test_an_end_of_a_game_started_from_steam_is_told(self):
+        """The Steam shortcut's game ends as Play's does: launcher.log and the game's log say how, and an end worth it
+        (a FATAL line, 70, 71 or 72, a Windows status) gets a message box, as no window shows it."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        ctx, told, log = self.play_from_steam(70, '[host] x\nFATAL: fs: another copy of the game is running\n')
+        self.assertEqual(len(told), 1)
+        text, game_log, calls = told[0]
+        self.assertEqual(text, 'The game ended with a fatal error (code 70): fs: another copy of the game is running. '
+                               'Its log is logs\\nx2navi.log in the game folder.')
+        self.assertIn('[launcher] the game ended with code 70', game_log)
+        self.assertIn(mock.call('play from Steam: the game ended with code 70; its log says: FATAL: fs: another copy '
+                                'of the game is running'), calls)
+        _, told, _ = self.play_from_steam(0xC0000005, '[host] x\n')
+        self.assertEqual([t[0] for t in told], ['The game ended with code 0xC0000005 (access violation). Its log is '
+                                                'logs\\nx2navi.log in the game folder.'])
+        ctx, told, log = self.play_from_steam(0, '[host] x\n[host] gfx: window closed; exiting\n')
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 0')
+        ctx, told, log = self.play_from_steam(1, '[host] perf: the last line\n')   # Task Manager's End task
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 1')
+        self.assertIn('[launcher] the game ended with code 1 at', log.read_text(encoding='utf-8'))
 
     def test_a_fatal_exit_shows_the_games_fatal_line(self):
         """Exit codes 70 and 71 follow a FATAL line in the game's log: the home screen and launcher.log name it."""
@@ -5155,6 +5552,30 @@ class WhilePlayingTest(Tmp):
         log.unlink()
         self.assertEqual(app.last_fatal(self.tmp), '')
         self.assertEqual(app.last_fatal(''), '')
+
+    def test_an_end_with_code_0_is_logged_and_noted_without_the_games_exit_line(self):
+        """A run ended with code 0 goes into launcher.log; when the game's log has no line of the game's own end (the
+        window's close, its ExitProcess, a FATAL line), the end is noted in that log too."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] log: x\n[host] gfx: window closed; exiting\n[host] perf: after it\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        a, log = self.ended(0, '[host] log: x\n[host] perf: frame 39660: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0, and its log has no line of its own end')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn("[launcher] the game ended with code 0 (the log has no line of the game's own end", text)
+        self.assertIs(app.log_has_own_exit(self.tmp), False)   # the note ends the search for the next run
+        log.write_text('FATAL: x\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.write_text('[host] guest ExitProcess at main+0x10; exiting\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.unlink()
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a, _ = self.ended(0, None)   # no log: logged as an end with code 0, nothing noted
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
 
     def test_the_fatal_line_is_looked_for_in_the_logs_end(self):
         try:
@@ -5637,6 +6058,18 @@ class ModsTest(Tmp):
         self.assertEqual(self.mods.code_waiting(self.game), [])          # the last build took it up
         cheat.write_text('[Moon jump]\n04000000 00000000 D65F03C0\n')
         self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])  # edited since
+
+    def test_code_cheats_take_mains_base_from_the_layout(self):
+        """recomp/layout.py alone decides the modules' bases: tools/cheats.py decodes main's pc-relative code at the
+        base the layout gives main, the first module of its order, and follows it when it changes."""
+        import importlib
+        import cheats
+        import layout
+        self.assertEqual(layout.ORDER[0], 'main')
+        self.assertEqual(cheats.BASE, layout.FIRST_BASE)
+        self.addCleanup(importlib.reload, cheats)
+        with mock.patch.object(layout, 'FIRST_BASE', 0x7100000000):
+            self.assertEqual(importlib.reload(cheats).BASE, 0x7100000000)
 
     def test_the_mods_code_is_in_the_lift_key_and_not_the_shaders_key(self):
         import make_game

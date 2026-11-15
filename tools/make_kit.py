@@ -13,7 +13,9 @@ or --dlss; not with --no-dlss), DLSS Frame Generation in bin/dlssg/ with --dlssg
 tools/build_dlssg.py beside NVIDIA Streamline's runtime, tools/streamline_pin.py: downloaded from NVIDIA's Streamline
 SDK release and checked, or --streamline), AMD's FSR 3.1 library with --ffx, its two FSR 4 libraries with --ffx4, the
 button art with --prompt-art, and README-BuildKit.md; no game code, data or anything generated from the game.
-check_content runs over the folder before it is zipped.
+check_content runs over the folder before it is zipped. The --xlate folder must hold a translator built from this
+checkout's sources (tools/build_xlate.py check_built), and the --dlssg DLL must export every function
+runtime/dlssg/nx2_sl.h declares (tools/build_dlssg.py check); the script stops first if not.
 
 --prompt-art names folders that hold XGamepad, P5Gamepad and Keyboard_Mouse, or those three folders themselves: the
 pictures tools/pad_prompts.py reads go into the kit's prompt-art folder (tools/prompt_art.py art_files), and
@@ -72,12 +74,19 @@ def main():
     ap.add_argument('--zip', action='store_true')
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / 'tools'))
+    import build_dlssg
     import build_shaders
+    import build_xlate
     import dlss_pin
     import prompt_art
     import streamline_pin
     if a.streamline and not a.dlssg:
         sys.exit('--streamline goes with --dlssg')
+    reason = build_xlate.check_built(a.xlate, 'nx2navi_xlate.exe')   # the translator of this checkout's sources
+    if reason:
+        sys.exit(reason)
+    if a.dlssg:   # a DLL older than runtime/dlssg/nx2_sl.h would leave features out at run time without an error
+        build_dlssg.check(a.dlssg)
     if a.prompt_art:
         prompt_art.art_files(a.prompt_art)   # the art is all there before anything is downloaded
     dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, ROOT / 'build' / 'dl')

@@ -267,7 +267,7 @@ static void frame_begin(uint64_t id, int at_input) {
         uint64_t p0 = perf_begin();
         if (L.kind == LL_NV) nv_sleep();
         else STORE(&L.staged[id % RING], id), amd_stage(VK_ANTI_LAG_STAGE_INPUT_AMD, id);
-        perf_end(PERF_PACE, p0);
+        perf_end_any(PERF_PACE, p0);   // the acquiring thread may not be the one that presents
         kern_core_back(&away);
         __atomic_add_fetch(&L.sleep_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
         __atomic_add_fetch(&L.n_sleep, 1, __ATOMIC_RELAXED);

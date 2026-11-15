@@ -42,9 +42,11 @@ PFun_slDLSSGGetState *p_dlssg_state;
 PFun_slPCLSetMarker *p_marker;
 PFun_slReflexSetOptions *p_reflex;
 PFun_slReflexSleep *p_sleep;
+PFun_slReflexGetState *p_reflex_state;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
 int g_available = -1;
+int g_low_latency = -1;              // Reflex's low-latency sleep on this GPU and driver (ReflexState), -1 not asked
 int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
 std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
 uint64_t g_presented, g_shown;
@@ -66,6 +68,17 @@ void sl_log(sl::LogType type, const char *msg) {
 }
 
 template <class T> T *proc(const char *name) { return reinterpret_cast<T *>(GetProcAddress(g_mod, name)); }
+
+// Whether Reflex's sleep runs on this GPU and driver: Streamline takes a frame limit without it and then sets nothing
+// (its slReflexSetOptions hands the limit to the driver only with the low-latency sleep available). Asked until
+// Streamline answers, from nx2sl_available and nx2sl_reflex2 (nx2sl_reflex too, which an older runtime calls), which
+// the runtime calls on the device's thread before any present or under its present lock (vk_dlssg.c reflex_apply),
+// never two at once: slReflexGetState is not thread safe.
+void reflex_state() {
+    static sl::ReflexState rs;
+    if (g_low_latency < 0 && p_reflex_state && p_reflex_state(rs) == sl::Result::eOk)
+        g_low_latency = rs.lowLatencyAvailable ? 1 : 0;
+}
 
 // The token of frame n. Tokens come from a small ring Streamline reuses, so each call takes its own right before use.
 sl::FrameToken *token(uint32_t frame) {
@@ -146,6 +159,8 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     if (p_feature(sl::kFeaturePCL, "slPCLSetMarker", f) == sl::Result::eOk) p_marker = (PFun_slPCLSetMarker *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSetOptions", f) == sl::Result::eOk) p_reflex = (PFun_slReflexSetOptions *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSleep", f) == sl::Result::eOk) p_sleep = (PFun_slReflexSleep *)f;
+    if (p_feature(sl::kFeatureReflex, "slReflexGetState", f) == sl::Result::eOk) p_reflex_state = (PFun_slReflexGetState *)f;
+    reflex_state();
     if (!p_dlssg_options || !p_marker) g_available = 0;
     // How many frames this GPU and driver generate per rendered frame: known once the device exists (else after the
     // first presents, nx2sl_present_marker)
@@ -168,16 +183,29 @@ extern "C" NX2SL_API void nx2sl_log_unavailable(VkPhysicalDevice physical) {
     say("dlssg: Streamline's support check for frame generation: %s (%d)", sl::getResultAsStr(r), (int)r);
 }
 
-// Streamline sets Reflex's mode on the swapchain it was told of last (VK_NV_low_latency2) and drops it while there is
-// none, so it is set again after each swapchain.
-extern "C" NX2SL_API void nx2sl_reflex(int mode) {
-    if (g_available != 1 || !p_reflex) return;
+// Streamline sets Reflex's mode and frame limit on the swapchain it was told of last (VK_NV_low_latency2, the sleep
+// mode's minimum interval) and drops them while there is none, so both are set again after each swapchain. Every call
+// carries both: a call without the limit clears it. 1 when Streamline took them, unless Streamline said Reflex's sleep
+// does not run here (then nothing would hold the limit). Where it has not said, the runtime's own check of the frames
+// (dlssg_pace.h) finds a limit nothing holds.
+extern "C" NX2SL_API int nx2sl_reflex2(int mode, uint32_t frame_limit_us) {
+    if (g_available != 1 || !p_reflex) return 0;
+    reflex_state();
     sl::ReflexOptions o{};
     o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
+    o.frameLimitUs = frame_limit_us;
     sl::Result r = p_reflex(o);
     static int n;
-    if (n++ < 8) say("dlssg: Reflex low-latency mode %s (%d)", mode == 2 ? "on with boost" : mode ? "on" : "off", (int)r);
+    if (n++ < 8 || (r != sl::Result::eOk && n < 40)) {   // the first calls, and later ones Streamline refused
+        char limit[48] = "no frame limit";
+        if (frame_limit_us) snprintf(limit, sizeof limit, "frame limit %.3f ms", frame_limit_us / 1000.0);
+        say("dlssg: Reflex low-latency mode %s, %s (%d)", mode == 2 ? "on with boost" : mode ? "on" : "off", limit, (int)r);
+    }
+    return r == sl::Result::eOk && (!frame_limit_us || g_low_latency != 0);
 }
+
+// The runtime before nx2sl_reflex2: the mode alone, no frame limit.
+extern "C" NX2SL_API void nx2sl_reflex(int mode) { nx2sl_reflex2(mode, 0); }
 
 // The game's simulation and its recording of the frame's commands are one span here: the guest's threads cannot be
 // told apart, so the simulation markers sit at the frame's start and the render submission runs until the frame's
@@ -209,6 +237,26 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
     uint32_t max = g_max.load();
     int n = enable > 0 ? enable : 0;
     if (n > (int)(max ? max : 1)) n = (int)(max ? max : 1);
+    static sl::Constants last;   // the constants of the last frame that had its inputs
+    static bool have_last;
+    if (n && !(depth && mv && cam) && have_last) {
+        // Generation is on for this present and the frame has no depth, motion vectors or camera: a menu, a fade or a
+        // load, while vk_dlssg.c holds the change of state for a few frames. Streamline's guide asks for the common
+        // constants at every frame and for null tags wherever depth or motion vectors are not valid
+        // (ProgrammingGuideDLSS_G.md 5.2 and 7.0). This frame gave neither, and Streamline logged "Unable to find
+        // 'common' constants for frame" and "Failed to find global tag 'kBufferTypeDepth'" and went on with what the
+        // frame before had set. It gets the last frame's constants again, as a new start, and the three tags as null.
+        sl::Constants c = last;
+        c.reset = sl::Boolean::eTrue;
+        p_constants(c, *t, vp);
+        sl::ResourceTag none[3] = {sl::ResourceTag(nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent),
+                                   sl::ResourceTag(nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent),
+                                   sl::ResourceTag(nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent)};
+        if ((t = token(frame))) p_tag(*t, vp, none, 3, (sl::CommandBuffer *)cb);
+        static int said;
+        if (!said++) say("dlssg: a frame without depth and motion vectors while generation is on gets the last constants "
+                         "as a new start and null tags");
+    }
     if (n && depth && mv && cam) {
         sl::Constants c{};
         matrix(c.cameraViewToClip, cam->view_to_clip);
@@ -231,6 +279,7 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         c.motionVectors3D = sl::Boolean::eFalse;
         c.reset = cam->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         p_constants(c, *t, vp);
+        last = c, have_last = true;
         sl::Resource rd = resource(depth), rm = resource(mv), rh = hudless ? resource(hudless) : sl::Resource{};
         sl::Extent ed{0, 0, depth->width, depth->height}, em{0, 0, mv->width, mv->height};
         sl::Extent eh{0, 0, hudless ? hudless->width : 0, hudless ? hudless->height : 0};

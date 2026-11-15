@@ -214,6 +214,99 @@ def start_game(exe):
                             stderr=subprocess.DEVNULL, close_fds=True, **flags)
 
 
+SYNCHRONIZE = 0x00100000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+WAIT_TIMEOUT = 0x102
+
+
+_k32 = None
+
+
+def _kernel32():
+    global _k32
+    if _k32:
+        return _k32
+    k = ctypes.WinDLL('kernel32')
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    k.WaitForSingleObject.restype = ctypes.c_ulong
+    k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    k.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p,
+                                             ctypes.POINTER(ctypes.c_ulong)]
+    k.K32EnumProcesses.argtypes = [ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    _k32 = k
+    return k
+
+
+class GameCopy:
+    """A process of the game this launcher did not start, held by a handle so that its exit code can still be read
+    once it has ended (game_copy). poll(), returncode and pid as subprocess.Popen has them; ended is True once it has
+    ended, also when its code could not be read (returncode then stays None)."""
+
+    def __init__(self, handle, pid):
+        self.handle, self.pid, self.returncode, self.ended = handle, pid, None, False
+
+    def poll(self):
+        if self.handle:
+            k = _kernel32()
+            if k.WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT:
+                return None
+            code = ctypes.c_ulong()
+            if k.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+                self.returncode = code.value
+            k.CloseHandle(self.handle)
+            self.handle, self.ended = None, True
+        return self.returncode
+
+
+def game_copy(exe, skip=None):
+    """Windows: the running process whose image is the file exe, other than the process id skip, as a GameCopy; None
+    when there is none or it cannot be opened. The game's own Restart (runtime/gfx_present.c gfx_window_closed) starts
+    the exe again (runtime/platform/win32.c plat_restart) and ends the process before it with code 0: following the
+    copy is how the launcher learns the code the game really ended with. The image is compared as a file, not as a
+    name, so the game of another install is not taken for this one."""
+    if os.name != 'nt':
+        return None
+    try:
+        k = _kernel32()
+        n = 1024
+        while True:
+            pids, got = (ctypes.c_ulong * n)(), ctypes.c_ulong()
+            if not k.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(got)):
+                return None
+            if got.value < ctypes.sizeof(pids):
+                break
+            n *= 4
+        want = os.path.normcase(os.path.abspath(str(exe)))
+        name = ctypes.create_unicode_buffer(32768)
+        for pid in pids[:got.value // ctypes.sizeof(ctypes.c_ulong)]:
+            if not pid or pid == skip:
+                continue
+            h = k.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            size = ctypes.c_ulong(len(name))
+            image = name.value if k.QueryFullProcessImageNameW(h, 0, name, ctypes.byref(size)) else ''
+            if (image and os.path.basename(os.path.normcase(image)) == os.path.basename(want)
+                    and _same_file(image, want) and k.WaitForSingleObject(h, 0) == WAIT_TIMEOUT):
+                return GameCopy(h, pid)
+            k.CloseHandle(h)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def _same_file(a, b):
+    if os.path.normcase(a) == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def start_detached(cmd, cwd=None):
     flags = {'creationflags': DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' \
         else {'start_new_session': True}

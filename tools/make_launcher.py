@@ -26,7 +26,8 @@ The release folder (--out) holds:
                                   bin/dlssg/ with --dlssg (DLSS Frame Generation: nx2navi_dlssg.dll, Streamline's
                                   runtime DLLs and nvngx_dlssg.dll at the version tools/streamline_pin.py pins,
                                   downloaded from NVIDIA's Streamline SDK release and checked, or --streamline; their
-                                  licences and a notice),
+                                  licences and a notice; the release stops first on a DLL that lacks an export
+                                  runtime/dlssg/nx2_sl.h declares, tools/build_dlssg.py check),
                                   lib/libnx2navirt.a (the runtime, prebuilt with the release's compiler),
                                   data/pgo-v111.profdata and .json with --pgo (the execution profile make_game.py
                                   compiles the lifted code and the runtime with, the prebuilt runtime included, and
@@ -188,6 +189,38 @@ def build_python(py):
 
 # ---------------------------------------------------------------- app/<version>/
 
+def check_xlate(xlate):
+    """A release carries the translator of its own sources. 0.10.0 and 0.10.1 shipped the 0.9.2 translator (identity
+    4d051299) after tools/xlate/Program.cs had raised the texture pool to 40960 slots, so their translations still
+    clamped every pool handle to slot 32767 and the ground went see-through after some area loads (issues #569 and
+    #824). A missing translator, or one whose nx2navi_xlate.id differs from this checkout's sources
+    (build_xlate.check_built), stops the build; main runs this before anything is resolved, downloaded or deleted.
+    On Windows the exe itself is asked too, as the .id says nothing of the exe beside it: a translator that declares
+    the texture pool with another length than its sources, or does not run, stops the build (xlate_smoke.pool_check)."""
+    import build_xlate
+    reason = build_xlate.check_built(xlate, 'nx2navi_xlate.exe')
+    if reason:
+        sys.exit(reason)
+    if os.name == 'nt':
+        import xlate_smoke
+        reason = xlate_smoke.pool_check(xlate / 'nx2navi_xlate.exe')
+        if reason:
+            sys.exit(f'{xlate / "nx2navi_xlate.exe"}: {reason}')
+    have = (xlate / 'nx2navi_xlate.id').read_text(encoding='ascii').strip()
+    print(f'translator identity {have[:16]}: built from this checkout\'s sources')
+
+
+def check_dlssg(dll):
+    """A release carries an nx2navi_dlssg.dll that exports every function runtime/dlssg/nx2_sl.h declares. The runtime
+    takes a missing optional export (nx2sl_reflex2, nx2sl_frames_max) for an older DLL and leaves that feature out
+    with one log line, so a DLL built from older sources would ship without an error: with the DLL of 0.8.0, which
+    lacks nx2sl_reflex2, Reflex would never hold the frame limit. Such a DLL, or a missing one, stops the build
+    (build_dlssg.check); main runs this before anything is resolved, downloaded or deleted."""
+    import build_dlssg
+    build_dlssg.check(dll)
+    print(f'{dll}: exports the {len(build_dlssg.declared_exports())} functions runtime/dlssg/nx2_sl.h declares')
+
+
 def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None, pipelines=None, ffx4=None,
               pgo_profile=None):
     # The runtime's own shaders are source in the repository and SPIR-V headers in a release: a player's PC compiles
@@ -204,9 +237,7 @@ def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, d
             shutil.copy2(ROOT / t, app / t)
     (app / 'VERSION').write_text(ver + '\n', encoding='utf-8')
     (app / 'bin').mkdir()
-    for n in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
-        if not (xlate / n).is_file():
-            sys.exit(f'{xlate / n} is missing: build the shader translator first (tools/build_xlate.py)')
+    for n in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):   # main checked them first (check_xlate)
         shutil.copy2(xlate / n, app / 'bin' / n)
     if ffx:   # FSR 3.1 loads it from beside the game (runtime/vk_ffx.cpp); make_game.py copies it there
         shutil.copy2(ffx, app / 'bin' / 'amd_fidelityfx_vk.dll')
@@ -384,6 +415,9 @@ def main():
         prompt_art.art_files(a.prompt_art)   # the art is all there before anything is downloaded or built
     if a.pgo:
         pgo.fitting(a.pgo)   # the profile fits this checkout's recomp/ before anything is downloaded or built
+    check_xlate(a.xlate)   # the translator is this checkout's before anything is downloaded, built or deleted
+    if a.dlssg:
+        check_dlssg(a.dlssg)   # and so is nx2navi_dlssg.dll
     out = a.out
     shutil.rmtree(out, ignore_errors=True)
     folder = out / 'NX2navi'

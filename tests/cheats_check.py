@@ -15,7 +15,8 @@ def main():
     env = dict(os.environ)
     env['PATH'] = str(Path(cc).parent) + os.pathsep + env.get('PATH', '')
     subprocess.run([cc, '-O2', '-Wall', '-Wextra', '-Wno-unused-function', '-ffunction-sections', '-fdata-sections',
-                    '-I', str(ROOT / 'runtime'), str(ROOT / 'tests/cheats_check.c'), str(ROOT / 'tests/cheats_stubs.c'),
+                    '-I', str(ROOT / 'runtime'), '-I', str(Path(cc).resolve().parents[1] / 'include' / 'vma'),
+                    str(ROOT / 'tests/cheats_check.c'), str(ROOT / 'tests/cheats_stubs.c'),
                     '-Wl,--gc-sections', '-o', str(exe), '-lm'], env=env, check=True)
     subprocess.run([str(exe)], env=env, check=True)
 

@@ -33,7 +33,7 @@ def main():
         alternatives = table.sites['main'][site]
         assert len(alternatives) == 1
         key, replacement, original = alternatives[0]
-        assert table.sets[key] == ('ostep', 'NX2NAVI_OCARINA_REALTIME', 1)
+        assert table.sets[key] == ('omovie', 'NX2NAVI_MOVIE_PTS', 1)
         assert original == 0xb942fa88
         words.append(replacement)
     assert words[0] == words[1]

@@ -66,6 +66,8 @@ int fs_save_busy(void);                                    // a save is being wr
                                                            // or save data changed in the last 3 s and not committed
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends
+void fs_save_wait(void);                                   // wait for a save Commit under way, refusing none later
+                                                           // (the orderly end's first step, gfx_present.c rt_exit_steps)
 // A shared save (save_share.c). fs_save_export: visit(ctx, path below the save with '/', bytes, size) for every file of
 // the save the game would load next, under the commit lock; visit returns 0 to fail. The number of files (0: no save
 // yet), -1 when one could not be read or visit failed.

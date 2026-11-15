@@ -62,8 +62,17 @@ unsigned rt_trace;
 // `2> file` keep their own file. Each start moves the earlier logs to nx2navi.1.log .. nx2navi.4.log. A file stops at 64 MiB
 // (NX2NAVI_TRACE can write that much). Lines from before log_open wait in a static buffer: mem_init runs first so that
 // nothing else lands in the guest address space, and an earlier open would put the CRT's heap there.
+// The end of the run still reaches a file past its cap: once the process is ending (rt_log_ending at the start of an
+// orderly end, gfx_present.c rt_exit_begin, of the frame-time summary, perf.c perf_summary_flush, of a fatal error,
+// dispatch.c fatal_end, of the crash report, crash_handler, of the lost device's watchdog, vk_device.c lost_wait_exit,
+// and in plat_exit, log_sync_ending), up to LOG_END_RESERVE more bytes are written, counted on their own. A
+// trace = perf session reaches the cap in about 90 minutes, and every line after it, the exit summary, "frametime:
+// exit", the stutter map and FATAL lines included, went to stderr only, which a game started from the launcher or
+// Explorer does not keep. rt_log_sync alone does not open the reserve: a bug capture calls it in play
+// (bugcap.c write_log_tail), and the play's lines after it would fill the reserve before the end came.
 #define LOG_KEEP 5
 #define LOG_CAP (64ull << 20)
+#define LOG_END_RESERVE (4ull << 20)
 enum { LOG_EARLY, LOG_FILE, LOG_OFF };
 static int g_log_state;
 static PlatAppend *g_log_file;
@@ -72,10 +81,14 @@ static char g_log_early[32768];
 static size_t g_log_early_n;
 static uint64_t g_log_bytes;
 
-// stderr's writes (log_sink). g_log_final: rt_log_sync has run, so the process is ending: an exit, a fatal error or a
-// crash report.
+// stderr's writes (log_sink). g_log_final: rt_log_sync has run: an exit, a fatal error, a crash report or a bug
+// capture (bugcap.c).
 static PlatMutex g_err_lock = PLAT_MUTEX_INIT;
 static volatile int32_t g_log_final;
+static volatile int32_t g_log_ending;   // rt_log_ending ran: the process is ending
+static uint64_t g_log_tail;             // bytes of the end the file was given past LOG_CAP
+
+void rt_log_ending(void) { __atomic_store_n(&g_log_ending, 1, __ATOMIC_RELEASE); }
 
 // The log's destinations: the file first, then stderr. logq.c calls it: from the log thread in a game run, else from
 // the thread that logs. A write to stderr can block for as long as its reader likes: a console window holds every write
@@ -89,9 +102,21 @@ static void log_sink(const char *p, size_t n) {
         uint64_t at = __atomic_fetch_add(&g_log_bytes, n, __ATOMIC_RELAXED);
         if (at + n <= LOG_CAP) {
             plat_append_write(g_log_file, p, n);
-        } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
-            static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
-            plat_append_write(g_log_file, cut, sizeof cut - 1);
+        } else {
+            if (at <= LOG_CAP) {   // the first write past the cap says so, once
+                static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only, "
+                                          "but for the lines of its end\n";
+                plat_append_write(g_log_file, cut, sizeof cut - 1);
+            }
+            if (__atomic_load_n(&g_log_ending, __ATOMIC_ACQUIRE)) {
+                uint64_t t = __atomic_fetch_add(&g_log_tail, n, __ATOMIC_RELAXED);
+                if (!t) {
+                    static const char end[] = "[host] log: the end of the run follows; the lines between the cap and it "
+                                              "were not written to this file\n";
+                    plat_append_write(g_log_file, end, sizeof end - 1);
+                }
+                if (t + n <= LOG_END_RESERVE) plat_append_write(g_log_file, p, n);
+            }
         }
     }
     // without the file stderr is the log (run_game.py, `2> file`), and it is waited for
@@ -109,12 +134,26 @@ void rt_log_sync(void) {
     logq_sync();
 }
 
+// plat_exit's first step in a game run (plat_exit_hook): the process ends here, so its last lines reach the file.
+static void log_sync_ending(void) {
+    rt_log_ending();
+    rt_log_sync();
+}
+
 // The console window was closed, or Ctrl+C or Ctrl+Break pressed in it (platform.h plat_console_setup): the end of a
 // closed game window, which writes the settings, the caches and the saves and logs the exit (gfx_present.c
 // gfx_window_closed). Left to Windows, a closed console ended the process with nothing saved.
 static void console_closed(const char *what) {
     rt_log("console: %s; the game ends as when its window is closed", what);
     gfx_window_closed();
+}
+
+// The window lost the focus (gfx_present.c gfx_window_focus_changed): a process ended from outside soon after lost the
+// lines the log thread was still gathering, and both unexplained ends of 2026-11-13 came seconds after one. The log
+// thread writes them at once, and the module list for the note of an ExitProcess is brought up to date.
+void rt_log_focus_lost(void) {
+    logq_nudge();
+    plat_exit_note_modules();
 }
 
 void rt_log_raw(const char *p, size_t n) {
@@ -189,10 +228,14 @@ static void log_open(int game) {
         __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
         rt_log("log: %s", g_log_path);
     }
+    if (game && g_log_file) {   // an ExitProcess nobody of ours asked for leaves a line in the file (platform.h)
+        plat_exit_note_setup(g_log_file, logq_peek);
+        plat_exit_note_modules();
+    }
     // A game run writes its log from the log thread (logq.c), whether the lines go to a log file or to stderr alone.
     const char *e = cfg_get("NX2NAVI_LOG_ASYNC");
     if (!game || (e && !strcmp(e, "0"))) return;
-    plat_exit_hook = rt_log_sync;
+    plat_exit_hook = log_sync_ending;
     if (logq_async()) rt_log("log: lines are written by a thread of their own (NX2NAVI_LOG_ASYNC)");
     else rt_log("log: no log thread; every line is written by the thread that logs it");
 }
@@ -301,13 +344,26 @@ static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
 // capture tool or a post-processing injector, by the words such files carry in their names. A crash inside one is that
 // program's: one report was an access violation in a recorder's layer the moment the present mode changed and the
 // swapchain was made again, another an injector's layer reading a null pointer at the end of every shader
-// preparation.
+// preparation. Vulkan layers are mostly named VkLayer_<name>.dll, and a recorder's Vulkan hook and a driver's capture
+// tool carry names of their own (the words below). The validation layer is left out: the game loads it itself when
+// NX2NAVI_VK_VALIDATION asks.
 static int foreign_hook(const char *module) {
     char low[160];
     size_t n = 0;
     for (; module && module[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)module[n]);
     low[n] = 0;
-    return strstr(low, "vk_layer") || strstr(low, "hook") || strstr(low, "overlay") || strstr(low, "reshade");
+    if (strstr(low, "vklayer_khronos")) return 0;
+    return strstr(low, "vk_layer") || strstr(low, "vklayer") || strstr(low, "hook") || strstr(low, "overlay") ||
+           strstr(low, "reshade") || strstr(low, "obs-vulkan") || strstr(low, "nvspcap");
+}
+
+// What the crash report says of the faulting module. A fault on the thread that hands the frame limit to RivaTuner
+// Statistics Server (rtss_limit.c, the "rtss" thread) is in the game's own calls of RTSS's library or around them,
+// whatever module it is in (the one such crash faulted in ntdll): the note names that and the setting that keeps the
+// game from calling it. On other threads RTSS's library is its overlay, which RTSS put there: foreign_hook's note.
+enum { CRASH_NOTE_NONE, CRASH_NOTE_FOREIGN, CRASH_NOTE_RTSS };
+static int crash_module_note(const char *module, int on_rtss_thread) {
+    return on_rtss_thread ? CRASH_NOTE_RTSS : foreign_hook(module) ? CRASH_NOTE_FOREIGN : CRASH_NOTE_NONE;
 }
 
 // Set when main_run has returned: the mode's work is done and saved, and all that still runs is the C runtime's exit
@@ -321,8 +377,10 @@ static volatile int32_t mode_done;
 static int mode_rc;
 
 static void crash_handler(const PlatCrash *x) {
-    static volatile int32_t busy;
-    if (plat_xchg32(&busy, 1)) plat_exit(71);
+    // shared with the fatal error's end (dispatch.c rt_ending_enter): another thread's fault or fatal error waits there
+    // while this report is written; a fault inside this thread's own report ends the process at once
+    if (!rt_ending_enter(71)) plat_exit(71);
+    rt_log_ending();   // the report reaches the log file past its cap (log_sink)
     if (__atomic_load_n(&mode_done, __ATOMIC_ACQUIRE) && x->module) {
         rt_log("exit: %s (%#x) in %s while the process was ending, after its work was done and saved%s: the run ends "
                "with its own code %d", x->what, x->code, *x->module ? x->module : "code outside every module",
@@ -341,9 +399,16 @@ static void crash_handler(const PlatCrash *x) {
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
     rt_log_raw("\n", 1);
-    if (foreign_hook(x->module))
+    const char *thread = plat_thread_name();
+    int on_rtss = thread && !strcmp(thread, "rtss");
+    int module_note = crash_module_note(x->module, on_rtss);
+    if (module_note == CRASH_NOTE_FOREIGN)
         rt_logf("  %s is not part of the game: a recording, overlay or capture program put it into the game. Close that "
                 "program or turn off its Vulkan capture, then start the game again\n", x->module);
+    else if (module_note == CRASH_NOTE_RTSS)
+        rt_logf("  the fault is on the thread that hands the frame limit to RivaTuner Statistics Server (rtss_limit.c), "
+                "in the game's calls of its library or around them; rtss = 0 in nx2navi.ini keeps the game from calling "
+                "it\n");
     // what the thread was doing (a pipeline build names its shaders): the stderr note crash_veh writes misses the log
     const char *note = plat_crash_context_get();
     if (note) rt_logf("  the thread was %s\n", note);
@@ -377,7 +442,11 @@ static void crash_handler(const PlatCrash *x) {
     rt_fatal_notes();   // the card, its driver and the memory settings in effect (vk_device.c fatal_note)
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
-    rtss_limit_restore();   // after the report: RivaTuner Statistics Server's profile as it was
+    // after the report: RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps
+    // for it in rtss-profile.txt (rtss_limit.c rtss_limit_crash), with no call into RTSS's library from a process that
+    // failed; only where that line could not be written is it put back here, and never from RTSS's own thread
+    rtss_limit_crash();
+    rt_rumble_stop_bounded();   // a controller on HD rumble stops (dispatch.c: 300 ms at most, SDL may be the crash)
     fflush(stderr);
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)
     plat_exit(71);
@@ -646,8 +715,10 @@ static int main_run(int argc, char **argv);
 
 // A game run never comes back here: it ends in plat_exit (boot.c, gfx_present.c). Every other mode returns its code.
 int main(int argc, char **argv) {
+    plat_stack_guarantee();   // a stack overflow on the main thread still gets its crash report (platform.h)
     mode_rc = main_run(argc, argv);
     __atomic_store_n(&mode_done, 1, __ATOMIC_RELEASE);   // from here on only the exit runs (mode_done, above)
+    plat_exit_orderly();   // the C runtime's exit ends the process with ExitProcess: no note of an end nobody asked for
     return mode_rc;
 }
 
@@ -734,6 +805,7 @@ static int main_run(int argc, char **argv) {
         if (plat_console_setup(console_closed))
             rt_log("console: QuickEdit off; closing the console ends the game as its window does");
         mem_start_note(0);   // memory.c: a warning when the machine has less memory free than the game takes
+        hang_watch_start();   // a report in the log when the frames or the GPU stop (hang_watch.c); never in tool modes
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off

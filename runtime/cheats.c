@@ -32,6 +32,7 @@
 #include "mods.h"
 #include "ui_text.h"
 #include "platform/platform.h"
+#include "vk.h"
 
 #ifdef _WIN32
 #define SEP "\\"
@@ -875,8 +876,15 @@ static void rebuild_if_needed(const char *dir) {
         rt_log("cheats: the rebuild did not start; the game starts with the code it has");
         return;
     }
-    prof_write();   // plat_exit runs no atexit handlers
+    // The orderly end's steps a start needs before the guest runs (gfx_present.c rt_exit_steps): no save is mounted
+    // and no menu has run, so the saves and nx2navi.ini have nothing to write. The prewarm builds meanwhile, so its
+    // crash marker and the boot's journal are put away: left in place, the next start took this end for a driver
+    // crash in the boot's builds (vk_pipeline.c pm_skipped, skip_init).
+    if (!rt_exit_begin()) plat_exit(0);
     rtss_limit_restore();
+    vk_pipeline_prewarm_marker_clear();
+    vk_pipeline_boot_abandon();
+    prof_write();   // plat_exit runs no atexit handlers
     plat_exit(0);
 }
 

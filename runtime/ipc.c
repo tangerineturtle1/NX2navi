@@ -83,9 +83,8 @@ static void applet_proxy_handler(IpcSession *s, const IpcRequest *rq, IpcRespons
         IpcSession *root = s->root ? s->root : s;    // object ids belong to the client's whole domain
         IpcSession *o = stub_object(kinds[k].name);
         if (!o) { rs->result = IPC_R_UNKNOWN_COMMAND; return; }
-        o->root = root;
-        if (!ipc_domain_add(root, o)) { free(o); rs->result = IPC_R_UNKNOWN_COMMAND; return; }
-        uint32_t id = (uint32_t)root->nobjects;
+        uint32_t id = ipc_domain_add(root, o);
+        if (!id) { free(o); rs->result = IPC_R_UNKNOWN_COMMAND; return; }
         IPC_OUT(rs, id);
         rs->domain = 1;
         rs->domain_objects = 1;
@@ -155,10 +154,30 @@ static IpcSession *stub_object(const char *name) {
     return o;
 }
 
+// Domain tables, their counts of their objects' references on them and their closed flags (IpcSession). Taken only for
+// sessions in a domain; never held across a handler or a close callback.
+static PlatMutex g_domains = PLAT_MUTEX_INIT;
+static volatile int32_t g_live;
+
+// The first free slot: a closed object's id is given out again, so a client that opens and closes objects in a loop
+// never runs out of the 32.
 unsigned ipc_domain_add(IpcSession *domain, IpcSession *object) {
-    if (domain->nobjects >= (int)(sizeof domain->objects / sizeof *domain->objects)) return 0;
-    domain->objects[domain->nobjects++] = object;
-    return (unsigned)domain->nobjects;
+    unsigned id = 0;
+    plat_mutex_lock(&g_domains);
+    int i = 0, max = (int)(sizeof domain->objects / sizeof *domain->objects);
+    while (i < domain->nobjects && domain->objects[i]) i++;
+    if (!domain->dom_closed && i < max) {
+        domain->objects[i] = object;
+        if (i == domain->nobjects) domain->nobjects++;
+        object->root = domain;
+        object->held_root = domain;
+        plat_inc32(&domain->refs);
+        domain->subs++;
+        plat_inc32(&g_live);   // a live server object from here; its last reference counts it out
+        id = (unsigned)i + 1;
+    }
+    plat_mutex_unlock(&g_domains);
+    return id;
 }
 
 // appletOE: the application-environment service. nn::oe::Initialize opens it; the calls that matter for
@@ -172,9 +191,8 @@ static void applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *
         proxy->name = "applet proxy";
         proxy->handler = applet_proxy_handler;
         proxy->refs = 1;
-        proxy->root = s;
-        if (!ipc_domain_add(s, proxy)) { free(proxy); rs->result = IPC_R_UNKNOWN_COMMAND; return; }
-        uint32_t id = (uint32_t)s->nobjects;   // the object's id inside the domain, written into the reply data
+        uint32_t id = ipc_domain_add(s, proxy);   // the object's id inside the domain, written into the reply data
+        if (!id) { free(proxy); rs->result = IPC_R_UNKNOWN_COMMAND; return; }
         IPC_OUT(rs, id);
         rs->domain = 1;
         rs->domain_objects = 1;
@@ -233,7 +251,6 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"csrng", csrng_handler},
 };
 
-static volatile int32_t g_live;
 static volatile int64_t g_released, g_requests;
 static _Thread_local const Cpu *t_req;   // guest context of the request being served
 
@@ -254,19 +271,49 @@ static uint32_t session_clone(IpcSession *s) {
     return kern_handle_new(KERN_SESSION, s);
 }
 
+// kern_handle_hold's callback: a request's reference, dropped through ipc_handle_closed once the request is answered.
+static void session_hold(void *o) { plat_inc32(&((IpcSession *)o)->refs); }
+
+// Drops one reference on a session; sub: the one an object of a domain held on that domain. A session in no domain
+// takes no lock here. A domain whose remaining references are all its objects' has lost its client: its table lets the
+// objects go, and each object that nothing else holds is closed and lets go of the domain in turn.
+static void session_release(IpcSession *s, int sub) {
+    IpcSession *drop[32];
+    int ndrop = 0;
+    int32_t n;
+    if (!sub && !s->root) {
+        n = plat_dec32(&s->refs);
+    } else {
+        plat_mutex_lock(&g_domains);
+        if (sub) s->subs--;
+        n = plat_dec32(&s->refs);
+        if (n && n == s->subs && s->root == s && !s->dom_closed) {
+            s->dom_closed = 1;
+            for (int i = 0; i < s->nobjects; i++) {
+                if (s->objects[i] && s->objects[i] != s) drop[ndrop++] = s->objects[i];
+                s->objects[i] = NULL;
+            }
+        }
+        plat_mutex_unlock(&g_domains);
+    }
+    for (int i = 0; i < ndrop; i++) session_release(drop[i], 0);
+    if (n) return;
+    if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
+    if (s->close) s->close(s->state);
+    IpcSession *root = s->held_root;
+    free(s);
+    plat_dec32(&g_live);
+    plat_inc64(&g_released);
+    if (root) session_release(root, 1);
+}
+
 void ipc_handle_closed(int kind, void *obj) {
     if (kind == KERN_TMEM) {
         free(obj);
         return;
     }
     if (kind != KERN_SESSION) rt_fatal("ipc_handle_closed: handle kind %d", kind);
-    IpcSession *s = obj;
-    if (plat_dec32(&s->refs)) return;
-    if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
-    if (s->close) s->close(s->state);
-    free(s);
-    plat_dec32(&g_live);
-    plat_inc64(&g_released);
+    session_release(obj, 0);
 }
 
 // ---- helpers for services
@@ -406,15 +453,20 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
 static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
     case 0:   // ConvertCurrentObjectToDomain: the session answers domain-tagged requests from now on
+        plat_mutex_lock(&g_domains);
         s->is_domain = 1;
         s->root = s;
         if (s->nobjects == 0) { s->objects[0] = s; s->nobjects = 1; }
+        plat_mutex_unlock(&g_domains);
         return;
-    case 1: { // CopyFromCurrentDomain(object id): a handle to that object of the domain
+    case 1: { // CopyFromCurrentDomain(object id): a handle to that object of the domain (a closed id is a bad handle)
         uint32_t id = rq->data_size >= 4 ? *(const uint32_t *)(const void *)rq->data : 0;
         if (!id || id > (uint32_t)s->nobjects) { rs->result = IPC_R_UNKNOWN_COMMAND; return; }
+        plat_mutex_lock(&g_domains);
         IpcSession *o = s->objects[id - 1];
-        plat_inc32(&o->refs);
+        if (o) plat_inc32(&o->refs);
+        plat_mutex_unlock(&g_domains);
+        if (!o) { rs->result = IPC_R_BAD_HANDLE; return; }
         rs->move[rs->nmove++] = kern_handle_new(KERN_SESSION, o);
         return;
     }
@@ -436,7 +488,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     IpcResponse rs;
     memset(&rs, 0, sizeof rs);
     int tipc = rq.type >= T_TIPC_BASE;
-    IpcSession *target = s;
+    IpcSession *target = s, *held = NULL;   // held: a domain object the request holds a reference on
     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
     if (tipc) {
         rq.cmd = rq.type - T_TIPC_BASE;
@@ -452,13 +504,31 @@ static void dispatch(IpcSession *s, uint32_t *m) {
             payload += 16;
             rs.domain = 1;
             uint32_t dcmd = dh[0] & 0xff, obj = dh[1];
-            if (dcmd == 2) return;   // CloseVirtualHandle: nothing to answer
+            if (dcmd == 2) {   // CloseVirtualHandle: the object leaves the domain (never the domain's own); no answer
+                IpcSession *o = NULL;
+                plat_mutex_lock(&g_domains);
+                if (obj >= 2 && obj <= (uint32_t)dom->nobjects && dom->objects[obj - 1] != dom) {
+                    o = dom->objects[obj - 1];
+                    dom->objects[obj - 1] = NULL;
+                }
+                plat_mutex_unlock(&g_domains);
+                if (o) session_release(o, 0);
+                return;
+            }
             if (obj == 0) obj = 1;   // this SDK addresses the domain's own object as 0
             if (obj > (uint32_t)dom->nobjects) {
                 ipc_backtrace();
                 rt_fatal("ipc: %s domain object %u (of %d) does not exist [hdr %08x %08x %08x %08x] [msg %08x %08x %08x %08x]", s->name, obj, dom->nobjects, dh[0], dh[1], dh[2], dh[3], m[0], m[1], m[2], m[3]);
             }
-            target = dom->objects[obj - 1];
+            plat_mutex_lock(&g_domains);
+            target = held = dom->objects[obj - 1];
+            if (held) plat_inc32(&held->refs);
+            plat_mutex_unlock(&g_domains);
+            if (!target) {   // an id the client closed
+                rs.result = IPC_R_BAD_HANDLE;
+                respond(m, 0, &rs);
+                return;
+            }
         }
         uint32_t h[4];
         memcpy(h, payload, 16);
@@ -479,6 +549,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     }
     if (rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) control(s, &rq, &rs);
     else target->handler(target, &rq, &rs);
+    if (held) session_release(held, 0);
     if (rt_trace & RT_TRACE_IPC) {
         char d[160];
         rt_log("ipc: %s %s %u -> %#x (copy %u move %u) from %s", s->name,
@@ -529,7 +600,10 @@ int ipc_svc(Cpu *c, uint32_t imm) {
     }
     case 0x21: case 0x22: {   // SendSyncRequest(w0 handle) / WithUserBuffer(x0 buffer, x1 size, w2 handle)
         uint32_t h = (uint32_t)(imm == 0x21 ? x[0] : x[2]);
-        IpcSession *s = kern_handle_get(h, KERN_SESSION);
+        // The request holds a reference on the session until it is answered: a CloseHandle of the session on another
+        // thread meanwhile leaves the object, and its close callback (renderer_close frees the audio renderer the
+        // handler uses), to whichever drops the last reference.
+        IpcSession *s = kern_handle_hold(h, KERN_SESSION, session_hold);
         if (!s) {
             rt_log("ipc: svc %#x on %#x, not a session handle", imm, h);
             x[0] = IPC_R_BAD_HANDLE;
@@ -542,6 +616,7 @@ int ipc_svc(Cpu *c, uint32_t imm) {
         t_req = c;
         dispatch(s, m);
         t_req = outer;
+        ipc_handle_closed(KERN_SESSION, s);   // the request's reference
         x[0] = 0;
         return 1;
     }

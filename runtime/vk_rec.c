@@ -166,15 +166,15 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
         // past it). Keeping objects until their submission completed and ending a part from the recorder
         // (rec_end_cb) fixed the white scene on an RX 6700 XT, but not this: 0.2.8 turned the recorder on for every
         // GPU and the AMD reports came back the same day. NX2NAVI_VK_RECORDER=1 turns it on for an A/B run.
-        // On AMD GPUs without mesh shaders (GCN: RX 400/500, Vega; RDNA 1) it is on with low_end_gpu = 1: every report above is from an
-        // RDNA 2-4 card, and those all have mesh shaders. An RX 580 ran with it and NX2NAVI_REC_CHECK
-        // (no hazards), the replay's part of the game's wait after a frame's first submission 6.9 ms instead of 12.
+        // Up to 0.10.1 the low-end GPU mode turned it on for AMD GPUs without mesh shaders (GCN: RX 400/500, Vega;
+        // RDNA 1): every report above is from an RDNA 2-4 card, and those all have mesh shaders. An RX 580 ran with it
+        // and NX2NAVI_REC_CHECK (no hazards), the replay's part of the game's wait after a frame's first submission
+        // 6.9 ms instead of 12. The mode is gone (cfg.c lowend_set): vk_recorder = 1 turns it on there as anywhere.
         const char *set = cfg_get("NX2NAVI_VK_RECORDER");
-        int amd_off = vk_caps.amd && (vk_ctx()->has_mesh_shader || !rt_knob("LOW_END_GPU", "0"));   // on only with low_end_gpu = 1
+        int amd_off = vk_caps.amd;
         mode = rt_knob("VK_RECORDER", amd_off ? "0" : "1");
         if (!mode && amd_off && !(set && *set))
-            rt_log("vk_rec: no recorder thread on AMD GPUs (NX2NAVI_VK_RECORDER=1 turns it on; low_end_gpu = 1 does on "
-                   "cards without mesh shaders)");
+            rt_log("vk_rec: no recorder thread on AMD GPUs (NX2NAVI_VK_RECORDER=1 turns it on)");
         if (mode) {
             plat_event_init(&wake_ev, 0, 0);
             rec_prio = plat_thread_priority_get();

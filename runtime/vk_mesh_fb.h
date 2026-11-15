@@ -18,6 +18,10 @@ uint64_t vk_meshfb_mesh_words(void);   // the mesh buffer's size as a binding se
 // was too small for. Returns the number of commands recorded in *cmds.
 VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, uint32_t count, int has_task,
                               uint32_t verts, uint32_t slot_words, VkBuffer *rec, int *cmds);
+// For a record whose count came from src (a count the GPU wrote): cuts it to what the buffers hold, in the task dispatch
+// (task_words, the task stage's payload words) or without a task stage (0) in the mesh dispatch and the instances
+// (shaders/meshfb_clamp.comp). Binds its own compute pipeline and set; four commands, between two barriers.
+void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words);
 // The pass between the task and the mesh dispatch (shaders/meshfb_scan.comp): binds its own compute pipeline and set.
 void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, uint32_t fan, uint32_t slot_words, uint32_t verts);
 // After the record is complete (the copies or the scan, and a barrier): keeps what the draw asked for where the host

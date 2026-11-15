@@ -31,10 +31,21 @@ static float delay_tap(const Delay *d, unsigned at) { int i = (int)d->write - (i
 static float allpass(Delay *d, float x, float gain) { float v = x - gain * d->data[d->read]; return delay_update(d, v) + gain * v; }
 static float gain10(float x) { return x >= 0 ? 1 : x <= -5.3f ? 0 : powf(10, x); }
 static float radians(float x) { return x * 3.14159265358979323846f / 180; }
+/* audio_mixer.c asks this before the game's block reaches create or update (and passes the sound through instead), so
+   validate's fatal is an invariant. */
+const char *audio_reverb_invalid(const Reverb3dParam *p) {
+    if (p->channels != 1 && p->channels != 2 && p->channels != 4 && p->channels != 6)
+        return "channel count not 1, 2, 4 or 6";
+    if (p->sample_rate < 1000 || p->sample_rate > 192000) return "sample rate outside 1 to 192 kHz";
+    if (!(p->decay_time > 0) || !(p->hf_decay_ratio > 0)) return "decay time or high-frequency decay ratio not above 0";
+    if (!(p->density >= 0 && p->density <= 100)) return "density outside 0 to 100";
+    if (!(p->reflection_delay >= 0 && p->reverb_delay >= 0 && p->reflection_delay + p->reverb_delay <= .4f))
+        return "reflection and reverb delay outside 0 to 0.4 s together";
+    return NULL;
+}
 static void validate(const Reverb3dParam *p) {
-    if ((p->channels != 1 && p->channels != 2 && p->channels != 4 && p->channels != 6) || p->sample_rate < 1000 || p->sample_rate > 192000 ||
-        !(p->decay_time > 0) || !(p->hf_decay_ratio > 0) || !(p->density >= 0 && p->density <= 100) ||
-        !(p->reflection_delay >= 0 && p->reverb_delay >= 0 && p->reflection_delay + p->reverb_delay <= .4f)) rt_fatal("invalid reverb3d parameters");
+    const char *why = audio_reverb_invalid(p);
+    if (why) rt_fatal("invalid reverb3d parameters: %s", why);
 }
 Reverb3d *audio_reverb_create(const Reverb3dParam *p) {
     validate(p); Reverb3d *s = calloc(1, sizeof *s); if (!s) rt_fatal("reverb allocation"); unsigned khz = p->sample_rate / 1000;

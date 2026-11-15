@@ -4,7 +4,12 @@
 // service validates every section against the header, keeps server-side voice state, advances it in real time (one
 // frame of sample_count / sample_rate seconds per render tick, signalling the renderer's event) and writes the output
 // status the client expects. The mixer behind it is audio_mixer.c.
+// A value in the game's RequestUpdate is not a reason to end the process (audio_bad): an update whose sections do not
+// match the renderer is refused whole with AUDREN_R_INVALID_UPDATE, and a record, effect or sink whose values the
+// renderer cannot use is left out of an update that is otherwise applied. NX2NAVI_AUDIO_STRICT=1 ends the process there
+// instead. OpenAudioRenderer's parameters (need) and the request's buffer descriptors (ipc.c ipc_guest) still end it.
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +74,24 @@ long audren_renderers_live(void) { return plat_cas32(&g_live, 0, 0); }
 
 static int revision_number(uint32_t rev) { return (int)(rev >> 24) - '0'; }
 
+void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) {
+    uint64_t n = __atomic_add_fetch(&r->bad_count, 1, __ATOMIC_RELAXED);
+    if (!r->strict && __atomic_exchange_n(&r->bad_seen[kind], 1, __ATOMIC_RELAXED)) return;   // formats only once
+    char what[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof what, fmt, ap);
+    va_end(ap);
+    if (r->strict) {
+        ipc_backtrace();   // the game's frame chain when the game's update thread is here; nothing on the render thread
+        rt_fatal("audio: %s; NX2NAVI_AUDIO_STRICT=1 ends the process here instead", what);
+    }
+    rt_log("audio: %s; game frame %llu, %llu times so far for all kinds together; logged once per kind", what,
+           (unsigned long long)game_frame(), (unsigned long long)n);
+}
+
+// OpenAudioRenderer's and GetWorkBufferSize's parameters, and host allocations: once per renderer, the SDK's fixed
+// values, not the game's updates.
 static void need(int ok, const char *what) {
     if (ok) return;
     ipc_backtrace();
@@ -112,11 +135,9 @@ static void renderer_free(AudioRenderer *r) {
 // ---- RequestUpdate
 typedef struct { const uint8_t *p, *end; } Reader;
 
-static const uint8_t *take(Reader *in, uint32_t n, const char *what) {
-    if ((size_t)(in->end - in->p) < n) {
-        rt_log("audren: input section %s (%u bytes) overruns the request", what, n);
-        need(0, "update input section size");
-    }
+// The next `n` bytes, or NULL when they run past the header's total (update_check refuses the update).
+static const uint8_t *take(Reader *in, uint32_t n) {
+    if ((size_t)(in->end - in->p) < n) return NULL;
     const uint8_t *p = in->p;
     in->p += n;
     return p;
@@ -139,14 +160,13 @@ static void voice_reset(ServerVoice *v) {
     v->ramp_pass = 0;   // a new voice starts at its volumes: no ramp from what the slot's last voice was mixed with
 }
 
+// request_update has checked the id against the voice count and, for a voice in use, its wave buffer index.
 static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
-    need(in->id < (uint32_t)r->param.voice_count, "voice id out of range");
     ServerVoice *v = &r->voices[in->id];
     if (in->is_new || !in->in_use) voice_reset(v);
     v->in = *in;
     v->use_float_biquads = 0;
     if (!in->in_use) return;
-    need(in->wave_buffer_index < 4, "wave buffer index");
     // The play state as the DSP keeps it: Stop on a voice that is not stopped
     // becomes Stopping, which the next render frame turns into Stopped after giving back every queued buffer.
     if (in->play_state == PLAY_STARTED) v->state = SV_STARTED;
@@ -247,22 +267,124 @@ static void voices_prepare(AudioRenderer *r) {
     }
 }
 
-static uint32_t effect_out_bytes(const AudioRenderer *r) { return revision_number(r->revision) >= 9 ? 0x90u : 0x10u; }
+static uint32_t effect_out_bytes(uint32_t revision) { return revision_number(revision) >= 9 ? 0x90u : 0x10u; }
 
-static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_size, uint8_t *output,
-                           uint64_t out_size, uint64_t perf_size) {
-    need(in_size >= sizeof(AudrenHeader), "update input too small");
-    AudrenHeader h;
-    memcpy(&h, input, sizeof h);
-    need(h.total <= in_size, "update total size");
-    Reader in = {input + sizeof h, input + h.total};
-    plat_mutex_lock(&r->lock);
-    const uint64_t locked_ns = r->stats ? kern_now_ns() : 0;
-    r->revision = h.revision;
-    const int vc = r->param.voice_count, ec = r->param.effect_count, sc = r->param.sink_count,
-              mc = r->param.submix_count + 1;
+// The output header of an update in the layout of `revision`, section by section: the SDK reads every section back and
+// aborts when a size differs from the one it expects.
+static AudrenHeader output_header(const AudioRenderer *r, uint32_t revision) {
+    const uint32_t npools = (uint32_t)r->param.effect_count + 4u * (uint32_t)r->param.voice_count;
+    AudrenHeader o = {0};
+    o.revision = AUDREN_REV(revision_number(revision) >= 1 ? revision_number(revision) : 1);
+    o.memory_pools = npools * sizeof(AudrenPoolOut);
+    o.voices = (uint32_t)r->param.voice_count * sizeof(AudrenVoiceOut);
+    o.effects = (uint32_t)r->param.effect_count * effect_out_bytes(revision);
+    o.sinks = (uint32_t)r->param.sink_count * sizeof(AudrenSinkOut);
+    o.performance = 0x10;
+    o.behavior = AUDREN_BEHAVIOR_OUT;
+    o.render_info = AUDREN_RENDER_INFO_OUT;
+    o.total = (uint32_t)sizeof o + o.memory_pools + o.voices + o.effects + o.sinks + o.performance + o.behavior +
+              o.render_info;
+    return o;
+}
+
+// An update's sections as update_check found them, and the output header it checked against the output buffer.
+typedef struct {
+    AudrenHeader h, out;
+    const uint8_t *behavior, *voices, *splitters, *mixes;
+    const AudrenPoolIn *pools;
+    const AudrenChannelIn *chans;
+    const AudrenEffectIn *effects;
+    const AudrenSinkIn *sinks;
+    size_t voice_stride;
+    int float_voices;
+} UpdateIn;
+
+// Every check of an update's framing, before anything of it is applied, in the order the sections come; without the
+// renderer lock (it reads the renderer's fixed counts and the game's input). The SDK builds each section from the
+// renderer's own counts, so a mismatch means this host reads another layout than the one the game wrote (a revision),
+// not a value the game chose. 0, or AUDREN_R_INVALID_UPDATE after one audio_bad line.
+static uint32_t update_check(AudioRenderer *r, const uint8_t *input, uint64_t in_size, uint64_t out_size, UpdateIn *u) {
+    if (in_size < sizeof(AudrenHeader))
+        return AUDIO_REFUSE(r, AB_UPD_SMALL, "the input is %#llx bytes, shorter than its %#x-byte header",
+                            (unsigned long long)in_size, (unsigned)sizeof(AudrenHeader));
+    AudrenHeader *h = &u->h;
+    memcpy(h, input, sizeof *h);
+    if (h->total > in_size || h->total < sizeof *h)
+        return AUDIO_REFUSE(r, AB_UPD_TOTAL, "the header's total is %#x bytes, the input %#llx and the header %#x",
+                            h->total, (unsigned long long)in_size, (unsigned)sizeof *h);
+    const int vc = r->param.voice_count, ec = r->param.effect_count, sc = r->param.sink_count;
     const uint32_t npools = (uint32_t)ec + 4u * (uint32_t)vc;
-    if (!r->logged) {
+    Reader in = {input + sizeof *h, input + h->total};
+    const uint8_t *skip;
+    // the next section, or the update refused when it runs past the header's total
+#define TAKE(dst, type, bytes, name)                                                                                   \
+    if (!((dst) = (type)take(&in, (bytes))))                                                                           \
+        return AUDIO_REFUSE(r, AB_UPD_OVERRUN,                                                                         \
+                            "the %s section (%#x bytes at offset %#llx) runs past the header's total %#x", name,       \
+                            (unsigned)(bytes), (unsigned long long)(in.p - input), h->total)
+    if (h->behavior != 0x10)
+        return AUDIO_REFUSE(r, AB_UPD_BEHAVIOR, "the behavior section is %#x bytes, the renderer reads %#x",
+                            h->behavior, 0x10u);
+    TAKE(u->behavior, const uint8_t *, h->behavior, "behavior");
+    if (h->memory_pools != npools * sizeof(AudrenPoolIn))
+        return AUDIO_REFUSE(r, AB_UPD_POOLS, "the memory pool section is %#x bytes, the renderer reads %#x (%u pools)",
+                            h->memory_pools, (unsigned)(npools * sizeof(AudrenPoolIn)), npools);
+    TAKE(u->pools, const AudrenPoolIn *, h->memory_pools, "memory pool");
+    if (h->voice_resources % sizeof(AudrenChannelIn) || h->voice_resources / sizeof(AudrenChannelIn) > (uint32_t)vc * 6)
+        return AUDIO_REFUSE(r, AB_UPD_CHANNELS,
+                            "the voice channel section is %#x bytes, the renderer reads records of %#x, %u at most",
+                            h->voice_resources, (unsigned)sizeof(AudrenChannelIn), (unsigned)vc * 6);
+    TAKE(u->chans, const AudrenChannelIn *, h->voice_resources, "voice channel");
+    u->float_voices = revision_number(h->revision) >= 15;
+    u->voice_stride = u->float_voices ? sizeof(AudrenVoiceInV2) : sizeof(AudrenVoiceIn);
+    if (h->voices != (uint32_t)vc * u->voice_stride)
+        return AUDIO_REFUSE(r, AB_UPD_VOICES,
+                            "the voice section is %#x bytes, the renderer reads %#x (%d voices of %#x, REV%d)",
+                            h->voices, (unsigned)(vc * u->voice_stride), vc, (unsigned)u->voice_stride,
+                            revision_number(h->revision));
+    TAKE(u->voices, const uint8_t *, h->voices, "voice");
+    if (h->effects != (uint32_t)ec * sizeof(AudrenEffectIn))
+        return AUDIO_REFUSE(r, AB_UPD_EFFECTS, "the effect section is %#x bytes, the renderer reads %#x (%d effects)",
+                            h->effects, (unsigned)(ec * sizeof(AudrenEffectIn)), ec);
+    TAKE(u->effects, const AudrenEffectIn *, h->effects, "effect");
+    TAKE(u->splitters, const uint8_t *, h->splitters, "splitter");
+    TAKE(u->mixes, const uint8_t *, h->mixes, "mix");
+    if (h->sinks != (uint32_t)sc * sizeof(AudrenSinkIn))
+        return AUDIO_REFUSE(r, AB_UPD_SINKS, "the sink section is %#x bytes, the renderer reads %#x (%d sinks)",
+                            h->sinks, (unsigned)(sc * sizeof(AudrenSinkIn)), sc);
+    TAKE(u->sinks, const AudrenSinkIn *, h->sinks, "sink");
+    TAKE(skip, const uint8_t *, h->performance, "performance");
+    TAKE(skip, const uint8_t *, h->render_info, "render info");
+#undef TAKE
+    (void)skip;
+    if (in.p != in.end)
+        return AUDIO_REFUSE(r, AB_UPD_UNCONSUMED, "%#llx bytes of the header's total %#x follow its last section",
+                            (unsigned long long)(in.end - in.p), h->total);
+    u->out = output_header(r, h->revision);
+    if (u->out.total > out_size)
+        return AUDIO_REFUSE(r, AB_UPD_OUTPUT,
+                            "the output buffer is %#llx bytes, the output %#x (effect results of %#x)",
+                            (unsigned long long)out_size, u->out.total, effect_out_bytes(h->revision));
+    return audio_mixer_routing_check(r, h->revision, u->splitters, h->splitters, u->mixes, h->mixes,
+                                     r->param.submix_count + 1);
+}
+
+// A refused update, on the thread that sends RequestUpdate only (the SDK sends from one; a second sender would only
+// race these diagnostic counts). The game ignores the result and goes on; while refusals go on, its sounds stop
+// following it.
+static void note_refused(AudioRenderer *r) {
+    r->refused++;
+    if (++r->refused_run == 1000)
+        rt_log("audio: 1000 RequestUpdates in a row were refused (about 5 s of the game's updates): the game's sounds "
+               "no longer follow it");
+}
+
+// 0, or AUDREN_R_INVALID_UPDATE with nothing of the update applied and nothing written to `output`.
+static uint32_t request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_size, uint8_t *output,
+                               uint64_t out_size, uint64_t perf_size) {
+    if (!r->logged && in_size >= sizeof(AudrenHeader)) {   // the first update's sizes, also when it is refused
+        AudrenHeader h;
+        memcpy(&h, input, sizeof h);
         r->logged = 1;
         rt_log("audren: update REV%d sizes behavior=%u pools=%u voices=%u channels=%u effects=%u mixes=%u sinks=%u "
                "perf=%u splitters=%u render=%u total=%u out=%llu perf_out=%llu",
@@ -270,80 +392,90 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
                h.mixes, h.sinks, h.performance, h.splitters, h.render_info, h.total, (unsigned long long)out_size,
                (unsigned long long)perf_size);
     }
-    need(h.behavior == 0x10, "behavior section size");
-    const uint8_t *behavior = take(&in, h.behavior, "behavior");
-    memcpy(&r->behavior_flags, behavior + 8, 8);
-    need(h.memory_pools == npools * sizeof(AudrenPoolIn), "memory pool section size");
-    const AudrenPoolIn *pools = (const AudrenPoolIn *)take(&in, h.memory_pools, "memory pools");
-    need(h.voice_resources % sizeof(AudrenChannelIn) == 0 &&
-             h.voice_resources / sizeof(AudrenChannelIn) <= (uint32_t)vc * 6,
-         "voice channel section size");
-    const AudrenChannelIn *chans = (const AudrenChannelIn *)take(&in, h.voice_resources, "voice channels");
-    const int float_voices = revision_number(h.revision) >= 15;
-    const size_t voice_stride = float_voices ? sizeof(AudrenVoiceInV2) : sizeof(AudrenVoiceIn);
-    need(h.voices == (uint32_t)vc * voice_stride, "voice section size");
-    const uint8_t *voices = take(&in, h.voices, "voices");
-    need(h.effects == (uint32_t)ec * sizeof(AudrenEffectIn), "effect section size");
-    const AudrenEffectIn *effects = (const AudrenEffectIn *)take(&in, h.effects, "effects");
-    const uint8_t *splitters = take(&in, h.splitters, "splitters");
-    const uint8_t *mixes = take(&in, h.mixes, "mixes");
-    need(h.sinks == (uint32_t)sc * sizeof(AudrenSinkIn), "sink section size");
-    const AudrenSinkIn *sinks = (const AudrenSinkIn *)take(&in, h.sinks, "sinks");
-    take(&in, h.performance, "performance");
-    take(&in, h.render_info, "render info");
-    need(in.p == in.end, "unconsumed update input");
+    UpdateIn u;
+    uint32_t refused = update_check(r, input, in_size, out_size, &u);
+    if (refused) {
+        note_refused(r);
+        return refused;
+    }
+    const AudrenHeader h = u.h;
+    const int vc = r->param.voice_count, ec = r->param.effect_count, sc = r->param.sink_count,
+              mc = r->param.submix_count + 1;
+    const uint32_t npools = (uint32_t)ec + 4u * (uint32_t)vc;
+    plat_mutex_lock(&r->lock);
+    const uint64_t locked_ns = r->stats ? kern_now_ns() : 0;
+    // the one check that needs the mixes as they are: under the lock, before the first write
+    refused = audio_mixer_mix_layout_check(r, u.mixes, h.mixes, mc);
+    if (refused) {
+        plat_mutex_unlock(&r->lock);
+        note_refused(r);
+        return refused;
+    }
+    r->refused_run = 0;
+    r->revision = h.revision;
+    memcpy(&r->behavior_flags, u.behavior + 8, 8);
+    const AudrenPoolIn *pools = u.pools;
+    const AudrenChannelIn *chans = u.chans;
+    const AudrenEffectIn *effects = u.effects;
+    const AudrenSinkIn *sinks = u.sinks;
 
+    // From here on a value the renderer cannot use leaves its one record out (audio_bad); the rest is applied.
     for (uint32_t i = 0; i < h.voice_resources / sizeof(AudrenChannelIn); i++) {
-        need(chans[i].id < (uint32_t)vc * 6, "channel resource id");
-        r->channels[chans[i].id] = chans[i];
+        const uint32_t id = chans[i].id;
+        if (id >= (uint32_t)vc * 6) {
+            audio_bad(r, AB_CHANNEL_ID, "voice channel resource %u names id %u of %d: that record is left out", i, id,
+                      vc * 6);
+            continue;
+        }
+        r->channels[id] = chans[i];
     }
     for (int i = 0; i < vc; i++) {
         AudrenVoiceIn v;
         AudrenVoiceInV2 v2;
-        if (float_voices) {
-            memcpy(&v2, voices + i * voice_stride, sizeof v2);
+        if (u.float_voices) {
+            memcpy(&v2, u.voices + i * u.voice_stride, sizeof v2);
             memset(&v, 0, sizeof v);
             memcpy(&v, v2.prefix, sizeof v2.prefix);
             memcpy((uint8_t *)&v + 0x3c, v2.tail, sizeof v2.tail);
             for (unsigned f = 0; f < 2; f++) {
-                v.biquads[f].enable = v2.biquads[f].enable;
-                if (!v.biquads[f].enable) continue;
-                for (unsigned c = 0; c < 3; c++) need(isfinite(v2.biquads[f].numerator[c]), "voice biquad numerator");
-                for (unsigned c = 0; c < 2; c++)
-                    need(isfinite(v2.biquads[f].denominator[c]), "voice biquad denominator");
+                const AudrenBiquadFloat *b = &v2.biquads[f];
+                v.biquads[f].enable = b->enable;
+                if (!b->enable) continue;
+                if (isfinite(b->numerator[0]) && isfinite(b->numerator[1]) && isfinite(b->numerator[2]) &&
+                    isfinite(b->denominator[0]) && isfinite(b->denominator[1]))
+                    continue;
+                audio_bad(r, AB_VOICE_FILTER,
+                          "voice slot %d's filter %u has a coefficient that is not a finite number (%g %g %g / %g %g): "
+                          "that filter is off", i, f, b->numerator[0], b->numerator[1], b->numerator[2],
+                          b->denominator[0], b->denominator[1]);
+                v.biquads[f].enable = v2.biquads[f].enable = 0;
             }
         } else
-            memcpy(&v, voices + i * voice_stride, sizeof v);
+            memcpy(&v, u.voices + i * u.voice_stride, sizeof v);
         // An unused slot can have a zero id. Release its own voice and leave voice zero playing.
         if (!v.in_use) v.id = (uint32_t)i;
+        if (v.id >= (uint32_t)vc) {
+            audio_bad(r, AB_VOICE_ID, "voice slot %d names voice %u of %d: that record is left out", i, v.id, vc);
+            continue;
+        }
+        if (v.in_use && v.wave_buffer_index >= 4) {
+            audio_bad(r, AB_WAVE_INDEX, "voice %u's current wave buffer is %u of 4: that record is left out", v.id,
+                      v.wave_buffer_index);
+            continue;
+        }
         update_voice(r, &v);
         ServerVoice *server = &r->voices[v.id];
-        server->use_float_biquads = (uint8_t)float_voices;
-        if (float_voices) memcpy(server->float_biquads, v2.biquads, sizeof v2.biquads);
+        server->use_float_biquads = (uint8_t)u.float_voices;
+        if (u.float_voices) memcpy(server->float_biquads, v2.biquads, sizeof v2.biquads);
     }
     for (int i = 0; i < ec; i++) r->effects[i] = effects[i];
     audio_mixer_update_effects(r);
-    audio_mixer_update_routing(r, splitters, h.splitters, mixes, h.mixes, mc);
+    audio_mixer_update_routing(r, u.splitters, h.splitters, u.mixes, h.mixes, mc);
     for (int i = 0; i < sc; i++) r->sinks[i] = sinks[i];
 
-    // ---- output
-    const uint32_t eo = effect_out_bytes(r);
-    AudrenHeader o = {0};
-    o.revision = AUDREN_REV(revision_number(h.revision) >= 1 ? revision_number(h.revision) : 1);
-    o.memory_pools = npools * sizeof(AudrenPoolOut);
-    o.voices = (uint32_t)vc * sizeof(AudrenVoiceOut);
-    o.effects = (uint32_t)ec * eo;
-    o.sinks = (uint32_t)sc * sizeof(AudrenSinkOut);
-    o.performance = 0x10;
-    o.behavior = AUDREN_BEHAVIOR_OUT;
-    o.render_info = AUDREN_RENDER_INFO_OUT;
-    o.total = (uint32_t)sizeof o + o.memory_pools + o.voices + o.effects + o.sinks + o.performance + o.behavior +
-              o.render_info;
-    if (o.total > out_size) {
-        rt_log("audren: output needs %u bytes, the client gave %llu (effect out %u)", o.total,
-               (unsigned long long)out_size, eo);
-        need(0, "update output size");
-    }
+    // ---- output: update_check has checked its size against the output buffer
+    const uint32_t eo = effect_out_bytes(h.revision);
+    const AudrenHeader o = u.out;
     memset(output, 0, out_size);
     uint8_t *w = output;
     memcpy(w, &o, sizeof o);
@@ -408,6 +540,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     if (late_gap)
         rt_log("audio: the game's audio update came %.1f ms after its last one (%llu render passes of 5 ms), game frame "
                "%llu", late_gap / 1e6, (unsigned long long)late_passes, (unsigned long long)game_frame());
+    return 0;
 }
 
 // ---- render tick: one frame each time the output device has taken the ring below its target (audio_mixer_pace_ns),
@@ -653,13 +786,19 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
                    rq->cmd, (unsigned long long)in.addr, (unsigned long long)in.size, (unsigned long long)out.addr,
                    (unsigned long long)out.size, (unsigned long long)perf.addr, (unsigned long long)perf.size, rq->na,
                    rq->nb, rq->nx, rq->nc);
-        need(in.size && out.size, "RequestUpdate buffers");
+        if (!in.size || !out.size) {
+            rs->result = AUDIO_REFUSE(r, AB_UPD_BUFFERS, "the input buffer is %#llx bytes and the output buffer %#llx",
+                                      (unsigned long long)in.size, (unsigned long long)out.size);
+            note_refused(r);
+            return;
+        }
         int prio = 0;
         if (g_game_prio) prio = plat_thread_priority_get(), plat_thread_priority(PLAT_PRIO_HIGHEST);   // AUDIO_GAME_PRIO
-        request_update(r, ipc_guest(in.addr, in.size), in.size, ipc_guest(out.addr, out.size), out.size, perf.size);
+        rs->result =
+            request_update(r, ipc_guest(in.addr, in.size), in.size, ipc_guest(out.addr, out.size), out.size, perf.size);
         if (g_game_prio)
             plat_thread_priority(g_game_prio >= 2 && prio < PLAT_PRIO_ABOVE_NORMAL ? PLAT_PRIO_ABOVE_NORMAL : prio);
-        for (unsigned i = 0; i < rq->nc && rq->cmd == 10; i++)
+        for (unsigned i = 0; i < rq->nc && rq->cmd == 10 && !rs->result; i++)   // the SDK reads no output of a refusal
             if (rq->c[i].size && (i >= rq->nb || !rq->b[i].size))
                 rs->xout[rs->nxout++] = (IpcBuffer){rq->c[i].addr, rq->c[i].size, i};
         return;
@@ -706,7 +845,13 @@ static void renderer_close(void *p) {
     plat_dec32(&g_live);
     audio_mixer_close(r);
     kern_handle_close(r->event);
-    rt_log("audren: renderer closed after %llu frames", (unsigned long long)r->elapsed_frames);
+    uint64_t bad = __atomic_load_n(&r->bad_count, __ATOMIC_RELAXED);
+    if (bad || r->refused)
+        rt_log("audren: renderer closed after %llu frames, game audio values left out or refused %llu times (%llu "
+               "updates refused)", (unsigned long long)r->elapsed_frames, (unsigned long long)bad,
+               (unsigned long long)r->refused);
+    else
+        rt_log("audren: renderer closed after %llu frames", (unsigned long long)r->elapsed_frames);
     renderer_free(r);
 }
 
@@ -717,9 +862,12 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         AudrenParameter p = IPC_ARG(rq, AudrenParameter, 0);
         uint64_t work = IPC_ARG(rq, uint64_t, 0x38);
         need(rq->ncopy >= 1, "OpenAudioRenderer without a transfer memory handle");
-        IpcTransferMemory *tm = kern_handle_get(rq->copy[0], KERN_TMEM);
-        need(tm && tm->size >= work, "OpenAudioRenderer work buffer is not a transfer memory of the stated size");
+        // A copy made under the kernel lock: a CloseHandle of the transfer memory on another thread frees the object.
+        IpcTransferMemory tm;
+        int have_tm = kern_handle_copy(rq->copy[0], KERN_TMEM, &tm, sizeof tm);
+        need(have_tm && tm.size >= work, "OpenAudioRenderer work buffer is not a transfer memory of the stated size");
         AudioRenderer *r = renderer_new(&p);
+        r->strict = (uint8_t)cfg_bool("NX2NAVI_AUDIO_STRICT");
         if (rt_knob("AUDIO_STATS", "0")) {
             r->stats = calloc(1, sizeof *r->stats);
             if (r->stats) r->stats->queue_min = UINT64_MAX;
@@ -728,12 +876,14 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         g_game_prio = gp && *gp ? atoi(gp) : 0;
         if (g_game_prio < 0 || g_game_prio > 2) g_game_prio = 0;
         rt_log("audio: stats %s (NX2NAVI_AUDIO_STATS); the game's audio thread %s (NX2NAVI_AUDIO_GAME_PRIO=%d); frames "
-               "owed after a stall are %s (NX2NAVI_AUDIO_CATCHUP)",
+               "owed after a stall are %s (NX2NAVI_AUDIO_CATCHUP); game audio values out of range are %s "
+               "(NX2NAVI_AUDIO_STRICT)",
                r->stats ? "on" : "off",
                g_game_prio == 2   ? "runs above normal priority, at the highest while its update is read"
                : g_game_prio == 1 ? "runs at the highest priority while its update is read"
                                   : "keeps its own priority",
-               g_game_prio, cfg_bool("NX2NAVI_AUDIO_CATCHUP") ? "rendered and dropped" : "not caught up");
+               g_game_prio, cfg_bool("NX2NAVI_AUDIO_CATCHUP") ? "rendered and dropped" : "not caught up",
+               r->strict ? "fatal" : "left out and logged once per kind");
         r->running = 1;
         audio_mixer_open(r);
         r->thread = plat_thread_new(render_thread, r, "audren");
@@ -743,7 +893,7 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
                "splitters %d/%d, REV%d, work buffer %#llx+%#llx",
                p.sample_rate, p.sample_count, p.mix_buffer_count, p.voice_count, p.effect_count, p.submix_count,
                p.sink_count, p.splitter_count, p.splitter_destination_count, revision_number(p.revision),
-               (unsigned long long)tm->addr, (unsigned long long)work);
+               (unsigned long long)tm.addr, (unsigned long long)work);
         rs->move[rs->nmove++] = ipc_session_new("IAudioRenderer", renderer_handler, r, renderer_close);
         return;
     }

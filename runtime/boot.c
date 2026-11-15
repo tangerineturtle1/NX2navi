@@ -324,13 +324,10 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
-    input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value before the exit
-    fs_save_flush();
-    vk_pipeline_prewarm_marker_clear();   // an orderly end, not a driver crash in the boot's builds (vk_pipeline.c pm_skipped)
-    vk_mem_exit_log();         // the memory report's ranking of the session
-    vk_pipeline_save_exit();   // no-op without the Vulkan back end
-    prof_write();
-    rtss_limit_restore();
+    // the orderly end the window's close takes (gfx_present.c rt_exit_steps), without nx2navi.ini: a scripted run's
+    // end is no player's; a close already ending the process keeps this thread in rt_exit_begin
+    if (!rt_exit_begin()) plat_exit(0);
+    rt_exit_steps(0);
     fflush(stderr);
     plat_exit(0);
 }

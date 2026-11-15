@@ -30,7 +30,7 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 - Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
 - `recomp/layout.py` alone decides module bases.
 - Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match, what goes wrong when it does not, and what our runtime does.
-- Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint). Comments and docs do not name other projects or say where code came from: the license header of copied code and its `THIRD_PARTY_NOTICES.md` row carry that.
+- Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint). Comments and docs do not name other projects or say where code came from: the license header of copied code and its `THIRD_PARTY_NOTICES.md` row carry that. `handover/` is the one exception: it is release 0.12.0, which hands installed launchers over to Triforce, and it names that project throughout.
 
 ## Writing
 

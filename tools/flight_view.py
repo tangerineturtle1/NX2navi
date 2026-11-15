@@ -14,14 +14,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-BLOCKED = ['pace_ms', 'fence_ms', 'drain_ms', 'pipe_ms', 'xlate_ms', 'tex_ms', 'astc_ms']
+BLOCKED = ['pace_ms', 'fence_ms', 'drain_ms', 'pipe_ms', 'xlate_ms', 'tex_ms', 'astc_ms', 'handoff_ms']
 # Counts that are 0 in a steady frame: any non-zero value is listed.
 RARE = ['shaders_xlated', 'pipe_built', 'pipe_waited', 'oneshot_waited', 'pipe_bg_used', 'draws_skip_pipe',
         'draws_skip_shader', 'tex_new', 'tex_alias', 'tex_up', 'tex_reup', 'wb_done', 'wb_skip']
 # Counts with a steady level: frames off the median by more than a quarter are listed.
 LEVEL = ['submits', 'passes', 'draws', 'draws_seen', 'clears', 'copies', 'dispatches']
 SHORT = {'interval_ms': 'ms', 'pace_ms': 'pace', 'fence_ms': 'fence', 'drain_ms': 'drain', 'pipe_ms': 'pipe',
-         'xlate_ms': 'xlate', 'tex_ms': 'tex', 'astc_ms': 'astc'}
+         'xlate_ms': 'xlate', 'tex_ms': 'tex', 'astc_ms': 'astc', 'handoff_ms': 'handoff'}
 
 
 def load(dump):

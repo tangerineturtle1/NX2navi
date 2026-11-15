@@ -1,12 +1,16 @@
-// Frame generation with AMD FSR 3.1 (NX2NAVI_FRAMEGEN = fsr3; applies after a restart): AMD's frame generation
-// swapchain (amd_fidelityfx_vk.dll, vk_ffx.cpp loads it) takes the place of gfx_present.c's swapchain. Every frame
-// the game presents, the swapchain presents a generated frame between it and the one before, on its own present
-// queue and pacing threads, so the screen shows twice the game's frame rate.
+// Frame generation with AMD FSR 3.1 (NX2NAVI_FRAMEGEN = fsr3, live: gfx_present.c window_settings_live makes the
+// swapchain again; a run whose device was made for DLSS Frame Generation waits for a restart, vk_fg_wanted): AMD's
+// frame generation swapchain (amd_fidelityfx_vk.dll, vk_ffx.cpp loads it) takes the place of gfx_present.c's
+// swapchain. Every frame the game presents, the swapchain presents a generated frame between it and the one before, on
+// its own present queue and pacing threads, so the screen shows twice the game's frame rate.
 //
 // The generated frame is built from the presented picture and the scene's depth and camera motion vectors, which
 // vk_dlaa.c makes for DLSS and FSR 3.1 upscaling, and without an upscaler for frame generation alone (vk_dlaa.c
 // fg_only_frame: the same pass at the scene's size, no jitter). The HUD is kept out through the picture without it
-// (vk_dlaa.c hudless); the menu is not generated, since generation pauses while it is open. The device creates two more queues of the graphics family for it (vk_device.c, vk_fg_queue_count).
+// (vk_dlaa.c hudless); the menu is not generated, since generation pauses while it is open. The device creates two more
+// queues for it (vk_device.c create_device, vk_fg_queue_count): of the graphics family where it has them; else the
+// present queue comes from another family that can present, and the acquire queue is a second queue of that family or
+// of any other, or the present queue itself when there is none.
 #ifdef _WIN32
 #include <windows.h>
 #endif

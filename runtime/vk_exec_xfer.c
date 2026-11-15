@@ -390,7 +390,7 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
+typedef struct { uint64_t addr, seq, fence; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
 
 // The replay workers (vk_exec.c "parallel groups") record the draws of one group at once. The front pass replays a
 // group's samples-passed resets and reports in the order of the stream before the workers record (vk_exec_xfer_front):
@@ -682,8 +682,24 @@ static void oq_cb(void *arg) {
         if (avail) sum += v;
         else {
             sum += 1;
-            vk_device_lost_poll();   // a query its submission never wrote: on a lost device the run ends here
-            LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
+            // A query its submission never wrote. Every RX 6000 report of a lost device (0.8.0 to 0.9.2) had this line
+            // first, its callback run for work the GPU had not finished. A timeline read above every value its signals
+            // carry, then the device itself, end the run here when it is lost (vk_sync.c "a lost device in the
+            // timelines' values", vk_device.c vk_device_lost_poll). Otherwise the slot counts as visible and the game
+            // goes on, as a ring that came round too early would leave it. The first such slot is logged with the
+            // submissions' state and the GPU's breadcrumbs: whether the GPU had finished this submission, and whether
+            // the timeline read above what was signalled.
+            vk_sync_check_timeline("an occlusion query its finished submission never wrote (a timeline value no "
+                                   "submission signals)");
+            vk_device_lost_poll();
+            static volatile char logged;
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
+                char st[512];
+                vk_sync_state_text(st, sizeof st);
+                rt_log("vk: occlusion query slot %u of submission %llu not available after its fence, counted as visible; "
+                       "%s", s->q[i], (unsigned long long)s->fence, st);
+                vk_crumbs_report();
+            }
         }
     }
     if (s->n && ++OQB.segs >= 12000) {
@@ -711,7 +727,7 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     OqSegment *s = calloc(1, sizeof *s);
     if (!s || (oq_nseg && !(s->q = malloc(sizeof *s->q * oq_nseg)))) rt_fatal("vk: out of memory");
     s->cap = oq_nseg;
-    s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
+    s->addr = addr, s->seq = report_seq, s->fence = ex->fence, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     if (addr) vk_exec_note_results(VK_RES_OQ);
     if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     if (gs_on >= 0) {   // the front pass: the workers add the queries of the group's ops before it
@@ -752,7 +768,7 @@ static void oq_report(VkExec *ex, uint64_t addr) {
 // wait whose signal comes in a later submission does not hold its work back: that work runs before what it waits for.
 // The replay keeps the value each event reaches in replay order (ev_seen, the signals recorded so far, on top of the
 // value in memory) and counts the waits it reaches unmet; NX2NAVI_TRACE=perf logs the count, and the first few are
-// logged as they happen. Replay thread only.
+// logged as they happen. Replay thread only, apart from vk_exec_event_met_now's unlocked read of ev_seen.
 #define EV_SEEN 64
 static struct { volatile uint32_t *val; uint32_t v; } ev_seen[EV_SEEN];
 static int ev_n, ev_next;
@@ -885,6 +901,22 @@ int vk_exec_event_met(const void *payload) {
     const uint32_t *seen;
     int late;
     return ev_met(payload, &mem, &seen, &late);
+}
+
+// The value in memory now, or the signals replayed so far, whatever submission is being recorded: for vk_exec.c
+// vk_exec_held_ready, which asks without the submission lock whether held work can go on in a submission of its own.
+// That submission takes its copies later, so a CPU signal given before now counts for it; testing at the copy point
+// (ev_mem) would take the copy point of the recording another thread may be making. ev_seen belongs to the replay and
+// is read here without its lock, so the answer is a decision only: a wrong "ready" makes an empty submission, which
+// decides again under the lock (vk_exec.c evo_resume).
+int vk_exec_event_met_now(const void *payload) {
+    const p_wait_event *p = payload;
+    if (ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value)) return 1;
+    int n = __atomic_load_n(&ev_n, __ATOMIC_RELAXED);
+    for (int i = 0; i < n && i < EV_SEEN; i++)
+        if (__atomic_load_n(&ev_seen[i].val, __ATOMIC_RELAXED) == p->val)
+            return ev_holds(__atomic_load_n(&ev_seen[i].v, __ATOMIC_RELAXED), p->mode, p->value);
+    return 0;
 }
 
 int vk_exec_signalled;

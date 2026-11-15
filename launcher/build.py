@@ -127,27 +127,54 @@ class Run:
                 pass
 
 
-def game_running(game_dir, exe='ocarina.exe'):
-    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing. A read-only
-    exe (a copy restored from a backup or read-only media) is refused too, though nothing runs it: its read-only
-    attribute is cleared and the open tried again, as the next build replaces the file anyway."""
+ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION = 5, 32
+
+
+def _write_open_error(path):
+    """0 when path opens for writing (it is closed again at once), else Windows' error code for the refusal. Every
+    share mode is granted, so a sharing violation comes only from a running image."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                              wintypes.DWORD, wintypes.HANDLE]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    # GENERIC_WRITE; FILE_SHARE_READ, FILE_SHARE_WRITE and FILE_SHARE_DELETE; OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL
+    h = k.CreateFileW(str(path), 0x40000000, 7, None, 3, 0x80, None)
+    if h in (None, wintypes.HANDLE(-1).value):
+        return ctypes.get_last_error() or -1
+    k.CloseHandle(h)
+    return 0
+
+
+def game_running(game_dir, exe='ocarina.exe', log=None):
+    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing, with a sharing
+    violation. A read-only exe (a copy restored from a backup or read-only media) is refused too, with access denied,
+    though nothing runs it: its read-only attribute is cleared and the open tried again, as the next build replaces
+    the file anyway. Access denied for another reason (an access list that denies the player writes, Controlled
+    Folder Access) is no running game either: taken for one, it kept Play saying "already running" and a rebuild
+    failing with "the game is running" for an exe that nothing ran. log, when given, gets a line for that case, which
+    a build's failure to replace the exe (tools/make_game.py) then has beside it."""
     path = os.path.join(str(game_dir), exe)
     if os.name != 'nt' or not os.path.isfile(path):
         return False
     for attempt in range(2):
-        try:
-            with open(path, 'r+b'):
-                return False
-        except PermissionError:
-            if attempt or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
-                return True
-            try:
-                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
-            except OSError:
-                return True
-        except OSError:
+        err = _write_open_error(path)
+        if err == ERROR_SHARING_VIOLATION:
+            return True
+        if err != ERROR_ACCESS_DENIED:   # opened, or gone meanwhile
             return False
-    return True
+        if attempt or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+            break
+        try:
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            break
+    if log:
+        log(f'{path} cannot be opened for writing (access denied), though the game does not run it: a build cannot '
+            'replace it until it can')
+    return False
 
 
 def build_state(game_dir):

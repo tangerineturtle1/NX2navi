@@ -25,6 +25,7 @@ rows, a new screen slides in, sparks drift over the backdrop and Navi bobs in th
 plays the game's own decide and cancel sounds, read from the player's game, for a choice and for going back.
 """
 import argparse
+import collections
 import colorsys
 import math
 import os
@@ -115,14 +116,19 @@ def free_gb(path):
         return 0.0
 
 
-# Exit codes that end the game, and what they mean. The game exits with 70 after a FATAL line of its own: an error it
-# cannot go on from, most often an allocation that failed because the memory ran out (runtime/dispatch.c rt_fatal), or
-# a failed re-run of itself (runtime/platform/win32.c plat_reexec). Its crash report exits with 71 after writing its
-# FATAL lines (runtime/main.c crash_handler). The others come from Windows when something ends the process before or
+# Exit codes that end the game, and what they mean. The game exits with 70 (runtime/dispatch.h RT_FATAL_EXIT) after a
+# FATAL line of its own: an error it cannot go on from, most often an allocation that failed because the memory ran
+# out (runtime/dispatch.c rt_fatal), or a failed re-run of itself (runtime/platform/win32.c plat_reexec). Its crash
+# report exits with 71 after writing its FATAL lines (runtime/main.c crash_handler). A lost graphics device ends it
+# with 72 (runtime/dispatch.h RT_LOST_EXIT, runtime/vk_device.c vk_device_lost_check), after a FATAL line too, unless
+# the report before that line hangs: then its watchdog (vk_device.c lost_wait_exit) ends the run with 72 and no FATAL
+# line, so 72's text stands without one. The others come from Windows when something ends the process before or
 # around that report.
 EXIT_CODES = {
     70: 'a fatal error: the FATAL line near the end of its log says which, often memory that ran out',
     71: 'the crash report ended the game',
+    72: 'the graphics device was lost: the GPU or its driver stopped, and the vk: lines near the end of its log say '
+        'what it was doing; a graphics driver update may help',
     0xC0000005: 'access violation',
     0xC00000FD: 'stack overflow',
     0xC0000142: 'a DLL failed to start',
@@ -132,6 +138,7 @@ EXIT_CODES = {
     0xC000041D: 'a fault inside a Windows callback',
     0xE06D7363: 'a C++ exception no one caught',
 }
+FATAL_CODES = (70, 71, 72)   # the codes that follow a FATAL line of the game's own (EXIT_CODES' comment)
 
 
 def exit_code_text(code):
@@ -148,9 +155,10 @@ FATAL_SHOWN = 240        # characters of a FATAL line the home screen shows; the
 
 def last_fatal(game_dir):
     """The last FATAL line of the game's latest run, without its "FATAL: ", or ''. The game writes one before it
-    exits with 70 (runtime/dispatch.c rt_fatal) or 71 (runtime/main.c crash_handler) into logs/nx2navi.log, which
-    each run starts anew (runtime/main.c log_open). A line this launcher added for an earlier run's end
-    (note_exit_in_log) ends the search: what stands before it is not this run's."""
+    exits with 70 (runtime/dispatch.c rt_fatal), 71 (runtime/main.c crash_handler) or 72 (runtime/vk_device.c
+    vk_device_lost_check) into logs/nx2navi.log, which each run starts anew (runtime/main.c log_open). A line this
+    launcher added for an earlier run's end (note_exit_in_log) ends the search: what stands before it is not this
+    run's."""
     if not game_dir:
         return ''
     try:
@@ -167,6 +175,38 @@ def last_fatal(game_dir):
     return ''
 
 
+# The lines the game writes when it ends on its own: the window's close (runtime/gfx_present.c gfx_window_closed), the
+# game's own exit (runtime/svc.c, ExitProcess), a timed run's end (runtime/boot.c), a fatal error and the crash report's
+# line for a fault on the way out (runtime/main.c).
+OWN_EXIT_LINES = ('gfx: window closed', 'guest ExitProcess', 'boot: frames', 'FATAL: ', 'exit: ')
+# The line a log stops with once it reached its size cap (runtime/main.c log_sink, LOG_CAP): the rest of that run,
+# its end lines too, went to stderr only.
+LOG_CUT_LINE = 'log: the file reached 64 MiB'
+
+
+def log_has_own_exit(game_dir):
+    """Whether the end of logs/nx2navi.log holds a line of the game's own end (OWN_EXIT_LINES) for its latest run; None
+    when the log cannot be read, or when it was cut at its size cap (LOG_CUT_LINE) and so cannot tell. A line this
+    launcher added for an earlier run's end (note_exit_in_log) ends the search."""
+    if not game_dir:
+        return None
+    try:
+        with open(Path(game_dir) / 'logs' / 'nx2navi.log', 'rb') as f:
+            f.seek(max(0, f.seek(0, 2) - FATAL_TAIL))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith('[launcher] the game ended'):
+            return False
+        body = line.split('] ', 1)[1] if line.startswith('[') and '] ' in line else line
+        if body.startswith(OWN_EXIT_LINES):
+            return True
+        if body.startswith(LOG_CUT_LINE):
+            return None
+    return False
+
+
 def note_exit_in_log(game_dir, text):
     """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
     process died before it could write a line itself."""
@@ -178,6 +218,104 @@ def note_exit_in_log(game_dir, text):
             f.write(f'[launcher] the game ended with code {text} at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
     except OSError:
         pass
+
+
+def log_is_new(game_dir, started):
+    """Whether logs/nx2navi.log was written at or after started (time.time() before the game was started). A run that
+    ends before it moves and opens its log (runtime/main.c log_open) leaves the log of a run before it in place. FAT
+    and exFAT drives keep a file's time to 2 s, hence the slack."""
+    if not game_dir or started is None:
+        return False
+    try:
+        return (Path(game_dir) / 'logs' / 'nx2navi.log').stat().st_mtime >= started - 2
+    except OSError:
+        return False
+
+
+LOG_WHERE = 'Its log is logs\\nx2navi.log in the game folder.'
+GameEnd = collections.namedtuple('GameEnd', 'log message note alarm')
+
+
+def shown_fatal(fatal):
+    return fatal if len(fatal) <= FATAL_SHOWN else fatal[:FATAL_SHOWN].rstrip() + '…'
+
+
+def game_end(game_dir, code, started=None, restarted=False):
+    """What the launcher says about an end of the game (App.watch_game, play_only): a GameEnd of the line for
+    launcher.log, the sentence for the player ('' for none), the text note_exit_in_log adds to the game's log ('' for
+    none), and alarm: whether the end is worth a message box where no window shows the sentence (a FATAL line, a code
+    of FATAL_CODES or a Windows status; not 0, nor 1, which Task Manager's End task gives). code is the exit code of
+    the run's last process, or None when it is not known, which happens only for a copy the game's own Restart started
+    that could not be followed (GameRun). started is time.time() before the game was started, restarted whether it
+    restarted itself on the way."""
+    how = ' after restarting itself' if restarted else ''
+    if code not in (0, None):
+        code &= 0xFFFFFFFF
+        text = exit_code_text(code)
+        # 70, 71 and 72 follow a FATAL line of the game's own, which names the error: the player gets that line and the
+        # launcher's log too, where the exit code alone said only that there was one
+        fatal = last_fatal(game_dir) if code in FATAL_CODES else ''
+        if fatal:
+            return GameEnd(f'the game ended with code {code}{how}; its log says: FATAL: {fatal}',
+                           f'The game ended with a fatal error (code {code}): {shown_fatal(fatal)}. {LOG_WHERE}',
+                           text, True)
+        return GameEnd(f'the game ended with code {text}{how}', f'The game ended with code {text}. {LOG_WHERE}', text,
+                       code in FATAL_CODES or code >= 0x80000000)
+    # No process of the game writes a FATAL line and exits with 0 (runtime/dispatch.c fatal_end, runtime/main.c
+    # crash_handler). After code 0, or a code not known, a FATAL line in a log written since the start is a copy's that
+    # the game's own Restart started (runtime/gfx_present.c gfx_window_closed): one that ended before the launcher saw
+    # it run, or one it could not follow. That copy's log is logs/nx2navi.log and holds the line already: no note.
+    fatal = last_fatal(game_dir) if log_is_new(game_dir, started) else ''
+    if fatal:
+        return GameEnd(f'the game ended after restarting itself; its log says: FATAL: {fatal}',
+                       f"A copy started by the game's Restart ended with a fatal error: {shown_fatal(fatal)}. "
+                       f'{LOG_WHERE}', '', True)
+    # Every end of a run the launcher started is logged, and when the game's log has no line of its own end, the end
+    # goes into that log: a session of 2026-11-13 stopped in play with code 0, no FATAL line and none of the game's exit
+    # lines, and nothing said how it had ended.
+    own = log_has_own_exit(game_dir)
+    if code is None:
+        return GameEnd('the game ended after restarting itself; the exit code of its last run is not known', '',
+                       "unknown (the game had restarted itself; the log has no line of the game's own end before "
+                       'this one)' if own is False else '', False)
+    if own is False:
+        return GameEnd(f'the game ended with code 0{how}, and its log has no line of its own end', '',
+                       "0 (the log has no line of the game's own end before this one)", False)
+    return GameEnd(f'the game ended with code 0{how}', '', '', False)
+
+
+class GameRun:
+    """A Play of the game, followed through the copies its own Restart starts. The Restart (runtime/gfx_present.c
+    gfx_window_closed) starts the exe again (runtime/platform/win32.c plat_restart) and ends the process before it
+    with code 0, so the code the game really ended with is its last copy's: once the process followed has ended with
+    0 while the exe still runs, the copy is looked for (winsys.game_copy) and followed from then on. proc is the
+    process followed, None once a copy could not be found (it ended before the next look, or the system did not show
+    it); the end's code is then not known. started is time.time() before the start (game_end's log_is_new)."""
+
+    def __init__(self, proc, game_dir, started):
+        self.proc, self.game_dir, self.started, self.restarted = proc, game_dir, started, False
+
+    def alive(self):
+        """Whether the process followed runs; nothing else is looked at. A winsys.GameCopy whose exit code could not
+        be read has ended all the same."""
+        return self.proc is not None and self.proc.poll() is None and getattr(self.proc, 'ended', False) is not True
+
+    def running(self):
+        """Whether the game still runs, this launcher's process or another of the same exe (build.game_running);
+        asked once a second until it says False."""
+        if self.alive():
+            return True
+        if not (self.game_dir and saves.game_running(self.game_dir)):
+            return False
+        if self.proc is not None and self.proc.returncode == 0:
+            self.restarted = True
+            self.proc = winsys.game_copy(Path(self.game_dir) / 'ocarina.exe', skip=self.proc.pid)
+        return True
+
+    def end(self):
+        """game_end for this run, once running() said False."""
+        return game_end(self.game_dir, None if self.proc is None else self.proc.returncode, self.started,
+                        self.restarted)
 
 
 def partial_image_gb(game_dir):
@@ -255,7 +393,7 @@ class App:
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
-        self.game_proc = None
+        self.game_run = None   # the Play being followed (GameRun), until watch_game sees its end
         self.cursor_frames, self.cursor_k = [], 0
         self.last_second = 0
         self.gamepad = winsys.Gamepad()
@@ -1530,7 +1668,7 @@ class App:
         gd = self.settings.get('game_dir')
         if not gd or not Path(gd).is_dir():
             self.save_message = 'Install the game first.'
-        elif (self.game_proc and self.game_proc.poll() is None) or saves.game_running(gd):
+        elif (self.game_run and self.game_run.alive()) or saves.game_running(gd):
             self.save_message = 'Quit the game first: it keeps its save open while it runs.'
         else:
             try:
@@ -1678,7 +1816,7 @@ class App:
         return {'title': m.name, 'text': lines}
 
     def game_busy(self, gd):
-        return bool((self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)))
+        return bool((self.game_run and self.game_run.alive()) or (gd and saves.game_running(gd)))
 
     def switch_mod(self, m, on):
         gd = self.settings.get('game_dir')
@@ -1872,7 +2010,7 @@ class App:
             self.message = 'The game is not built yet.'
             self.render()
             return
-        if self.game_proc and self.game_proc.poll() is None:
+        if self.game_run and self.game_run.alive():
             return
         if saves.game_running(gd):   # a copy this launcher did not start (another launcher, a shortcut, a test run)
             self.message = 'The game is already running.'
@@ -1891,8 +2029,9 @@ class App:
             return
         if waiting:
             self.ctx.log(f'play: without the code of {", ".join(waiting)}, whose build did not finish')
+        started = time.time()
         try:
-            self.game_proc = winsys.start_game(exe)
+            self.game_run = GameRun(winsys.start_game(exe), gd, started)
         except OSError as e:
             self.message = f'The game could not start: {e}'
             self.render()
@@ -1904,29 +2043,23 @@ class App:
         self.root.after(1000, self.watch_game)
 
     def watch_game(self):
-        # The game's own Restart ends the process started here and starts another (gfx_present.c gfx_window_closed)
-        gd = self.settings.get('game_dir')
-        if (self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)):
+        """Once a second while the game Play started runs, its Restart's copies too (GameRun.running); then the window
+        comes back and the end goes into launcher.log, into the game's log when that has no line of it, and on home
+        when there is something to tell (game_end)."""
+        run = self.game_run
+        if run and run.running():
             self.root.after(1000, self.watch_game)
             return
-        code = self.game_proc.returncode if self.game_proc else 0
-        self.game_proc = None
+        self.game_run = None
         self.root.deiconify()
         self.root.lift()
-        if code not in (0, None):
-            text = exit_code_text(code)
-            # 70 and 71 follow a FATAL line of the game's own, which names the error: the player gets that line
-            # and the launcher's log too, where the exit code alone said only that there was one
-            fatal = last_fatal(self.game_dir()) if code & 0xFFFFFFFF in (70, 71) else ''
-            if fatal:
-                shown = fatal if len(fatal) <= FATAL_SHOWN else fatal[:FATAL_SHOWN].rstrip() + '…'
-                self.ctx.log(f'the game ended with code {code & 0xFFFFFFFF}; its log says: FATAL: {fatal}')
-                self.message = (f'The game ended with a fatal error (code {code & 0xFFFFFFFF}): {shown}. Its log is '
-                                'logs\\nx2navi.log in the game folder.')
-            else:
-                self.ctx.log(f'the game ended with code {text}')
-                self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
-            note_exit_in_log(self.game_dir(), text)
+        if run:
+            end = run.end()
+            self.ctx.log(end.log)
+            if end.note:
+                note_exit_in_log(run.game_dir, end.note)
+            if end.message:
+                self.message = end.message
         if self.install_staged('the game exited'):
             return
         self.show('home', self.focus)
@@ -1965,7 +2098,7 @@ class App:
         for the restart into it; True when it was installed."""
         if self.job and self.job.result is None:
             return False
-        running = bool(self.game_proc and self.game_proc.poll() is None)
+        running = bool(self.game_run and self.game_run.alive())
         ver = self.bg.install(self.settings.get('game_dir'), self.release, why, asked=asked, running=running)
         if not ver:
             return False
@@ -1988,7 +2121,7 @@ class App:
                 self.bg.asked = False
                 gd = self.settings.get('game_dir')
                 if (self.screen == 'home' and self.release and jobs.update_available(self.ctx, self.release)
-                        and not (self.game_proc and self.game_proc.poll() is None)
+                        and not (self.game_run and self.game_run.alive())
                         and not (gd and build.game_running(gd))):
                     self.run_job(jobs.UpdateDownloadJob(self.ctx, self.release), 'home')
                     return
@@ -2277,7 +2410,7 @@ class App:
                 last = max(self.settings.get('last_check', 0.0), self.check_started)
                 if self.settings.get('auto_check') and time.time() - last >= jobs.RECHECK:
                     self.check_now()
-                if self.bg.waiting and not (self.game_proc and self.game_proc.poll() is None):
+                if self.bg.waiting and not (self.game_run and self.game_run.alive()):
                     self.install_staged('the game closed')
         except Exception as e:
             self.ctx.log(f'minute: {e!r}')
@@ -2734,6 +2867,18 @@ def play_only(ctx):
     exe = Path(gd) / 'ocarina.exe' if gd else None
     if not exe or not exe.is_file():
         return None
+    # The window or a command may run a job in the game folder meanwhile (a rebuild, an update's install, the mods'
+    # build): the game started now would be the build that job is replacing, which then fails to replace it, and
+    # mods.prepare would unpack into the folder the job reads. Such a job holds the launcher folder's lock and leaves
+    # jobs.MARKER. The lock is only tried, and let go at once: held, it would keep the window from opening.
+    try:
+        locks.FileLock(ctx.layout.instance_lock, 'play from Steam', where=ctx.layout.root).release()
+    except locks.Busy:
+        job = jobs.running_job(ctx)
+        if job:
+            ctx.log(f'play from Steam: not started: the launcher is busy with {job["task"]}')
+            tell(f'NX2navi is busy with {job["task"]}. Start the game when it is done.')
+            return 0
     if saves.game_running(gd):
         ctx.log('play from Steam: the game is already running')
         return 0
@@ -2747,16 +2892,24 @@ def play_only(ctx):
     if waiting:   # the window builds the mods' code in, then starts the game (App.start with --play)
         ctx.log(f'play from Steam: the game is built again first for the code of {", ".join(waiting)}')
         return None
+    started = time.time()
     try:
-        proc = winsys.start_game(exe)
+        run = GameRun(winsys.start_game(exe), gd, started)
     except OSError as e:
         ctx.log(f'play from Steam: {exe}: {e}')
         return None
     ctx.log(f'play from Steam: {exe}')
     time.sleep(2)
-    while proc.poll() is None or saves.game_running(gd):
+    while run.running():
         time.sleep(1)
-    ctx.log(f'play from Steam: the game ended (code {proc.returncode})')
+    # The end is told as Play's is (App.watch_game), with no window: a box for an end worth one. The logs come first,
+    # since the box waits for OK and Steam may end this process meanwhile.
+    end = run.end()
+    ctx.log(f'play from Steam: {end.log}')
+    if end.note:
+        note_exit_in_log(gd, end.note)
+    if end.alarm:
+        tell(end.message)
     return 0
 
 

@@ -50,6 +50,11 @@ typedef void (*PFN_nx2sl_log_unavailable)(VkPhysicalDevice physical);
 // Reflex's low-latency mode, 0 off, 1 on, 2 on with boost: after the device, and after each swapchain the game creates
 // through the interposer (the mode is the swapchain's)
 typedef void (*PFN_nx2sl_reflex)(int mode);
+// The same with Reflex's frame limit, frame_limit_us microseconds from one frame's start to the next (0 none), which
+// the driver's sleep then holds (vk_dlssg.c vk_dlssg_pace). Each call sets both, so the runtime calls only this one when
+// the DLL has it. 1 when Streamline took them and, for a limit, Reflex's sleep runs on this GPU and driver. Optional:
+// an older DLL lacks it, and the game's own limiter then keeps the frame limit.
+typedef int (*PFN_nx2sl_reflex2)(int mode, uint32_t frame_limit_us);
 // Frames are numbered by the game's presents: frame n ends with its n-th present (vk_dlssg.c vk_dlssg_game_present).
 // Where the game starts a frame: with hold, Reflex's sleep, which holds the start until the time the driver computes
 // from the measured render and queue times; then the frame's simulation and render-submit-start markers.

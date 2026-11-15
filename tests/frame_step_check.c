@@ -17,7 +17,7 @@ uint64_t rt_guest_start_ns;
 const char *cfg_get(const char *key) {
     if (!strcmp(key, "NX2NAVI_FPS_LIMIT")) return limit;
     if (!strcmp(key, "NX2NAVI_STEP_STEADY")) return steady;
-    if (!strcmp(key, "NX2NAVI_RTSS")) return "0";
+    if (!strcmp(key, "NX2NAVI_RTSS")) return "1";
     return NULL;
 }
 unsigned cfg_version(void) { return version; }
@@ -38,8 +38,14 @@ static int fg_mult = 1;   // frames on screen per game frame
 int vk_dlssg_multiplier(void) { return fg_mult; }
 int vk_dlssg_active(void) { return fg_mult > 1; }
 int vk_lowlat_on(void) { return 0; }
-void rtss_limit_want(int64_t millihz) { (void)millihz; }
-int rtss_limit_active(void) { return 0; }
+static int64_t rtss_want;          // the newest want (rtss_limit.c)
+static int rtss_movie;             // the newest movie rate RTSS was told of
+void rtss_limit_want(int64_t millihz) { rtss_want = millihz; }
+void rtss_limit_movie(int hz) { rtss_movie = hz; }
+static int rtss_holds;              // RivaTuner Statistics Server holds the game to the want (rtss_limit.c)
+static uint64_t kern_ns, hosted;    // kern_now_ns, and its time at the newest host present (0: none yet)
+int rtss_limit_active(void) { return rtss_holds; }
+uint64_t gfx_window_hosted_ns(void) { return hosted; }
 // The time manager the sound job's gate reads its step from (frame_rate.c sound_job_step), while the sound checks run:
 // [main+0x4c7e890] holds the slot, the slot the manager, the manager +0x10 the step. Nothing else reads.
 static int fake_manager;
@@ -67,7 +73,7 @@ int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint
     (void)dst, (void)src, (void)n, (void)ok;
     return 0;
 }
-uint64_t kern_now_ns(void) { return 0; }
+uint64_t kern_now_ns(void) { return kern_ns; }
 // the floor watch (off here)
 int floor_watch_wanted(void) { return 0; }
 int floor_watch_found(const uint64_t *addr, const float *val, const int *unit, int n, const float link[3]) {
@@ -176,6 +182,9 @@ int main(int argc, char **argv) {
     int mean = argc > 1 && !strcmp(argv[1], "mean");
     if (mean) steady = "0";
     frame_step_init();
+    // the pacer's period while Reflex holds the limit (vk_dlssg.c vk_dlssg_pace): 240 fps for a game stepping by the clock
+    CHECK(frame_step_ceiling_ns() == 4166666, "the ceiling of a game that steps by the clock: %llu ns",
+          (unsigned long long)frame_step_ceiling_ns());
     float one, cut0;
     memcpy(&one, page + 256, 4);
     memcpy(&cut0, page + 260, 4);
@@ -279,6 +288,47 @@ int main(int argc, char **argv) {
               caps[i].gen, game, caps[i].game_hz);
     }
     fg_mult = 1;
+
+    // RivaTuner Statistics Server holds the limit: the pacer keeps the 240 ceiling while host presents go out, and the
+    // limit's own period before the first host present and once none went out for 200 ms (a minimised window, a frame
+    // hold), when RTSS has nothing to hold.
+    {
+        static const struct { const char *l; int holds; uint64_t hosted_ago; double hz; const char *what; } cases[] = {
+            {"60", 1, 10000000, 240, "RTSS holds, a host present 10 ms ago: the ceiling alone"},
+            {"60", 1, 199000000, 240, "199 ms ago: still RTSS's"},
+            {"60", 1, 250000000, 60, "250 ms ago: the limit back"},
+            {"60", 1, 0, 60, "no host present yet: the limit"},
+            {"60", 0, 10000000, 60, "RTSS does not hold: the limit"},
+            {"144", 1, 250000000, 144, "144, minimised: 144"},
+            {"unlimited", 1, 10000000, 240, "unlimited, RTSS holds: the ceiling is the limit"}};
+        kern_ns = 50000000000ull;
+        for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+            set_limit(cases[i].l);
+            rtss_holds = cases[i].holds;
+            hosted = cases[i].hosted_ago ? kern_ns - cases[i].hosted_ago : 0;
+            double hz = 1e9 / (double)frame_step_cap_ns();
+            CHECK(fabs(hz - cases[i].hz) < 0.01, "%s: paces at %.3f fps, not %.0f", cases[i].what, hz, cases[i].hz);
+        }
+        // A movie while RTSS holds 144: RTSS keeps the play limit (no rewrite of its profile at the movie's start and
+        // end) and the pacer holds the movie's 60 with its slots; at 40 the want stays 40 too (rtss_decide.h rtss_target
+        // decides what the profile gets).
+        hosted = kern_ns - 10000000;
+        static const struct { const char *l; int64_t want; } movies[] = {{"144", 144000}, {"40", 40000}};
+        for (unsigned i = 0; i < 2; i++) {
+            set_limit(movies[i].l);
+            movie = 1;
+            double hz = 1e9 / (double)frame_step_cap_ns();
+            CHECK(fabs(hz - 60) < 0.01 && rtss_want == movies[i].want && rtss_movie == 60,
+                  "a movie at a limit of %s under RTSS: paces at %.3f fps, wants %lld, movie %d", movies[i].l, hz,
+                  (long long)rtss_want, rtss_movie);
+            movie = 0;
+            hz = 1e9 / (double)frame_step_cap_ns();
+            CHECK(fabs(hz - 240) < 0.01 && rtss_want == movies[i].want && !rtss_movie,
+                  "after the movie at %s: paces at %.3f fps, wants %lld, movie %d", movies[i].l, hz,
+                  (long long)rtss_want, rtss_movie);
+        }
+        rtss_holds = 0, hosted = kern_ns = 0;
+    }
 
     // The water's ripples at 144 fps, a step of 60/144 frame: 64 water objects asked once a frame each run 600 steps
     // in 1440 frames (the cut gave none), and the day's seconds asked between them keep their own fraction.

@@ -62,20 +62,55 @@ static const float early_gain[5][10]={
     {0}
 };
 static const float pre_time[5]={12.5f,40,50,50,0};
-static void validate_delay(const AudrenDelayParam *p) {
+/* What makes a delay, reverb or compressor block unusable for the DSP below, or NULL. The game sends these blocks, so
+   audio_mixer.c audio_mixer_update_effects asks audio_effect_invalid before it creates or updates a DSP and passes
+   the effect's sound through instead; the validate_* checks in create and update are then invariants. */
+static const char *delay_invalid(const AudrenDelayParam *p) {
     unsigned rate=(p->sample_rate>>14)/1000;
-    if(!channel_ok(p->channels) || p->channel_max<p->channels || rate<1 || rate>192 || p->delay_max>20000 || p->delay>p->delay_max)
-        rt_fatal("audio delay parameters");
+    if(!channel_ok(p->channels))return "channel count not 1, 2, 4 or 6";
+    if(p->channel_max<p->channels)return "more channels than its channel_max";
+    if(rate<1 || rate>192)return "sample rate outside 1 to 192 kHz";
+    if(p->delay_max>20000)return "longest delay above 20000";
+    if(p->delay>p->delay_max)return "delay above its longest delay";
+    return NULL;
+}
+static const char *reverb_invalid(const AudrenReverbParam *p) {
+    if(!channel_ok(p->channels))return "channel count not 1, 2, 4 or 6";
+    if(p->channel_max<p->channels)return "more channels than its channel_max";
+    if(p->sample_rate<16384 || p->sample_rate>192*16384)return "sample rate outside 1 to 192 kHz";
+    if(p->early_mode<0 || p->early_mode>4)return "early mode outside 0 to 4";
+    if(p->late_mode<0 || p->late_mode>3)return "late mode outside 0 to 3";
+    if(p->decay<=0 || p->hf_decay<=0)return "decay or high-frequency decay not above 0";
+    if(p->pre_delay<0)return "pre-delay below 0";
+    return NULL;
+}
+static const char *compressor_invalid(const AudrenCompressorParam *p) {
+    if(!channel_ok(p->channels))return "channel count not 1, 2, 4 or 6";
+    if(p->channel_max<p->channels)return "more channels than its channel_max";
+    if(!isfinite(p->threshold))return "threshold not finite";
+    if(!(p->ratio>0) || !isfinite(p->ratio))return "ratio not above 0 or not finite";
+    if(!(p->input_gain>=0 && p->input_gain<=1) || !(p->attack>=0 && p->attack<=1) || !(p->release>=0 && p->release<=1))
+        return "input gain, attack or release outside 0 to 1";
+    if(!isfinite(p->output_gain))return "output gain not finite";
+    return NULL;
+}
+const char *audio_effect_invalid(unsigned type,const void *param) {
+    if(type==3){AudrenDelayParam p;memcpy(&p,param,sizeof p);return delay_invalid(&p);}
+    if(type==4){AudrenReverbParam p;memcpy(&p,param,sizeof p);return reverb_invalid(&p);}
+    if(type==9){AudrenCompressorParam p;memcpy(&p,param,sizeof p);return compressor_invalid(&p);}
+    return NULL;
+}
+static void validate_delay(const AudrenDelayParam *p) {
+    const char *why=delay_invalid(p);
+    if(why)rt_fatal("audio delay parameters: %s",why);
 }
 static void validate_reverb(const AudrenReverbParam *p) {
-    if(!channel_ok(p->channels) || p->channel_max<p->channels || p->sample_rate<16384 || p->sample_rate>192*16384 ||
-        p->early_mode<0 || p->early_mode>4 || p->late_mode<0 || p->late_mode>3 || p->decay<=0 || p->hf_decay<=0 || p->pre_delay<0)
-        rt_fatal("audio standard reverb parameters");
+    const char *why=reverb_invalid(p);
+    if(why)rt_fatal("audio standard reverb parameters: %s",why);
 }
 static void validate_compressor(const AudrenCompressorParam *p) {
-    if(!channel_ok(p->channels) || p->channel_max<p->channels || !isfinite(p->threshold) || !(p->ratio>0) || !isfinite(p->ratio) ||
-        !(p->input_gain>=0 && p->input_gain<=1) || !(p->attack>=0 && p->attack<=1) || !(p->release>=0 && p->release<=1) || !isfinite(p->output_gain))
-        rt_fatal("audio compressor parameters");
+    const char *why=compressor_invalid(p);
+    if(why)rt_fatal("audio compressor parameters: %s",why);
 }
 AudioEffectDsp *audio_effect_create(unsigned type,const void *param,unsigned revision) {
     AudioEffectDsp *s=calloc(1,sizeof *s);if(!s)rt_fatal("audio effect allocation");
@@ -96,6 +131,9 @@ AudioEffectDsp *audio_effect_create(unsigned type,const void *param,unsigned rev
     return s;
 }
 void audio_effect_free(AudioEffectDsp *s) { if(s){for(int i=0;i<10;i++)free(s->line[i].data);free(s);} }
+/* The "requires reset" checks are invariants too: audio_mixer_update_effects frees the DSP whenever the channels, the
+   rate or the longest delay differ from the block of the update before, which is the one this DSP was made or last
+   updated from. */
 void audio_effect_update(AudioEffectDsp *s,const void *param) {
     if(s->type==3){
         AudrenDelayParam p;memcpy(&p,param,sizeof p);validate_delay(&p);

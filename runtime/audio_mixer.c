@@ -59,6 +59,7 @@ typedef struct {
     float *delay, detector[6], compression[6], peak[6], minimum[6]; int position[6], delay_max, channels;
     AudioEffectDsp *dsp; unsigned type; uint8_t wire[160];
     float biquad_z[6][2], numerator[3], denominator[2]; uint8_t biquad_channels;
+    uint8_t bad;   // the game's parameters for it cannot be used: passed through (audio_mixer_update_effects)
 } EffectState;
 typedef struct Mixer {
     float *buf; int nbuf, frame;
@@ -117,6 +118,11 @@ static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
     m->reported |= 1u << bit;
     rt_log("audio: %s (%d)", msg, value);
+}
+// A guest range ipc.c ipc_guest takes (it ends the process on any other): not 0, not wrapping, below the guest address
+// limit. It does not prove the memory is mapped.
+static int guest_range_ok(uint64_t addr, uint64_t size) {
+    return addr && addr + size >= addr && addr + size <= RT_ADDRESS_LIMIT;
 }
 
 // ---- output: SDL3 audio stream fed from the ring
@@ -701,73 +707,246 @@ void audio_mixer_close(AudioRenderer *r) {
 }
 
 /* ---------- routing input: splitters and mixes ---------- */
-static void splitters_update(AudioRenderer *r, const uint8_t *p, uint32_t n) {
+#define SNDH 0x48444e53u
+#define SNDI 0x49444e53u
+#define SNDD 0x44444e53u
+// The splitter section of an update: the SNDH header with the record counts, one SNDI record per splitter the update
+// changes with its destination ids and 12 reserved bytes (measured, REV11), then one SNDD record per destination it
+// changes (0x70, 0x90 or 0xa8 bytes by revision); the section is padded to 16 bytes, and the game leaves the padding as
+// it is (measured). One walk serves both passes of an update, so both read the same bytes. With `apply` 0
+// (audio_mixer_routing_check: before anything of the update is applied, without the lock) it checks the framing only
+// and returns AUDREN_R_INVALID_UPDATE on a fault, which refuses the update. With `apply` 1 (audio_mixer_update_routing,
+// lock held) it stores the records: a record that names a splitter or destination the renderer does not have is left
+// out, a destination id in a splitter's list that the renderer does not have is stored as -1, which both splitter loops
+// of audio_mixer_render skip, and a destination filter with a coefficient that is not a finite number is off (audio_bad
+// each). Offsets are 64-bit, so a huge id count cannot wrap a bounds test.
+// A framing fault (SPL_FAULT): with `apply` 0 the update is refused (AUDIO_REFUSE). With `apply` 1 it can only come
+// from the game rewriting its input during its own RequestUpdate, between the two walks; the update is taken by then,
+// so the walk stops there, the records before it stay applied, the mix section is applied after it, and the log says
+// the rest of the splitter section is left out (audio_mixer_update_routing ignores the result).
+#define SPL_FAULT(kind, fmt, ...)                                                                                      \
+    (apply ? (audio_bad(r, (kind), fmt "; the rest of the splitter section is left out", ##__VA_ARGS__),             \
+              AUDREN_R_INVALID_UPDATE)                                                                                 \
+           : AUDIO_REFUSE(r, (kind), fmt, ##__VA_ARGS__))
+static uint32_t splitters_walk(AudioRenderer *r, uint32_t revision, const uint8_t *p, uint32_t n, int apply) {
     Mixer *m = r->mixer;
-    if (!n) return;
+    const uint32_t nsplit = (uint32_t)r->param.splitter_count, ndest = (uint32_t)r->param.splitter_destination_count;
+    if (!n) return 0;
+    if (n < 0x20)
+        return SPL_FAULT(AB_SPL_HEADER, "the splitter section is %u bytes, under its 32-byte header", n);
     uint32_t hdr[3];
-    if (n < 0x20) rt_fatal("audio splitter section header");
     memcpy(hdr, p, 12);
-    if (hdr[0] != 0x48444e53u) rt_fatal("audio splitter header magic (SNDH)");
-    uint32_t ni = hdr[1], nd = hdr[2], at = 0x20;
+    if (hdr[0] != SNDH) return SPL_FAULT(AB_SPL_MAGIC, "the splitter section starts with %08x, not SNDH", hdr[0]);
+    const uint32_t ni = hdr[1], nd = hdr[2];
+    const unsigned rev = (revision >> 24) - '0', stride = rev >= 15 ? 0xa8 : rev >= 12 ? 0x90 : 0x70;
+    uint64_t at = 0x20;
     for (uint32_t i = 0; i < ni; i++) {
-        uint32_t h[4]; if (at + 16 > n) rt_fatal("audio splitter info overruns section");
-        memcpy(h, p + at, 16); at += 16;
-        if (h[0] != 0x49444e53u || h[1] >= (uint32_t)m->nsplit || h[3] > (uint32_t)m->ndest || at + 4u * h[3] > n) {
-            rt_log("audio: splitter info %u at %#x: %08x %08x %08x %08x (section %u bytes, infos %u, destinations %u)", i, at - 16, h[0], h[1], h[2], h[3], n, ni, nd);
-            rt_fatal("audio splitter info (SNDI)");
+        uint32_t h[4];
+        if (at + 16 > n)
+            return SPL_FAULT(AB_SPL_INFO_OVERRUN,
+                             "splitter info %u of %u at %#llx overruns the %u-byte splitter section", i, ni,
+                             (unsigned long long)at, n);
+        memcpy(h, p + at, 16);
+        at += 16;
+        if (h[0] != SNDI || at + 4ull * h[3] > n)
+            return SPL_FAULT(AB_SPL_INFO,
+                             "splitter info %u at %#llx: %08x %08x %08x %08x (section %u bytes, infos %u, "
+                             "destinations %u)",
+                             i, (unsigned long long)(at - 16), h[0], h[1], h[2], h[3], n, ni, nd);
+        if (at + 4ull * h[3] + 12 > n)
+            return SPL_FAULT(AB_SPL_PADDING,
+                             "the reserved bytes after splitter info %u's %u ids overrun the %u-byte splitter "
+                             "section", i, h[3], n);
+        if (apply && (h[1] >= nsplit || h[3] > ndest)) {
+            audio_bad(r, AB_SPL_ID,
+                      "splitter info %u names splitter %u of %u with %u destinations of %u: that record is left out",
+                      i, h[1], nsplit, h[3], ndest);
+        } else if (apply) {
+            int32_t *ids = calloc(h[3] ? h[3] : 1, sizeof(int32_t));
+            if (!ids) rt_fatal("audio splitter destinations");
+            memcpy(ids, p + at, 4u * h[3]);
+            for (uint32_t k = 0; k < h[3]; k++)
+                if (ids[k] < 0 || (uint32_t)ids[k] >= ndest) {
+                    audio_bad(r, AB_SPL_DEST_REF, "splitter %u's destination %u is %d of %u: that destination is "
+                              "left out", h[1], k, ids[k], ndest);
+                    ids[k] = -1;
+                }
+            SplitInfo *s = &m->split[h[1]];
+            free(s->ids);
+            s->ndest = (int32_t)h[3];
+            s->ids = ids;
         }
-        SplitInfo *s = &m->split[h[1]]; free(s->ids);
-        s->ndest = (int32_t)h[3]; s->ids = calloc(h[3] ? h[3] : 1, sizeof(int32_t));
-        if (!s->ids) rt_fatal("audio splitter destinations");
-        memcpy(s->ids, p + at, 4u * h[3]); at += 4u * h[3] + 12;   /* 12 reserved bytes follow the ids (measured, NX2NAVI REV11) */
-        if (at > n) rt_fatal("audio splitter info padding overruns section");
-        for (uint32_t k = 0; k < h[3]; k++) if (s->ids[k] < 0 || s->ids[k] >= m->ndest) rt_fatal("audio splitter destination id");
+        at += 4ull * h[3] + 12;
     }
     for (uint32_t i = 0; i < nd; i++) {
-        unsigned rev=(r->revision>>24)-'0',stride=rev>=15?0xa8:rev>=12?0x90:0x70;
-        uint8_t e[0xa8]={0}; if (at>n||stride>n-at) rt_fatal("audio splitter destination overruns section");
-        memcpy(e, p + at, stride); at += stride;
-        uint32_t magic, id; int32_t dst; memcpy(&magic, e, 4); memcpy(&id, e + 4, 4); memcpy(&dst, e + 0x68, 4);
-        if (magic != 0x44444e53u || id >= (uint32_t)m->ndest) rt_fatal("audio splitter destination (SNDD)");
-        SplitDest *d = &m->dest[id]; memcpy(d->vol, e + 8, sizeof d->vol); d->dest = dst;
-        d->used=e[rev>=15?0x9c:rev>=12?0x84:0x6c];
-        for(unsigned f=0;f<2;f++){
-            AudrenBiquadFloat b={0};
-            if(rev>=15)memcpy(&b,e+0x6c+f*sizeof b,sizeof b);
-            else if(rev>=12){AudrenBiquad q;memcpy(&q,e+0x6c+f*sizeof q,sizeof q);b.enable=q.enable;for(unsigned c=0;c<3;c++)b.numerator[c]=q.numerator[c]/16384.0f;for(unsigned c=0;c<2;c++)b.denominator[c]=q.denominator[c]/16384.0f;}
-            if(b.enable){for(unsigned c=0;c<3;c++)if(!isfinite(b.numerator[c]))rt_fatal("audio splitter nonfinite numerator");for(unsigned c=0;c<2;c++)if(!isfinite(b.denominator[c]))rt_fatal("audio splitter nonfinite denominator");}
-            if(!b.enable||!d->biquads[f].enable||!d->used)memset(d->state[f],0,sizeof d->state[f]);
-            d->biquads[f]=b;
+        uint8_t e[0xa8] = {0};
+        if (at > n || stride > n - at)
+            return SPL_FAULT(AB_DEST_OVERRUN,
+                             "splitter destination %u of %u at %#llx overruns the %u-byte splitter section "
+                             "(records of %#x bytes)", i, nd, (unsigned long long)at, n, stride);
+        memcpy(e, p + at, stride);
+        at += stride;
+        uint32_t magic, id;
+        int32_t dst;
+        memcpy(&magic, e, 4);
+        memcpy(&id, e + 4, 4);
+        memcpy(&dst, e + 0x68, 4);
+        if (magic != SNDD)
+            return SPL_FAULT(AB_DEST_MAGIC, "splitter destination %u at %#llx starts with %08x, not SNDD", i,
+                             (unsigned long long)(at - stride), magic);
+        if (!apply) continue;
+        if (id >= ndest) {
+            audio_bad(r, AB_DEST_ID, "splitter destination record %u names destination %u of %u: that record is left "
+                      "out", i, id, ndest);
+            continue;
+        }
+        SplitDest *d = &m->dest[id];
+        memcpy(d->vol, e + 8, sizeof d->vol);
+        d->dest = dst;
+        d->used = e[rev >= 15 ? 0x9c : rev >= 12 ? 0x84 : 0x6c];
+        for (unsigned f = 0; f < 2; f++) {
+            AudrenBiquadFloat b = {0};
+            if (rev >= 15) {
+                memcpy(&b, e + 0x6c + f * sizeof b, sizeof b);
+            } else if (rev >= 12) {   // Q14 filters
+                AudrenBiquad q;
+                memcpy(&q, e + 0x6c + f * sizeof q, sizeof q);
+                b.enable = q.enable;
+                for (unsigned c = 0; c < 3; c++) b.numerator[c] = q.numerator[c] / 16384.0f;
+                for (unsigned c = 0; c < 2; c++) b.denominator[c] = q.denominator[c] / 16384.0f;
+            }
+            if (b.enable && !(isfinite(b.numerator[0]) && isfinite(b.numerator[1]) && isfinite(b.numerator[2]) &&
+                              isfinite(b.denominator[0]) && isfinite(b.denominator[1]))) {
+                audio_bad(r, AB_DEST_FILTER, "splitter destination %u's filter %u has a coefficient that is not a "
+                          "finite number (%g %g %g / %g %g): that filter is off", id, f, b.numerator[0],
+                          b.numerator[1], b.numerator[2], b.denominator[0], b.denominator[1]);
+                b.enable = 0;   // its state is cleared below, as for a filter the game turned off
+            }
+            if (!b.enable || !d->biquads[f].enable || !d->used) memset(d->state[f], 0, sizeof d->state[f]);
+            d->biquads[f] = b;
         }
     }
-    if (at <= n && n - at < 16) at = n;   /* the section is padded to 16 bytes; the padding is not cleared by the game (measured) */
-    if (at != n) { rt_log("audio: splitter section %u bytes, parsed %u (infos %u, destinations %u)", n, at, ni, nd); rt_fatal("audio splitter section size"); }
+    if (at <= n && n - at < 16) at = n;   // the padding to 16 bytes, which the game does not clear (measured)
+    if (at != n)
+        return SPL_FAULT(AB_SPL_SIZE,
+                         "the splitter section is %u bytes and its records end at %#llx (infos %u, destinations %u)",
+                         n, (unsigned long long)at, ni, nd);
+    return 0;
 }
-void audio_mixer_update_routing(AudioRenderer *r, const uint8_t *splitters, uint32_t splitter_bytes, const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
-    splitters_update(r, splitters, splitter_bytes);
-    if (mix_bytes == (uint32_t)mix_count * sizeof(AudrenMixIn)) { memcpy(r->mixes, mixes, mix_bytes); return; }
+#undef SPL_FAULT
+uint32_t audio_mixer_routing_check(AudioRenderer *r, uint32_t revision, const uint8_t *splitters,
+                                   uint32_t splitter_bytes, const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
+    uint32_t refused = splitters_walk(r, revision, splitters, splitter_bytes, 0);
+    if (refused) return refused;
+    if (mix_bytes == (uint32_t)mix_count * sizeof(AudrenMixIn)) return 0;
     /* MixInParameterDirtyOnly: 0x20-byte header {u32 magic 0xCAFEBABE, u32 count, pad} followed by the dirty mixes */
     if (mix_bytes >= 0x20 && (mix_bytes - 0x20) % sizeof(AudrenMixIn) == 0) {
-        uint32_t magic, n; memcpy(&magic, mixes, 4); memcpy(&n, mixes + 4, 4);
-        if (magic != 0xcafebabeu || n * sizeof(AudrenMixIn) != mix_bytes - 0x20) rt_fatal("audio dirty mix header");
-        for (uint32_t i = 0; i < n; i++) {
-            AudrenMixIn m; memcpy(&m, mixes + 0x20 + i * sizeof m, sizeof m);
-            if (m.mix_id < 0 || m.mix_id >= mix_count) rt_fatal("audio mix id");
-            r->mixes[m.mix_id] = m;
-        }
+        uint32_t magic, count;
+        memcpy(&magic, mixes, 4);
+        memcpy(&count, mixes + 4, 4);
+        if (magic != 0xcafebabeu || count * sizeof(AudrenMixIn) != mix_bytes - 0x20)
+            return AUDIO_REFUSE(r, AB_MIX_DIRTY, "the changed-mix header reads %08x and %u mixes for %u bytes of mixes",
+                                magic, count, mix_bytes - 0x20);
+        return 0;
+    }
+    return AUDIO_REFUSE(r, AB_MIX_SIZE, "the mix section is %u bytes for %d mixes of %#x bytes", mix_bytes, mix_count,
+                        (unsigned)sizeof(AudrenMixIn));
+}
+// The mixes' buffers as audio_mixer_render lays them out: one after another, for the mixes in use, from buffer 0. A
+// negative count of a mix in use would start the mixes after it before buffer 0, and more buffers than the renderer
+// has would run past them, so such an update is refused before anything of it is applied; the render's layout check is
+// then an invariant. The update's records are applied as audio_mixer_update_routing applies them (a changed-mix record
+// with an id the renderer does not have is left out). This check and audio_mixer_update_routing each read the mix
+// section from guest memory, so the check holds for the apply only because the game does not rewrite its input during
+// its own RequestUpdate (its sending thread waits in the IPC call).
+uint32_t audio_mixer_mix_layout_check(AudioRenderer *r, const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
+    int32_t buffers[256];
+    uint8_t used[256];
+    if (mix_count > 256) mix_count = 256;   // audren.c renderer_new keeps submix_count below 256
+    for (int i = 0; i < mix_count; i++) buffers[i] = r->mixes[i].buffer_count, used[i] = r->mixes[i].in_use;
+    const int full = mix_bytes == (uint32_t)mix_count * sizeof(AudrenMixIn);
+    const uint32_t records =
+        full ? (uint32_t)mix_count : mix_bytes >= 0x20 ? (mix_bytes - 0x20) / sizeof(AudrenMixIn) : 0;
+    const uint8_t *x = full ? mixes : mixes + 0x20;
+    for (uint32_t i = 0; i < records; i++, x += sizeof(AudrenMixIn)) {
+        int32_t id = (int32_t)i;
+        if (!full) memcpy(&id, x + offsetof(AudrenMixIn, mix_id), 4);
+        if (id < 0 || id >= mix_count) continue;
+        memcpy(&buffers[id], x + offsetof(AudrenMixIn, buffer_count), 4);
+        used[id] = x[offsetof(AudrenMixIn, in_use)];
+    }
+    int64_t need = 0;
+    for (int i = 0; i < mix_count; i++) {
+        if (!used[i]) continue;
+        if (buffers[i] < 0)
+            return AUDIO_REFUSE(r, AB_MIX_LAYOUT, "mix %d is in use with %d mix buffers", i, buffers[i]);
+        need += buffers[i];
+    }
+    if (need > r->param.mix_buffer_count)
+        return AUDIO_REFUSE(r, AB_MIX_LAYOUT, "the mixes in use need %lld mix buffers, the renderer has %d",
+                            (long long)need, r->param.mix_buffer_count);
+    return 0;
+}
+void audio_mixer_update_routing(AudioRenderer *r, const uint8_t *splitters, uint32_t splitter_bytes,
+                                const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
+    splitters_walk(r, r->revision, splitters, splitter_bytes, 1);
+    if (mix_bytes == (uint32_t)mix_count * sizeof(AudrenMixIn)) {
+        memcpy(r->mixes, mixes, mix_bytes);
         return;
     }
-    rt_log("audio: mix section %u bytes for %d mixes", mix_bytes, mix_count);
-    rt_fatal("audio mix section size");
+    if (mix_bytes < 0x20) return;   // refused by audio_mixer_routing_check
+    /* the changed mixes only: audio_mixer_routing_check has checked the header against the section's size */
+    const uint32_t n = (mix_bytes - 0x20) / sizeof(AudrenMixIn);
+    for (uint32_t i = 0; i < n; i++) {
+        AudrenMixIn x;
+        memcpy(&x, mixes + 0x20 + i * sizeof x, sizeof x);
+        if (x.mix_id < 0 || x.mix_id >= mix_count) {
+            audio_bad(r, AB_MIX_ID, "changed-mix record %u names mix %d of %d: that record is left out", i, x.mix_id,
+                      mix_count);
+            continue;
+        }
+        r->mixes[x.mix_id] = x;
+    }
 }
 
-/* Effect parameters arrive once per IPC update, while the DSP may process multiple frames. */
+// A delay, reverb or compressor block audio_effect_invalid refused, with its values: one line per kind.
+static void effect_bad(AudioRenderer *r, int id, const AudrenEffectIn *e, const char *why) {
+    if (e->type == 3) {
+        AudrenDelayParam p;
+        memcpy(&p, e->specific, sizeof p);
+        audio_bad(r, AB_DELAY_PARAMS,
+                  "delay effect %d on mix %d: %s (channels %u of %u, sample rate %#x, delay %u of %u): its sound "
+                  "passes through unchanged",
+                  id, e->mix_id, why, p.channels, p.channel_max, p.sample_rate, p.delay, p.delay_max);
+    } else if (e->type == 4) {
+        AudrenReverbParam p;
+        memcpy(&p, e->specific, sizeof p);
+        audio_bad(r, AB_REVERB_PARAMS,
+                  "reverb effect %d on mix %d: %s (channels %u of %u, sample rate %#x, early mode %d, late mode %d, "
+                  "decay %d, high-frequency decay %d, pre-delay %d): its sound passes through unchanged",
+                  id, e->mix_id, why, p.channels, p.channel_max, (unsigned)p.sample_rate, p.early_mode, p.late_mode,
+                  p.decay, p.hf_decay, p.pre_delay);
+    } else {
+        AudrenCompressorParam p;
+        memcpy(&p, e->specific, sizeof p);
+        audio_bad(r, AB_COMPRESSOR_PARAMS,
+                  "compressor effect %d on mix %d: %s (channels %u of %u, threshold %g, ratio %g, input gain %g, "
+                  "attack %g, release %g, output gain %g): its sound passes through unchanged",
+                  id, e->mix_id, why, p.channels, p.channel_max, p.threshold, p.ratio, p.input_gain, p.attack,
+                  p.release, p.output_gain);
+    }
+}
+
+/* Effect parameters arrive once per IPC update, while the DSP may process multiple frames. An enabled effect whose
+   parameters cannot be used is marked bad (audio_bad logs it): audio_mixer_render passes its sound through, with no
+   DSP, delay line or reverb state made from those values, until an update brings usable ones. */
 void audio_mixer_update_effects(AudioRenderer *r) {
     Mixer *m = r->mixer;
     for (int i=0;i<r->param.effect_count;i++) {
         const AudrenEffectIn *e=&r->effects[i]; EffectState *s=&m->effect[i];
         unsigned revision=audio_revision(r);
         int reset=e->is_new || s->type!=e->type;
+        s->bad=0;
         if(reset){audio_effect_free(s->dsp);s->dsp=NULL;memset(s->biquad_z,0,sizeof s->biquad_z);}
         if(e->type==3 || e->type==4 || e->type==9) {
             unsigned status,channels;int dimensions_changed=0;
@@ -775,14 +954,19 @@ void audio_mixer_update_effects(AudioRenderer *r) {
             else if(e->type==4){AudrenReverbParam p,old;memcpy(&p,e->specific,sizeof p);memcpy(&old,s->wire,sizeof old);status=p.status;channels=p.channels;dimensions_changed=p.channels!=old.channels || p.sample_rate!=old.sample_rate;}
             else {AudrenCompressorParam p,old;memcpy(&p,e->specific,sizeof p);memcpy(&old,s->wire,sizeof old);status=p.status;channels=p.channels;dimensions_changed=p.channels!=old.channels;}
             if(status==0 || dimensions_changed){audio_effect_free(s->dsp);s->dsp=NULL;}
-            if(e->enabled && channels){if(!s->dsp)s->dsp=audio_effect_create(e->type,e->specific,revision);else audio_effect_update(s->dsp,e->specific);}
+            if(e->enabled && channels){
+                const char *why=audio_effect_invalid(e->type,e->specific);
+                if(why){audio_effect_free(s->dsp);s->dsp=NULL;s->bad=1;effect_bad(r,i,e,why);}
+                else if(!s->dsp)s->dsp=audio_effect_create(e->type,e->specific,revision);
+                else audio_effect_update(s->dsp,e->specific);
+            }
         } else if(s->dsp){audio_effect_free(s->dsp);s->dsp=NULL;}
         if(e->type==6){
             unsigned status;
             if(revision>=15){AudrenBiquadEffectV2 p;memcpy(&p,e->specific,sizeof p);s->biquad_channels=p.channels;status=p.status;memcpy(s->numerator,p.numerator,sizeof p.numerator);memcpy(s->denominator,p.denominator,sizeof p.denominator);}
             else {AudrenBiquadEffectV1 p;memcpy(&p,e->specific,sizeof p);s->biquad_channels=p.channels;status=p.status;for(int k=0;k<3;k++)s->numerator[k]=p.numerator[k]/16384.f;for(int k=0;k<2;k++)s->denominator[k]=p.denominator[k]/16384.f;}
             if(status==0 || (status==1 && revision<6))memset(s->biquad_z,0,sizeof s->biquad_z);
-            if(e->enabled && (s->biquad_channels<1 || s->biquad_channels>6))rt_fatal("biquad effect channel count");
+            // an enabled one with a channel count outside 1-6 is skipped by mix_simple_effect, which logs it
         }
         s->type=e->type;memcpy(s->wire,e->specific,sizeof s->wire);
         if(e->type!=5 || e->is_new) { audio_reverb_free(s->reverb); s->reverb=NULL; s->pending=1; }
@@ -793,9 +977,17 @@ void audio_mixer_update_effects(AudioRenderer *r) {
                 memset(s->detector,0,sizeof s->detector);memset(s->position,0,sizeof s->position);
                 for(int c=0;c<6;c++)s->compression[c]=s->minimum[c]=1;
                 memset(s->peak,0,sizeof s->peak);
-                if(e->enabled) {
-                    if(p.channels<1 || p.channels>6 || p.delay_max<1 || p.delay_max>192000)rt_fatal("limiter delay dimensions");
-                    s->delay=calloc((size_t)p.channels*p.delay_max,sizeof(float));if(!s->delay)rt_fatal("limiter delay allocation");
+                // channels outside 1-6: no delay line, and mix_limiter skips the effect and logs it
+                if(e->enabled && p.channels>=1 && p.channels<=6) {
+                    if(p.delay_max<1 || p.delay_max>192000) {
+                        s->bad=1;   // checked again at the next update: without a delay line this block runs each time
+                        audio_bad(r,AB_LIMITER_SIZE,"limiter effect %d on mix %d has a longest delay of %d "
+                                  "samples, not 1 to 192000: its sound passes through unchanged",i,e->mix_id,
+                                  p.delay_max);
+                    } else {
+                        s->delay=calloc((size_t)p.channels*p.delay_max,sizeof(float));
+                        if(!s->delay)rt_fatal("limiter delay allocation");
+                    }
                 }
             }
             if(p.statistics_reset) { memset(s->peak,0,sizeof s->peak); for(int c=0;c<6;c++)s->minimum[c]=1; }
@@ -805,6 +997,18 @@ void audio_mixer_update_effects(AudioRenderer *r) {
         if(s->reverb && p.sample_rate!=s->param.sample_rate) { audio_reverb_free(s->reverb); s->reverb=NULL; }
         if(memcmp(&p,&s->param,72) || p.status<2) s->pending=1;
         s->param=p;
+        // the render creates or updates the reverb from these values (mix_effects); one with another channel count is
+        // skipped there
+        if(e->enabled && (p.channels==1 || p.channels==2 || p.channels==4 || p.channels==6)) {
+            const char *why=audio_reverb_invalid(&p);
+            if(why) {
+                s->bad=1;
+                audio_bad(r,AB_R3D_PARAMS,"reverb3d effect %d on mix %d: %s (sample rate %u, decay time %g, "
+                          "high-frequency decay ratio %g, density %g, reflection delay %g s, reverb delay %g s): its "
+                          "sound passes through unchanged",i,e->mix_id,why,p.sample_rate,p.decay_time,
+                          p.hf_decay_ratio,p.density,p.reflection_delay,p.reverb_delay);
+            }
+        }
     }
 }
 
@@ -946,16 +1150,35 @@ static int mix_depth(AudioRenderer *r, int id) {
 
 /* Guest custom effects exchange int32 samples in two rings. Each ring has CPU and DSP
    0x40-byte headers followed by samples; only the DSP header's owned cursor is advanced. */
-static void mix_aux(AudioRenderer *r, int mix, const AudrenEffectIn *e) {
+// The render-pass effects below skip an effect whose dimensions, guest ring or mix buffer indices the game set out of
+// range (nothing of it is read or written in that pass) and log it once per kind through audio_bad; every index is
+// checked before the first write.
+static void mix_aux(AudioRenderer *r, int mix, int id, const AudrenEffectIn *e) {
     Mixer *m=r->mixer; AudrenAuxParam p; memcpy(&p,e->specific,sizeof p);
     if(!p.send_info || !p.return_info || !p.capacity || !p.channels) return;
-    if(p.channels>24 || p.capacity>16*1024*1024)rt_fatal("auxiliary effect dimensions");
-    uint8_t *send=ipc_guest(p.send_info,128+(uint64_t)p.capacity*4), *ret=ipc_guest(p.return_info,128+(uint64_t)p.capacity*4);
+    const uint64_t ring_bytes=128+(uint64_t)p.capacity*4;
+    if(p.channels>24 || p.capacity>16*1024*1024) {
+        audio_bad(r,AB_AUX_SIZE,"auxiliary effect %d on mix %d has %u channels and rings of %u samples (24 and 16 "
+                  "Mi at most): it is skipped",id,mix,p.channels,p.capacity);
+        return;
+    }
+    if(!guest_range_ok(p.send_info,ring_bytes) || !guest_range_ok(p.return_info,ring_bytes)) {
+        audio_bad(r,AB_AUX_ADDRESS,"auxiliary effect %d on mix %d has its rings at %#llx and %#llx (%#llx bytes), "
+                  "outside guest memory: it is skipped",id,mix,(unsigned long long)p.send_info,
+                  (unsigned long long)p.return_info,(unsigned long long)ring_bytes);
+        return;
+    }
+    for(unsigned c=0;c<p.channels;c++)
+        if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count) {
+            audio_bad(r,AB_AUX_INDEX,"auxiliary effect %d on mix %d sends buffer %u and returns to %u of the mix's "
+                      "%d: it is skipped",id,mix,p.input[c],p.output[c],r->mixes[mix].buffer_count);
+            return;
+        }
+    uint8_t *send=ipc_guest(p.send_info,ring_bytes), *ret=ipc_guest(p.return_info,ring_bytes);
     uint32_t *sh=(uint32_t *)(send+64),*rh=(uint32_t *)(ret+64); int32_t *sd=(int32_t *)(send+128),*rd=(int32_t *)(ret+128);
     uint32_t wr=sh[1],read=rh[0],total=p.channels*(uint32_t)m->frame;
     if(e->enabled) report_once(m,6,"auxiliary effect in use, channels",(int)p.channels);
     for(unsigned c=0;c<p.channels;c++) {
-        if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count)rt_fatal("auxiliary effect mix buffer");
         float *input=mixbuf(m,m->offset[mix]+p.input[c]),*output=mixbuf(m,m->offset[mix]+p.output[c]);
         if(!e->enabled) { if(input!=output)memmove(output,input,m->frame*sizeof(float)); continue; }
         uint64_t w=(uint64_t)wr+c*m->frame,at=(uint64_t)read+c*m->frame;
@@ -978,12 +1201,30 @@ void audio_mixer_effect_result(AudioRenderer *r, int id, void *output, unsigned 
 static void mix_limiter(AudioRenderer *r, int mix, int id) {
     Mixer *m=r->mixer; EffectState *s=&m->effect[id]; const AudrenEffectIn *e=&r->effects[id];
     AudrenLimiterParam p;memcpy(&p,e->specific,sizeof p);
-    if(p.channels<1 || p.channels>6) { if(e->enabled)rt_fatal("limiter channel count");return; }
-    if(e->enabled && (!s->delay || p.delay_min<1 || p.delay_min>p.delay_max || p.attack<0 || p.attack>1 || p.release<0 || p.release>1))rt_fatal("limiter parameters");
+    if(p.channels<1 || p.channels>6) {
+        if(e->enabled)audio_bad(r,AB_LIMITER_CHANNELS,"limiter effect %d on mix %d has %u channels, not 1 to 6: it "
+                                "is skipped",id,mix,p.channels);
+        return;
+    }
+    for(int c=0;c<p.channels;c++)
+        if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count) {
+            audio_bad(r,AB_LIMITER_INDEX,"limiter effect %d on mix %d reads buffer %u and writes %u of the mix's %d: "
+                      "it is skipped",id,mix,p.input[c],p.output[c],r->mixes[mix].buffer_count);
+            return;
+        }
+    // NaN-safe: an attack or release that is not a number would turn the mix, and every mix it feeds, into NaN
+    int pass=!e->enabled;
+    if(e->enabled && (!s->delay || !(p.delay_min>=1 && p.delay_min<=p.delay_max) || !(p.attack>=0 && p.attack<=1) ||
+                      !(p.release>=0 && p.release<=1))) {
+        if(!s->bad)   // bad: audio_mixer_update_effects logged the longest delay that left it without a delay line
+            audio_bad(r,AB_LIMITER_PARAMS,"limiter effect %d on mix %d: delay %d of %d samples, attack %g, release "
+                      "%g (a delay of 1 to the longest, times of 0 to 1): its sound passes through unchanged",id,mix,
+                      p.delay_min,p.delay_max,p.attack,p.release);
+        pass=1;
+    }
     for(int c=0;c<p.channels;c++) {
-        if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count)rt_fatal("limiter mix buffer");
         float *input=mixbuf(m,m->offset[mix]+p.input[c]),*output=mixbuf(m,m->offset[mix]+p.output[c]);
-        if(!e->enabled) { if(input!=output)memmove(output,input,m->frame*sizeof(float));continue; }
+        if(pass) { if(input!=output)memmove(output,input,m->frame*sizeof(float));continue; }
         for(int k=0;k<m->frame;k++) {
             float x=(input[k]*(32768.f/32767.f))*p.input_gain,level=fabsf(x);
             float coeff=level>s->detector[c]?p.attack:p.release;s->detector[c]+=coeff*(level-s->detector[c]);
@@ -1010,16 +1251,32 @@ static void effect_counter_add(uint32_t cpu,uint32_t *dsp,uint32_t count) {
     uint32_t previous=*dsp-cpu,next=*dsp+count;
     *dsp=next-cpu<previous?cpu-1:next;
 }
-static void mix_capture(AudioRenderer *r,int mix,const AudrenEffectIn *e) {
+static void mix_capture(AudioRenderer *r,int mix,int id,const AudrenEffectIn *e) {
     Mixer *m=r->mixer;AudrenAuxParam p;memcpy(&p,e->specific,sizeof p);
     if(!p.send_info || !p.capacity || !p.channels)return;
-    if(p.channels>24 || p.capacity>16*1024*1024)rt_fatal("capture effect dimensions");
-    uint8_t *base=ipc_guest(p.send_info,128+(uint64_t)p.capacity*4);uint32_t *cpu=(uint32_t *)base,*dsp=(uint32_t *)(base+64);int32_t *data=(int32_t *)(base+128);
+    const uint64_t ring_bytes=128+(uint64_t)p.capacity*4;
+    if(p.channels>24 || p.capacity>16*1024*1024) {
+        audio_bad(r,AB_CAPTURE_SIZE,"capture effect %d on mix %d has %u channels and a ring of %u samples (24 and 16 "
+                  "Mi at most): it is skipped",id,mix,p.channels,p.capacity);
+        return;
+    }
+    if(!guest_range_ok(p.send_info,ring_bytes)) {
+        audio_bad(r,AB_CAPTURE_ADDRESS,"capture effect %d on mix %d has its ring at %#llx (%#llx bytes), outside guest "
+                  "memory: it is skipped",id,mix,(unsigned long long)p.send_info,(unsigned long long)ring_bytes);
+        return;
+    }
+    uint8_t *base=ipc_guest(p.send_info,ring_bytes);
+    uint32_t *cpu=(uint32_t *)base,*dsp=(uint32_t *)(base+64);int32_t *data=(int32_t *)(base+128);
     dm_guest_write_prepare(base+64,64);
     if(!e->enabled){dsp[0]=dsp[1]=dsp[3]=0;return;}
+    for(unsigned c=0;c<p.channels;c++)
+        if(p.input[c]>=r->mixes[mix].buffer_count) {
+            audio_bad(r,AB_CAPTURE_INDEX,"capture effect %d on mix %d reads buffer %u of the mix's %d: it is skipped",
+                      id,mix,p.input[c],r->mixes[mix].buffer_count);
+            return;
+        }
     uint32_t wr=dsp[1],total=p.channels*(uint32_t)m->frame;
     for(unsigned c=0;c<p.channels;c++){
-        if(p.input[c]>=r->mixes[mix].buffer_count)rt_fatal("capture effect input buffer");
         float *in=mixbuf(m,m->offset[mix]+p.input[c]);uint64_t at=(uint64_t)wr+c*m->frame;
         if(at<=p.capacity)prepare_ring_write((uint8_t *)data,p.capacity*4,(uint32_t)(at%p.capacity)*4,(uint64_t)m->frame*4);
         for(int k=0;k<m->frame;k++){int32_t value=effect_integer(in[k]);in[k]=value/32768.f;if(at<=p.capacity)data[(at+(unsigned)k)%p.capacity]=value;}
@@ -1032,31 +1289,60 @@ static void mix_capture(AudioRenderer *r,int mix,const AudrenEffectIn *e) {
 }
 static void mix_simple_effect(AudioRenderer *r,int mix,int id) {
     Mixer *m=r->mixer;const AudrenEffectIn *e=&r->effects[id];EffectState *s=&m->effect[id];
+    static const char *const names[10]={[1]="buffer-mix",[3]="delay",[4]="reverb",[6]="biquad",[9]="compressor"};
     if(e->type==1){
         AudrenBufferMixParam p;memcpy(&p,e->specific,sizeof p);if(!e->enabled)return;
-        if(p.count>24)rt_fatal("buffer-mix effect count");
+        if(p.count>24) {
+            audio_bad(r,AB_BUFMIX_COUNT,"buffer-mix effect %d on mix %d mixes %u pairs of buffers (24 at most): it is "
+                      "skipped",id,mix,p.count);
+            return;
+        }
+        for(unsigned c=0;c<p.count;c++)
+            if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count) {
+                audio_bad(r,AB_BUFMIX_INDEX,"buffer-mix effect %d on mix %d mixes buffer %u into %u of the mix's %d: "
+                          "it is skipped",id,mix,p.input[c],p.output[c],r->mixes[mix].buffer_count);
+                return;
+            }
         for(unsigned c=0;c<p.count;c++){
-            if(p.input[c]>=r->mixes[mix].buffer_count || p.output[c]>=r->mixes[mix].buffer_count)rt_fatal("buffer-mix effect index");
             float *in=mixbuf(m,m->offset[mix]+p.input[c]),*out=mixbuf(m,m->offset[mix]+p.output[c]);
             for(int k=0;k<m->frame;k++)out[k]+=ceilf(in[k]*32768*p.volume[c])/32768;
         }return;
     }
     unsigned channels;if(e->type==6)channels=s->biquad_channels;else {uint16_t n;memcpy(&n,e->specific+14,2);channels=n;}
-    if(channels<1 || channels>6){if(e->enabled)rt_fatal("audio DSP effect channels");return;}
+    if(channels<1 || channels>6){
+        // bad: a delay, reverb or compressor with such a count was logged at its update, by its parameters' kind
+        if(e->enabled && !s->bad)
+            audio_bad(r,AB_DSP_CHANNELS,"%s effect %d on mix %d has %u channels, not 1 to 6: it is skipped",
+                      names[e->type],id,mix,channels);
+        return;
+    }
     float *in[6]={0},*out[6]={0};unsigned revision=audio_revision(r);
     for(unsigned c=0;c<channels;c++){
         unsigned idx=c;
         if(channels==6 && ((e->type==3 && revision<11)||(e->type==4 && revision>=11))){static const unsigned map[6]={0,1,4,5,2,3};idx=map[c];}
-        if(e->specific[idx]>=r->mixes[mix].buffer_count || e->specific[6+idx]>=r->mixes[mix].buffer_count)rt_fatal("audio DSP effect buffer index");
+        if(e->specific[idx]>=r->mixes[mix].buffer_count || e->specific[6+idx]>=r->mixes[mix].buffer_count) {
+            audio_bad(r,AB_DSP_INDEX,"%s effect %d on mix %d reads buffer %u and writes %u of the mix's %d: it is "
+                      "skipped",names[e->type],id,mix,e->specific[idx],e->specific[6+idx],r->mixes[mix].buffer_count);
+            return;   // nothing written yet: the loop only takes pointers
+        }
         in[c]=mixbuf(m,m->offset[mix]+e->specific[idx]);out[c]=mixbuf(m,m->offset[mix]+e->specific[6+idx]);
     }
-    if(!e->enabled){for(unsigned c=0;c<channels;c++)if(in[c]!=out[c])memmove(out[c],in[c],(size_t)m->frame*sizeof(float));return;}
+    // bad: parameters audio_mixer_update_effects could not use; it logged them and made no DSP
+    if(!e->enabled || s->bad){
+        for(unsigned c=0;c<channels;c++)if(in[c]!=out[c])memmove(out[c],in[c],(size_t)m->frame*sizeof(float));
+        return;
+    }
     if(e->type==6){
         for(unsigned c=0;c<channels;c++)for(int k=0;k<m->frame;k++){
             float x=in[c][k],y=s->numerator[0]*x+s->biquad_z[c][0];
             s->biquad_z[c][0]=s->numerator[1]*x+s->denominator[0]*y+s->biquad_z[c][1];s->biquad_z[c][1]=s->numerator[2]*x+s->denominator[1]*y;out[c][k]=y;
         }
-    } else {if(!s->dsp)rt_fatal("audio DSP effect state missing");audio_effect_process(s->dsp,in,out,m->frame);}
+    } else {
+        // an invariant: audio_mixer_update_effects makes the DSP of every enabled effect with channels whose
+        // parameters pass, and marks the others bad
+        if(!s->dsp)rt_fatal("audio DSP effect state missing");
+        audio_effect_process(s->dsp,in,out,m->frame);
+    }
 }
 static void mix_effects(AudioRenderer *r, int mix) {
     Mixer *m=r->mixer; int count=0;
@@ -1066,22 +1352,38 @@ static void mix_effects(AudioRenderer *r, int mix) {
     for(int n=0;n<count;n++) {
         int id=m->effect_order[n]; const AudrenEffectIn *e=&r->effects[id]; EffectState *s=&m->effect[id];
         if(e->type==1 || e->type==3 || e->type==4 || e->type==6 || e->type==9){mix_simple_effect(r,mix,id);continue;}
-        if(e->type==2) { mix_aux(r,mix,e); continue; }
-        if(e->type==8) { mix_capture(r,mix,e);continue; }
+        if(e->type==2) { mix_aux(r,mix,id,e); continue; }
+        if(e->type==8) { mix_capture(r,mix,id,e);continue; }
         if(e->type==7) { mix_limiter(r,mix,id); continue; }
         if(e->type!=5) {
             if(e->enabled && e->type<32 && !(m->effect_reported&(1u<<e->type))) { m->effect_reported|=1u<<e->type; rt_log("audio: effect type %u not implemented",e->type); }
             continue;
         }
         Reverb3dParam *p=&s->param; float *input[6]={0},*output[6]={0};
-        if(p->channels!=1 && p->channels!=2 && p->channels!=4 && p->channels!=6) { if(e->enabled)rt_fatal("audio reverb channel count"); continue; }
-        for(int c=0;c<p->channels;c++) {
+        if(p->channels!=1 && p->channels!=2 && p->channels!=4 && p->channels!=6) {
+            if(e->enabled)audio_bad(r,AB_R3D_CHANNELS,"reverb3d effect %d on mix %d has %u channels, not 1, 2, 4 or "
+                                    "6: it is skipped",id,mix,p->channels);
+            continue;
+        }
+        int skip=0;
+        for(int c=0;c<p->channels && !skip;c++) {
             int idx=c; /* REV11+ channel resources use L,R,C,LFE,BL,BR; the reference DSP uses legacy order. */
             if(p->channels==6 && (r->revision>>24)>='0'+11) { static const int map[6]={0,1,4,5,2,3}; idx=map[c]; }
-            if(p->input[idx]>=r->mixes[mix].buffer_count || p->output[idx]>=r->mixes[mix].buffer_count)rt_fatal("audio reverb buffer index");
+            if(p->input[idx]>=r->mixes[mix].buffer_count || p->output[idx]>=r->mixes[mix].buffer_count) {
+                audio_bad(r,AB_R3D_INDEX,"reverb3d effect %d on mix %d reads buffer %u and writes %u of the mix's %d: "
+                          "it is skipped",id,mix,p->input[idx],p->output[idx],r->mixes[mix].buffer_count);
+                skip=1;   // nothing written yet: the loop only takes pointers
+                continue;
+            }
             input[c]=mixbuf(m,m->offset[mix]+p->input[idx]); output[c]=mixbuf(m,m->offset[mix]+p->output[idx]);
         }
-        if(!e->enabled) { for(int c=0;c<p->channels;c++)if(input[c]!=output[c])memmove(output[c],input[c],m->frame*sizeof(float)); continue; }
+        if(skip) continue;
+        // bad: values audio_reverb_invalid refused (audio_mixer_update_effects logged them); the reverb is neither made
+        // nor updated from them
+        if(!e->enabled || s->bad) {
+            for(int c=0;c<p->channels;c++)if(input[c]!=output[c])memmove(output[c],input[c],m->frame*sizeof(float));
+            continue;
+        }
         if(!s->reverb)s->reverb=audio_reverb_create(p); else if(s->pending)audio_reverb_update(s->reverb,p);
         s->pending=0; audio_reverb_process(s->reverb,input,output,m->frame);
     }
@@ -1108,13 +1410,28 @@ _Static_assert(__builtin_offsetof(CircularSinkParam,input)==28,"circular sink wi
 static void mix_circular_sink(AudioRenderer *r,int id) {
     Mixer *m=r->mixer;CircularSinkParam p;memcpy(&p,r->sinks[id].name,sizeof p);
     if(!p.address || !p.size)return;
-    if(p.channels<1 || p.channels>6 || p.format!=FMT_PCM16 || p.size>256*1024*1024 || p.size%2)rt_fatal("circular audio sink parameters");
+    // a sink the game set out of range is skipped in this pass: nothing of it is written, its position stays
+    if(p.channels<1 || p.channels>6 || p.format!=FMT_PCM16 || p.size>256*1024*1024 || p.size%2) {
+        audio_bad(r,AB_SINK_PARAMS,"circular sink %d has %u channels, format %u and %u bytes (1 to 6, 16-bit, an even "
+                  "size up to 256 MiB): it is skipped",id,p.channels,p.format,p.size);
+        return;
+    }
+    if(!guest_range_ok(p.address,p.size)) {
+        audio_bad(r,AB_SINK_ADDRESS,"circular sink %d has its buffer at %#llx (%#x bytes), outside guest memory: it is "
+                  "skipped",id,(unsigned long long)p.address,p.size);
+        return;
+    }
+    for(unsigned c=0;c<p.channels;c++)
+        if(p.input[c]>=m->nbuf) {
+            audio_bad(r,AB_SINK_INDEX,"circular sink %d reads mix buffer %u of %d: it is skipped",id,p.input[c],
+                      m->nbuf);
+            return;
+        }
     if(m->sink_address[id]!=p.address || m->sink_size[id]!=p.size){m->sink_address[id]=p.address;m->sink_size[id]=p.size;m->sink_offset[id]=m->sink_old[id]=m->sink_written[id]=0;}
     uint8_t *data=ipc_guest(p.address,p.size);uint32_t at=m->sink_offset[id];
     prepare_ring_write(data,p.size,at,(uint64_t)p.channels*m->frame*2);
     float gain=r->mixes[0].in_use?r->mixes[0].volume:1;
     for(unsigned c=0;c<p.channels;c++){
-        if(p.input[c]>=m->nbuf)rt_fatal("circular audio sink input index");
         float *in=mixbuf(m,p.input[c]);
         for(int k=0;k<m->frame;k++){
             float scaled=in[k]*gain*32768;int16_t value=!isfinite(scaled)?0:scaled>=32767?32767:scaled<=-32768?-32768:(int16_t)scaled;
@@ -1132,6 +1449,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds, int drop) {
     memset(m->buf, 0, (size_t)m->nbuf * (size_t)frames * sizeof(float));
     int at = 0;
     for (int i = 0; i < mc; i++) { m->offset[i] = at; if (r->mixes[i].in_use) at += r->mixes[i].buffer_count; }
+    // an invariant: audio_mixer_mix_layout_check refuses an update that would leave the mixes so
     if (at > m->nbuf) { rt_log("audio: mixes use %d buffers, renderer has %d", at, m->nbuf); rt_fatal("audio mix buffer layout"); }
 
     float (*vs)[MAX_FRAME]=m->voice_scratch,*filtered=m->filter_scratch;
@@ -1192,6 +1510,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds, int drop) {
         if (v->in.splitter_id != SPLITTER_UNUSED && v->in.splitter_id < (uint32_t)m->nsplit) {
             const SplitInfo *s = &m->split[v->in.splitter_id];
             for (int c = 0; c < cc; c++) for (int k = c; k < s->ndest; k += cc) {
+                if (s->ids[k] < 0) continue;   // an id the renderer does not have (splitters_walk)
                 SplitDest *d = &m->dest[s->ids[k]];
                 if (!d->used || !mix_valid(r, d->dest)) continue;
                 const float *source=splitter_filter(d,vs[c],filtered,frames);
@@ -1267,6 +1586,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds, int drop) {
             const MixPrev *xp = &m->mix_prev[order[a]];
             const int xramp = ramp && xp->ok && xp->splitter == x->dest_splitter_id && xp->buffers == x->buffer_count;
             for (int c = 0; c < x->buffer_count && c < 24; c++) for (int k = c; k < s->ndest; k += x->buffer_count) {
+                if (s->ids[k] < 0) continue;   // an id the renderer does not have (splitters_walk)
                 SplitDest *d = &m->dest[s->ids[k]];
                 if (!d->used || !mix_valid(r, d->dest)) continue;
                 const float *source=splitter_filter(d,mixbuf(m,src+c),filtered,frames);
@@ -1352,18 +1672,33 @@ void audio_mixer_render(AudioRenderer *r, double seconds, int drop) {
 // ---- IAudioDevice: one output device, stereo or 5.1 (output_channels)
 static const char device_name[] = "AudioTvOutput";
 
-// The events the game took to hear of a change of the output device (IAudioDevice's, its notifications' and the
+// The events the game took to hear of a change of the output device (IAudioDevice's, its two notifications' and the
 // virtual device manager's). audio_channels_live signals them all: the game then asks for the channel count again, as
-// it does on a console whose output moves from the TV to headphones.
+// it does on a console whose output moves from the TV to headphones. A slot is counted before its handle is stored, so
+// audio_channels_live skips a slot that still reads 0 (kern_event_signal ends the process on a bad handle).
 static uint32_t change_events[16];
 static _Atomic int n_change_events;
 
-static uint32_t change_event_new(void) {
-    uint32_t ev = kern_event_new();
+static void change_event_list(uint32_t ev) {
     int i = atomic_fetch_add(&n_change_events, 1);
-    if (i < 16) change_events[i] = ev;
-    return ev;
+    if (i < 16) __atomic_store_n(&change_events[i], ev, __ATOMIC_RELEASE);
 }
+
+// One event per kind, made at the kind's first request; every request gets its own readable handle to it. Made per
+// request, each call took a kernel handle for good, and past 16 the events were no longer signalled. Two first
+// requests at once each make one: the loser closes its own, which was never listed, so nothing signals a closed handle.
+static uint32_t change_event_of(volatile uint32_t *kind) {
+    uint32_t ev = __atomic_load_n(kind, __ATOMIC_ACQUIRE);
+    if (ev) return ev;
+    uint32_t mine = kern_event_new(), expected = 0;
+    if (__atomic_compare_exchange_n(kind, &expected, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        change_event_list(mine);
+        return mine;
+    }
+    kern_handle_close(mine);
+    return expected;
+}
+static volatile uint32_t device_event, input_notify_event, output_notify_event, vdm_event;
 
 // Present path, after a settings change (gfx_present.c window_settings_live): a changed NX2NAVI_AUDIO_CHANNELS is
 // decided again, and when it gives another channel count the game is told its output device changed. The game asks
@@ -1382,7 +1717,10 @@ void audio_channels_live(void) {
     if (now == was) return;
     int n = atomic_load(&n_change_events);
     if (n > 16) n = 16;
-    for (int i = 0; i < n; i++) kern_event_signal(change_events[i]);
+    for (int i = 0; i < n; i++) {
+        uint32_t e = __atomic_load_n(&change_events[i], __ATOMIC_ACQUIRE);
+        if (e) kern_event_signal(e);
+    }
     rt_log("audio: NX2NAVI_AUDIO_CHANNELS=%s: the output goes from %s to %s; the game is told the device changed "
            "(%d events)", want, was == 6 ? "5.1" : "stereo", now == 6 ? "5.1" : "stereo", n);
 }
@@ -1402,7 +1740,6 @@ static IpcBuffer out_buffer(const IpcRequest *rq, int *pointer) {
 }
 
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    static uint32_t change_event;   // the device change event: signalled when the output's channels change (audio_channels_live)
     int pointer;
     switch (rq->cmd) {
     case 0: case 6: case 14: {   // ListAudioDeviceName(Auto), ListAudioOutputDeviceName [13.0.0+]
@@ -1424,27 +1761,17 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
         return;
     }
     case 5: { int32_t n = output_channels(); IPC_OUT(rs, n); return; }   // GetActiveChannelCount
-    case 4: case 11: case 12: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
-        uint32_t ev = __atomic_load_n(&change_event, __ATOMIC_ACQUIRE);
-        if (!ev) {
-            uint32_t mine = change_event_new(), expected = 0;
-            if (__atomic_compare_exchange_n(&change_event, &expected, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                ev = mine;
-            else
-                ev = expected;   // the loser's event stays unused (no host-side close yet)
-        }
-        rs->copy[rs->ncopy++] = kern_event_readable(ev);
+    case 4: case 11: case 12:   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
+        rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(&device_event));
         return;
-    }
     // 17.0.0+: Acquire/Release Audio{Input,Output}DeviceNotification (15-18), 18.0.0+: SetAudioDeviceOutputVolume-
     // AutoTuneEnabled (19) / IsAudioDeviceOutputVolumeAutoTuneEnabled (20), 21.0.0+:
     // IsActiveOutputDeviceEstimatedLowLatency (21). Command ids as the system answers them. The
     // host applies no auto-tuned volume, so the answers are "off" / "no".
-    case 15: case 17: {   // Acquire...Notification -> a readable event, signalled with the others
-        uint32_t ev = change_event_new();
-        rs->copy[rs->ncopy++] = kern_event_readable(ev);
+    case 15: case 17:   // Acquire...Notification -> a readable event, signalled with the others
+        rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(rq->cmd == 15 ? &input_notify_event
+                                                                                  : &output_notify_event));
         return;
-    }
     case 16: case 18: case 19: return;
     case 20: case 21: { uint8_t no = 0; IPC_OUT(rs, no); return; }
     default: ipc_unimplemented(s, rq);
@@ -1510,7 +1837,7 @@ static void virtual_device_manager_handler(IpcSession *s, const IpcRequest *rq, 
         put_block(rq, rs, block, sizeof block);
         return;
     }
-    case 500: rs->copy[rs->ncopy++] = kern_event_readable(change_event_new()); return;   // state change event
+    case 500: rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(&vdm_event)); return;   // state change event
     case 700: case 800: return;   // AttachStream / DetachStream
     default: {
         static volatile int32_t seen[64];

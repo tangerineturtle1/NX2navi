@@ -7,11 +7,17 @@ declares such an image without a format, and its read needs StorageImageReadWith
 layer count of texture handle 0x10, for which the translator has no type answer: the texture must be declared as an
 array, or the count reads as 1. Every module is validated with spirv-val.
 
-  python tools/xlate_smoke.py
+Last, pool_check sends a fragment shader that queries a texture whose handle it reads from an input, which the
+translator reads from the texture pool array: the array must have tools/xlate/Program.cs TexturePoolLength entries and
+the handle must be clamped to the last of them. A translator older than its sources (0.10.0 and 0.10.1 shipped one
+whose pool had 32768 entries) fails it. tools/make_launcher.py check_xlate runs pool_check on the translator it ships.
+
+  python tools/xlate_smoke.py [--exe <nx2navi_xlate>]
 """
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -71,9 +77,82 @@ def layer_count_code() -> bytes:
     return struct.pack(f"<{len(words)}Q", *words)
 
 
+IPA = 0xE0 << 56  # IPA, pass mode
+TXQ_B = 0x1BEA  # opcode bits 51-63 of TXQ.B (handle in a register)
+
+
+def pool_query_code() -> bytes:
+    """Fragment code: R4 = user attribute 0.x (IPA of a[0x80]), R0 = the width of the texture whose handle is R4 (TXQ.B
+    of the dimension, mask x), R1-R3 constants; render target 0 = R0-R3."""
+    header = [0] * 20
+    header[0] = 2 | (3 << 5) | (5 << 10)  # SPH type 2, version 3, stage fragment
+    header[18] = 0xF  # OMAP: render target 0, components xyzw
+    ipa = IPA | (7 << 47) | (RZ << 39) | (0x80 << 28) | (RZ << 20) | PT | (RZ << 8) | 4
+    txq = (TXQ_B << 51) | (0x1 << 31) | (1 << 22) | PT | (4 << 8) | 0
+    words = [SCHED, ipa, txq, mov32i(1, 0.0), SCHED, mov32i(2, 0.0), mov32i(3, 1.0), EXIT, 0]
+    return struct.pack("<20I", *header) + struct.pack(f"<{len(words)}Q", *words)
+
+
+def spirv_clamps(spv: bytes):
+    """The lengths of a module's OpTypeArray types and the 32-bit constants its GLSL.std.450 UMin instructions take."""
+    w = struct.unpack(f"<{len(spv) // 4}I", spv[:len(spv) // 4 * 4])
+    consts, lengths, umin, glsl = {}, [], [], None
+    i = 5  # after the header
+    while i < len(w):
+        n, op = w[i] >> 16, w[i] & 0xFFFF
+        if not n:
+            break
+        ins = w[i:i + n]
+        if op == 11 and struct.pack(f"<{n - 2}I", *ins[2:]).split(b"\0")[0] == b"GLSL.std.450":  # OpExtInstImport
+            glsl = ins[1]
+        elif op == 43 and n == 4:  # OpConstant: type, id, value
+            consts[ins[2]] = ins[3]
+        elif op == 28:  # OpTypeArray: id, element type, length
+            lengths.append(ins[3])
+        elif op == 12 and n > 5 and ins[3] == glsl and ins[4] == 38:  # OpExtInst UMin
+            umin += ins[5:]
+        i += n
+    return [consts.get(x) for x in lengths], [consts[x] for x in umin if x in consts]
+
+
+def pool_check(exe: Path):
+    """None when exe declares the texture pool array with tools/xlate/Program.cs TexturePoolLength entries and clamps a
+    pool handle to the last of them; otherwise why not."""
+    m = re.search(r"TexturePoolLength = (\d+)", (ROOT / "tools" / "xlate" / "Program.cs").read_text(encoding="utf-8"))
+    if not m:
+        return "tools/xlate/Program.cs names no TexturePoolLength"
+    length = int(m.group(1))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        code = tmp / "pool_ps.bin"
+        code.write_bytes(pool_query_code())
+        out = tmp / "out"
+        job = {"key": "pool_ps", "stage": "ps", "code": str(code), "debug": False, "fout": {"0": "float"}}
+        try:
+            r = subprocess.run([str(exe), "--serve"], input=json.dumps({"job": job, "out": str(out)}) + "\n",
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"the translator does not run: {e}"
+        if r.stdout.strip() != "ok pool_ps":
+            return f"the translator answered {r.stdout.strip()[:120]!r} to the texture pool shader"
+        try:
+            textures = json.loads((out / "pool_ps.res.json").read_text(encoding="utf-8")).get("textures") or []
+            lengths, clamps = spirv_clamps((out / "pool_ps.spv").read_bytes())
+        except (OSError, ValueError, struct.error) as e:
+            return f"the translator's texture pool shader cannot be read: {e}"
+    pools = [t.get("array") for t in textures if t.get("pool") == 1]
+    if pools != [length] or length not in lengths:
+        return (f"the translator declares the texture pool with {pools or 'no'} entries, where its sources say {length} "
+                f"(tools/xlate/Program.cs TexturePoolLength): it is older than its sources")
+    if length - 1 not in clamps:
+        return f"the translator clamps a texture pool handle to {clamps}, not to {length - 1}"
+    return None
+
+
 def main() -> int:
-    if not EXE.is_file():
-        print(f"missing {EXE}; run tools/build_xlate.py", file=sys.stderr)
+    exe = Path(sys.argv[sys.argv.index("--exe") + 1]) if "--exe" in sys.argv[1:-1] else EXE
+    if not exe.is_file():
+        print(f"missing {exe}; run tools/build_xlate.py", file=sys.stderr)
         return 2
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -94,7 +173,7 @@ def main() -> int:
             json.dumps({"job": image_job, "out": str(out)}),
             json.dumps({"job": layer_job, "out": str(out)}),
         ]
-        r = subprocess.run([str(EXE), "--serve"], input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=60)
+        r = subprocess.run([str(exe), "--serve"], input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=60)
         replies = r.stdout.splitlines()
         print("replies:", replies)
         if (len(replies) != 5 or replies[0] != "ok const_ps" or not replies[1].startswith("fail ") or replies[2] != "ok again"
@@ -115,7 +194,9 @@ def main() -> int:
             v = subprocess.run([str(SPIRV_VAL), "--target-env", "vulkan1.3", str(spv)], capture_output=True, text=True)
             print(f"{key}: spirv-val exit {v.returncode} ({len(data)} bytes) {v.stdout}{v.stderr}")
             failed |= v.returncode != 0
-        return int(failed)
+    why = pool_check(exe)
+    print(f"pool_ps: {why or 'the texture pool array and its clamp have the length tools/xlate/Program.cs names'}")
+    return int(failed or why is not None)
 
 
 if __name__ == "__main__":

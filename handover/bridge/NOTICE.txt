@@ -1,0 +1,18 @@
+NX2navi is now Triforce
+=======================
+
+This version of NX2navi's launcher is the handover to Triforce: the two projects have merged and go on as Triforce.
+
+launcher/start.pyw              what NX2navi.exe starts, as in every version
+launcher/handover.py            the window: Get Triforce / Open Triforce, Play NX2navi, where your game files are
+launcher/cli.py                 the command line's answer
+launcher/selftest.py            pictures of the window for a look before release (NX2navi.exe --selftest --shots DIR)
+launcher/art/                   the window's pictures (the Triforce crest; the fairy is NX2navi's logo)
+launcher/triforce/              Triforce Setup, Triforce's launcher, as published at https://triforceproject.com,
+                                with setup.json: its release, size and sha256. The window checks the file against
+                                them before it starts it.
+
+Triforce is free software under the GNU General Public License, version 3. Its source code, Triforce Setup's
+included, is at https://git.triforceproject.com/triforce/source
+
+Nothing in this folder is game data, and nothing in it is derived from the game.

@@ -7,11 +7,12 @@ with --events and reads its progress lines).
                                    [--dlss libnvidia-ngx-dlss.so.<version> | --no-dlss]
 
 The AppImage holds no game files: the kit's tools/, recomp/, runtime/ and docs, the shader translator built by
-tools/build_xlate.py (bin/nx2navi_xlate), NVIDIA's DLSS library with its notice (bin/, tools/dlss_pin.py: downloaded
-from NVIDIA's DLSS SDK repository and checked, or --dlss; not with --no-dlss: an AppImage made without the library
-downloads it after a build on machines with NVIDIA's driver, AppRun's get_dlss), the pinned Vulkan Memory Allocator
-header, the pinned Vulkan headers (toolchain/vulkan-headers, tools/vulkan_pin.py: the runtime names Vulkan extensions
-newer than the headers many distributions package), and a relocatable CPython 3.14 (python-build-standalone, as `uv python install 3.14` puts in
+tools/build_xlate.py from this checkout's sources (bin/nx2navi_xlate; the script stops first on another, check_built),
+NVIDIA's DLSS library with its notice (bin/, tools/dlss_pin.py: downloaded from NVIDIA's DLSS SDK repository and
+checked, or --dlss; not with --no-dlss: an AppImage made without the library downloads it after a build on machines with
+NVIDIA's driver, AppRun's get_dlss), the pinned Vulkan Memory Allocator header, the pinned Vulkan headers
+(toolchain/vulkan-headers, tools/vulkan_pin.py: the runtime names Vulkan extensions newer than the headers many
+distributions package), and a relocatable CPython 3.14 (python-build-standalone, as `uv python install 3.14` puts in
 ~/.local/share/uv/python) with numpy, lz4, zstandard, fonttools and pillow, and with --prompt-art the button art
 make_game.py's prompts step draws from (as make_kit.py --prompt-art: the pictures tools/prompt_art.py art_files names,
 into the kit's prompt-art folder; without it that step is skipped and the game keeps the Switch prompts). zbic, the GPL
@@ -201,6 +202,10 @@ def main():
         if not need.exists():
             sys.exit(f'{need} is missing (tools/build_xlate.py builds the translator; tools/build_game.py fetches VMA)')
     sys.path.insert(0, str(ROOT / 'tools'))
+    import build_xlate
+    reason = build_xlate.check_built(xlate, 'nx2navi_xlate')   # the translator of this checkout's sources, or none
+    if reason:
+        sys.exit(reason)
     import dlss_pin
     dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, ROOT / 'build' / 'dl', linux=True)
 

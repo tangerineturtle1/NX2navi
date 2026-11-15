@@ -161,8 +161,15 @@ static void factor(float out[8], float k) {   // the array at factor k, as cam_p
 // read and write; each copy found becomes the array at factor to and is remembered (copies, when fresh is set).
 // Returns how many were rewritten. Runs on its own thread: the regions are read 16 MiB at a time under mem_read_hold,
 // so the game's own mapping calls wait for one piece at most.
+// Pages the lazy write-back has armed (GPU-written buffers the CPU has not read since, never the camera table) are
+// left alone: a read would fetch each armed range from the GPU inside the fault handler (memory.c lazy_fault) while
+// the game runs, and hold the game's mapping calls meanwhile. A piece that holds some is gone through in STEP pieces,
+// without the armed ones; the first search that leaves some out says so, since with NX2NAVI_WB_PROBE every piece
+// counts as armed and the search then finds nothing.
 static int rewrite(float k, float to, int fresh) {
-    enum { PIECE = 16 << 20 };
+    enum { PIECE = 16 << 20, STEP = 64 << 10 };
+    static int told;
+    uint64_t left_out = 0;
     float from[8], into[8];
     factor(from, k);
     factor(into, to);
@@ -189,6 +196,14 @@ static int rewrite(float k, float to, int fresh) {
                     continue;
                 }
                 uint64_t n = stop - a < PIECE ? stop - a : PIECE;
+                if (mem_lazy_touches(a, n)) {
+                    if (n > STEP) n = STEP;
+                    if (mem_lazy_touches(a, n)) {
+                        a += n;
+                        left_out += n;
+                        continue;
+                    }
+                }
                 if (n >= len && mem_read_hold(a, n)) {
                     const uint8_t *p = (const uint8_t *)(uintptr_t)a, *e = p + n;
                     for (const uint8_t *q = p; q + len <= e && (q = memchr(q, first, (size_t)(e - q) - len + 1)); q++) {
@@ -201,9 +216,14 @@ static int rewrite(float k, float to, int fresh) {
                     mem_read_release();
                 }
                 // a copy across two pieces: the next piece starts a little before this one's end
-                a += n < PIECE ? n : n - (len - 1);
+                a += a + n >= stop ? n : n - (len - 1);
             }
         }
+    }
+    if (left_out && !told) {
+        told = 1;
+        rt_log("camera speed: the search left out %.1f MiB the GPU wrote and the CPU has not read since (lazy "
+               "write-back; with NX2NAVI_WB_PROBE all of it)", left_out / 1048576.0);
     }
     return found;
 }

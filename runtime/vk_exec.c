@@ -26,6 +26,8 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_evo_peek.h"
+#include "vk_pass_hooks.h"
 #include "vk_target_frames.h"
 #include "vk_dlaa.h"
 
@@ -194,7 +196,9 @@ static void runs_frame(uint64_t frame) {
 uint64_t vk_exec_submit_seq;
 
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
-    vk_exec_cond_frame_end(frame);   // a frame boundary in replay order (present_image runs on the replay thread)
+    // a frame boundary in replay order: vk_backend.c present_image runs it under the submission lock, or the next
+    // submission does (vk_frame_owed.h)
+    vk_exec_cond_frame_end(frame);
     runs_frame(frame);
     if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
@@ -815,8 +819,10 @@ void vk_exec_pass_begin(VkExec *ex) {
     resolve_rt(ex);
     if (vk_texture_deferred()) return;   // a chunk's lookup waits for its turn (chunk_record): the op is replayed again
     // A parallel group's targets do not change: its pass hooks, which follow the frame pass by pass, run in its first
-    // chunk, which the others start after (chunk_record).
-    if (!rw_chunk || !rw_chunk->idx) {
+    // chunk, which the others start after (chunk_record), and at that chunk's first pass alone: a pass it begins again
+    // later may come after the hooks of passes further on in the stream (vk_pass_hooks.h).
+    if (pass_hooks_due(rw_chunk != NULL, rw_chunk ? rw_chunk->idx : 0,
+                       rw_chunk ? __atomic_load_n(&rw_chunk->g->hooks, __ATOMIC_RELAXED) : 0)) {
         // the submitting thread past a group: the hooks read what its first chunk's left, and wait for the whole
         // group where they change what its draws read (vk_exec_hook_turn)
         if (!rw_chunk) vk_exec_hooks_wait();
@@ -1164,7 +1170,8 @@ static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 // tests there; in area loads and some places a tail hands the CPU results and goes as before. The pictures matched
 // those without it standing, along the route and through warps to five areas. Not measured with the lazy write-back
 // (NVIDIA's and Intel's default), where a tail's uniform updates are noted as writes and no tail goes early.
-// Not with shadow storage, emulated mesh shaders, a frame dump or a pass capture, nor inside a chunk or a continuation.
+// Not with shadow storage, emulated mesh shaders, the mesh fallback (vk_mesh_path.h: never measured with the early
+// tail), a frame dump or a pass capture, nor inside a chunk or a continuation.
 static struct {
     int on;                  // the submission's tail is being recorded
     int live0;               // vk_mem_live_swap's note from before it
@@ -1276,11 +1283,20 @@ typedef struct Cont {
     uint8_t *st;
 } Cont;
 static struct { uintptr_t q; Cont *head, *tail; } evq[EVO_QUEUES];
+// What vk_exec_held_ready needs of each queue's first continuation, as a copy (vk_evo_peek.h): it runs without the
+// submission lock (vk_sync.c sub_lock) while another thread may free that continuation (evo_resume). Published under
+// that lock by peek_publish wherever evq[s].head, or the head's at or since, changes.
+static EvoPeek evq_peek[EVO_QUEUES];
+_Static_assert(sizeof(EvoWait) == sizeof(p_wait_event) && offsetof(EvoWait, val) == offsetof(p_wait_event, val) &&
+                   offsetof(EvoWait, mode) == offsetof(p_wait_event, mode) &&
+                   offsetof(EvoWait, value) == offsetof(p_wait_event, value),
+               "vk_evo_peek.h EvoWait must have p_wait_event's layout");
 static int evo_on = -1, evo_in;     // knob; inside a continuation
 static uintptr_t evo_queue;         // queue of the stream being walked (0: it cannot stop at a wait)
-static int evo_pending;             // continuations held
+// continuations held: written under the submission lock (cont_push, evo_resume), read by any thread (vk_exec_held)
+static int evo_pending;
 static uint64_t evo_held, evo_resumed, evo_forced, evo_switches;   // since the last perf line
-int vk_exec_held(void) { return evo_pending; }
+int vk_exec_held(void) { return __atomic_load_n(&evo_pending, __ATOMIC_RELAXED); }
 #define ST_LO offsetof(VkExec, rt)
 #define ST_HI offsetof(VkExec, views)
 
@@ -1411,11 +1427,24 @@ static void cont_free(Cont *c) {
     free(c->h), free(c->st), free(c);
 }
 
+// Publishes queue s's first continuation for vk_exec_held_ready (evq_peek): whether one is held, the wait it stopped
+// at, copied out of its private recording, and when it stopped.
+static void peek_publish(int s) {
+    const Cont *c = evq[s].head;
+    EvoPeekCopy v = {0};
+    if (c) {
+        v.has = 1, v.since = c->since;
+        if (c->at) v.has_at = 1, v.w = *(const EvoWait *)nvn_op_payload(c->at);
+    }
+    evo_peek_publish(&evq_peek[s], &v);
+}
+
 static void cont_push(int slot, Cont *c) {
     if (evq[slot].tail) evq[slot].tail->next = c;
     else evq[slot].head = c;
     evq[slot].tail = c;
-    evo_pending++;
+    __atomic_store_n(&evo_pending, evo_pending + 1, __ATOMIC_RELAXED);   // the only writer: under the submission lock
+    if (evq[slot].head == c) peek_publish(slot);
 }
 
 // Swaps the queue state in ex with buf (ST_HI - ST_LO bytes); what the swapped-in state names is bound again.
@@ -1449,7 +1478,9 @@ static int cont_ready(const Cont *c) {
 // taken after the game has finished writing, and the frame is replayed in the call the game's fence stands for.
 // Only state may precede the wait in the command buffer, and the event must be one the CPU has signalled before;
 // the wait ends after NX2NAVI_GATE_WAIT_MS at the latest, and the submission is then held as before.
-static struct { uint64_t n, ns, late; } GW;   // since the last perf line: waits, their time, waits that ran out
+// Since the last perf line: waits, their time, waits that ran out. vk_exec_gate_wait runs on the submitting thread
+// before the submission lock, so several threads add at once: atomics, and the thread whose add ends the window logs it.
+static struct { uint64_t n, ns, late; } GW;
 
 static const void *gate_first_wait(const op_hdr *h) {
     for (int k = 0; k < 256; k++) {
@@ -1484,25 +1515,36 @@ void vk_exec_gate_wait(const uint64_t *handles, int n) {
     uint64_t t0 = kern_now_ns(), now = t0;
     for (unsigned i = 0; !vk_exec_event_holds_now(w); i++) {
         if ((i & 15) == 15 && (now = kern_now_ns()) - t0 >= (uint64_t)cap_ns) {
-            GW.late++;
+            __atomic_add_fetch(&GW.late, 1, __ATOMIC_RELAXED);
             break;
         }
         if (i < 20000) plat_pause();
         else plat_yield();
     }
-    GW.n++, GW.ns += kern_now_ns() - t0;
-    if (GW.n >= 600) {
+    __atomic_add_fetch(&GW.ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&GW.n, 1, __ATOMIC_RELAXED) == 600) {   // one thread takes the window; adds after it count in
+        uint64_t wn = __atomic_exchange_n(&GW.n, 0, __ATOMIC_RELAXED);
+        uint64_t wns = __atomic_exchange_n(&GW.ns, 0, __ATOMIC_RELAXED);
+        uint64_t late = __atomic_exchange_n(&GW.late, 0, __ATOMIC_RELAXED);
         if (rt_trace & RT_TRACE_PERF)
             rt_log("perf: gate: %llu submissions waited for the CPU's signal before their copies, %.2f ms on average; "
-                   "%llu waited %lld ms without it and were held", (unsigned long long)GW.n, (double)GW.ns / (double)GW.n / 1e6,
-                   (unsigned long long)GW.late, (long long)(cap_ns / 1000000));
-        GW.n = GW.ns = GW.late = 0;
+                   "%llu waited %lld ms without it and were held", (unsigned long long)wn, (double)wns / (double)wn / 1e6,
+                   (unsigned long long)late, (long long)(cap_ns / 1000000));
     }
 }
 
+// Reads only the published copies (evq_peek): vk_backend.c held_resume and submit_sync call this without the
+// submission lock. A copy that overlapped a publish on every try counts as not ready, as losing that race did before.
+// The wait is tested on the event's value now (vk_exec_event_met_now), not at the copy point of a submission another
+// thread may be recording: the question is whether held work can go on in a submission of its own, which takes its
+// copies later. vk_exec_record, the one caller under the lock, asks right after its own copy point, where the two agree.
 int vk_exec_held_ready(void) {
-    for (int s = 0; evo_pending && s < EVO_QUEUES; s++)
-        if (evq[s].head && cont_ready(evq[s].head)) return 1;
+    for (int s = 0; __atomic_load_n(&evo_pending, __ATOMIC_RELAXED) && s < EVO_QUEUES; s++) {
+        EvoPeekCopy c;
+        if (evo_peek_read(&evq_peek[s], &c) &&
+            evo_peek_ready(&c, vk_exec_event_met_now, vk_exec_submit_seq_now(), CONT_MAX))
+            return 1;
+    }
     return 0;
 }
 
@@ -1565,6 +1607,7 @@ static void evo_resume(VkExec *ex) {
                 evo_resumed++;
                 vk_exec_evt('r', (const void *)evq[s].q, 0);
                 if (cont_walk(ex, c)) {   // waits again: the queue's state stays with it
+                    peek_publish(s);
                     vk_exec_evt('w', NULL, 0);
                     vk_exec_pass_end(ex);
                     if (!c->st && !(c->st = malloc(ST_HI - ST_LO))) rt_fatal("vk: out of memory (queue state)");
@@ -1574,7 +1617,8 @@ static void evo_resume(VkExec *ex) {
                 }
                 evq[s].head = c->next;   // done: the queue's next submission starts with the state this one left
                 if (!evq[s].head) evq[s].tail = NULL;
-                evo_pending--;
+                peek_publish(s);   // the next one, or none; the copy names nothing inside c
+                __atomic_store_n(&evo_pending, evo_pending - 1, __ATOMIC_RELAXED);
                 vk_exec_evt('d', NULL, 0);
                 cont_free(c);
                 c = evq[s].head;
@@ -1854,9 +1898,12 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // threads row sets it)
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
-// Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
-// (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark a compute dispatch of the
-// replay's own, with an occlusion query slot found unavailable after its fence just before; the cause is not known.
+// Valley; 5 or 7 workers measured the same as 3. Players' games crashed with 3 on by default
+// (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark the game's own compute
+// dispatch (op_dispatch: 20x1x1 groups of cs d7566eb1, a depth probe) and nothing after it marked, since the group of
+// draws that followed was recorded by the workers, whose passes have no marks; an occlusion query slot was found
+// unavailable after its fence just before. An RX 6600 lost it the same way twice (0.9.2). The cause is not known;
+// auto gives that driver no workers (vk_exec_replay_workers_auto), and auto is the default again since 0.11.0.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or
@@ -1885,8 +1932,9 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // group: up to N (at most LIVE_GROUPS) groups are handed out and not in their part yet, their chunks taken from one
 // queue in the order of the stream (Q). Hyrule Field, 3 workers (2026-11-12): the frame's groups took 6.8 ms of the
 // submitting thread and the ops between them 4.6. A group's chunk 0 runs its pass hooks after the group before began
-// its pass, and waits for every earlier group where a hook acts; a turn (vk_exec_turn) waits for every earlier chunk,
-// of earlier groups too.
+// its pass, once (a pass it begins again later would run them after those of passes further on, vk_pass_hooks.h), and
+// waits for every earlier group where a hook acts; a turn (vk_exec_turn) waits for every earlier chunk, of earlier
+// groups too.
 // The submitting thread waits for the groups (group_wait), and puts their command buffers and query slots in place
 // (group_drain, oldest first: groups_put_done), only where the order needs it:
 // - for room when N groups are out, before a part is split off or submitted (a part due before a group goes to the
@@ -2449,6 +2497,9 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     uint64_t t0 = kern_now_ns();
     gfx_tl_note('g', 0, draws, (uint64_t)n);
     vk_exec_barrier(ex);         // the command buffer so far ends behind a full barrier, every image back in GENERAL
+    // the chunks' passes get no marks (vk_exec_pass_begin): a lost device's report names the group between the marks.
+    // After the barrier, whose end of an open pass ends that pass's mark and empties the note.
+    vk_gpu_gap_note(VK_GAP_GROUP, draws);
     g->upd = vk_exec_draw_group_begin(ex);
     // the front pass
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;
@@ -2633,7 +2684,9 @@ static void rec_claim(void) {
 void vk_exec_tail_begin(VkExec *ex) {
     if (!tail_enabled() || TL.on || ex != x_cur || rw_chunk || evo_in) return;
     if (Q.drained != Q.out) group_drain(ex, PW_OP);   // the cut needs every piece of the part
-    if (!vk_sync_wb_split() || !vk_mesh_shader_native() || vk_dump_armed || vk_gpu_passes_capturing()) return;
+    if (!vk_sync_wb_split() || !vk_mesh_shader_native() || vk_ctx()->mesh_fallback || vk_dump_armed ||
+        vk_gpu_passes_capturing())
+        return;
     if (!vk_sync_tail_ok()) return;
     if (ex->in_pass) vk_exec_pass_end(ex);
     vk_exec_barrier(ex);   // the command buffer so far ends behind a full barrier, every image back in GENERAL
@@ -2675,7 +2728,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
-    vk_exec_submit_seq++;
+    __atomic_store_n(&vk_exec_submit_seq, vk_exec_submit_seq + 1, __ATOMIC_RELAXED);   // read without the lock too
     split_draws = part_start = 0;
     split_at = split_n < 0 ? 0 : split_n ? split_n : INT_MAX;   // 0 until maybe_split reads the settings
     part_t0 = kern_now_ns();
