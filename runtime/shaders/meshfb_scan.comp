@@ -4,9 +4,15 @@
 // in task order, so that mesh workgroup g finds its task and its index among that task's in list entry g, and writes
 // the draw's record: how many mesh workgroups to dispatch and how many instances to draw.
 //
-// One thread walks the tasks: the order of the list is the order the primitives are drawn in, which has to be the
-// same in every frame and in the depth and colour passes of one frame.
-layout(local_size_x = 1) in;
+// The order of the list is the order the primitives are drawn in, which has to be the same in every frame and in the
+// depth and colour passes of one frame: task t's mesh workgroups take the entries from the sum of the counts of the
+// tasks before it on, in order. One workgroup of 256 threads takes the tasks 256 at a time: each thread reads one
+// task's count, a prefix sum in shared memory gives every task its first entry, and the threads then write the
+// chunk's entries side by side, each finding the task of its entry by a binary search over the sums. The list, the
+// counts and the record are the ones a single thread walking the tasks in order writes: the same entries, cut off at
+// the same room.
+#define THREADS 256u
+layout(local_size_x = 256) in;
 
 layout(push_constant) uniform Params {
     uint rec;          // the record's first word in the record buffer
@@ -17,24 +23,49 @@ layout(push_constant) uniform Params {
     uint max_groups;   // workgroups one dispatch may have (maxComputeWorkGroupCount)
 } pc;
 
-// The record: words 0-2 the task dispatch (x written before this pass), 4-6 the mesh dispatch, 8-11 the draw (vertices,
-// instances, first vertex, first instance), 12 the mesh workgroups the tasks asked for, 13 the task workgroups.
+// The record: words 0-2 the task dispatch (x written before this pass, and cut to the task window by meshfb_clamp.comp
+// when the GPU wrote it), 4-6 the mesh dispatch, 8-11 the draw (vertices, instances, first vertex, first instance), 12
+// the mesh workgroups the tasks asked for, 13 the task workgroups asked for (written with word 0, before any cut).
 layout(set = 0, binding = 0) buffer Rec { uint w[]; } rec;
 layout(set = 0, binding = 1) readonly buffer Task { uint w[]; } task;
 layout(set = 0, binding = 2) writeonly buffer List { uint e[]; } list;
 layout(set = 0, binding = 3) readonly buffer Mesh { uint w[]; } mesh;   // read for its size alone
 
+shared uint sums[THREADS];   // the chunk's counts, summed up to and including each task
+
 void main() {
-    uint asked = rec.w[pc.rec];
-    uint tasks = min(min(asked, uint(task.w.length()) / pc.task_words), 1u << 24);
+    uint lid = gl_LocalInvocationIndex;
+    uint tasks = min(min(rec.w[pc.rec], uint(task.w.length()) / pc.task_words), 1u << 24);
     uint room = min(min(uint(mesh.w.length()) / pc.slot_words, uint(list.e.length())), pc.max_groups);
     uint fan = min(pc.fan, 255u);
-    uint m = 0u, want = 0u;
-    for (uint t = 0u; t < tasks; t++) {
-        uint c = min(task.w[t * pc.task_words + 1u], fan);
-        want += c;
-        for (uint j = 0u; j < c && m < room; j++) list.e[m++] = t | j << 24;
+    uint m = 0u, want = 0u;   // entries written so far (at most room), and mesh workgroups asked for
+    for (uint t0 = 0u; t0 < tasks; t0 += THREADS) {
+        uint t = t0 + lid;
+        sums[lid] = t < tasks ? min(task.w[t * pc.task_words + 1u], fan) : 0u;
+        barrier();
+        for (uint off = 1u; off < THREADS; off <<= 1) {
+            uint add = lid >= off ? sums[lid - off] : 0u;
+            barrier();
+            sums[lid] += add;
+            barrier();
+        }
+        uint total = sums[THREADS - 1u];   // at most 256 * 255: m + k below cannot wrap
+        uint fill = min(total, room - m);
+        for (uint k = lid; k < fill; k += THREADS) {
+            uint lo = 0u, hi = THREADS - 1u;   // the first task whose sum passes entry k
+            while (lo < hi) {
+                uint mid = (lo + hi) >> 1;
+                if (sums[mid] > k) hi = mid;
+                else lo = mid + 1u;
+            }
+            uint first = lo > 0u ? sums[lo - 1u] : 0u;
+            list.e[m + k] = (t0 + lo) | (k - first) << 24;
+        }
+        m += fill;
+        want += total;
+        barrier();   // every thread has read the sums before the next chunk writes them
     }
+    if (lid != 0u) return;
     rec.w[pc.rec + 4u] = m;
     rec.w[pc.rec + 5u] = 1u;
     rec.w[pc.rec + 6u] = 1u;
@@ -43,5 +74,4 @@ void main() {
     rec.w[pc.rec + 10u] = 0u;
     rec.w[pc.rec + 11u] = 0u;
     rec.w[pc.rec + 12u] = want;
-    rec.w[pc.rec + 13u] = asked;
 }

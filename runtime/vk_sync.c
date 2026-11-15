@@ -1167,7 +1167,8 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
     return &slots[cur_slot];
 }
 
-// ---- the part's pre-pass command buffer (vk.h vk_sync_pre; vk_exec_draw.c mesh emulation, NX2NAVI_MESH_EMU_BATCH)
+// ---- the part's pre-pass command buffer (vk.h vk_sync_pre; vk_exec_draw.c mesh emulation, NX2NAVI_MESH_EMU_BATCH,
+// and the mesh fallback's batches, NX2NAVI_MESH_FB_BATCH)
 // Begun at the first call of a part, submitted right before the part (after the mirror prologue) and ended there. Its
 // own pool: with the recorder on, the recorder thread records the part (cmd_pool) while the replay records this.
 static VkCommandPool pre_pool;
@@ -1222,7 +1223,7 @@ static int nchain;
 static VkCommandBuffer pre_end(uint64_t fence) {
     VkCommandBuffer cb = pre_cb;
     if (!cb) return VK_NULL_HANDLE;
-    vk_exec_mesh_flush(cb);   // the stages of the pass's emulated draws, by stage
+    vk_exec_mesh_flush(cb);   // the stages of the pass's emulated or fallback mesh draws, by stage
     ts_close(cb, pre_pair, fence, GTL_PRE);
     pre_pair = -1;
     vkEndCommandBuffer(cb);
