@@ -3504,6 +3504,9 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
     PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
     PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
+    // the mesh fallback's windows (vk_mesh_fb.c), which its vertex stage binds: two batched draws of one program with
+    // equal bindings read different windows
+    PUT(vk_meshfb_window_serial());
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
         float in[3];
