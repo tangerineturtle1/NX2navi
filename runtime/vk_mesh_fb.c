@@ -56,7 +56,10 @@ static struct {
     VkDeviceSize rwin[MESHFB_RECS][3][2];   // offset and range
     VkDeviceSize used[3], align;           // the batch's windows end at used; offsets are multiples of align
     uint32_t serial, batch_draws;          // serial: changes with the current window (vk_meshfb_window_serial)
-    uint64_t batches, batched, cuts, most_draws, most_bytes;   // NX2NAVI_TRACE=perf: since the last perf line
+    // NX2NAVI_TRACE=perf, since the last perf line: batches ended, draws batched, batches ended because a window did not
+    // fit, the most draws and window bytes of one batch, draws clipped to their window, and draws drawn by themselves
+    // with the batches on (vk_meshfb_solo, by reason)
+    uint64_t batches, batched, cuts, most_draws, most_bytes, clipped_p, solo[3];
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -283,6 +286,7 @@ static void record_check(uint32_t i, int account) {
         M.rwin[i][WIN_LIST][1] != M.list_bytes) {
         // a window, sized from what the program asked for before (vk_meshfb_window): its need now holds this draw's
         uint64_t k = ++M.clipped;
+        M.clipped_p++;
         if (k <= 16 || !(k & (k - 1))) {
             char from[96] = "";
             if (tasks) snprintf(from, sizeof from, " from %u task workgroups (room for %u)", tasks, M.cap_tasks[i]);
@@ -404,11 +408,23 @@ void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words) {
     vkCmdDispatch(cb, 1, 1, 1);
 }
 
-void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at) {
-    uint32_t i = (uint32_t)(at / REC_BYTES);
-    VkBufferCopy cp = {at + 48, (VkDeviceSize)i * 8, 8};
-    vkCmdCopyBuffer(cb, M.rec, M.stat, 1, &cp);
-    M.noted[i] = 1;
+void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at) { vk_meshfb_note_many(cb, &at, 1); }
+
+void vk_meshfb_note_many(VkCommandBuffer cb, const VkDeviceSize *at, int n) {
+    VkBufferCopy cp[256];
+    for (int k = 0; k < n;) {
+        int m = 0;
+        for (; k < n && m < 256; k++, m++) {
+            uint32_t i = (uint32_t)(at[k] / REC_BYTES);
+            cp[m] = (VkBufferCopy){at[k] + 48, (VkDeviceSize)i * 8, 8};
+            M.noted[i] = 1;
+        }
+        vkCmdCopyBuffer(cb, M.rec, M.stat, (uint32_t)m, cp);
+    }
+}
+
+void vk_meshfb_solo(int why) {
+    if (why >= 0 && why < 3) M.solo[why]++;
 }
 
 uint64_t vk_meshfb_short(void) {
@@ -430,6 +446,17 @@ void vk_meshfb_perf_log(uint64_t frame) {
            (unsigned long long)PF.indirect, (unsigned long long)PF.with_task, b->draws, (double)b->mesh / mib,
            (double)b->task / mib, b->list, (double)b->bound / mib, b->unbounded, (double)PF.largest / mib,
            (double)PF.largest_bound / mib, (unsigned long long)(M.mesh_bytes >> 20));
+    uint64_t solo = M.solo[0] + M.solo[1] + M.solo[2];
+    if (M.batched || solo)
+        rt_log("perf: frame %llu: mesh fallback batches: %llu draws batched in %llu batches (at most %llu draws and %.1f MiB "
+               "of windows in one), %llu batches ended because a window did not fit, %llu draws did not fit their window; "
+               "%llu draws by themselves (%llu with a compute layout that is not pushed, %llu with no room for a cut, %llu "
+               "without a pre-pass command buffer)", (unsigned long long)frame, (unsigned long long)M.batched,
+               (unsigned long long)M.batches, (unsigned long long)M.most_draws, (double)M.most_bytes / mib,
+               (unsigned long long)M.cuts, (unsigned long long)M.clipped_p, (unsigned long long)solo,
+               (unsigned long long)M.solo[0], (unsigned long long)M.solo[1], (unsigned long long)M.solo[2]);
+    M.batches = M.batched = M.cuts = M.most_draws = M.most_bytes = M.clipped_p = 0;
+    memset(M.solo, 0, sizeof M.solo);
     PerfGroup open = PF.cur;   // the draws of the group still open belong to the next period too: its id stays
     memset(&PF, 0, sizeof PF);
     PF.cur.id = open.id;

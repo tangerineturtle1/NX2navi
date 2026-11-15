@@ -59,10 +59,15 @@ void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words);
 // binds its own compute pipeline and set.
 void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, uint32_t fan, uint32_t slot_words, uint32_t verts);
 // After the record is complete (the copies or the scan, and a barrier): keeps what the draw asked for where the host
-// reads it later. One copy command.
+// reads it later. One copy command; vk_meshfb_note_many: one for the n records at at[] (a batch's).
 void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at);
+void vk_meshfb_note_many(VkCommandBuffer cb, const VkDeviceSize *at, int n);
+// A draw drawn by itself while the batches are on, for the perf line: why (0 a compute layout that is not pushed, 1 no
+// room for another cut, 2 no pre-pass command buffer).
+void vk_meshfb_solo(int why);
 // NX2NAVI_TRACE=perf, every 600 frames: the line with the most mesh, task and list bytes one pass group asked for
-// (draws are looked at once their submission is done, a few frames later). Nothing when off.
+// (draws are looked at once their submission is done, a few frames later), and with batches the line of their counts.
+// Nothing when off.
 void vk_meshfb_perf_log(uint64_t frame);
 // Draws so far whose programs emitted more than the buffers or their windows hold, the records not looked at yet
 // included: call it with the device idle (a probe, the shutdown).

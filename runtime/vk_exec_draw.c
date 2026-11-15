@@ -5874,13 +5874,15 @@ static void mesh_shading_rate(VkExec *ex) {
 //   mesh dispatch            the mesh module, with the mesh stage's bindings
 //   draw                     one instance per mesh workgroup, with the generated vertex stage and the program's
 //                            fragment stage, the instance count from the record
-// Every step reads what the one before wrote, and the dispatches cannot be recorded inside a pass: each such draw ends
-// the open pass with a full barrier (what the game wrote before, its culling, and the last draw's reads of the
-// buffers come first), and the next draw begins it again. Between the steps stand barriers of the stages and accesses
-// each one orders (mfb_barrier): the fills and copies before the dispatches that read the record as indirect
-// arguments, the task dispatch before the scan, the scan before the mesh dispatch, and the mesh dispatch before
-// everything after it, the draw first. The buffers are reused by every draw (vk_mesh_fb.c), which the full barrier
-// before a draw's first step makes safe: the previous draw's vertex stage has read them by then.
+// Every step reads what the one before wrote, and the dispatches cannot be recorded inside a pass. With the batches
+// (NX2NAVI_MESH_FB_BATCH, default on; "the mesh fallback's batches" below) the dispatches of a pass's draws run before
+// the pass, each draw in windows of the buffers of its own, and the draws stay in the pass. A draw drawn by itself
+// (the batches off, or a draw they do not take) ends the open pass with a full barrier (what the game wrote before,
+// its culling, and the last draw's reads of the buffers come first), and the next draw begins it again; it gets the
+// whole buffers, which the full barrier before its first step makes safe: the draws before have read them by then.
+// Between the steps stand barriers of the stages and accesses each one orders (mfb_barrier, mfb_flush): the fills and
+// copies before the dispatches that read the record as indirect arguments, the task dispatch before the scan, the
+// scan before the mesh dispatch, and the mesh dispatch before everything after it, the draw first.
 //
 // The modules of a program are made once, on a thread of their own, with their compute pipelines (a mesh program of
 // the game is up to 900,000 SPIR-V words, and its pipeline compiles for as long as the mesh pipeline it replaces):
@@ -6087,6 +6089,180 @@ static int mfb_dispatch(VkExec *ex, const GfxShader *cs, int stage, VkBuffer rec
 // (NX2NAVI_TRACE=perf reports the most one such group asks for). mfb_last_serial: the pass the last draw began.
 static uint32_t mfb_group, mfb_last_serial;
 
+// ---- the mesh fallback's batches (NX2NAVI_MESH_FB_BATCH, default on)
+// The dispatches of a pass's fallback draws run before the pass, in the part's pre-pass command buffer (vk_sync.c
+// vk_sync_pre), recorded by stage when it ends (mfb_flush, from vk_exec_mesh_flush): the clamp of every count the GPU
+// wrote, every task dispatch, every scan, one copy of every draw's note, every mesh dispatch, with one barrier between
+// stages for all the draws. Each draw has
+// windows of the buffers of its own (vk_mesh_fb.c vk_meshfb_window), so the draws' dispatches need nothing of each
+// other's, and its draw stays in the pass with no barrier: the pre-pass command buffer's last barrier orders the
+// dispatches before the part. At the first such draw of a pass the part is cut (vk_exec_split_now), so that what the
+// replay recorded before the pass, the game's culling among it, runs before the dispatches; a window that does not fit
+// what the batch left cuts the part again and the draw begins the next batch. Drawn one by one, each draw ended its
+// pass and the GPU idled through four or five small serial steps and their barriers per draw (RX 570, Hyrule Field,
+// 0.10.1: about 106 indirect dispatches and 580 gaps of barriers and state a frame, 8.6 ms of GPU time in the gaps).
+// What the pass itself writes before a draw is not seen by the draw's dispatches, as with mesh emulation's batches:
+// uniform updates, dispatches and copies end the pass. A draw is drawn by itself (vk_meshfb_solo counts why) when a
+// compute layout of its program is not pushed with a template, when no part can be cut (vk_sync.c CHAIN_MAX), or
+// without a pre-pass command buffer.
+typedef struct {
+    VkPipeline p;
+    VkPipelineLayout layout;
+    VkDescriptorUpdateTemplate tpl;
+    VkDescriptorSet pset;   // the texture pools' set (set 2), or VK_NULL_HANDLE
+    size_t doff;            // its pushed descriptors, in MFQ.d
+    uint32_t dbytes;
+} MfbStage;
+typedef struct {
+    MfbStage st[2];   // the task dispatch (has_task), the mesh dispatch
+    VkDeviceSize at;  // the record
+    uint32_t task_words, fan, slot_words, verts;
+    int has_task, indirect;   // indirect: its count is the GPU's, cut to its windows before the dispatches read it
+} MfbQ;
+#define MFQ_MAX 256
+static struct {
+    MfbQ q[MFQ_MAX];
+    int n, tasks, indirect;
+    VkBuffer rec;   // the record buffer
+    uint8_t *d;     // the pushed descriptors of the queued dispatches
+    size_t dn, dcap;
+} MFQ;
+
+static int mfb_batch = -1;
+static int mfb_batch_on(void) {
+    if (mfb_batch < 0) {
+        mfb_batch = rt_knob("MESH_FB_BATCH", "1");
+        rt_log("vk: mesh fallback: %s (NX2NAVI_MESH_FB_BATCH=%d)",
+               mfb_batch ? "the dispatches of a pass's draws run before the pass, in a command buffer of their own, each "
+                           "draw in windows of the buffers"
+                         : "each draw ends its pass and runs its dispatches there", mfb_batch);
+    }
+    return mfb_batch;
+}
+// Probes only (mesh_fb_probe.c): the batches on or off from here on, between submissions.
+void vk_exec_meshfb_batch(int on) { mfb_batch = on; }
+
+// A compute pipeline whose descriptors can be pushed again later from their bytes: set 0 pushed with a template.
+static int mfb_pushed(VkPipeline p, const VkPipeInfo *info) {
+    return p && info && info->push && info->tpl[0] && info->n_sets <= 1 && !(info->pool && !pool_on());
+}
+
+// One of a queued draw's dispatches: the bindings of NVN stage `stage` for pipeline p, as mfb_dispatch binds them, kept
+// for mfb_flush. The build goes into the replay's command buffer, where it binds only at the compute bind point, which
+// the pass does not use, so that its side effects (the pool set's sync, the notes of bound memory) stay where the draw
+// is in the stream. 0 when there is no memory for the descriptors.
+static int mfb_capture(VkExec *ex, VkPipeline p, const VkPipeInfo *info, int stage, MfbStage *out) {
+    ex->dc->mfb_stage = stage;
+    bind_resources(ex, info);
+    ex->dc->mfb_stage = 0;
+    if (MFQ.dn + emu_d_bytes > MFQ.dcap) {
+        size_t c = MFQ.dcap ? MFQ.dcap * 2 : 65536;
+        while (c < MFQ.dn + emu_d_bytes) c *= 2;
+        uint8_t *d = realloc(MFQ.d, c);
+        if (!d) return 0;
+        MFQ.d = d, MFQ.dcap = c;
+    }
+    memcpy(MFQ.d + MFQ.dn, emu_d, emu_d_bytes);
+    *out = (MfbStage){p, info->layout, info->tpl[0], info->pool ? PL.set : VK_NULL_HANDLE, MFQ.dn, emu_d_bytes};
+    MFQ.dn += emu_d_bytes;
+    return 1;
+}
+
+static void mfb_bind(VkCommandBuffer cb, const MfbStage *s) {
+    rec_push_tpl(vk_pipeline_push_tpl_fn(), cb, s->tpl, s->layout, 0, MFQ.d + s->doff, s->dbytes);
+    if (s->pset) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 2, 1, &s->pset, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->p);
+}
+
+// The queued draws' dispatches into cb (the pre-pass command buffer), by stage. The records' fills and copies went into
+// cb as each draw was queued.
+static void mfb_flush(VkCommandBuffer cb) {
+    if (!MFQ.n || !cb) return;
+    const VkPipelineStageFlags2 st_cs = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, st_ind = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                                st_tr = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    const VkAccessFlags2 a_sr = VK_ACCESS_2_SHADER_STORAGE_READ_BIT, a_sw = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         a_ind = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, a_tr = VK_ACCESS_2_TRANSFER_READ_BIT;
+    // the records: the dispatches' indirect arguments, the clamps' and the scans' words, and without a task stage the
+    // notes' copy
+    me_barrier(cb, st_tr, VK_ACCESS_2_TRANSFER_WRITE_BIT, st_ind | st_cs | st_tr, a_ind | a_sr | a_sw | a_tr);
+    if (MFQ.indirect) {
+        // every count the GPU wrote, cut to its draw's windows (vk_mesh_fb.c vk_meshfb_clamp), with one barrier for all
+        for (int i = 0; i < MFQ.n; i++)
+            if (MFQ.q[i].indirect) vk_meshfb_clamp(cb, MFQ.q[i].at, MFQ.q[i].task_words);
+        // the cut counts: the dispatches' indirect arguments, the scans' words and the notes' copy
+        me_barrier(cb, st_cs, a_sw, st_ind | st_cs | st_tr, a_ind | a_sr | a_sw | a_tr);
+    }
+    if (MFQ.tasks) {
+        for (int i = 0; i < MFQ.n; i++)
+            if (MFQ.q[i].has_task) mfb_bind(cb, &MFQ.q[i].st[0]), vkCmdDispatchIndirect(cb, MFQ.rec, MFQ.q[i].at);
+        me_barrier(cb, st_cs, a_sw, st_cs, a_sr | a_sw);   // the payloads, before the scans read them
+        for (int i = 0; i < MFQ.n; i++) {
+            const MfbQ *q = &MFQ.q[i];
+            if (q->has_task) vk_meshfb_scan(cb, q->at, q->task_words, q->fan, q->slot_words, q->verts);
+        }
+        // the lists and the records' counts: the mesh dispatches' arguments and list entries, and the notes' copy
+        me_barrier(cb, st_cs, a_sw, st_ind | st_cs | st_tr, a_ind | a_sr | a_tr);
+    }
+    VkDeviceSize at[MFQ_MAX];
+    for (int i = 0; i < MFQ.n; i++) at[i] = MFQ.q[i].at;
+    vk_meshfb_note_many(cb, at, MFQ.n);
+    for (int i = 0; i < MFQ.n; i++) mfb_bind(cb, &MFQ.q[i].st[1]), vkCmdDispatchIndirect(cb, MFQ.rec, MFQ.q[i].at + 16);
+    // the mesh windows, the records and the notes before everything after them: the part's draws
+    me_barrier(cb, st_cs | st_tr, a_sw | VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+               VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    MFQ.n = MFQ.tasks = MFQ.indirect = 0, MFQ.dn = 0;
+}
+
+// A draw of the batches: its dispatches queued for the pre-pass command buffer, its draw recorded in the pass. 0 when it
+// is to be drawn by itself (what was recorded by then is a cut, which leaves the replay as it would a split).
+static int mfb_batch_draw(VkExec *ex, MfbCs *c, const GfxShader *vs, uint32_t count, const VkMemSpan *ind, uint32_t verts,
+                          uint32_t slot_words, uint64_t bound) {
+    const VkPipeInfo *mi = NULL, *ti = NULL;
+    VkPipeline mp = vk_pipeline_compute(c->cs_mesh, &mi), tp = c->ts ? vk_pipeline_compute(c->cs_task, &ti) : VK_NULL_HANDLE;
+    if (!mfb_pushed(mp, mi) || (c->ts && !mfb_pushed(tp, ti))) return vk_meshfb_solo(0), 0;
+    // the pass's first such draw: what came before, the game's culling among it, goes into the part before the batch's
+    if (!(ex->in_pass && ex->pre_pass == ex->pass_serial) && !vk_exec_split_now(ex)) return vk_meshfb_solo(1), 0;
+    VkCommandBuffer pre = vk_sync_pre();
+    if (!pre) return vk_meshfb_solo(2), 0;
+    uint32_t task_words = c->ts ? c->ti.payload_bytes / 4 : 0;
+    int ts = c->ts != NULL;
+    if (!vk_meshfb_window(&c->need, ts, ind != NULL, count, c->ti.threads, slot_words, task_words)) {
+        // the batch's windows leave too little: the batch ends with its part, and the draw begins the next
+        if (!vk_exec_split_now(ex)) return vk_meshfb_solo(1), 0;
+        if (!(pre = vk_sync_pre())) return vk_meshfb_solo(2), 0;
+        if (!vk_meshfb_window(&c->need, ts, ind != NULL, count, c->ti.threads, slot_words, task_words))
+            return vk_meshfb_solo(2), 0;   // not with the batch empty: a window is at most the whole buffers
+    }
+    if (MFQ.n == MFQ_MAX) mfb_flush(pre);
+    VkBuffer rec;
+    int cmds;
+    VkDeviceSize at = vk_meshfb_record(pre, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts, verts,
+                                       slot_words, mfb_group, bound, &c->need, ex->fence, &rec, &cmds);
+    MfbQ *q = &MFQ.q[MFQ.n];
+    *q = (MfbQ){.at = at, .task_words = task_words, .fan = c->ti.threads, .slot_words = slot_words, .verts = verts,
+                .has_task = ts, .indirect = ind != NULL};
+    if ((ts && !mfb_capture(ex, tp, ti, NVN_STAGE_TASK, &q->st[0])) || !mfb_capture(ex, mp, mi, NVN_STAGE_MESH, &q->st[1])) {
+        vk_meshfb_window_whole();
+        draw_skipped(ex, 1, SK_PIPE_FAILED);
+        return 1;
+    }
+    MFQ.rec = rec, MFQ.n++, MFQ.tasks += ts, MFQ.indirect += ind != NULL;
+    DrawCtx *const cx = ex->dc;
+    cx->c0_binst = 0;
+    cx->mfb_cur_vs = vs;   // its binding of the mesh buffer is the current window
+    int prim = c->mi.ipp == 1 ? NVN_DRAW_PRIMITIVE_POINTS : c->mi.ipp == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
+    int ok = prepare_draw_ex(ex, prim, 0x7fffffff, 0, 2);
+    vk_meshfb_window_whole();
+    if (!ok) return 1;
+    ex->pre_pass = mfb_last_serial = ex->pass_serial;
+    vk_exec_frame.draws++;
+    if (ex->mark && ind) ex->mark->mesh_ind++;   // the pass's mesh draws (vk_crumbs.c describe_mark)
+    else if (ex->mark) ex->mark->mesh++;
+    vkCmdDrawIndirect(ex->cb, rec, at + 32, 1, sizeof(VkDrawIndirectCommand));
+    ex->recorded++;
+    return 1;
+}
+
 // A mesh draw of `count` workgroups, or of the count in the game's record at ind (4 bytes, GPU-written), which lies
 // at `list` in the game's memory (0: no record).
 static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t list) {
@@ -6139,6 +6315,10 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     uint32_t verts = c->mi.maxp * c->mi.ipp, slot_words = meshfb_slot_words(&c->mi);
     uint32_t most = vk_ctx()->props.limits.maxComputeWorkGroupCount[0];
     if (count > most) count = most;   // a count the GPU wrote is cut on the GPU, below
+    uint64_t bound = ind ? 0 : ts ? (uint64_t)count * (c->ti.threads < 255 ? c->ti.threads : 255) : count;
+    if (!(ex->in_pass && ex->pass_serial == mfb_last_serial)) mfb_group++;
+    if (mfb_batch_on() && mfb_batch_draw(ex, c, vs, count, ind, verts, slot_words, bound)) return;
+    vk_meshfb_window_whole();   // a draw by itself has the whole buffers
     VkBuffer rec;
     int cmds;
     const VkPipelineStageFlags2 st_cs = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, st_ind = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
@@ -6146,13 +6326,10 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     const VkAccessFlags2 a_sr = VK_ACCESS_2_SHADER_STORAGE_READ_BIT, a_sw = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          a_ind = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     int dirty = ex->bar_dirty;   // the full barrier below orders what came before; the steps after it need no more
-    if (!(ex->in_pass && ex->pass_serial == mfb_last_serial)) mfb_group++;
     vk_exec_barrier(ex);   // ends the pass; the culling's record and the last draw's reads come before what follows
     vk_gpu_gap_note(VK_GAP_MESH_FB, 64);   // the record's fills and its count's copy
     VkDeviceSize at = vk_meshfb_record(ex->cb, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts != NULL,
-                                       verts, slot_words, mfb_group,
-                                       ind ? 0 : ts ? (uint64_t)count * (c->ti.threads < 255 ? c->ti.threads : 255) : count,
-                                       &c->need, ex->fence, &rec, &cmds);
+                                       verts, slot_words, mfb_group, bound, &c->need, ex->fence, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
     // the record: the dispatches' indirect arguments, the clamp's and the scan's words, and without a task stage the
     // copy of the note
@@ -6661,8 +6838,13 @@ static int me_flush(VkCommandBuffer cb) {
     return k + 4;
 }
 
-// vk.h: the pre-pass command buffer ends (vk_sync.c pre_end): the stages of the draws queued for it go in first.
-void vk_exec_mesh_flush(VkCommandBuffer cb) { me_flush(cb); }
+// vk.h: the pre-pass command buffer ends (vk_sync.c pre_end): the stages of the draws queued for it go in first, mesh
+// emulation's and the mesh fallback's, and the fallback's next batch starts at its buffers' starts.
+void vk_exec_mesh_flush(VkCommandBuffer cb) {
+    me_flush(cb);
+    mfb_flush(cb);
+    vk_meshfb_batch_reset();
+}
 
 // count: the first stage's workgroups, or ind: a {count, 1, 1} record to dispatch from
 // args: an indirect draw's arguments in game memory (count, 1, 1 copied into a ring entry, which ind then is)
