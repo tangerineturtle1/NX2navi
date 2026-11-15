@@ -23,8 +23,8 @@ typedef struct MeshFbNeed {
 // after the windows of the batch's draws before it, which become the current ones (vk_meshfb_buffer) and the next
 // record's (vk_meshfb_record). Sized for the draw: a direct draw without a task stage `count` mesh workgroups; a direct
 // draw with one `count` task workgroups and at most `fan` mesh workgroups each, fewer by what its program asked for so
-// far; an indirect draw what its program asked for at most so far; each estimate with half again as margin and at
-// least a 64th of the buffer, and with nothing asked yet half the buffer. Never more than the whole buffer. 0 when a window does not fit what the batch left
+// far; an indirect draw what its program asked for at most so far; each estimate doubled as margin and at least a
+// 32nd of the mesh buffer and a 16th of the task buffer, and with nothing asked yet half the buffer. Never more than the whole buffer. 0 when a window does not fit what the batch left
 // and the batch holds draws: nothing changes, and the caller ends the batch (vk_meshfb_batch_reset) and asks again.
 int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_t count, uint32_t fan, uint32_t slot_words,
                      uint32_t task_words);

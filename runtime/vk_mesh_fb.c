@@ -190,22 +190,22 @@ int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_
     uint64_t room = M.mesh_bytes / 4 / slot_words, task_room = M.task_bytes / 4 / task_words;
     if (has_task && room > M.list_bytes / 4) room = M.list_bytes / 4;
     // A program's history can be near nothing (its draws were culled while off screen) and then jump when it comes into
-    // view, past the 1.5 margin. Windows estimated from history therefore hold at least a 64th of each buffer, which a
-    // pass of 30 such draws still fits in.
-    uint64_t floor_slots = room / 64, floor_tasks = task_room / 64;
+    // view, or grow faster than the margin while the camera comes closer. Windows estimated from history therefore hold
+    // at least a 32nd of the mesh buffer and a 16th of the task buffer, and a batch that runs out of room is cut.
+    uint64_t floor_slots = room / 32, floor_tasks = task_room / 16;
     uint64_t slots, tasks = 0;
     if (!has_task) {
         // a direct draw's workgroup count is its need; an indirect one's is what the program asked for at most so far
-        slots = !indirect ? count : need->seen ? max_of((uint64_t)need->max_want * 3 / 2 + 64, floor_slots) : room / 2;
+        slots = !indirect ? count : need->seen ? max_of((uint64_t)need->max_want * 2 + 64, floor_slots) : room / 2;
     } else if (!indirect) {
         // its task workgroups exactly; each starts fan mesh workgroups at most, and as many as the program's most so far
         tasks = count;
         uint64_t bound = (uint64_t)count * fan;
-        slots = need->seen ? at_most(bound, max_of((uint64_t)count * need->ratio16 * 3 / 32 + 64, floor_slots))
+        slots = need->seen ? at_most(bound, max_of((uint64_t)count * need->ratio16 / 8 + 64, floor_slots))
                            : at_most(bound, room / 2);
     } else {
-        tasks = need->seen ? max_of((uint64_t)need->max_tasks * 3 / 2 + 16, floor_tasks) : task_room / 2;
-        slots = need->seen ? max_of((uint64_t)need->max_want * 3 / 2 + 64, floor_slots) : room / 2;
+        tasks = need->seen ? max_of((uint64_t)need->max_tasks * 2 + 16, floor_tasks) : task_room / 2;
+        slots = need->seen ? max_of((uint64_t)need->max_want * 2 + 64, floor_slots) : room / 2;
     }
     slots = at_most(slots ? slots : 1, room), tasks = at_most(tasks, task_room);
     VkDeviceSize bytes[3] = {has_task ? tasks * task_words * 4 : 0, slots * slot_words * 4, has_task ? slots * 4 : 0};
