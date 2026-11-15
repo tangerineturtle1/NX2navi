@@ -3457,7 +3457,8 @@ typedef struct {
     size_t n_ans;
     PreparedJobs jobs;
     uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
-    volatile int64_t next, done, missing, failed, refined;
+    uint8_t (*mv)[32];                                     // per record: its last-frame vertex variant's input id, or zero
+    volatile int64_t next, done, missing, failed, refined, motion;
 } Prep;
 
 static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx *)x)->rec + 12, ((const PrgIdx *)y)->rec + 12, 32); }
@@ -3465,6 +3466,19 @@ static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx 
 static void prg_collect(const uint8_t *rec, void *ctx) {
     PrgList *l = ctx;
     l->idx[l->n++].rec = rec;
+}
+
+// A vertex shader that reads a user bank besides the camera's (c4), the test the object motion vectors' draw path makes
+// (vk_exec_draw.c, before it asks for the last-frame variant; vk_mvprev.c): such a draw asks for that variant, a
+// translation of its own that play otherwise makes the first time such an object is drawn, and the object has no
+// motion vectors until it is done. Narrower tests (the place and bone banks c7 and c5 alone) left a third of the
+// variants a long session asked for unprepared.
+static int motion_candidate(const GfxShader *s) {
+    const GfxShaderRes *ur;
+    int n = gfx_shader_resources(s, GFX_RES_UBO, &ur);
+    for (int i = 0; i < n; i++)
+        if (ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4) return 1;
+    return 0;
 }
 
 static void prep_worker(void *arg) {
@@ -3484,14 +3498,23 @@ static void prep_worker(void *arg) {
         uint32_t st, len;
         memcpy(&st, e->rec, 4), memcpy(&len, e->rec + 4, 4);
         const uint8_t *control = e->rec + 44, *code = control + CONTROL_SIZE, *c1 = code + len;
-        GfxShaderAnswers a, b;
+        GfxShaderAnswers a, b, *used = &a;
         unpack_answers(r + 68, &a);
         const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a), *t;
         if (s && r[ANS_REC - 1] & SEED_DEFAULT && gfx_shader_guess_refine(s, (int)st, &a, &b) &&
             (t = gfx_shader_get((int)st, control, code, len, c1, &b)))
-            s = t, plat_inc64(&p->refined);
+            s = t, used = &b, plat_inc64(&p->refined);
         if (!s) plat_inc64(&p->failed);
-        else if (p->iid) memcpy(p->iid[i], s->iid, 32);
+        else {
+            if (p->iid) memcpy(p->iid[i], s->iid, 32);
+            // its last-frame variant too, with the answers of the variant it comes from
+            if (p->mv && st == GFX_STAGE_VS && !used->mvprev && motion_candidate(s)) {
+                GfxShaderAnswers m = *used;
+                m.mvprev = 1;
+                if ((t = gfx_shader_get((int)st, control, code, len, c1, &m)))
+                    memcpy(p->mv[i], t->iid, 32), plat_inc64(&p->motion);
+            }
+        }
         plat_inc64(&p->done);
     }
     preparing = NULL;
@@ -3499,9 +3522,11 @@ static void prep_worker(void *arg) {
 
 // Translates every record of ans_path whose program is in prg_path on `threads` threads with up to `procs` translators.
 // *ans_out, *iid_out (optional; free them): the answers records and the input id each resolved to (zero: failed).
+// *mv_out (optional; free it): per record, the input id of the last-frame variant of a vertex shader motion_candidate
+// takes, translated as well (zero: none).
 // Returns the record count, -1 without the files.
 static long long prepare_files(const char *ans_path, const char *prg_path, int threads, int procs, const char *what,
-                               uint8_t **ans_out, uint8_t (**iid_out)[32]) {
+                               uint8_t **ans_out, uint8_t (**iid_out)[32], uint8_t (**mv_out)[32]) {
     paths();
     double t0 = (double)plat_now_ms();
     uint8_t *ab = NULL, *pb = NULL;
@@ -3514,7 +3539,9 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     }
     Prep p = {.progs = {calloc(pn / PRG_HEAD + 1, sizeof(PrgIdx)), 0}, .ans = ab, .n_ans = an / ANS_REC};
     if (iid_out) p.iid = calloc(p.n_ans + 1, 32);
-    if (!p.progs.idx || (iid_out && !p.iid)) return free(p.progs.idx), free(p.iid), free(ab), free(pb), -1;
+    if (mv_out) p.mv = calloc(p.n_ans + 1, 32);
+    if (!p.progs.idx || (iid_out && !p.iid) || (mv_out && !p.mv))
+        return free(p.progs.idx), free(p.iid), free(p.mv), free(ab), free(pb), -1;
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
     plat_inc32(&C.suspended);   // a preparation translates everything under the current translator, carrying nothing
@@ -3546,6 +3573,9 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
            (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed, (long long)p.missing, (long long)p.refined,
            (double)plat_now_ms() - t0);
     rt_log("gfx_shader: prepare: %lld equivalent translator requests reused", (long long)p.jobs.reused);
+    if (mv_out)
+        rt_log("gfx_shader: prepare: %lld last-frame vertex variants for the object motion vectors (vertex shaders that "
+               "read a user bank besides the camera's)", (long long)p.motion);
     for (int b = 0; b < BUCKETS; b++) {
         PreparedJob *j = p.jobs.buckets[b];
         while (j) {
@@ -3558,6 +3588,7 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     if (ans_out) *ans_out = ab;
     else free(ab);
     if (iid_out) *iid_out = p.iid;
+    if (mv_out) *mv_out = p.mv;
     return (long long)p.n_ans;
 }
 
@@ -3566,7 +3597,7 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
         rt_log("gfx_shader: prepare: no recorded answers (not recording)");
         return;
     }
-    prepare_files(RC.ans_path, RC.prg_path, threads, procs, "recorded pairs", NULL, NULL);
+    prepare_files(RC.ans_path, RC.prg_path, threads, procs, "recorded pairs", NULL, NULL, NULL);
 }
 
 // ---- prepared variants (shader-prepared.bin next to pipeline-keys.bin)
@@ -3612,7 +3643,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     snprintf(out, sizeof out, "%s/shader-prepared.bin", dir);
     double t0 = (double)plat_now_ms();
     uint64_t fail0 = (uint64_t)n_failures;
-    uint8_t *ab = NULL, (*iid)[32] = NULL;
+    uint8_t *ab = NULL, (*iid)[32] = NULL, (*mv)[32] = NULL;
     // What this list is prepared from goes into its head (prp_file.h): the seed as it is on the disk now, and the
     // translator before the host options are mixed in, which is what nx2navi_xlate.id holds. The list there before
     // is replaced whole at the end; the log says whether it came from this seed.
@@ -3633,9 +3664,9 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     // For the whole run: the variants built into the driver's cache after it (vk_pipeline.c lb_warm_prepared) are the
     // current translator's, as before carrying existed.
     plat_inc32(&C.suspended);
-    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &iid);
+    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &iid, &mv);
     if (n < 0) return 1;
-    uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
+    uint8_t *recs = calloc(2 * (size_t)n + 1, PRP_REC);   // each record's variant, and a vertex shader's last-frame one
     static const uint8_t zero[32];
     size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
@@ -3646,6 +3677,15 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
         uint8_t prio = a[ANS_REC - 1] & ~SEED_DEFAULT;
         r[0] = a[0] < 6 ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
         memcpy(r + 4, iid[i], 32);
+        by[r[1]]++, stages[r[0]]++, u++;
+    }
+    // then the last-frame vertex variants, in the priority of the variant each comes from
+    for (long long j = 0; recs && mv && j < n; j++) {
+        if (!memcmp(mv[j], zero, 32) || !set_add(&seen, hash8(mv[j]))) continue;
+        uint8_t *r = recs + u * PRP_REC;
+        uint8_t prio = ab[(size_t)j * ANS_REC + ANS_REC - 1] & ~SEED_DEFAULT;
+        r[0] = GFX_STAGE_VS, r[1] = prio > 2 ? 2 : prio;
+        memcpy(r + 4, mv[j], 32);
         by[r[1]]++, stages[r[0]]++, u++;
     }
     free(seen.v);
@@ -3667,7 +3707,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
-    free(file), free(recs), free(iid), free(ab);
+    free(file), free(recs), free(iid), free(mv), free(ab);
     return ok ? 0 : 1;
 }
 
