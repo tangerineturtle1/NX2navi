@@ -961,7 +961,8 @@ void vk_sync_worker_end(VkCommandBuffer cb);
 // with a full barrier at the first call of a part; VK_NULL_HANDLE when it cannot be made. Replay thread, sub_lock held.
 VkCommandBuffer vk_sync_pre(void);
 // vk_exec_draw.c: records into the pre-pass command buffer, as it ends, the stages of the emulated mesh draws queued
-// for it (NX2NAVI_MESH_EMU_BATCH). A weak vk_sync.c version does nothing.
+// for it (NX2NAVI_MESH_EMU_BATCH) and the dispatches of the mesh fallback's batch (NX2NAVI_MESH_FB_BATCH), whose next
+// batch then starts at its buffers' starts. A weak vk_sync.c version does nothing.
 void vk_exec_mesh_flush(VkCommandBuffer cb);
 // Ends the part being recorded without handing it to the queue (it goes with the next part that does, in order) and
 // returns the command buffer the replay continues in; VK_NULL_HANDLE when no more parts can wait. Replay thread.

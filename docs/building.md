@@ -952,8 +952,9 @@ part of `--probe-vkexec` translate shaders of the census below: they look for `b
 exe's own version first, then of the other one.
 `--probe-vkmem` also checks CPU-backed texture uploads and rewrites, GPU-written texture aliases, and memory write watches.
 `--probe-meshfb` (no game files) draws mesh programs of the runtime's own, with and without a task stage and with
-direct and GPU-written workgroup counts, through `VK_EXT_mesh_shader` and through the mesh fallback, and compares the
-pictures; on a device without mesh shaders only the fallback draws. A change to `runtime/mesh_fb.c`,
+direct and GPU-written workgroup counts, through `VK_EXT_mesh_shader` and through the mesh fallback draw by draw and in
+batches (`NX2NAVI_MESH_FB_BATCH`), and compares the pictures; on a device without mesh shaders only the fallback draws.
+It also checks two draws that do not fit one batch, and draws larger than their window and than the buffers. A change to `runtime/mesh_fb.c`,
 `runtime/vk_mesh_fb.c` or the fallback's part of `runtime/vk_exec_draw.c` passes it. With
 `NX2NAVI_PROBE_MESHFB_DIR=<folder>` it converts the game's own task and mesh translations instead, for `spirv-val`
 (the top of `runtime/mesh_fb_probe.c` says what the folder holds).

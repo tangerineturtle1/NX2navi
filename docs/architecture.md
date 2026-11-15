@@ -181,10 +181,22 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     mesh dispatch, which writes each workgroup's vertex lines and primitive bytes into its slot of the mesh buffer;
     and an instanced indirect draw, one instance per slot, whose generated vertex stage looks the vertex of each
     primitive corner up in the slot (`runtime/vk_exec_draw.c` `mfb_draw`, `runtime/vk_mesh_fb.c`).
-  - Each step reads what the one before wrote, so full barriers stand between them and every such draw ends its pass:
-    a village frame's 45 mesh draws are 45 passes cut, 90 to 135 dispatches and about 270 barriers more than with mesh
-    shaders. The buffers (`mesh_fallback_mb`, 128 MiB) are reused by every draw, so they hold the largest draw, not
-    a frame; a draw that emits more loses what does not fit, and the log says how much it needed.
+  - Each step reads what the one before wrote, and dispatches cannot be recorded inside a pass. With `mesh_fb_batch`
+    (default 1) the dispatches of a pass's draws run together before the pass, in the part's pre-pass command buffer:
+    every task dispatch, every scan, every mesh dispatch, with one barrier between those stages for all the draws, and
+    the draws stay in their pass with no barrier (`runtime/vk_exec_draw.c` "the mesh fallback's batches"). The part
+    is cut at the pass's first such draw, so the game's culling before the pass runs first. Each draw of a batch gets
+    windows of the buffers (`mesh_fallback_mb`, 128 MiB) of its own, which its modules bind as buffers: exactly its
+    workgroup count when the CPU knows it, else what its program asked for so far with half again as margin
+    (`runtime/vk_mesh_fb.c` `vk_meshfb_window`). A window that does not fit what the batch left cuts the part again
+    and starts a new batch. A draw that emits more than its window loses what does not fit, the log says so ("did not
+    fit its window"), and its program's next windows are sized for it, a few frames later, once its submission is
+    done. With `mesh_fb_batch = 0`, and for a draw a batch does not take (a compute layout without push descriptors,
+    no room for another cut), each draw ends its pass and runs its steps there behind full barriers, with the whole
+    buffers: a village frame's 45 mesh draws are then 45 passes cut, 90 to 135 dispatches and about 270 barriers
+    more than with mesh shaders. A draw that emits more than the whole buffers loses what does not fit, and the log
+    says how much it needed. `NX2NAVI_TRACE=perf` reports every 600 frames the most one pass asked for, and the
+    batches, their cuts and the draws drawn by themselves.
   - A program's modules and compute pipelines are made by worker threads at its first draw, which is skipped until
     they are ready (`mesh_fallback_workers`, auto: one for each 4 logical processors, 1 to 4, so a place's programs,
     which all arrive in its first frames, are not made one after the other); they are not recorded for the next start,
