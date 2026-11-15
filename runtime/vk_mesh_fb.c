@@ -32,6 +32,10 @@ static struct {
     const uint32_t *stat_map;                          // per record: mesh workgroups and task workgroups it asked for
     uint32_t cap_slots[MESHFB_RECS], slot_words[MESHFB_RECS], cap_tasks[MESHFB_RECS];   // what the record's draw had room for
     uint8_t noted[MESHFB_RECS];
+    // NX2NAVI_TRACE=perf only (vk_meshfb_record): what the report of the most one pass asks for needs of each record
+    uint32_t group[MESHFB_RECS], task_words[MESHFB_RECS];   // the draw's group (vk_meshfb_record); its task payload's size
+    uint64_t bound[MESHFB_RECS];                            // the most mesh workgroups the CPU could tell it needs (0: unknown)
+    uint8_t has_task[MESHFB_RECS], indirect[MESHFB_RECS];
     uint32_t next;
     uint64_t draws, short_draws, worst_bytes;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -39,6 +43,14 @@ static struct {
     VkPipelineLayout layout;
     VkPipeline scan, clamp;
 } M;
+
+// What the checked records of one group (draws that one pass would batch) asked for.
+typedef struct { uint32_t id, draws, list, unbounded; uint64_t mesh, task, bound; } PerfGroup;
+// The perf line's totals since the last one (perf_account, vk_meshfb_perf_log).
+static struct {
+    uint64_t draws, groups, indirect, with_task, largest, largest_bound;   // largest: the most one draw asked for, in bytes
+    PerfGroup cur, best;
+} PF;
 
 static int make_buffer(VkCtx *c, VkDeviceSize size, VkBufferUsageFlags usage, int host, VkBuffer *b, VmaAllocation *a, void **map) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage};
@@ -124,11 +136,36 @@ VkDescriptorBufferInfo vk_meshfb_buffer(int cb_slot) {
 
 uint64_t vk_meshfb_mesh_words(void) { return M.mesh_bytes / 4; }
 
-// The record about to be written again: what its last draw asked for against what it had room for.
-static void record_check(uint32_t i) {
+// Adds the record's draw to the perf line's group totals. The records come in ring order, so a group's draws are
+// contiguous: a new group id closes the one before, and the group that asked for the most mesh bytes is kept.
+static void perf_account(uint32_t i, uint32_t want, uint32_t tasks) {
+    PerfGroup *g = &PF.cur;
+    if (g->draws && g->id != M.group[i]) {
+        if (g->mesh >= PF.best.mesh) PF.best = *g;
+        PF.groups++;
+        memset(g, 0, sizeof *g);
+    }
+    uint64_t sw = (uint64_t)M.slot_words[i] * 4, asked = (uint64_t)want * sw;
+    g->id = M.group[i];
+    g->draws++;
+    g->mesh += asked;
+    g->task += (uint64_t)tasks * M.task_words[i] * 4;
+    if (M.has_task[i]) g->list += want;
+    if (M.bound[i]) g->bound += M.bound[i] * sw;
+    else g->unbounded++;
+    PF.draws++;
+    PF.indirect += M.indirect[i];
+    PF.with_task += M.has_task[i];
+    if (asked >= PF.largest) PF.largest = asked, PF.largest_bound = M.bound[i] * sw;
+}
+
+// The record about to be written again: what its last draw asked for against what it had room for. `account`: also
+// count it for the perf line (only the ring's own walk, not the sweep of vk_meshfb_short, which is out of order).
+static void record_check(uint32_t i, int account) {
     if (!M.noted[i]) return;
     M.noted[i] = 0;
     uint32_t want = M.stat_map[2 * i], tasks = M.stat_map[2 * i + 1];
+    if (account && (rt_trace & RT_TRACE_PERF)) perf_account(i, want, tasks);
     if (want <= M.cap_slots[i] && tasks <= M.cap_tasks[i]) return;
     uint64_t need = (uint64_t)want * M.slot_words[i] * 4;
     if (need > M.worst_bytes) M.worst_bytes = need;
@@ -144,11 +181,16 @@ static void record_check(uint32_t i) {
 }
 
 VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, uint32_t count, int has_task,
-                              uint32_t verts, uint32_t slot_words, VkBuffer *rec, int *cmds) {
+                              uint32_t verts, uint32_t slot_words, uint32_t group, uint64_t bound_slots, VkBuffer *rec,
+                              int *cmds) {
     uint32_t i = M.next++ % MESHFB_RECS;
     VkDeviceSize at = (VkDeviceSize)i * REC_BYTES;
-    record_check(i);
+    record_check(i, 1);
     M.draws++;
+    if (rt_trace & RT_TRACE_PERF) {
+        M.group[i] = group, M.bound[i] = bound_slots, M.task_words[i] = 0;
+        M.has_task[i] = (uint8_t)(has_task != 0), M.indirect[i] = src != VK_NULL_HANDLE;
+    }
     M.slot_words[i] = slot_words, M.cap_slots[i] = (uint32_t)(M.mesh_bytes / 4 / (slot_words ? slot_words : 1));
     M.cap_tasks[i] = 0xffffffffu;   // vk_meshfb_scan knows the payload size
     if (has_task && M.cap_slots[i] > M.list_bytes / 4) M.cap_slots[i] = (uint32_t)(M.list_bytes / 4);
@@ -188,6 +230,7 @@ VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src
 void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, uint32_t fan, uint32_t slot_words, uint32_t verts) {
     uint32_t i = (uint32_t)(at / REC_BYTES);
     M.cap_tasks[i] = (uint32_t)(M.task_bytes / 4 / (task_words ? task_words : 1));
+    M.task_words[i] = task_words;
     VkDescriptorBufferInfo bi[4] = {{M.rec, 0, VK_WHOLE_SIZE}, {M.task, 0, M.task_bytes}, {M.list, 0, M.list_bytes},
                                     {M.mesh, 0, M.mesh_bytes}};
     VkWriteDescriptorSet w[4];
@@ -228,8 +271,24 @@ void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at) {
 
 uint64_t vk_meshfb_short(void) {
     if (!M.ok) return 0;
-    for (uint32_t i = 0; i < MESHFB_RECS; i++) record_check(i);
+    for (uint32_t i = 0; i < MESHFB_RECS; i++) record_check(i, 0);
     return M.short_draws;
+}
+
+void vk_meshfb_perf_log(uint64_t frame) {
+    if (!M.ok || !(rt_trace & RT_TRACE_PERF) || frame % 600 || !PF.draws) return;
+    const double mib = 1048576.0;
+    const PerfGroup *b = PF.cur.mesh > PF.best.mesh ? &PF.cur : &PF.best;   // the group still open counts too
+    rt_log("perf: frame %llu: mesh fallback: %llu draws in %llu pass groups (%llu indirect, %llu with a task stage); most in "
+           "one group: %u draws, %.1f MiB mesh asked, %.2f MiB task payloads, %u list entries, bounds %.1f MiB + %u unbounded "
+           "draws; largest draw %.1f MiB asked (bound %.1f MiB); mesh buffer %llu MiB", (unsigned long long)frame,
+           (unsigned long long)PF.draws, (unsigned long long)(PF.groups + (PF.cur.draws != 0)),
+           (unsigned long long)PF.indirect, (unsigned long long)PF.with_task, b->draws, (double)b->mesh / mib,
+           (double)b->task / mib, b->list, (double)b->bound / mib, b->unbounded, (double)PF.largest / mib,
+           (double)PF.largest_bound / mib, (unsigned long long)(M.mesh_bytes >> 20));
+    PerfGroup open = PF.cur;   // the draws of the group still open belong to the next period too: its id stays
+    memset(&PF, 0, sizeof PF);
+    PF.cur.id = open.id;
 }
 
 void vk_meshfb_shutdown(void) {

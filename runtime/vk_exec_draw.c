@@ -6079,6 +6079,10 @@ static int mfb_dispatch(VkExec *ex, const GfxShader *cs, int stage, VkBuffer rec
     return 1;
 }
 
+// The group number of the draw being recorded: draws in one pass, with nothing ending it between them, share one
+// (NX2NAVI_TRACE=perf reports the most one such group asks for). mfb_last_serial: the pass the last draw began.
+static uint32_t mfb_group, mfb_last_serial;
+
 // A mesh draw of `count` workgroups, or of the count in the game's record at ind (4 bytes, GPU-written), which lies
 // at `list` in the game's memory (0: no record).
 static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t list) {
@@ -6138,10 +6142,12 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     const VkAccessFlags2 a_sr = VK_ACCESS_2_SHADER_STORAGE_READ_BIT, a_sw = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          a_ind = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     int dirty = ex->bar_dirty;   // the full barrier below orders what came before; the steps after it need no more
+    if (!(ex->in_pass && ex->pass_serial == mfb_last_serial)) mfb_group++;
     vk_exec_barrier(ex);   // ends the pass; the culling's record and the last draw's reads come before what follows
     vk_gpu_gap_note(VK_GAP_MESH_FB, 64);   // the record's fills and its count's copy
     VkDeviceSize at = vk_meshfb_record(ex->cb, ind ? ind->buffer : VK_NULL_HANDLE, ind ? ind->offset : 0, count, ts != NULL,
-                                       verts, slot_words, &rec, &cmds);
+                                       verts, slot_words, mfb_group,
+                                       ind ? 0 : ts ? (uint64_t)count * (c->ti.threads < 255 ? c->ti.threads : 255) : count, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
     // the record: the dispatches' indirect arguments, the clamp's and the scan's words, and without a task stage the
     // copy of the note
@@ -6181,6 +6187,7 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t 
     cx->mfb_cur_vs = vs;
     int prim = c->mi.ipp == 1 ? NVN_DRAW_PRIMITIVE_POINTS : c->mi.ipp == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
     if (!prepare_draw_ex(ex, prim, 0x7fffffff, 0, 2)) return;
+    mfb_last_serial = ex->pass_serial;
     vk_exec_frame.draws++;
     if (ex->mark && ind) ex->mark->mesh_ind++;   // the pass's mesh draws (vk_crumbs.c describe_mark)
     else if (ex->mark) ex->mark->mesh++;

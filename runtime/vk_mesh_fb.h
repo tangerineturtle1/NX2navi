@@ -15,9 +15,11 @@ uint64_t vk_meshfb_mesh_words(void);   // the mesh buffer's size as a binding se
 // pass: the workgroup count from 4 bytes at src_off of src, or `count` when src is VK_NULL_HANDLE. Without a task
 // stage that count is the mesh dispatch and the draw's instance count; with one it is the task dispatch, and
 // vk_meshfb_scan writes the rest. slot_words: of the draw's mesh program, for the report of a draw the mesh buffer
-// was too small for. Returns the number of commands recorded in *cmds.
+// was too small for. group: the draws of one pass share a number (NX2NAVI_TRACE=perf adds up the draws of a group);
+// bound_slots: the most mesh workgroups the CPU can tell the draw needs, 0 when it cannot (indirect). Returns the number of commands recorded in *cmds.
 VkDeviceSize vk_meshfb_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, uint32_t count, int has_task,
-                              uint32_t verts, uint32_t slot_words, VkBuffer *rec, int *cmds);
+                              uint32_t verts, uint32_t slot_words, uint32_t group,
+                              uint64_t bound_slots, VkBuffer *rec, int *cmds);
 // For a record whose count came from src (a count the GPU wrote): cuts it to what the buffers hold, in the task dispatch
 // (task_words, the task stage's payload words) or without a task stage (0) in the mesh dispatch and the instances
 // (shaders/meshfb_clamp.comp). Binds its own compute pipeline and set; four commands, between two barriers.
@@ -27,6 +29,9 @@ void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, ui
 // After the record is complete (the copies or the scan, and a barrier): keeps what the draw asked for where the host
 // reads it later. One copy command.
 void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at);
+// NX2NAVI_TRACE=perf, every 600 frames: the line with the most mesh, task and list bytes one pass group asked for
+// (draws are looked at when their record comes round again, so it trails by about 80 frames). Nothing when off.
+void vk_meshfb_perf_log(uint64_t frame);
 // Draws so far whose programs emitted more than the buffers hold, the records not looked at yet included: call it
 // with the device idle (a probe, the shutdown).
 uint64_t vk_meshfb_short(void);
