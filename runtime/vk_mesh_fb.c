@@ -55,7 +55,8 @@ static struct {
     VkDescriptorBufferInfo cur[3];
     VkDeviceSize rwin[MESHFB_RECS][3][2];   // offset and range
     VkDeviceSize used[3], align;           // the batch's windows end at used; offsets are multiples of align
-    uint32_t serial, batch_draws;          // serial: changes with the current window (vk_meshfb_window_serial)
+    uint64_t serial;                       // grows with every change of the current windows (vk_meshfb_window_serial)
+    uint32_t batch_draws;
     // NX2NAVI_TRACE=perf, since the last perf line: batches ended, draws batched, batches ended because a window did not
     // fit, the most draws and window bytes of one batch, draws clipped to their window, and draws drawn by themselves
     // with the batches on (vk_meshfb_solo, by reason)
@@ -165,7 +166,7 @@ VkDescriptorBufferInfo vk_meshfb_buffer(int cb_slot) {
     return M.cur[cb_slot == MESHFB_CB_TASK ? WIN_TASK : cb_slot == MESHFB_CB_LIST ? WIN_LIST : WIN_MESH];
 }
 
-uint32_t vk_meshfb_window_serial(void) { return M.serial; }
+uint64_t vk_meshfb_window_serial(void) { return M.serial; }
 
 void vk_meshfb_window_whole(void) {
     if (M.cur[WIN_MESH].range == M.mesh_bytes && !M.cur[WIN_MESH].offset && M.cur[WIN_TASK].range == M.task_bytes &&

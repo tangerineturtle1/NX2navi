@@ -30,9 +30,9 @@ int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_
                      uint32_t task_words);
 // The whole buffers become the current windows again.
 void vk_meshfb_window_whole(void);
-// A number that changes whenever the current windows do: the replay's skip of an equal descriptor build counts it in
+// A number that grows whenever the current windows change: the replay's skip of an equal descriptor build counts it in
 // (vk_exec_draw.c bind_sig), as the windows are not in the bound state it compares.
-uint32_t vk_meshfb_window_serial(void);
+uint64_t vk_meshfb_window_serial(void);
 // The batch's command buffer has ended: the next batch's windows start at the buffers' starts.
 void vk_meshfb_batch_reset(void);
 // Batches ended so far because a window did not fit what they left (the probe).

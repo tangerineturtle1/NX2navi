@@ -3503,10 +3503,9 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT(ex->prog->serial);
     PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
     PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
-    PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
-    // the mesh fallback's windows (vk_mesh_fb.c), which its vertex stage binds: two batched draws of one program with
-    // equal bindings read different windows
-    PUT(vk_meshfb_window_serial());
+    // All three only grow, so their sum changes with each. The third counts the mesh fallback's windows (vk_mesh_fb.c),
+    // which its vertex stage binds: two batched draws of one program with equal bindings read different windows.
+    PUT(vk_mem_gen() + vk_usnap_gen() + vk_meshfb_window_serial());
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
         float in[3];
@@ -6253,8 +6252,11 @@ static int mfb_batch_draw(VkExec *ex, MfbCs *c, const GfxShader *vs, uint32_t co
     int prim = c->mi.ipp == 1 ? NVN_DRAW_PRIMITIVE_POINTS : c->mi.ipp == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
     int ok = prepare_draw_ex(ex, prim, 0x7fffffff, 0, 2);
     vk_meshfb_window_whole();
+    // the pre-pass command buffer serves the pass the draw opened or is in, also when the draw was skipped there: the
+    // part holds nothing before it that the next draw's dispatches would read
+    if (ex->in_pass) ex->pre_pass = ex->pass_serial;
     if (!ok) return 1;
-    ex->pre_pass = mfb_last_serial = ex->pass_serial;
+    mfb_last_serial = ex->pass_serial;
     vk_exec_frame.draws++;
     if (ex->mark && ind) ex->mark->mesh_ind++;   // the pass's mesh draws (vk_crumbs.c describe_mark)
     else if (ex->mark) ex->mark->mesh++;
