@@ -2,9 +2,13 @@
 //
 // Draw part, no game files: two mesh programs of the runtime's own in the shape the translator gives one
 // (shaders/meshfb_probe_*.mesh, .task), one without a task stage and one fed by a task program, drawn through the
-// replay into an RGBA8 target with direct and with indirect workgroup counts, and both in one pass after each other.
-// Each picture is drawn twice, through VK_EXT_mesh_shader and through the fallback, and the two are compared texel by
-// texel; without mesh shaders on the device only the fallback draws, and the probe says that nothing was compared.
+// replay into an RGBA8 target with direct and with indirect workgroup counts, both in one pass after each other, and
+// each twice in one pass with another grid. Each picture is drawn through VK_EXT_mesh_shader and through the fallback,
+// draw by draw and in batches (NX2NAVI_MESH_FB_BATCH), and the pictures are compared texel by texel; without mesh
+// shaders on the device only the fallback draws, and the probe says that the mesh pipeline's were not compared. Then
+// two draws that do not fit one batch's windows (each drawn whole, in two batches), a draw larger than the mesh buffer
+// and larger than its window, and the background builds. The mesh buffer is 16 MiB (mesh_fallback_mb) unless the
+// settings give another size.
 //
 // Module part, with NX2NAVI_PROBE_MESHFB_DIR=<dir>: every "<name>" of <dir>/list.txt names <dir>/<name>.in (a stored
 // shader input, gfx_shader.c in_store: control section and code) and <dir>/<name>.spv (its translation). The compute
@@ -45,6 +49,7 @@
     } while (0)
 
 void vk_exec_probe_shader(const uint8_t *ctl, const GfxShader *s);   // vk_exec_draw.c
+void vk_exec_meshfb_batch(int on);                                    // vk_exec_draw.c
 void vk_exec_draw_shutdown(void);
 void vk_exec_xfer_shutdown(void);
 
@@ -326,7 +331,9 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
     prog_t *plain = make_prog(ms, NULL, fs), *tasked = make_prog(tm, ts, fs);
 
     // 24 cells of a 6 x 4 grid by 24 mesh workgroups; 40 cells of an 8 x 5 grid by 10 task workgroups that start 0 to
-    // 4 mesh workgroups each
+    // 4 mesh workgroups each. A program drawn twice in one pass draws its cells in another grid the second time, so a
+    // second draw that read the first one's output (the replay's skip of an equal descriptor build, which must see the
+    // fallback's windows) draws another picture.
     const MeshDraw cases[][2] = {
         {{plain, 24, 0, {6, 4}, {1, 1, 1, 1}}},
         {{plain, 24, 1, {6, 4}, {1, 1, 1, 1}}},
@@ -334,54 +341,92 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
         {{tasked, 10, 1, {8, 5}, {1, 1, 1, 1}}},
         {{plain, 24, 1, {6, 4}, {1, 1, 1, 1}}, {tasked, 10, 1, {8, 5}, {0.5f, 1, 0.25f, 1}}},
         {{tasked, 10, 0, {8, 5}, {1, 1, 1, 1}}, {plain, 24, 0, {6, 4}, {1, 0.5f, 0.5f, 1}}},
+        {{plain, 24, 1, {6, 4}, {1, 1, 1, 1}}, {plain, 40, 1, {8, 5}, {0.5f, 1, 0.25f, 1}}},
+        {{tasked, 10, 0, {8, 5}, {1, 1, 1, 1}}, {tasked, 10, 1, {10, 4}, {1, 0.5f, 0.5f, 1}}},
     };
     static const char *const names[] = {"mesh, direct", "mesh, indirect", "task + mesh, direct", "task + mesh, indirect",
-                                        "mesh then task + mesh in one pass, indirect", "task + mesh then mesh in one pass, direct"};
-    enum { CASES = sizeof cases / sizeof cases[0] };
-    static uint32_t px[2][CASES][TEX_W * TEX_H];
+                                        "mesh then task + mesh in one pass, indirect", "task + mesh then mesh in one pass, direct",
+                                        "mesh twice in one pass, other grids, indirect",
+                                        "task + mesh twice in one pass, other grids, direct then indirect"};
+    enum { CASES = sizeof cases / sizeof cases[0], TWICE = 6 };
+    // way 0 the mesh pipeline, 1 the fallback draw by draw, 2 the fallback in batches
+    static uint32_t px[3][CASES][TEX_W * TEX_H];
     int native = c->has_mesh_shader, was = c->mesh_fallback;
-    for (int way = native ? 0 : 1; way < 2; way++) {
-        c->mesh_fallback = way;
+    for (int way = native ? 0 : 1; way < 3; way++) {
+        c->mesh_fallback = way > 0;
+        vk_exec_meshfb_batch(way == 2);
         for (int k = 0; k < CASES; k++)
             if (draw_picture(b, &pool, &color, cases[k], cases[k][1].prog ? 2 : 1, px[way][k])) return 1;
     }
     c->mesh_fallback = was;
     for (int k = 0; k < CASES; k++) {
-        int fb = drawn_texels(px[1][k]);
+        int fb = drawn_texels(px[1][k]), wb, db = differing(px[1][k], px[2][k], &wb);
         CHECK(fb > TEX_W * TEX_H / 20, "%s: the fallback drew %d texels", names[k], fb);
+        CHECK(!db, "%s: %d texels differ between the fallback draw by draw and in batches, by up to %d of 255 (%d texels "
+              "drawn draw by draw)", names[k], db, wb, fb);
         if (!native) {
-            printf("probe-meshfb: %s: the fallback drew %d of %d texels (no mesh shaders here: not compared)\n", names[k], fb,
-                   TEX_W * TEX_H);
+            printf("probe-meshfb: %s: the fallback drew %d of %d texels, the same in batches (no mesh shaders here: not "
+                   "compared with them)\n", names[k], fb, TEX_W * TEX_H);
             continue;
         }
         int worst, diff = differing(px[0][k], px[1][k], &worst), nat = drawn_texels(px[0][k]);
         CHECK(nat > TEX_W * TEX_H / 20, "%s: the mesh pipeline drew %d texels", names[k], nat);
         CHECK(worst <= 1, "%s: %d texels differ between the mesh pipeline and the fallback, by up to %d of 255 (the mesh "
               "pipeline drew %d texels, the fallback %d)", names[k], diff, worst, nat, fb);
-        printf("probe-meshfb: %s: %d texels drawn by the mesh pipeline, %d by the fallback, %d differ (by %d of 255 at most)\n",
-               names[k], nat, fb, diff, worst);
+        printf("probe-meshfb: %s: %d texels drawn by the mesh pipeline, %d by the fallback, the same in batches, %d differ "
+               "(by %d of 255 at most)\n", names[k], nat, fb, diff, worst);
     }
     int w01, w23;
     CHECK(!differing(px[1][0], px[1][1], &w01) && !differing(px[1][2], px[1][3], &w23),
           "the fallback's direct and indirect pictures differ");
     CHECK(!vk_meshfb_short(), "%llu of the draws above did not fit the fallback's buffers", (unsigned long long)vk_meshfb_short());
-    // More workgroups than the mesh buffer has slots for: what fits is drawn, the rest is dropped and counted. The
-    // cells past the grid are outside the picture, so it is the 24-cell picture again.
-    uint32_t slots = (uint32_t)(vk_meshfb_mesh_words() / 540), over = slots + 1000;
-    const MeshDraw big = {plain, over, 1, {6, 4}, {1, 1, 1, 1}};
+    // Two draws of three fifths of the mesh buffer each in one pass: the second one's window does not fit what the
+    // first left, so it ends the batch and begins the next, and both are drawn whole. The cells past the grids are
+    // outside the picture, so it is the picture of the two grids again.
+    uint32_t slots = (uint32_t)(vk_meshfb_mesh_words() / 540), part = slots / 5 * 3;
+    const MeshDraw two[2] = {{plain, part, 0, {6, 4}, {1, 1, 1, 1}}, {plain, part, 0, {8, 5}, {0.5f, 1, 0.25f, 1}}};
     static uint32_t bpx[TEX_W * TEX_H];
+    uint64_t cuts = vk_meshfb_cuts_total();
     c->mesh_fallback = 1;
-    int bad = draw_picture(b, &pool, &color, &big, 1, bpx);
+    vk_exec_meshfb_batch(1);
+    int bad = draw_picture(b, &pool, &color, two, 2, bpx);
     c->mesh_fallback = was;
     if (bad) return 1;
     b->finish();
-    int wb, db = differing(bpx, px[1][0], &wb);
-    CHECK(!db, "a draw of %u workgroups, %u more than the mesh buffer holds: %d texels differ from the 24-cell picture", over,
-          over - slots, db);
-    CHECK(vk_meshfb_short() == 1, "a draw of %u workgroups with room for %u was counted as %llu draws that did not fit", over, slots,
+    int wt, dt = differing(bpx, px[1][TWICE], &wt);
+    CHECK(vk_meshfb_cuts_total() == cuts + 1, "two draws of %u workgroups with room for %u in all ended %llu batches, not one",
+          part, slots, (unsigned long long)(vk_meshfb_cuts_total() - cuts));
+    CHECK(!dt, "two draws of %u workgroups with room for %u in all: %d texels differ from the picture of the two grids", part,
+          slots, dt);
+    CHECK(!vk_meshfb_short(), "two draws of %u workgroups with room for %u in all: %llu counted as not fitting", part, slots,
           (unsigned long long)vk_meshfb_short());
-    printf("probe-meshfb: a draw of %u workgroups with room for %u: the picture of the first 24 is whole, the draw was counted\n",
-           over, slots);
+    printf("probe-meshfb: two draws of %u workgroups in one pass with room for %u in all: two batches, both whole\n", part,
+           slots);
+    // More workgroups than the mesh buffer has slots for: what fits is drawn, the rest is dropped and counted. The
+    // cells past the grid are outside the picture, so it is the 24-cell picture again. In a batch first: the window
+    // is what the program's draws above asked for with a margin, smaller than the buffer, and the draw does not fit
+    // it. Then draw by draw, with the whole buffer. Then in a batch again, where the program's window has grown to the
+    // whole buffer from what the first draw asked for.
+    uint32_t over = slots + 1000;
+    const MeshDraw big = {plain, over, 1, {6, 4}, {1, 1, 1, 1}};
+    static const char *const how[3] = {"in a batch", "by itself", "in a batch again"};
+    for (int k = 0; k < 3; k++) {
+        c->mesh_fallback = 1;
+        vk_exec_meshfb_batch(k != 1);
+        bad = draw_picture(b, &pool, &color, &big, 1, bpx);
+        c->mesh_fallback = was;
+        if (bad) return 1;
+        b->finish();
+        int wb, db = differing(bpx, px[1][0], &wb);
+        CHECK(!db, "a draw of %u workgroups %s, %u more than the mesh buffer holds: %d texels differ from the 24-cell picture",
+              over, how[k], over - slots, db);
+        uint64_t n = vk_meshfb_short(), w = vk_meshfb_clipped();
+        CHECK(n == (uint64_t)k + 1 && w == 1, "a draw of %u workgroups %s with room for %u: %llu draws counted as not "
+              "fitting, %llu of them their window (%d and 1 expected)", over, how[k], slots, (unsigned long long)n,
+              (unsigned long long)w, k + 1);
+        printf("probe-meshfb: a draw of %u workgroups %s with room for %u: the picture of the first 24 is whole, the draw "
+               "was counted%s\n", over, how[k], slots, k ? "" : " as not fitting its window");
+    }
     // As the game runs it: pipelines built in the background, and a program's modules made on the fallback's own
     // thread. New shader objects of the same programs are drawn until the picture is whole: the draws before that are
     // skipped, and none may leave a partial picture behind for good.
@@ -394,6 +439,7 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
     const MeshDraw again[2] = {{tasked2, 10, 0, {8, 5}, {1, 1, 1, 1}}, {plain2, 24, 0, {6, 4}, {1, 0.5f, 0.5f, 1}}};
     vk_pipeline_async_enable();
     c->mesh_fallback = 1;
+    vk_exec_meshfb_batch(1);
     int tries = 0, left = -1, wa;
     while (left && tries < 500) {
         if (tries++) plat_sleep_ms(10);
@@ -413,6 +459,8 @@ int probe_meshfb(void) {
     const char *dir = cfg_get("NX2NAVI_PROBE_MESHFB_DIR");
     if (dir && *dir) return modules_part(dir);
     vk_hdr_off();
+    // a mesh buffer of 16 MiB, so the draws that fill most of it stay small
+    if (!cfg_is_set("NX2NAVI_MESH_FALLBACK_MB")) cfg_setenv("NX2NAVI_MESH_FALLBACK_MB", "16");
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");

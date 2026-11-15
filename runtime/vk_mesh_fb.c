@@ -60,6 +60,7 @@ static struct {
     // fit, the most draws and window bytes of one batch, draws clipped to their window, and draws drawn by themselves
     // with the batches on (vk_meshfb_solo, by reason)
     uint64_t batches, batched, cuts, most_draws, most_bytes, clipped_p, solo[3];
+    uint64_t cuts_total;   // batches ended because a window did not fit, in all (vk_meshfb_cuts_total)
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -174,11 +175,13 @@ void vk_meshfb_window_whole(void) {
     M.serial++;
 }
 
+static void drain(int reuse);
 static VkDeviceSize round_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
 static uint64_t at_most(uint64_t v, uint64_t most) { return v < most ? v : most; }
 
 int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_t count, uint32_t fan, uint32_t slot_words,
                      uint32_t task_words) {
+    drain(0);   // what the program's draws in done submissions asked for
     if (!slot_words) slot_words = 1;
     if (!task_words) task_words = 1;
     if (fan > 255) fan = 255;   // as the scan reads it
@@ -203,7 +206,7 @@ int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_
     for (int k = 0; k < 3; k++) {
         off[k] = round_up(M.used[k], M.align);
         if (bytes[k] && off[k] + bytes[k] > total[k]) {
-            if (M.batch_draws) return M.cuts++, 0;   // the caller cuts the pass and asks again with the batch empty
+            if (M.batch_draws) return M.cuts++, M.cuts_total++, 0;   // the caller cuts and asks again, the batch empty
             off[k] = 0;
         }
     }
@@ -219,6 +222,8 @@ int vk_meshfb_window(const MeshFbNeed *need, int has_task, int indirect, uint32_
     if (M.batch_draws > M.most_draws) M.most_draws = M.batch_draws;
     return 1;
 }
+
+uint64_t vk_meshfb_cuts_total(void) { return M.cuts_total; }
 
 void vk_meshfb_batch_reset(void) {
     if (M.batch_draws) M.batches++;
@@ -282,8 +287,11 @@ static void record_check(uint32_t i, int account) {
     uint64_t need = (uint64_t)want * M.slot_words[i] * 4;
     if (need > M.worst_bytes) M.worst_bytes = need;
     uint64_t n = ++M.short_draws;
-    if (M.rwin[i][WIN_MESH][1] != M.mesh_bytes || M.rwin[i][WIN_TASK][1] != M.task_bytes ||
-        M.rwin[i][WIN_LIST][1] != M.list_bytes) {
+    // room in whole slots and payloads: a window may end short of the buffer's end by less than one
+    uint64_t room = M.mesh_bytes / 4 / (M.slot_words[i] ? M.slot_words[i] : 1), task_room = 0;
+    if (M.has_task[i] && room > M.list_bytes / 4) room = M.list_bytes / 4;
+    if (M.has_task[i]) task_room = M.task_bytes / 4 / (M.task_words[i] ? M.task_words[i] : 1);
+    if (M.cap_slots[i] < room || (M.has_task[i] && M.cap_tasks[i] < task_room)) {
         // a window, sized from what the program asked for before (vk_meshfb_window): its need now holds this draw's
         uint64_t k = ++M.clipped;
         M.clipped_p++;
@@ -434,6 +442,8 @@ uint64_t vk_meshfb_short(void) {
     M.drained = M.next;
     return M.short_draws;
 }
+
+uint64_t vk_meshfb_clipped(void) { return M.clipped; }
 
 void vk_meshfb_perf_log(uint64_t frame) {
     if (!M.ok || !(rt_trace & RT_TRACE_PERF) || frame % 600 || !PF.draws) return;

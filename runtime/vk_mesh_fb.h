@@ -35,6 +35,8 @@ void vk_meshfb_window_whole(void);
 uint32_t vk_meshfb_window_serial(void);
 // The batch's command buffer has ended: the next batch's windows start at the buffers' starts.
 void vk_meshfb_batch_reset(void);
+// Batches ended so far because a window did not fit what they left (the probe).
+uint64_t vk_meshfb_cuts_total(void);
 
 // A draw's record, 64 bytes of the record buffer (*rec) at the offset returned: the task dispatch at +0, the mesh
 // dispatch at +16, the draw (VkDrawIndirectCommand) at +32. Records the fills and copies that start it, outside a
@@ -70,6 +72,8 @@ void vk_meshfb_solo(int why);
 // Nothing when off.
 void vk_meshfb_perf_log(uint64_t frame);
 // Draws so far whose programs emitted more than the buffers or their windows hold, the records not looked at yet
-// included: call it with the device idle (a probe, the shutdown).
+// included: call it with the device idle (a probe, the shutdown). vk_meshfb_clipped: of those, the draws whose window
+// was smaller than the buffers (call it after vk_meshfb_short).
 uint64_t vk_meshfb_short(void);
+uint64_t vk_meshfb_clipped(void);
 void vk_meshfb_shutdown(void);   // the device must be idle
