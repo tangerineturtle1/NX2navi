@@ -7183,6 +7183,10 @@ void vk_texture_sizes(PerfSizes *s) {
 #define RES_HOT 3                        // presents: sampled this lately, it is wanted in video memory
 #define RES_WARM PRESENTS(15)            // presents: cold enough to make room for one sampled lately (res_plan)
 #define RES_MARGIN ((uint64_t)256 << 20)
+// A texture sampled within RES_HOT presents comes back into new memory up to the budget less this, not RES_MARGIN: in
+// Hyrule Field a 263 MiB texture array sampled every frame waited in system memory with 330 MiB under the budget, and
+// the GPU's frame took 2 to 8 ms longer. Coming back puts the figure past the target, so cold blocks then go out.
+#define RES_BACK_MARGIN ((uint64_t)64 << 20)
 #define RES_FRAME_BYTES ((uint64_t)64 << 20)
 #define RES_OLD_N 2048
 #define RES_BLOCK_COLD 90
@@ -7425,7 +7429,7 @@ static void residency_step(void) {
         uint64_t b = e->bytes;
         if (res_move(c, e, 0, 1)) {
             RS.frame_b += b, RS.n_up++, RS.up_b += b;
-        } else if (RS.used + b <= target && res_move(c, e, 0, 0)) {
+        } else if (RS.used + b + RES_BACK_MARGIN <= RS.budget && res_move(c, e, 0, 0)) {
             RS.used += b, RS.frame_b += b, RS.n_up++, RS.up_b += b;
         } else {
             waiting = 1;
