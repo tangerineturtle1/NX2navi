@@ -51,8 +51,11 @@ How to measure the frame rate of a scene the same way twice, and how to read the
   the 99th percentile instead, which reads a little higher.
 - **p99**: the 99th percentile frame time.
 - **CPU / GPU / Stall %**: each frame's length is put down to what the render thread waited for
-  (`tools/bench.py` `bound_of`): GPU when the fence wait is half the frame or more, stall when pipeline builds, shader
-  translation and texture uploads are a quarter or more, CPU otherwise (the game thread and the replay of its draws).
+  (`tools/bench.py` `bound_of`): GPU when the fence wait is half the frame or more, or when the GPU was busy for 80% of
+  the frame or more (the GPU time per frame of the frame's 60-frame window, the runtime's own rule), stall when
+  pipeline builds, shader translation and texture uploads are a quarter or more, CPU otherwise (the game thread and the
+  replay of its draws). The GPU time is needed with `NX2NAVI_REPLAY_ASYNC=1`: the replay threads wait for the GPU
+  then, not the render thread, so the fence wait alone marked every frame CPU-bound.
 - **GPU ms**: the GPU's busy time per frame from its own timestamps, averaged over 60 frames. A GPU-bound frame has
   GPU ms close to its frame time; a CPU-bound one well under it.
 - **Replay ms**: the CPU time of replaying the game's draws as Vulkan commands, per frame.

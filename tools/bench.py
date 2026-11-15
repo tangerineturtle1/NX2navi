@@ -16,7 +16,9 @@ its end (runtime/perf.c seg_frame).
 What is measured comes from the game's own log with NX2NAVI_TRACE=perf and NX2NAVI_PERF_SLOW_MS=1, so every present
 gets a "perf: slow frame" line (runtime/perf.c perf_present): its interval and what the render thread waited for.
 A frame is
-  gpu    when it waited for the GPU's fence for at least half of it,
+  gpu    when the render thread waited for the GPU's fence for at least half of it, or when the GPU was busy for 80%
+         of it or more (the GPU time per frame of the 60-frame window the frame is in, the runtime's own rule: with
+         NX2NAVI_REPLAY_ASYNC=1 the replay threads wait for the GPU, not the render thread),
   stall  when pipeline builds, shader translation and texture uploads took at least a quarter of it,
   pace   when the frame limiter held it for at least 15% of it (should not happen: the runs are uncapped),
   cpu    otherwise: the game thread and the replay of its draws set the pace.
@@ -35,6 +37,7 @@ timing: a scene's first frames stall far longer than in play, and its numbers ar
 stretch with the game's own.
 """
 import argparse
+import bisect
 import csv
 import datetime
 import json
@@ -65,12 +68,13 @@ FIELDS = ('frame', 'ms', 'pipeline', 'xlate', 'texture', 'astc', 'fence', 'pacin
 BOUNDS = ('cpu', 'gpu', 'stall', 'pace')
 
 
-def bound_of(f):
-    """The side that set the frame's length, from what the render thread waited for (see the module's docstring)."""
+def bound_of(f, gpu_ms=None):
+    """The side that set the frame's length, from what the render thread waited for and the GPU time per frame of the
+    frame's window (see the module's docstring)."""
     ms = f['ms']
     if ms <= 0:
         return 'cpu'
-    if f['fence'] >= 0.5 * ms:
+    if f['fence'] >= 0.5 * ms or (gpu_ms is not None and gpu_ms >= 0.8 * ms):
         return 'gpu'
     if f['pipeline'] + f['xlate'] + f['texture'] >= 0.25 * ms:
         return 'stall'
@@ -85,7 +89,6 @@ def parse_log(text):
     for line in text.splitlines():
         if m := SLOW_RE.search(line):
             f = dict(zip(FIELDS, (int(m[1]), *map(float, m.groups()[1:]))))
-            f['bound'] = bound_of(f)
             frames[f['frame']] = f
         elif m := SEG_START_RE.search(line):
             starts[m[1]] = int(m[2])
@@ -98,7 +101,18 @@ def parse_log(text):
             replay_win[int(m[1])] = float(m[2])
     for w in windows:
         w['replay_ms'] = replay_win.get(w['frame'])
+    mark_bounds(frames, windows)
     return frames, starts, ends, windows
+
+
+def mark_bounds(frames, windows):
+    """Each frame's bound, with the GPU time of the 60-frame window it is in: the window line at frame N covers the
+    frames N-59 to N. A frame after the last window line has the render thread's waits alone."""
+    ends = sorted(w['frame'] for w in windows)
+    gpu = {w['frame']: w['gpu_ms'] for w in windows}
+    for k, f in frames.items():
+        i = bisect.bisect_left(ends, k)
+        f['bound'] = bound_of(f, gpu[ends[i]] if i < len(ends) and ends[i] - 60 < k else None)
 
 
 def measured(frames, starts, windows, seg='measure', end='end'):

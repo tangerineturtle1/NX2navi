@@ -15,7 +15,7 @@ import bench  # noqa: E402
 PERF_C = Path(__file__).resolve().parent.parent / 'runtime' / 'perf.c'
 
 SLOW = ('perf: slow frame %d: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f '
-        'drain %.1f; replay %.1f')
+        'drain %.1f handoff 0.0; replay %.1f')
 SEG_START = "segment: '%s' starts at frame %d, world %s s"
 SEG_END = ("segment: '%s' frames %d-%d, world %s to %s s: %d frames in %.1f s, mean %.2f ms (%.1f fps), 1%% low %.1f "
            "fps (%.2f ms), worst %.1f ms at frame %d; over 25 ms %d, 50 ms %d, 100 ms %d; %s")
@@ -40,7 +40,7 @@ def main():
     src = PERF_C.read_text(encoding='utf-8')
     # the format strings the parser depends on must still be in the runtime, as written
     for piece in ('"perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f '
-                  'pacing %.1f "', '"drain %.1f; replay %.1f%s"', "\"segment: '%s' starts at frame %llu, world %s s\"",
+                  'pacing %.1f "', '"drain %.1f handoff %.1f; replay %.1f%s"', "\"segment: '%s' starts at frame %llu, world %s s\"",
                   "\"segment: '%s' frames %llu-%llu, world %s to %s s: %llu frames in %.1f s, mean %.2f ms (%.1f fps), "
                   "1%% low %.1f \"", '"gpu avg %.2f ms (%llu parts timed, %llu not; copies into VRAM mirrors %.2f ms)"',
                   '"%.0f MiB, private %.0f MiB; bound: %s"'):
@@ -83,6 +83,20 @@ def main():
     check(bench.bound_of(f(ms=10, fence=4.9)) == 'cpu', 'fence under half is cpu')
     check(bench.bound_of(f(ms=10, texture=2.5)) == 'stall', 'a quarter in texture uploads is a stall')
     check(bench.bound_of(f(ms=10, pacing=1.5)) == 'pace', 'pacing')
+    check(bench.bound_of(f(ms=10), gpu_ms=8) == 'gpu', 'the GPU busy for 80% of the frame is gpu')
+    check(bench.bound_of(f(ms=10), gpu_ms=7.9) == 'cpu', 'the GPU busy for under 80% is cpu')
+    # a window line at frame N gives its GPU time to frames N-59 to N; later frames have none
+    fr = {k: f(frame=k, ms=10) for k in (60, 61, 120, 121)}
+    bench.mark_bounds(fr, [{'frame': 60, 'gpu_ms': 9.0}, {'frame': 120, 'gpu_ms': 2.0}])
+    check([fr[k]['bound'] for k in (60, 61, 120, 121)] == ['gpu', 'cpu', 'cpu', 'cpu'], 'frames take their window')
+    fr = {1: f(frame=1, ms=10)}
+    bench.mark_bounds(fr, [{'frame': 60, 'gpu_ms': None}])
+    check(fr[1]['bound'] == 'cpu', 'a window without timestamps')
+
+    # logs of 0.11.0 and older have no handoff field
+    old = bench.SLOW_RE.search('perf: slow frame 7: 20.0 ms; blocked pipeline 0.0 xlate 0.0 texture 0.0 astc 0.0 fence 1.0 '
+                               'pacing 0.0 drain 0.0; replay 12.0')
+    check(old is not None and old[10] == '12.0', 'slow frame line without handoff')
 
     # spread over runs
     m, lo, hi, pct = bench.spread([50.0, 55.0, 45.0])
