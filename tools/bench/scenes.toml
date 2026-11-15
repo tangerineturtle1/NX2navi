@@ -1,0 +1,125 @@
+# Benchmark scenes for tools/bench.py (docs/performance.md). Game 1.1.1, child Link.
+#
+# Per scene:
+#   dbg        NX2NAVI_DBG_TEST steps as [when, step]; when "@<ms>" is game time since the save loaded
+#              (runtime/debug_tools.c test_script): warp <area> <start position>, freecam <on> <sticks> <metres a
+#              second>, camavoid <0|1> (keep the free camera a metre above the ground), event <name>
+#   moves      stick lines on the input script, as [seconds after the warm-up, stick, x, y, seconds held]. With the
+#              free camera on, LSTICK y flies it ahead and RSTICK x turns it (2.4 radians a second at full tilt)
+#   warmup_s   game time before measuring: the teleport, the area load and the first textures and pipelines
+#   measure_s  game time measured
+# The areas and start positions are the ones the game's StartPos file names (NX2NAVI_DBG_TEST logs them as
+# "debug: place").
+#
+# The flight, the same in every scene, at 2 m a second: a full turn on the spot, 8 m ahead, a full turn back, 8 m back,
+# a slow full turn, 8 m ahead while turning a little and back. It stays within about 8 m of the start position, where
+# the game's own camera put it behind Link, so it does not pass through walls into the void outside the map (wider
+# arcs did), and it still sees the whole area from there.
+
+[[scene]]
+name = "kokiri"
+note = "Kokiri Forest, the known worst case: the village from its middle"
+dbg = [["@1000", "warp KokiriForest_Child ReturnFromDreamWorld"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "kakariko"
+note = "Kakariko Village from its gate"
+dbg = [["@1000", "warp KakarikoVillage_Child KakarikoVillage_Entrance"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "field"
+note = "Hyrule Field below the steps to Kakariko Village"
+dbg = [["@1000", "warp HyruleField_Child HyruleField_FrontOfKakarikoVillage"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "dekutree"
+note = "Inside the Deku Tree: the first floor from the entrance"
+dbg = [["@1000", "warp InsideTheDekuTree EntrancePos"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "cutscene"
+note = "A Kokiri Forest cutscene the debug tools start (event Dm_Kokiri_0030); asked three times, as the game takes it only once Link stands free after the teleport"
+dbg = [["@1000", "warp KokiriForest_Child ReturnFromDreamWorld"],
+       ["@12000", "event Dm_Kokiri_0030"], ["@14000", "event Dm_Kokiri_0030"], ["@16000", "event Dm_Kokiri_0030"]]
+warmup_s = 18
+measure_s = 25
+
+[[scene]]
+name = "dekuboss"
+note = "The Deku Tree's boss room, the free camera looking up at the ceiling (players reported the frame rate falls there)"
+dbg = [["@1000", "warp GohmaStage GohmaStage"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+# RSTICK y raises the view 1.8 radians a second at full tilt: 1 s at half tilt looks about 50 degrees up, a turn on the
+# spot, 0.6 s more to about 80 degrees, a turn back, then level again and the slow turn of the other scenes.
+moves = [[0, "RSTICK", 0, 16384, 1.0],
+         [1.5, "RSTICK", 16384, 0, 5.24],
+         [7, "RSTICK", 0, 16384, 0.6],
+         [8, "RSTICK", -16384, 0, 5.24],
+         [14, "RSTICK", 0, -16384, 1.6],
+         [16, "RSTICK", 8192, 0, 10.48]]
+warmup_s = 14
+measure_s = 30
+
+[[scene]]
+name = "market"
+note = "Market, child, from the square: the crowd of people and the shops around it"
+dbg = [["@1000", "warp Market_Child GameOverRespawn"], ["@10000", "freecam 1 1 2"], ["@10000", "camavoid 1"]]
+moves = [[0, "RSTICK", 16384, 0, 5.24],
+         [6, "LSTICK", 0, 32767, 4],
+         [10.5, "RSTICK", -16384, 0, 5.24],
+         [16, "LSTICK", 0, -32767, 4],
+         [20.5, "RSTICK", 8192, 0, 10.48],
+         [31.5, "LSTICK", 0, 32767, 4], [31.5, "RSTICK", -6000, 0, 4],
+         [36, "LSTICK", 0, -32767, 3.5]]
+warmup_s = 14
+measure_s = 40
+
+[[scene]]
+name = "fieldrun"
+note = "Hyrule Field at speed, from outside the Market gate: the free camera flies 8 m a second, about 130 m out over the open field and back, so new parts of the field come into view as when running across it"
+dbg = [["@1000", "warp HyruleField_Child HyruleField_FrontOfMarket"], ["@10000", "freecam 1 1 8"], ["@10000", "camavoid 1"],
+       ["@10500", "camgo 0 3 0 0 0.087"]]
+# The game's camera starts 0.087 rad below level and ground avoidance needs DLSS, DLAA or FSR, so the camgo levels the
+# view and lifts it 3 m: the legs fly level over the field instead of into it. 128 m out, a half turn, 128 m back and a
+# half turn again, so the last frame looks out over the field as the first did.
+moves = [[0, "LSTICK", 0, 32767, 16],
+         [16.5, "RSTICK", 16384, 0, 2.62],
+         [19.5, "LSTICK", 0, 32767, 13.5],
+         [36, "RSTICK", 16384, 0, 2.62]]
+warmup_s = 14
+measure_s = 40

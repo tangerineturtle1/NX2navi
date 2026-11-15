@@ -1203,6 +1203,15 @@ static void fly_tick(void) {
                             fc.pos[2], fc.yaw, fc.pitch);
 }
 
+// A step written "@<ms>:" in place of "<tick>:" waits for the world clock instead (game time since the save's first
+// frame, frame_step_world_us): pad reads come as often as frames, so a tick is a different moment at another frame rate,
+// and a benchmark (tools/bench.py) needs its teleport and route at the same game time as its input script's marks.
+static int step_due(const char *step, uint64_t tick) {
+    if (*step != '@') return strtoull(step, NULL, 10) <= tick;
+    int64_t world = frame_step_world_us();
+    return world >= 0 && (uint64_t)world >= strtoull(step + 1, NULL, 10) * 1000ull;
+}
+
 static void test_script(uint64_t tick) {
     static char buf[2048];
     static const char *next;
@@ -1214,7 +1223,7 @@ static void test_script(uint64_t tick) {
         // the places and events, read with the flag names as the menu starts them, for warp, event and routeto
         if (state > 0) dbg_flags_refresh(), dbg_names(NULL);
     }
-    while (state > 0 && next && *next && strtoull(next, NULL, 10) <= tick) {
+    while (state > 0 && next && *next && step_due(next, tick)) {
         const char *colon = strchr(next, ':'), *end = strchr(next, ';');
         if (!colon) break;
         unsigned hash = 0, on = 0, size = 4;

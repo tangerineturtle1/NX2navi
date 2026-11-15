@@ -1,6 +1,6 @@
 # NX2navi
 
-Static recompilation of *Ocarina of Time* (Switch 2, ARM64, game version 1.1.1) into a native Windows x86-64 exe with a Vulkan renderer. Design: [docs/architecture.md](docs/architecture.md). Toolchain, build commands and tests: [docs/building.md](docs/building.md). The players' launcher, setup and updates: [docs/launcher.md](docs/launcher.md).
+Static recompilation of *Ocarina of Time* (Switch 2, ARM64, game version 1.1.1) into a native Windows x86-64 exe with a Vulkan renderer. Design: [docs/architecture.md](docs/architecture.md). Toolchain, build commands and tests: [docs/building.md](docs/building.md). The players' launcher, setup and updates: [docs/launcher.md](docs/launcher.md). Measuring frame rate: [docs/performance.md](docs/performance.md).
 
 ## Game content boundary
 
