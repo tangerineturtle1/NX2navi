@@ -404,9 +404,9 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
            slots);
     // More workgroups than the mesh buffer has slots for: what fits is drawn, the rest is dropped and counted. The
     // cells past the grid are outside the picture, so it is the 24-cell picture again. In a batch first: the window
-    // is what the program's draws above asked for with a margin, smaller than the buffer, and the draw does not fit
-    // it. Then draw by draw, with the whole buffer. Then in a batch again, where the program's window has grown to the
-    // whole buffer from what the first draw asked for.
+    // is what the program's draws above asked for, doubled as margin, which is more than the buffer, so the window is
+    // the whole buffer (vk_mesh_fb.c vk_meshfb_window) and the draw is counted as not fitting the buffer, not its
+    // window. Then draw by draw, with the whole buffer. Then in a batch again.
     uint32_t over = slots + 1000;
     const MeshDraw big = {plain, over, 1, {6, 4}, {1, 1, 1, 1}};
     static const char *const how[3] = {"in a batch", "by itself", "in a batch again"};
@@ -421,11 +421,11 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
         CHECK(!db, "a draw of %u workgroups %s, %u more than the mesh buffer holds: %d texels differ from the 24-cell picture",
               over, how[k], over - slots, db);
         uint64_t n = vk_meshfb_short(), w = vk_meshfb_clipped();
-        CHECK(n == (uint64_t)k + 1 && w == 1, "a draw of %u workgroups %s with room for %u: %llu draws counted as not "
-              "fitting, %llu of them their window (%d and 1 expected)", over, how[k], slots, (unsigned long long)n,
+        CHECK(n == (uint64_t)k + 1 && w == 0, "a draw of %u workgroups %s with room for %u: %llu draws counted as not "
+              "fitting, %llu of them their window (%d and 0 expected)", over, how[k], slots, (unsigned long long)n,
               (unsigned long long)w, k + 1);
         printf("probe-meshfb: a draw of %u workgroups %s with room for %u: the picture of the first 24 is whole, the draw "
-               "was counted%s\n", over, how[k], slots, k ? "" : " as not fitting its window");
+               "was counted\n", over, how[k], slots);
     }
     // As the game runs it: pipelines built in the background, and a program's modules made on the fallback's own
     // thread. New shader objects of the same programs are drawn until the picture is whole: the draws before that are
