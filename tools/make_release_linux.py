@@ -438,7 +438,6 @@ Comment=Builds Ocarina of Time for this PC from your own game files
 Exec=AppRun
 Icon=nx2navi-setup
 Categories=Game;
-Terminal=false
 '''
 
 

@@ -503,7 +503,7 @@ class App:
             APPS.mkdir(parents=True, exist_ok=True)
             (APPS / 'nx2navi-ocarina.desktop').write_text(
                 '[Desktop Entry]\nType=Application\nName=Ocarina of Time (NX2navi)\n'
-                f'Exec={exec_quote(out / "play.sh")}\nPath={out}\nIcon={icon}\nTerminal=false\nCategories=Game;\n',
+                f'Exec={exec_quote(out / "play.sh")}\nPath={out}\nIcon={icon}\nCategories=Game;\n',
                 encoding='utf-8')
         except OSError:
             pass
