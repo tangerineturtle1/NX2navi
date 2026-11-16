@@ -33,6 +33,18 @@ const char *dbg_flag_name(int i);      // NULL: no name found for it
 void dbg_flag_set(uint32_t hash, int on);
 int dbg_names(int *found);             // 0 not started, 1 being read from the game's files, 2 read (*found of them)
 
+// Individual collection flags, in the order of the game's own 100-entry collection list. -1 means no loaded value.
+int dbg_skulls(void);
+const char *dbg_skull_area(int i);
+int dbg_skull_pos(int i, float xyz[3]);
+int dbg_skull_collected(int i);
+void dbg_skull_set(int i, int on);       // also sets the token count to the number collected
+int dbg_skull_tokens(void);              // the token count the game shows and its rewards read; -1 not loaded
+void dbg_skull_tokens_match(void);       // sets the token count to the number collected
+// Travel uses the nearest named entrance in the placement's area; it does not put Link at the spider's coordinates.
+const char *dbg_skull_entrance(int i);   // NULL when no known entrance has coordinates
+int dbg_skull_travel(int i);
+
 // Teleporting and events. The places are the game's areas with their named start positions, and the events its event
 // files that hold a script: both lists come from the player's game files with the flag names (0 until dbg_names
 // answers 2). dbg_warp changes area as the game's own doors do; dbg_event_start starts an event by its name. One at a

@@ -7,7 +7,7 @@ extern "C" {
 #endif
 void debug_menu_layout(uint32_t w, uint32_t h, float scale);   // between ImGui::NewFrame and Render, present thread
 void debug_menu_tab(int tab);                                  // the tab to show at the next layout (test hook): 0 to 4
-#define DEBUG_MENU_TABS 5
+#define DEBUG_MENU_TABS 6
 #ifdef __cplusplus
 }
 #endif
