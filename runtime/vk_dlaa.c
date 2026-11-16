@@ -497,6 +497,8 @@ static struct {
         uint64_t used;           // evals count when it last ran
         uint64_t feat_used;      // evals count when feat last ran: behind used while the size runs on another's
         uint64_t feat_fence;     // the submission that last created or evaluated feat (vk_exec_recording_fence)
+        int fails;               // feature creations refused in a row for this size (create_failed)
+        uint64_t retry_ns;       // plat_now_ns before which no new creation is tried
     } sizes[DLSS_SIZES], *last;  // last: the one the previous DLAA frame ran with
     struct Size *host;           // the one whose feature that frame ran on: last, or the DLSS mode's (range_host)
     int stepped;                 // this evaluation: another render size than the last one's, on the same feature
@@ -684,6 +686,26 @@ static int use_fsr(void) { return !N.ngx_up && fsr_frame; }
 static void dl_fail(const char *what, NgxResult r) {
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
     D.failed = 1;
+}
+
+// A DLSS feature the driver refused to make (seen: bad00002 for a second size, a frame without a camera into another
+// 2560x1440 depth, with the gameplay one alive and video memory near its budget). Turning DLAA off for the run there,
+// as dl_fail does, also left frame generation without depth and motion (vk_dlaa_fg_inputs) for the rest of the run:
+// only this size waits, tried again after 2, 4, 8... s, and left without DLSS after CREATE_TRIES refusals.
+#define CREATE_TRIES 6
+static void create_failed(struct Size *e, NgxResult r) {
+    e->feat = NULL, e->fails++;
+    uint64_t wait_s = 2ull << (e->fails - 1);
+    e->retry_ns = plat_now_ns() + wait_s * 1000000000ull;
+    if (D.last == e) D.last = NULL;
+    if (e->fails < CREATE_TRIES)
+        rt_log("dlaa: DLSS feature creation at %ux%u -> %ux%u failed (%08x), try %d of %d: this size goes without DLSS, "
+               "tried again in %llu s; the other sizes and frame generation carry on", e->w, e->h, e->ow, e->oh,
+               (unsigned)r, e->fails, CREATE_TRIES, (unsigned long long)wait_s);
+    else
+        rt_log("dlaa: DLSS feature creation at %ux%u -> %ux%u failed (%08x) %d times: this size goes without DLSS while "
+               "it is kept; the other sizes and frame generation carry on", e->w, e->h, e->ow, e->oh, (unsigned)r,
+               CREATE_TRIES);
 }
 
 static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, VkImage *img, VmaAllocation *mem,
@@ -2435,6 +2457,9 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     // (vk_dlaa_pass), and a depth that did not cover the sub-rectangle keeps the frame on its own feature.
     const int use_range = !fsr && N.ngx_up && range_on();
     struct Size *host = use_range && z->width >= w && z->height >= h ? range_host(e) : e;
+    // a size whose feature the driver refused waits for its next try (create_failed): this frame goes without DLSS,
+    // as one with NGX not up, and the other sizes, the gameplay one and frame generation with it, carry on
+    if (!fsr && !host->feat && host->fails && (host->fails >= CREATE_TRIES || plat_now_ns() < host->retry_ns)) return;
     const int step = D.ev_w && (w != D.ev_w || h != D.ev_h || ow != D.ev_ow || oh != D.ev_oh);
     D.stepped = 0;
     if (e != D.last) {
@@ -2510,7 +2535,8 @@ own_feature:
         // The feature is made for the size of its entry: this frame's own, or the larger one of the DLSS mode's, which
         // was released since (release_kept) and takes this frame's size as a sub-rectangle.
         const uint32_t fw = host->w, fh = host->h;
-        if (idle_free() != 2) release_kept(host, feat_released);
+        // a try after a refusal releases every other feature first: the room they hold may be what was missing
+        if (idle_free() != 2 || host->fails) release_kept(host, feat_released || host->fails);
         feat_released = 0;
         p_setu(p, "CreationNodeMask", 1);
         p_setu(p, "VisibilityNodeMask", 1);
@@ -2554,7 +2580,12 @@ own_feature:
                    "ms for them, %s", (unsigned)r0, inflight, waited,
                    NGX_OK(r) && host->feat ? "made at the second try" : "refused again");
         }
-        if (!NGX_OK(r) || !host->feat) return dl_fail("DLSS feature creation", r);
+        if (!NGX_OK(r) || !host->feat) {
+            if (D.last == e) D.last = NULL;
+            return create_failed(host, r);
+        }
+        if (host->fails) rt_log("dlaa: DLSS feature at %ux%u -> %ux%u created at try %d", fw, fh, ow, oh, host->fails + 1);
+        host->fails = 0, host->retry_ns = 0;
         host->feat_fence = vk_exec_recording_fence();   // NGX records the creation into cb
         D.reset = 1, D.steps_made += step;
         int q = perf_quality(fw, ow), pr = q == 0 ? pm : q == 3 ? pl : pk;

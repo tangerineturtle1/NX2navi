@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 KIT_DIRS = ('recomp', 'runtime')
 KIT_FILES = ('VERSION', 'LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'nx2navi.ini.example')
-TOOLS_SKIP = ('vendor', 'xlate', '__pycache__')   # the translator ships built (bin/); its sources stay out
+TOOLS_SKIP = ('vendor', 'xlate', 'ffx_linux', '__pycache__')   # the translator ships built (bin/); its sources stay out
 PACKAGES = ('numpy==2.5.4', 'lz4==4.4.5', 'zstandard==0.25.0', 'fonttools==4.68.0', 'pillow==12.3.0')
 
 APPRUN = r'''#!/bin/bash
@@ -55,6 +55,8 @@ NX2navi $(cat "$KIT/VERSION") - build Ocarina of Time (Switch 2, game 1.1.1) nat
   $(basename "${APPIMAGE:-$0}") <your game.nup> [game folder]       build (default folder: ~/Games/Ocarina)
   $(basename "${APPIMAGE:-$0}") --check <your game.nup>             only check the dump's version
   $(basename "${APPIMAGE:-$0}") --make-game <make_game.py options>  run tools/make_game.py directly
+  $(basename "${APPIMAGE:-$0}") --get-fsr4 [game folder]            AMD FSR 4 for the game, made on this PC from AMD's
+                                                                    SDK DLL (asks to agree to AMD's licence first)
 
 The game folder then holds 'ocarina' and 'play.sh', which starts it. Nothing of the game is in this file:
 everything the build writes comes from your dump, so keep it to yourself.
@@ -72,14 +74,34 @@ case "$1" in ""|-h|--help) usage; exit 0 ;; esac
 EVENTS=()
 ev() { [ ${#EVENTS[@]} -gt 0 ] && printf '@@{"ev":"%s","step":"%s"%s}\n' "$1" "$2" "${3:+,$3}"; return 0; }
 if [ "$1" = --events ]; then EVENTS=(--events); shift; fi
+
+# --get-fsr4 [folder]: AMD FSR 4 beside a built game (tools/fsr4_linux.py); needs none of the checks below. The window
+# passes --accept-amd-license after its own question; the command line asks here.
+if [ "$1" = --get-fsr4 ]; then
+    FOLDER="${2:-$HOME/Games/Ocarina}"
+    ACCEPT=()
+    if [ "${3:-}" = --accept-amd-license ]; then
+        ACCEPT=(--accept-amd-license)
+    else
+        echo "AMD FSR 4 is made from AMD's FSR SDK 2.3.0 upscaler DLL, downloaded from AMD's GitHub release and read on this PC."
+        echo "Licence: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.3.0/docs/license.md"
+        read -r -p "Do you agree to AMD's licence for it? [y/N] " yn
+        case "$yn" in [yY]*) ACCEPT=(--accept-amd-license) ;; *) echo "Nothing done."; exit 1 ;; esac
+    fi
+    exec "$PY" -I "$KIT/tools/fsr4_linux.py" --out "$FOLDER" --kit "$KIT" --pydeps "$PYDEPS" "${ACCEPT[@]}" \
+        "${EVENTS[@]+"${EVENTS[@]}"}"
+fi
 ev step deps '"state":"start"'
 
 missing=()
-for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
-# The Vulkan headers come with this file (the kit's toolchain/vulkan-headers): a distribution's may be too old.
-for h in SDL3/SDL.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
-    [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
-done
+# A kit with its own toolchain (make_appimage.py --linux-toolchain) needs none of the system's compiler or headers
+if [ ! -x "$KIT/linux-toolchain/llvm/bin/clang" ]; then
+    for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+    # The Vulkan headers come with this file (the kit's toolchain/vulkan-headers): a distribution's may be too old.
+    for h in SDL3/SDL.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
+        [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
+    done
+fi
 if [ ${#missing[@]} -gt 0 ]; then
     cat >&2 <<EOF
 Missing: ${missing[*]}
@@ -148,6 +170,10 @@ get_dlss() {
 
 echo "Building into $OUT with $jobs compiles at a time (${mem_gb} GB of RAM); this takes 10 to 25 minutes."
 run_make_game --nup "$NUP" --out "$OUT" --jobs "$jobs" "${EVENTS[@]+"${EVENTS[@]}"}" || exit $?
+# AMD FSR 3.1 for Linux (tools/ffx_linux, built with the AppImage): runtime/vk_ffx.cpp loads it from beside the game
+for f in libamd_fidelityfx_vk.so libamd_fidelityfx_vk-LICENSE.txt; do
+    [ -f "$KIT/ffx/$f" ] && cp -f "$KIT/ffx/$f" "$OUT/$f"
+done
 if [ -e /proc/driver/nvidia/version ] && [ -z "${NX2NAVI_NO_DLSS:-}" ]; then
     ev step dlss '"state":"start"'; get_dlss; ev step dlss '"state":"done"'
 else
@@ -190,6 +216,12 @@ def main():
                                                "downloading it from NVIDIA's DLSS SDK repository")
     ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the AppImage')
     ap.add_argument('--out', type=Path, default=ROOT / 'dist', help='where the AppImage goes (default dist/)')
+    ap.add_argument('--ffx', type=Path, metavar='FOLDER',
+                    help='the folder tools/ffx_linux/build.sh wrote libamd_fidelityfx_vk.so and its licence into: FSR 3.1 '
+                         'on Linux; without it the game has no FSR 3.1')
+    ap.add_argument('--linux-toolchain', type=Path, metavar='FOLDER',
+                    help='the folder tools/make_linux_toolchain.py wrote: the game then builds with it (LLVM, a Steam '
+                         'Runtime sysroot, its libraries) instead of the system\'s compiler, headers and libraries')
     ap.add_argument('--prompt-art', type=Path, nargs='+', metavar='FOLDER',
                     help='folders holding XGamepad, P5Gamepad and Keyboard_Mouse (or those folders): the button art, as '
                          'make_kit.py --prompt-art takes it (a release zip\'s prompt-art folder does too)')
@@ -236,6 +268,15 @@ def main():
     # (tools/build_game.py vulkan_include finds them in the kit): fetched and checked here when not there yet
     import vulkan_pin
     shutil.copytree(vulkan_pin.resolve(ROOT / vulkan_pin.FOLDER), kit / vulkan_pin.FOLDER)
+    if a.ffx:
+        (kit / 'ffx').mkdir()
+        for f in ('libamd_fidelityfx_vk.so', 'libamd_fidelityfx_vk-LICENSE.txt'):
+            shutil.copy2(a.ffx / f, kit / 'ffx' / f)
+        print('FSR 3.1: libamd_fidelityfx_vk.so')
+    if a.linux_toolchain:   # tools/make_game.py LINUX_TOOLCHAIN
+        shutil.copytree(a.linux_toolchain, kit / 'linux-toolchain', symlinks=True)
+        print('toolchain: ' + subprocess.run([kit / 'linux-toolchain' / 'llvm' / 'bin' / 'clang', '--version'],
+                                             capture_output=True, text=True).stdout.splitlines()[0])
     if a.prompt_art:
         import prompt_art
         n, size = prompt_art.copy_art(a.prompt_art, kit / prompt_art.FOLDER)

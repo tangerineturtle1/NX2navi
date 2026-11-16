@@ -4,7 +4,8 @@ command line keeps working as before.
 
 It runs AppRun itself with --events, which does what the command line does (the package check, zbic, make_game.py,
 NVIDIA's DLSS, play.sh) and prints make_game.py's "@@" progress lines (tools/make_game.py, --events) plus its own for
-the steps around it. The last dump and folder are remembered in ~/.config/nx2navi/appimage.json, the last run's output
+the steps around it. The "AMD FSR 4" button, once the game is built, asks to agree to AMD's licence and then runs
+AppRun --get-fsr4 (tools/fsr4_linux.py), which makes the FSR 4 library beside the game on this PC. The last dump and folder are remembered in ~/.config/nx2navi/appimage.json, the last run's output
 in ~/.cache/nx2navi/build.log (Details opens it).
 
 The window is one Tk canvas. The Tk that comes with python-build-standalone has no Xft, so its only font is X11's
@@ -33,7 +34,9 @@ APPS = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share')
 DEFAULT_OUT = Path.home() / 'Games' / 'Ocarina'
 
 # make_game.py's steps (STEPS, plus check) and AppRun's own around them, in the order they run
-STEPS = ('deps', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'dlss')
+STEPS = ('deps', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'dlss', 'fsr4')
+FSR4_LIB = 'amd_fidelityfx_upscaler_vk.so'   # tools/fsr4_linux.py LIBRARY
+AMD_LICENSE = 'https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.3.0/docs/license.md'
 
 TEXT = {
     'en': {
@@ -45,6 +48,12 @@ TEXT = {
         'deps': 'Check the packages', 'check': 'Check the dump', 'exefs': 'Unpack the program files',
         'romfs': 'Build the RomFS image', 'lift': 'Turn the code into C', 'compile': 'Compile the game',
         'shaders': 'Prepare the shaders', 'prompts': 'Draw the button prompts', 'dlss': 'NVIDIA DLSS',
+        'fsr4': 'AMD FSR 4 (optional)', 'fsr4_button': 'AMD FSR 4', 'fsr4_agree': 'Agree and get FSR 4',
+        'fsr4_ask': 'AMD FSR 4 is made on this PC from the upscaler DLL of AMD\'s FSR SDK 2.3.0, downloaded from '
+                    'AMD\'s release (about 120 MB), and a source build (git and GCC, 10 to 20 minutes). The DLL comes under '
+                    'AMD\'s licence: ' + AMD_LICENSE + ' . Press the button again to agree and start.',
+        'fsr4_done': 'AMD FSR 4 is beside the game: choose it in the game\'s menu under Screen, Upscaling.',
+        'fsr4_nogame': 'Install the game first: FSR 4 goes beside it.',
         'running': 'running', 'done': 'done', 'skip': 'kept', 'failed': 'failed', 'na': '—',
         'ready': 'Close other heavy programs while it builds: it uses a lot of memory.',
         'finished': 'Finished. Press Play.', 'stopped': 'Stopped:', 'cancelled': 'Cancelled. Run it again to go on.',
@@ -60,6 +69,13 @@ TEXT = {
         'deps': 'Vérifier les paquets', 'check': 'Vérifier le dump', 'exefs': 'Extraire les fichiers du programme',
         'romfs': 'Construire l\'image RomFS', 'lift': 'Convertir le code en C', 'compile': 'Compiler le jeu',
         'shaders': 'Préparer les shaders', 'prompts': 'Dessiner les icônes de boutons', 'dlss': 'NVIDIA DLSS',
+        'fsr4': 'AMD FSR 4 (facultatif)', 'fsr4_button': 'AMD FSR 4', 'fsr4_agree': 'Accepter et installer FSR 4',
+        'fsr4_ask': 'AMD FSR 4 est construit sur ce PC à partir de la DLL d\'upscaling du FSR SDK 2.3.0 d\'AMD, '
+                    'téléchargée depuis la release d\'AMD (environ 120 Mo), et d\'une compilation des sources (git et GCC, '
+                    '10 à 20 minutes). La DLL est soumise à la licence d\'AMD : ' + AMD_LICENSE + ' . Appuyez de '
+                    'nouveau sur le bouton pour l\'accepter et lancer.',
+        'fsr4_done': 'AMD FSR 4 est à côté du jeu : choisissez-le dans le menu du jeu, Écran, Upscaling.',
+        'fsr4_nogame': 'Installez d\'abord le jeu : FSR 4 se place à côté.',
         'running': 'en cours', 'done': 'fait', 'skip': 'conservé', 'failed': 'échec', 'na': '—',
         'ready': 'Fermez les gros programmes pendant le build : il utilise beaucoup de mémoire.',
         'finished': 'Terminé. Appuyez sur Jouer.', 'stopped': 'Arrêté :',
@@ -197,7 +213,7 @@ def exec_quote(path):
 
 
 class App:
-    W, H = 760, 640   # logical pixels (96 dpi); everything is drawn at scale
+    W, H = 760, 680   # logical pixels (96 dpi); everything is drawn at scale
 
     def __init__(self, root, apprun, icon):
         self.root, self.apprun, self.icon = root, apprun, icon
@@ -210,7 +226,8 @@ class App:
         self.proc, self.events, self.log = None, queue.Queue(), []
         self.rows = {s: [0.0, ''] for s in STEPS}   # fraction, state
         self.status, self.status_color = T['ready'], 'dim'
-        self.confirm = self.close_armed = False
+        self.confirm = self.close_armed = self.fsr4_armed = False
+        self.task = None   # 'build' or 'fsr4' while AppRun runs
         self.dirty = True
         root.title(f"NX2navi – {T['title']}")
         if icon and icon.is_file():
@@ -334,8 +351,12 @@ class App:
         x = w - m
         x = self.button('play', x, by, T['play'], primary=playable and not self.proc, enabled=playable and not self.proc)
         main = T['confirm'] if self.confirm else T['cancel'] if self.proc else T['update'] if built else T['install']
-        x = self.button('main', x - self.px(10), by, main, primary=not playable and not self.proc)
-        self.button('details', x - self.px(10), by, T['details'], enabled=CACHE.joinpath('build.log').is_file() or bool(self.log))
+        x = self.button('main', x - self.px(10), by, main, primary=not playable and not self.proc,
+                        enabled=not self.proc or self.task == 'build')
+        x = self.button('details', x - self.px(10), by, T['details'], enabled=CACHE.joinpath('build.log').is_file() or bool(self.log))
+        have4 = (Path(self.out) / FSR4_LIB).is_file()
+        self.button('fsr4', x - self.px(10), by, T['fsr4_agree'] if self.fsr4_armed else T['fsr4_button'] + (' ✓' if have4 else ''),
+                    primary=self.fsr4_armed, enabled=built and not self.proc)
         self.dirty = False
 
     # ---- input
@@ -370,8 +391,12 @@ class App:
             self.play()
         elif key == 'main':
             self.main_button()
+        elif key == 'fsr4':
+            self.fsr4_button()
         if key != 'main':
             self.confirm = False
+        if key != 'fsr4':
+            self.fsr4_armed = False
         if key:
             save_config({'nup': self.nup, 'out': self.out, 'shortcut': self.shortcut})
         self.mark()
@@ -389,12 +414,31 @@ class App:
             self.status, self.status_color = T['nodump'], 'warn'
             return
         self.rows = {s: [0.0, ''] for s in STEPS}
+        self.start('build', [self.nup, self.out])
+
+    def start(self, task, args):
         self.log, self.cancelled, self.failed, self.missing = [], False, None, False
         self.status, self.status_color = T['ready'], 'dim'
-        self.proc = subprocess.Popen([str(self.apprun), '--events', self.nup, self.out], stdout=subprocess.PIPE,
+        self.task = task
+        self.proc = subprocess.Popen([str(self.apprun), '--events', *args], stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1,
                                      start_new_session=True)
         threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
+
+    def fsr4_button(self):
+        """First press: what it does and AMD's licence. Second press: agreed, AppRun --get-fsr4 runs."""
+        if self.proc:
+            return
+        if not (Path(self.out) / 'ocarina').is_file():
+            self.status, self.status_color = T['fsr4_nogame'], 'warn'
+            return
+        if not self.fsr4_armed:
+            self.fsr4_armed = True
+            self.status, self.status_color = T['fsr4_ask'], 'warn'
+            return
+        self.fsr4_armed = False
+        self.rows['fsr4'] = [0.0, '']
+        self.start('fsr4', ['--get-fsr4', self.out, '--accept-amd-license'])
 
     def kill(self):
         try:
@@ -456,7 +500,7 @@ class App:
         self.mark()
 
     def finished(self, code):
-        self.proc = None
+        self.proc, task, self.task = None, self.task, None
         try:
             CACHE.mkdir(parents=True, exist_ok=True)
             CACHE.joinpath('build.log').write_text('\n'.join(self.log) + '\n', encoding='utf-8')
@@ -464,6 +508,8 @@ class App:
             pass
         if self.cancelled:
             self.status, self.status_color = T['cancelled'], 'warn'
+        elif code == 0 and task == 'fsr4':
+            self.status, self.status_color = T['fsr4_done'], 'ok'
         elif code == 0:
             self.status, self.status_color = T['finished'], 'ok'
             if self.shortcut:

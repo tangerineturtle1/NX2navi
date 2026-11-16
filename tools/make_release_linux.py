@@ -83,7 +83,7 @@ mr.PINS.update(PINS)   # one cache (toolchain/release-dl) and one fetch for both
 
 # What clang, lld and the runtime build need from the LLVM release (the rest of its 8 GB stays packed).
 LLVM_MEMBERS = [f'bin/clang-{LLVM_MAJOR}', 'bin/clang', 'bin/clang++', 'bin/lld', 'bin/ld.lld', 'bin/llvm-ar',
-                'bin/llvm-ranlib', 'bin/llvm-objcopy', 'bin/llvm-strip', f'lib/clang/{LLVM_MAJOR}/include']
+                'bin/llvm-ranlib', 'bin/llvm-objcopy', 'bin/llvm-objdump', 'bin/llvm-strip', f'lib/clang/{LLVM_MAJOR}/include']
 # The parts of the sniper SDK a C/C++ compile and link for x86_64 can read.
 SNIPER_MEMBERS = ['usr/include', 'usr/share/pkgconfig', 'usr/lib/x86_64-linux-gnu', 'usr/lib/gcc/x86_64-linux-gnu',
                   'lib/x86_64-linux-gnu', 'lib64', 'usr/share/doc/libsdl3-0', 'usr/share/doc/libopus0',

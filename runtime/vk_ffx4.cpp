@@ -1,5 +1,10 @@
 // AMD FSR 4 (FSR Upscaling 4.x, the machine-learned upscaler) through the libraries of AMD's FSR SDK 2.4:
-// amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to the executable, loaded at run time. The SDK's
+// amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to the executable, loaded at run time. On
+// Linux, where AMD ships no library, amd_fidelityfx_upscaler_vk.so next to the executable is the API itself: a Vulkan
+// FSR 4 upscaler the player builds from AMD's SDK DLL (the launcher's "Get FSR 4", tools/fsr4_linux.py), with no loader
+// in front of it. It reads the back end descriptor by the SDK's older type (BACKEND_VK_DEPRECATED, same layout), which
+// is chained beside the current one, and needs VK_EXT_descriptor_buffer on the device (vk_device.c enables it when the
+// file is there, vk_ffx4_device_wanted). The SDK's
 // headers are in third_party/ffx_sdk (MIT), at the paths they have in the SDK. FSR 3.1 and frame generation stay with
 // vk_ffx.cpp and the library of SDK 1.1.4: the two sets of headers name the same types with other layouts, so nothing
 // of the API crosses between the two files, and vk_ffx.cpp's vk_ffx_upscale calls in here first.
@@ -14,30 +19,16 @@
 // inverted, the far plane at infinity) and the camera motion vectors in render pixels from this frame to the previous
 // one. FSR 4 needs no reactive or transparency mask.
 #define VK_FFX_NO_API   // vk_ffx.h: without the API declarations of the other set of headers
-#ifndef _WIN32
-// AMD publishes the SDK's libraries for Windows only: in any other build FSR 4 is never listed, vk_ffx.cpp's FSR 3.1
-// path is all there is, and the SDK's headers are not read.
-extern "C" {
-#include "vk.h"
-#include "vk_ffx.h"
-}
-extern "C" int vk_ffx4_available(void) { return 0; }
-extern "C" const char *vk_ffx4_name(void) { return "AMD FSR 4"; }
-extern "C" int vk_ffx4_upscale(VkCommandBuffer, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *,
-                               float, float, int, float, const VkFfxCamera *) {
-    return 0;
-}
-extern "C" void vk_ffx4_release(void) {}
-extern "C" int vk_ffx4_holds(void) { return 0; }
-extern "C" int vk_ffx4_failed(void) { return 0; }
-extern "C" void vk_ffx4_retry(void) {}
-extern "C" void vk_ffx4_trim(uint64_t) {}
-extern "C" uint64_t vk_ffx4_vram(int *contexts) { return *contexts = 0, 0; }
-extern "C" void vk_ffx4_release_idle(void) {}
-extern "C" int vk_ffx4_dead_take(uint64_t) { return 0; }
-extern "C" uint64_t vk_ffx4_dead_fence(void) { return 0; }
-#else
+#ifdef _WIN32
 #include <windows.h>
+#define FFX4_LIBRARY "amd_fidelityfx_loader_vk.dll"
+#define FFX4_UPSCALER "amd_fidelityfx_upscaler_vk.dll"
+#else
+#include <dlfcn.h>
+#define FFX4_LIBRARY "amd_fidelityfx_upscaler_vk.so"   // the upscaler is the API: there is no loader
+#define FFX4_UPSCALER FFX4_LIBRARY
+#define MAX_PATH 4096
+#endif
 #include <atomic>
 #include <mutex>
 #include <stdbool.h>
@@ -92,14 +83,25 @@ void message(uint32_t type, const wchar_t *msg) {
 
 // a library of the SDK next to the executable; 0 when the path does not fit
 int beside_exe(const char *name, char *path, size_t size) {
+#ifdef _WIN32
     DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
     while (n && path[n - 1] != '\\') n--;
     return snprintf(path + n, size - n, "%s", name) < (int)(size - n);
+#else
+    char *cut = plat_exe_path(path, size) ? plat_last_sep(path) : NULL;
+    if (!cut) return 0;
+    size_t n = (size_t)(cut + 1 - path);
+    return snprintf(path + n, size - n, "%s", name) < (int)(size - n);
+#endif
 }
 
 int file_there(const char *path) {
+#ifdef _WIN32
     DWORD attr = GetFileAttributesA(path);
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    return plat_file_exists(path);
+#endif
 }
 
 int g_loader = -1;   // under g_lock: -1 not tried, 0 the loader is not there or does not load, 1 its entry points are in A
@@ -110,8 +112,9 @@ int load(void) {
     const VkCtx *c = vk_ctx();
     if (!c || !c->device) return -1;   // asked before the device: again later
     char loader[MAX_PATH];
-    if (!beside_exe("amd_fidelityfx_loader_vk.dll", loader, sizeof loader) || !file_there(loader))
+    if (!beside_exe(FFX4_LIBRARY, loader, sizeof loader) || !file_there(loader))
         return g_loader = 0;   // not shipped beside this build: nothing is said, FSR 3.1 is what the menu offers
+#ifdef _WIN32
     HMODULE m = LoadLibraryA(loader);
     if (!m) {
         rt_log("ffx4: %s does not load (error %lu): FSR 4 off", loader, (unsigned long)GetLastError());
@@ -122,8 +125,24 @@ int load(void) {
     A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
+#else
+    void *m = plat_lib_open(loader);
+    if (!m) {
+        rt_log("ffx4: %s does not load (%s): FSR 4 off", loader, dlerror());
+        return g_loader = 0;
+    }
+    A.create = (PfnFfxCreateContext)plat_lib_sym(m, "ffxCreateContext");
+    A.destroy = (PfnFfxDestroyContext)plat_lib_sym(m, "ffxDestroyContext");
+    A.configure = (PfnFfxConfigure)plat_lib_sym(m, "ffxConfigure");
+    A.query = (PfnFfxQuery)plat_lib_sym(m, "ffxQuery");
+    A.dispatch = (PfnFfxDispatch)plat_lib_sym(m, "ffxDispatch");
+    if (!vk_ffx4_device_ready()) {
+        rt_log("ffx4: the device was made without VK_EXT_descriptor_buffer, which %s needs: FSR 4 off", FFX4_LIBRARY);
+        return g_loader = 0;
+    }
+#endif
     if (!A.create || !A.destroy || !A.configure || !A.query || !A.dispatch) {
-        rt_log("ffx4: amd_fidelityfx_loader_vk.dll lacks the API entry points: FSR 4 off");
+        rt_log("ffx4: " FFX4_LIBRARY " lacks the API entry points: FSR 4 off");
         return g_loader = 0;
     }
     return g_loader = 1;
@@ -153,7 +172,7 @@ int probe(void) {
     int loaded = load();
     if (loaded <= 0) return loaded;
     char upscaler[MAX_PATH];
-    if (!beside_exe("amd_fidelityfx_upscaler_vk.dll", upscaler, sizeof upscaler) || !file_there(upscaler)) return 0;
+    if (!beside_exe(FFX4_UPSCALER, upscaler, sizeof upscaler) || !file_there(upscaler)) return 0;
     uint64_t ids[16] = {};
     const char *names[16] = {};
     int n = versions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, ids, names, 16);
@@ -197,6 +216,7 @@ int probe(void) {
 struct Made {
     ffxCreateContextDescUpscale desc;
     ffxCreateBackendVKDesc backend;
+    ffxCreateBackendVKDesc older;   // Linux: the same descriptor by the type the library there reads
     ffxOverrideVersion version;
     ffxCreateContextDescUpscaleVersion built;
 };
@@ -275,6 +295,11 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh, bool dr
     m->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     m->backend.header.pNext = &m->version.header;
     m->backend.deviceContext = {c->device, c->phys, vkGetDeviceProcAddr};
+#ifndef _WIN32
+    m->older = m->backend;
+    m->older.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
+    m->backend.header.pNext = &m->older.header;
+#endif
     m->desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     m->desc.header.pNext = &m->backend.header;
     m->desc.flags =
@@ -318,6 +343,32 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh, bool dr
     }
     return slot;
 }
+
+#ifndef _WIN32
+// The Linux library samples its three inputs in SHADER_READ_ONLY_OPTIMAL (it is told COMPUTE_READ for them, the state
+// it accepts), while the scene leaves them in GENERAL: they go there for the dispatch and back to GENERAL after it.
+void inputs_layout(VkCommandBuffer cb, const VkFfxImage *const in[3], bool to_read) {
+    VkImageMemoryBarrier b[3] = {};
+    for (int k = 0; k < 3; k++) {
+        VkFormat f = in[k]->format;
+        bool depth = f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_X8_D24_UNORM_PACK32;
+        bool stencil = f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        b[k].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b[k].srcAccessMask = to_read ? VK_ACCESS_MEMORY_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+        b[k].dstAccessMask = to_read ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b[k].oldLayout = to_read ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b[k].newLayout = to_read ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        b[k].srcQueueFamilyIndex = b[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[k].image = in[k]->image;
+        b[k].subresourceRange = {(VkImageAspectFlags)(depth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                      : stencil ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
+    }
+    vkCmdPipelineBarrier(cb, to_read ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         to_read ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                         0, nullptr, 3, b);
+}
+#endif
 
 // The context for a render size and an output size: the one made for them, else a new one, in a free slot or in place
 // of the least recently used one; the others of that output size go once they are not recent. What goes is let go of
@@ -412,6 +463,15 @@ extern "C" void vk_ffx4_trim(uint64_t now_ns) {
         if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) retire_up(&u, "no upscale used it for 90 s");
 }
 
+extern "C" int vk_ffx4_device_wanted(void) {
+#ifdef _WIN32
+    return 0;   // AMD's loader asks the device for nothing more
+#else
+    char path[MAX_PATH];
+    return beside_exe(FFX4_LIBRARY, path, sizeof path) && file_there(path);
+#endif
+}
+
 extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                                const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam) {
     if (!vk_ffx4_available() || g_off.load(std::memory_order_acquire)) return 0;
@@ -426,10 +486,17 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, cons
     ffxDispatchDescUpscale d = {};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = cb;
+#ifdef _WIN32
     // Every image is in GENERAL, which the back end reads as its unordered-access state, and is left there
-    d.color = image(color, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
-    d.depth = image(depth, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
-    d.motionVectors = image(mv, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, 0);
+    const uint32_t in_state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
+#else
+    const VkFfxImage *const in[3] = {color, depth, mv};
+    const uint32_t in_state = FFX_API_RESOURCE_STATE_COMPUTE_READ;   // read-only inputs, the one state it takes
+    inputs_layout(cb, in, true);
+#endif
+    d.color = image(color, in_state, 0);
+    d.depth = image(depth, in_state, 0);
+    d.motionVectors = image(mv, in_state, 0);
     d.output = image(out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
     d.jitterOffset = {jx, jy};
     d.motionVectorScale = {1.0f, 1.0f};
@@ -448,6 +515,9 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, cons
     d.viewSpaceToMetersFactor = cam && cam->meters > 0 ? cam->meters : 1.0f;
     ffxReturnCode_t r = A.dispatch(&u->ctx, &d.header);
     u->fence = vk_exec_recording_fence();   // recorded into cb (a refusal too, for all this side knows)
+#ifndef _WIN32
+    inputs_layout(cb, in, false);   // also after a refused dispatch: the scene finds them as it left them
+#endif
     if (r != FFX_API_RETURN_OK) {
         static int told;
         if (told++ < 8) rt_log("ffx4: %s dispatch failed (%u)", g_name, (unsigned)r);
@@ -518,4 +588,3 @@ extern "C" uint64_t vk_ffx4_vram(int *contexts) {
     *contexts = n;
     return bytes;
 }
-#endif   // _WIN32

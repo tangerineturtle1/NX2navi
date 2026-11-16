@@ -21,6 +21,7 @@
 #include "vk_dlssg_device.h"
 #include "vk_lowlat.h"
 #include "vk_mesh_path.h"
+#include "vk_ffx.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
@@ -426,6 +427,11 @@ typedef struct {
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
     VkPhysicalDevicePresentIdFeaturesKHR pid;
     VkPhysicalDeviceAntiLagFeaturesAMD antilag;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT dbuf;   // FSR 4 on Linux (vk_ffx4_device_wanted)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmat;
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT fp8;
+#endif
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
@@ -579,6 +585,23 @@ static int create_device(void) {
             CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
         }
     }
+    // FSR 4 on Linux (vk_ffx4.cpp): the library beside the executable binds its resources through descriptor buffers,
+    // and its FP8 network runs on cooperative matrices of FP8 where the device reports both; its INT8 network needs
+    // nothing more. Only when the file is there, so a device without it is made as before.
+    int ffx4 = vk_ffx4_device_wanted() && has_ext(ep, ne, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+    if (ffx4 && n_ext + 3 <= sizeof ext / sizeof *ext) {
+        g_vk.has_descriptor_buffer = 1;
+        ext[n_ext++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+        CHAIN(dbuf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
+#ifdef VK_EXT_shader_float8
+        if (has_ext(ep, ne, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+            ext[n_ext++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+            ext[n_ext++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
+            CHAIN(cmat, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR);
+            CHAIN(fp8, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
+        }
+#endif
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -614,6 +637,13 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;
+    if (g_vk.has_descriptor_buffer) {   // the descriptor buffers alone: none of their capture, image-layout or push modes
+        c->dbuf.descriptorBufferCaptureReplay = c->dbuf.descriptorBufferImageLayoutIgnored = VK_FALSE;
+        c->dbuf.descriptorBufferPushDescriptors = VK_FALSE;
+        if (!c->dbuf.descriptorBuffer) g_vk.has_descriptor_buffer = 0;
+        rt_log("vk: descriptor buffers for FSR 4: %s", g_vk.has_descriptor_buffer ? "on" : "the extension is there, its feature is not");
+    }
+    if (c->cmat.sType) c->cmat.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     if (g_vk.has_vrs) {   // the rate is set per draw; no rate attachment and no per-primitive rates
         c->vrs.attachmentFragmentShadingRate = c->vrs.primitiveFragmentShadingRate = VK_FALSE;
         if (!c->vrs.pipelineFragmentShadingRate) g_vk.has_vrs = 0;
@@ -977,3 +1007,4 @@ int probe_vkdevice(void) {
 // The GPU has mesh shaders (vk_exec.c vk_exec_tail_begin: the early tail runs only on such a card).
 int vk_mesh_shader_native(void) { return g_vk.has_mesh_shader; }
 
+int vk_ffx4_device_ready(void) { return g_vk.has_descriptor_buffer; }

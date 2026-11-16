@@ -71,7 +71,8 @@ typedef struct VkCtx {
         has_present_id,                     // ... and the presentId feature: presents may carry a frame's number
         has_anti_lag,                       // VK_AMD_anti_lag with its antiLag feature (vk_lowlat.c)
         lists_low_latency,                  // the driver lists one of the two, left out: the run started with the mode off
-        has_mesh_queries;                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
+        has_mesh_queries,                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
+        has_descriptor_buffer;              // VK_EXT_descriptor_buffer, for FSR 4 on Linux only (vk_ffx4_device_wanted)
     int mesh_fallback;                      // task and mesh programs run as compute passes and are drawn from buffers
                                             // (mesh_fallback: auto as vk_mesh_path.h decides; vk_exec_draw.c "mesh fallback")
     int mesh_emulation;                     // they are drawn by the mesh emulation (mesh_emulation = 1 where
