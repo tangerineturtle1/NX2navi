@@ -4236,6 +4236,42 @@ class LockTest(Tmp):
 
 # ---------------------------------------------------------------- the icon
 
+class SavesScreenTest(Tmp):
+    def test_open_rows_distinguish_game_saves_from_imports_and_backups(self) -> None:
+        try:
+            from launcher.ui.app import App
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        app = mock.MagicMock()
+        app.settings = {'game_dir': str(self.tmp)}
+        app.export_dir.return_value = self.tmp
+        app.export_message = app.save_message = app.save_folder_message = ''
+        app.open_game_saves.side_effect = lambda: App.open_game_saves(app)
+        rows = {row.label: row for row in App.rows_saves(app)}
+        open_game = rows['Open Game Saves Folder'].on
+        open_imports = rows['Open Import and Backup Folder'].on
+        with mock.patch.dict(os.environ, {'NX2NAVI_PROFILE_DIR': ''}):
+            open_game()
+            app.open.assert_not_called()
+            self.assertIn('Start the game first.', app.save_folder_message)
+            game_saves = self.tmp / 'profile' / 'save'
+            game_saves.mkdir(parents=True)
+            open_game()
+            app.open.assert_called_once_with(game_saves)
+            self.assertEqual(app.save_folder_message, '')
+            open_imports()
+            self.assertEqual(app.open.call_args.args, (self.tmp / 'saves',))
+            custom_saves = self.tmp / 'custom' / 'save'
+            custom_saves.mkdir(parents=True)
+            (self.tmp / 'nx2navi.ini').write_text('profile_dir = custom\n')
+            os.environ.pop('NX2NAVI_PROFILE_DIR')
+            open_game()
+            self.assertEqual(app.open.call_args.args, (custom_saves,))
+            os.environ['NX2NAVI_PROFILE_DIR'] = str(game_saves.parent)
+            open_game()
+            self.assertEqual(app.open.call_args.args, (game_saves,))
+
+
 class SavesTest(unittest.TestCase):
     """launcher/saves.py: where the game keeps its save, the save folders it recognises, and the import."""
 

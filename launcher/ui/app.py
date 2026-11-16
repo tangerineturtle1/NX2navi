@@ -380,6 +380,7 @@ class App:
         self.message = ''
         self.look_message = ''   # why the last background picture was not taken, in Customize Launcher's descriptions
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
+        self.save_folder_message = ''
         self.export_message = ''   # the last Export Save result, shown in its description
         self.steam_message = ''   # the last Add to Steam result, shown in its description
         self.mods_message = ''   # what the last change on the Mods screen did, shown in its descriptions
@@ -1606,10 +1607,14 @@ class App:
                        'Your current save is copied to the saves folder first.')
         if self.save_message:
             import_desc, folder_desc = (self.save_message,) + import_desc, (self.save_message,) + folder_desc
+        game_saves_desc = ('Open the folder where the game stores its saves.',)
+        if self.save_folder_message:
+            game_saves_desc = (self.save_folder_message,) + game_saves_desc
 
         def report(v):
             self.settings['export_with_log'] = bool(v)
             self.settings.save()
+
         return [
             Row('value', 'Export Save', out.name or str(out), on=self.export_save, desc=export_desc),
             Row('toggle', 'Add Log and Settings', on=report, get=lambda: bool(self.settings.get('export_with_log')),
@@ -1624,12 +1629,31 @@ class App:
                 'orange_arrow' if ready else 'arrow', on=lambda: self.import_saves(folder=False), desc=import_desc),
             Row('value', 'Import a Save Folder', 'Choose a Folder', 'arrow',
                 on=lambda: self.import_saves(folder=True), desc=folder_desc),
-            Row('value', 'Open Saves Folder', '', 'arrow',
+            Row('value', 'Open Game Saves Folder', '', 'arrow', on=self.open_game_saves,
+                desc=game_saves_desc),
+            Row('value', 'Open Import and Backup Folder', '', 'arrow',
                 on=lambda: gd and Path(gd).is_dir() and self.open(saves.ensure_saves_dir(gd)),
-                desc=('The saves folder of the game folder: saves to import, and a backup of each save an import '
-                      'replaced.',)),
+                desc=('Open the folder for saves waiting to be imported and backups of replaced saves.',)),
             Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
         ]
+
+    def open_game_saves(self) -> None:
+        gd = self.settings.get('game_dir')
+        try:
+            if not gd or not Path(gd).is_dir():
+                raise saves.SaveError('Install the game first.')
+            profile = os.environ.get('NX2NAVI_PROFILE_DIR')
+            if profile is None:
+                profile = gameini.get(gd, 'PROFILE_DIR')
+            folder = Path(gd) / (profile or 'profile') / 'save'
+            if not folder.is_dir():
+                raise saves.SaveError('The game has not created its save folder yet. Start the game first.')
+        except (saves.SaveError, OSError) as e:
+            self.save_folder_message = str(e)
+        else:
+            self.save_folder_message = ''
+            self.open(folder)
+        self.show('saves', self.focus)
 
     def choose_export_dir(self):
         d = filedialog.askdirectory(parent=self.root, title='Choose where Export Save writes its zip',

@@ -96,7 +96,8 @@ row for each mod, More Mods when they fill more than a page, Load Order, Back); 
 left and right to move it); customize (Color Scheme, with Custom Background Color, Panel Color and
 Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
 Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
-Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
+Open Game Saves Folder, Open Import and Backup Folder, Back); settings (update check, Install Updates Automatically,
+Hide Launcher While Playing, Keep
 Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
 
@@ -329,6 +330,9 @@ runs. Keep Build Cache off deletes the lifted C and the objects (about 1.5 GB) a
 A bug report from a place in the game the developer has not reached yet is quickest to reproduce with the reporter's
 save. Saves (home, under Game Folder; `launcher/saves.py`) and the Saves rows of the game's settings menu (Game tab;
 `runtime/save_share.c`) write and read the same zip.
+
+Open Game Saves Folder opens `profile/save` beside the game, or `save` inside the configured `NX2NAVI_PROFILE_DIR`.
+Open Import and Backup Folder opens the game folder's `saves` directory.
 
 **Export.** Export Save writes `NX2navi-save-<date>_<time>.zip` into the Downloads folder (Export To chooses another
 folder) and opens the folder with the zip selected, ready to drag into a bug report. With Add Log and Settings on (the
