@@ -1,0 +1,13 @@
+{
+  "_comment": "Ocarina of Time (Switch 2) 1.1.1 ExeFS hashes for tools/build_game.py; code modules uncompressed, as tools/make_game.py writes them. Hashes only; no game data.",
+  "title_id": "0400486024DEC000",
+  "version": 131072,
+  "display_version": "1.1.1",
+  "exefs_sha256": {
+    "rtld": "2ca90471579664c488ca938d5a5697d77c9a71d374238fa4ee8d62706511c103",
+    "subsdk0": "59b492257e9aaa3c16430908f866649bee68ab17e9326bd08d7fb28296a244fa",
+    "main.npdm": "94c154d83cbaca00d092958cc2b3a0494d7308fe49de8cb33ece7e9e67303ea7",
+    "main": "ca344998b12a1b9c98444162dde46f9f6a53326e6107434bc42dfae2bc4a5eb4",
+    "sdk": "3256a316e02a1d7e9349172de7ece03b3771948e85f5a09a6f81651f73e9e9fc"
+  }
+}
