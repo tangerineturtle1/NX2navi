@@ -56,6 +56,7 @@
 #include "layout.h"
 #include "platform/platform.h"
 #include "rtss_decide.h"
+#include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
@@ -259,8 +260,13 @@ static int movie_cap_hz(void) {
 }
 
 // Frames on screen per game frame while frame generation runs: 2 with AMD's (vk_fg.cpp, one generated frame), the
-// multiplier with NVIDIA's (vk_dlssg.c, one to three); 1 while neither generates (off, or paused for the menu).
-static int generated_factor(void) { return vk_fg_generating() ? 2 : vk_dlssg_multiplier(); }
+// multiplier with NVIDIA's (vk_dlssg.c through Streamline, one to three; gfx_present.c through NGX, one to five); 1
+// while none generates (off, or paused for the menu).
+static int generated_factor(void) {
+    if (vk_fg_generating()) return 2;
+    int s = vk_dlssg_multiplier(), n = gfx_ngxfg_multiplier();
+    return s > n ? s : n;
+}
 
 // The limit counts the frames the game draws, and frame generation adds its frames on top: a limit of 60 at 4x is 60
 // drawn and 240 shown. Counted on the screen instead, the game was paced at the limit over the factor, so each step up
@@ -300,10 +306,10 @@ uint64_t frame_step_cap_ns(void) {
         const char *e = cfg_get("NX2NAVI_RTSS");
         rtss_allowed = !(e && !strcmp(e, "0"));
     }
-    int64_t rtss_out = !rtss_allowed                          ? RTSS_OUT_SETTING
-                       : vk_fg_wanted() || vk_dlssg_active() ? RTSS_OUT_FRAMEGEN
-                       : vk_lowlat_on()                      ? RTSS_OUT_LOWLAT
-                                                             : 0;
+    int64_t rtss_out = !rtss_allowed                                            ? RTSS_OUT_SETTING
+                       : vk_fg_wanted() || vk_dlssg_active() || vk_ngxfg_on() ? RTSS_OUT_FRAMEGEN
+                       : vk_lowlat_on()                                        ? RTSS_OUT_LOWLAT
+                                                                               : 0;
     int gen = generated_factor();
     int movie_hz = movie_cap_hz();
     static int movie_clock = -1;   // NX2NAVI_MOVIE_CLOCK=0: the steady step and the usual pacing through a movie too

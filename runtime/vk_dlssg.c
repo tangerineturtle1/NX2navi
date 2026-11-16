@@ -130,7 +130,8 @@ static int limit_allowed(void) {
 // With any upscaler or none: vk_dlaa.c makes the inputs either way (vk_dlaa_frame says which, at the start and at each
 // change).
 int vk_dlssg_wanted(void) {
-    if (S.wanted < 0) S.wanted = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss");
+    // not where NGX generates the frames into the DXGI presenter instead (vk_dlaa.c vk_ngxfg_wanted)
+    if (S.wanted < 0) S.wanted = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss") && !vk_ngxfg_wanted();
     return S.wanted;
 }
 

@@ -30,6 +30,7 @@
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "gfx_dxp.h"
 #include "vk_exec.h"
 #include "vk_fg.h"
 #include "vk_ffx.h"
@@ -97,7 +98,8 @@ static struct {
 } N = {.wanted = -1};
 
 // DLSS Frame Generation through NGX itself (vk_ngxfg_*, at the end of this file): NX2NAVI_FRAMEGEN = dlss where
-// Streamline does not run, which is every build but the Windows one.
+// Streamline does not run: every build but the Windows one, and on Windows a run whose picture goes out through the DXGI
+// presenter (gfx_dxp.h), which has no Vulkan swapchain for Streamline to take over.
 static struct {
     int max;                     // generated frames per rendered one this GPU allows (MultiFrameCountMax), 0: none
     NgxHandle *feat;
@@ -110,14 +112,23 @@ static struct {
 // Whether this run can generate frames through NGX: DLSS upscaling on at the start, as NGX comes up only then. The
 // swapchain then gets the presenter's extra images and NGX is asked about frame generation; whether frames are
 // generated is NX2NAVI_FRAMEGEN = dlss, read live (vk_ngxfg_on).
+// Windows: Streamline's path (vk_dlssg.c) unless DLSS Frame Generation is set at the start with HDR on, and the window's
+// display shows HDR10 from another adapter than NVIDIA's (dxp_hdr_elsewhere): the picture then goes out through the
+// DXGI presenter, and the frames are generated into its images (gfx_present.c dg_record). Asked before the instance
+// exists (vk_dlssg_wanted). NX2NAVI_DLSSG_NGX = 1 takes this path always, 0 never.
 int vk_ngxfg_wanted(void) {
-#ifdef _WIN32
-    return 0;   // Streamline's path there (vk_dlssg.c)
-#else
     static int w = -1;
-    if (w < 0) w = cfg_bool("NX2NAVI_DLAA") && strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
-    return w;
+    if (w >= 0) return w;
+    w = cfg_bool("NX2NAVI_DLAA") && strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
+#ifdef _WIN32
+    if (w) {
+        const char *force = cfg_get("NX2NAVI_DLSSG_NGX");
+        if (force && *force) w = atoi(force) != 0;
+        else w = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss") && strcmp(cfg_value("NX2NAVI_HDR"), "0") && dxp_hdr_elsewhere();
+        if (w) rt_log("ngxfg: DLSS Frame Generation through NGX into the DXGI presenter (HDR10 on a display another adapter drives)");
+    }
 #endif
+    return w;
 }
 
 typedef void (*SetI)(NgxParam *, const char *, int);
@@ -614,7 +625,17 @@ static struct {
 #define FG_INPUT_PRESENTS 4   // an evaluation is taken at its own present, or the one after when the present thread is behind
 static int fg_current(uint64_t made) { return D.presents - made <= FG_INPUT_PRESENTS; }
 
+// With the game's own HDR picture: the upscaler's output before the HUD, linear RGBA16F in GENERAL, once per copy.
+int vk_dlaa_fg_prehud(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h) {
+    if (!vk_hdr_native() || !D.hl_fresh) return 0;
+    D.hl_fresh = 0;
+    if (!fg_current(D.hl_at) || D.hl_fmt != VK_FORMAT_R16G16B16A16_SFLOAT) return 0;
+    *img = D.hl, *view = D.hl_view, *w = D.hl_w, *h = D.hl_h;
+    return 1;
+}
+
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt) {
+    if (vk_hdr_native()) return 0;   // the game encodes its picture itself: this copy is not what the display gets
     if (!D.hl_fresh) return 0;
     D.hl_fresh = 0;
     if (!fg_current(D.hl_at)) return 0;
@@ -2702,8 +2723,8 @@ static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32
 static void hudless(VkCommandBuffer cb, VkImage src, uint32_t w, uint32_t h) { hudless_from(cb, src, 0, 0, w, h); }
 static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32_t layer, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
-    int hdr = vk_hdr_wanted() && !vk_hdr_native();
-    if (vk_hdr_native()) return;
+    // the game's own HDR: the same linear copy, for the HUD's mask (vk_dlaa_fg_prehud); it is no HUD-less picture
+    int hdr = vk_hdr_wanted();
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
         retire_hl();   // the presents of the last frames may still read it

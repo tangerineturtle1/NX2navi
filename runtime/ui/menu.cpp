@@ -1177,10 +1177,10 @@ static void row_framegen_mult(bool restart) {
 }
 
 // NVIDIA's frame generation runs through NGX itself, not through Streamline (vk_dlaa.c vk_ngxfg_*, gfx_present.c
-// ng_*): every build but the Windows one.
+// ng_* and dg_*): every build but the Windows one, and on Windows a run whose picture goes out through the DXGI presenter.
 static bool framegen_ngx(void) {
 #ifdef _WIN32
-    return false;
+    return vk_ngxfg_wanted() != 0;
 #else
     return true;
 #endif

@@ -29,6 +29,11 @@ void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D
 uint64_t vk_fg_presents(VkSwapchainKHR sc);   // frames the swapchain presented, generated ones included (0: off)
 PFN_vkSetHdrMetadataEXT vk_fg_hdr_metadata_fn(void);   // AMD's replacement for vkSetHdrMetadataEXT while active, else NULL
 void vk_fg_release(void);
+// Without AMD's swapchain, for the DXGI presenter (HDR10 on a display another adapter drives; gfx_present.c fg_direct):
+int vk_fg_direct_ok(void);                   // the setting asks for FSR 3.1 frame generation and it can run this way
+// the frame's preparation and the generated frame into cb; 1 when out holds the frame between present and the one before
+int vk_fg_direct_frame(VkCommandBuffer cb, VkFormat fmt, VkExtent2D ext, VkImage hudless, const int pic[4], VkImage present,
+                       VkImage out, float peak_nits, int masked);
 uint64_t vk_fg_vram(void);   // the frame generation context's video memory, FSR 3.1's or FSR 4's; 0 none or not told
 
 // The same through AMD's FSR SDK 2.4 (vk_fg4.cpp), for vk_fg.cpp alone: it takes this path while FSR 4 is the upscaler,

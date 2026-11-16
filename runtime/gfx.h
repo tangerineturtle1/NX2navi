@@ -25,6 +25,7 @@ void gfx_tl_present(void);
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
 uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time of a tick (pacing)
+int gfx_ngxfg_multiplier(void);   // frames on screen per game frame with NGX's frame generation (gfx_present.c), 1 without
 double gfx_window_refresh_hz(void);                        // refresh rate of the window's monitor; 0 unknown
 uint64_t gfx_window_hosted_ns(void);                       // kern_now_ns() of the newest host present; 0 before one
 int gfx_window_focused(void);
