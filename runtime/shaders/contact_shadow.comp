@@ -35,8 +35,29 @@ void main() {
     if (d <= 0.0 || d >= 0.999) return;   // nothing drawn, or the sky
     float z = d * pc.proj.z;
     if (z > 80.0) return;
+    // Near the camera the sun's first cascade already draws the small shadows, and the depth target is a mesh of flat
+    // triangles many pixels wide: a march from a face or an arm close up runs into the neighbouring triangles of the
+    // same surface and darkened whole triangles of it (blocky patches on Link's face in close views). The march fades
+    // in from 3 m to 8 m.
+    float near = smoothstep(3.0, 8.0, z);
+    if (near <= 0.0) return;
     vec2 uv = (vec2(px) + 0.5) * pc.size.zw;
     vec3 p = view_pos(uv, z);
+    // The surface's normal from the depth of its neighbours (the nearer of each pair, so an edge takes the side the pixel
+    // is on). A surface turned away from the sun is already unlit in the game's own shading: a march from it runs into
+    // the surface itself at once, and darkening it again turned a character with the sun behind him brown and black.
+    // The march counts only on surfaces facing the sun, fading in over the first part of that range.
+    ivec2 sz2 = ivec2(pc.size.xy) - 1;
+    float zl = texelFetch(lin_depth, clamp(px - ivec2(1, 0), ivec2(0), sz2), 0).x * pc.proj.z;
+    float zr = texelFetch(lin_depth, clamp(px + ivec2(1, 0), ivec2(0), sz2), 0).x * pc.proj.z;
+    float zu = texelFetch(lin_depth, clamp(px - ivec2(0, 1), ivec2(0), sz2), 0).x * pc.proj.z;
+    float zd = texelFetch(lin_depth, clamp(px + ivec2(0, 1), ivec2(0), sz2), 0).x * pc.proj.z;
+    vec3 dx = abs(zr - z) < abs(z - zl) ? view_pos(uv + vec2(pc.size.z, 0.0), zr) - p : p - view_pos(uv - vec2(pc.size.z, 0.0), zl);
+    vec3 dy = abs(zd - z) < abs(z - zu) ? view_pos(uv + vec2(0.0, pc.size.w), zd) - p : p - view_pos(uv - vec2(0.0, pc.size.w), zu);
+    vec3 n = normalize(cross(dy, dx));
+    if (dot(n, p) > 0.0) n = -n;   // toward the camera
+    float facing = smoothstep(0.05, 0.3, dot(n, pc.light.xyz));
+    if (facing <= 0.0) return;
     // the march grows with distance, as one pixel covers more ground; thickness keeps thin blades from hiding the sky
     float len = pc.light.w * clamp(z / 10.0, 0.4, 3.0);
     float thick = 0.15 + z * 0.01;
@@ -50,13 +71,17 @@ void main() {
         if (any(lessThan(quv, vec2(0.0))) || any(greaterThan(quv, vec2(1.0)))) break;
         float sz = texelFetch(lin_depth, ivec2(quv * pc.size.xy), 0).x * pc.proj.z;
         float delta = -q.z - sz;   // how far the scene at that pixel is in front of the ray point
-        if (delta > 0.02 + z * 0.002 && delta < thick) {
+        // half a step more: a curved surface's flat triangles rise above the ray by about that much between steps
+        if (delta > 0.02 + z * 0.002 + 0.5 * step_len && delta < thick) {
             occ = 1.0 - float(i) / float(STEPS);   // a hit close to the pixel shadows more than one at the end
             break;
         }
     }
+    // The darkening stands for the sunlight the pixel loses; the sky's and the bounced light stay, so even a full hit at
+    // full strength keeps part of the colour (MAX_DARK).
+    const float MAX_DARK = 0.6;
     float fade = 1.0 - smoothstep(40.0, 80.0, z);
-    float k = 1.0 - pc.proj.w * occ * fade;
+    float k = 1.0 - MAX_DARK * pc.proj.w * occ * fade * near * facing;
     if (pc.opt.x > 0.5) {
         imageStore(scene, px, vec4(k, k, k, 1.0));
         return;
