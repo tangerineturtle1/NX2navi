@@ -195,6 +195,27 @@ site omovie main 3b5c908 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d
 # manager, last read at main+0xa682ec, and every path from the site reaches a call before it reads x13 again.
 site opickup main a68300 1e38000c 1e38000c 5ac0118d 53057dad 0b0d018c   # fcvtzs w12, s0; clz w13, w12; lsr w13, w13, #5; add w12, w12, w13
 
+# Sun shadows (runtime/resolution.c). The page's data: +92 the fixed sun shadow map size, +0x850 the factor on the
+# cascade distances, 1.0 for the game's own.
+set shadow      NX2NAVI_PATCH_SHADOW      0
+set cascade     NX2NAVI_PATCH_CASCADE     1
+
+# Sun shadow map size (runtime/resolution.c shadow_init switches the set on). Each frame the engine sizes its shadow
+# cascades (a D16 4-layer array) in the function around main+0x472900: a base size, interpolated down by how close the
+# cover is (the fmadd at main+0x4729d8), converted at main+0x4729e8 and rounded up to 8 at main+0x4729ec; the rounded
+# value is the width (+0x408 of the cascade set) and, through the packed store at +0xe0, the height (+0x428). Every
+# change of size moves the shadow texels, so leaf shadows jump instead of sliding. The page's fixed size (+92) goes in
+# just before the rounding; x9 is free there (main+0x4729f8 writes it next).
+site shadow main 4729ec 11001d28 @page:x9 b9405d29 11001d28   # add w8, w9, #7 -> adrp x9, page; ldr w9, [x9, #92]; add w8, w9, #7
+
+# Sun shadow cascade distances (runtime/resolution.c res_shadow_frame). Each frame the function around main+0x472900
+# sets the sun's cascades up: the first one's near distance, where each further one begins (from its own array on the
+# stack, main+0x472aa0) and the far distance (main+0x472af8) go into the cascade set's array ([x26+0x330]). With the
+# set on, the begins and the far distance are multiplied by the float at page +0x850 on the way; s3 and an integer
+# register are kept on the stack around it.
+site cascade main 472aa0 bc6b7981 bc6b7981 bc1f0fe3 @page:x14 bd4851c3 1e230821 bc4107e3   # ldr s1, [x12, x11, lsl #2]; s1 *= [page+0x850]
+site cascade main 472af8 bc28d920 8b28c928 f81f0fea bd000be3 @page:x10 bd485143 1e230803 bd000103 bd400be3 f84107ea   # str s0, [x9, w8, sxtw #2] -> the same with s0 * [page+0x850]
+
 # Mouse camera: the camera's stick input update (main+0x37c300) puts the right stick through a radial dead zone of
 # 0.005, scales the radius to one, clamps it and raises it to StickExponent (2, the default of
 # game__component__PlayerCameraParam); then come the reset timer at +0x5e0 (the stick reads zero while it runs), the X/Y

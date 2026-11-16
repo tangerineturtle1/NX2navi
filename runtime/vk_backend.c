@@ -316,6 +316,7 @@ static void frame_end(uint64_t frame, const tex_t *t) {   // t: the presented te
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_exec_barrier_log(frame);
+    res_shadow_frame();   // NX2NAVI_SHADOW_RANGE changed in the menu: Ocarina's cascades take it
     vk_dlaa_frame();
     vk_mvsurvey_frame();
     vk_mvprev_frame();
