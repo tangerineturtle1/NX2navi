@@ -305,6 +305,11 @@ static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total, int
     vmaFlushAllocation(vk_ctx()->vma, a->alloc, 0, total);   // a no-op on coherent memory
 }
 
+// The player's model ownership goes with a submission only for the motion vectors the upscaler or frame generation reads
+// (vk_exec_draw.c mvobj_draw): without either, nothing reads it, and the walk of the player's actor and models in guest
+// memory at every submission is left out.
+static int owners_wanted(void) { return motion_owner_enabled() && (vk_dlaa_available() || vk_dlaa_fg_only()); }
+
 // NX2NAVI_REPLAY_ASYNC, the submitting thread before the submission is queued for the replay: the uniform ranges it
 // binds are copied now, while they hold what the game submitted. vk_usnap_begin takes the copy over when the replay
 // reaches the submission, and leaves out there what GPU writes in flight touch (the replay knows them only then).
@@ -315,7 +320,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     Taken *t = calloc(1, sizeof *t);
     if (!t) rt_fatal("vk_usnap: out of memory");
     t->n = n, t->first = handles[0];
-    if (motion_owner_enabled()) {
+    if (owners_wanted()) {
         t->owners = malloc(sizeof *t->owners);
         if (t->owners) motion_owner_capture(t->owners);
     }
@@ -399,7 +404,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     }
     if (adopt(handles, n)) return;
     // Without a producer snapshot, asynchronous replay must not read present-day actor ownership.
-    if (!gfx_replay_async() && motion_owner_enabled()) {
+    if (!gfx_replay_async() && owners_wanted()) {
         U.owners = malloc(sizeof *U.owners);
         if (U.owners) motion_owner_capture(U.owners);
     }
