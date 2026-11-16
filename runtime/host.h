@@ -162,6 +162,7 @@ void perf_set_overlay(int mode);
 int perf_gpu_timing(void);                      // GPU timestamps wanted: NX2NAVI_TRACE=perf, the full overlay, or a
                                                 // feature that asked (perf_gpu_timing_want)
 void perf_gpu_timing_want(int on);              // dynres.c: GPU timestamps while dynamic resolution runs
+void perf_gpu_timing_want_fg(int on);           // gfx_present.c ng_multiplier: ... while the dynamic multiplier is set
 void perf_gpu_busy(uint64_t ns);                // GPU busy time of a timed submission part (vk_sync.c, any thread)
 uint64_t perf_gpu_busy_total(void);             // its running total (the overlay's GPU time per frame)
 #define RT_RESULT(module, desc) ((uint32_t)(module) | ((uint32_t)(desc) << 9))

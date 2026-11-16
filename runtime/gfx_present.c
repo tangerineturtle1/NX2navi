@@ -1515,18 +1515,47 @@ static int ng_ready(void) {
 // NX2NAVI_FG_MULT: 2 to 6, or dynamic: only the frames needed to reach the display's refresh rate at the rendered frame
 // rate (240 Hz at 60 fps: 4x), between 2x and what the GPU allows, as NVIDIA describes its dynamic multi frame
 // generation; a new multiplier must hold for 30 frames before it is taken, so it does not flicker.
+// Once the frames on screen reach the refresh rate, the display paces the game: each rendered frame then takes the
+// multiplier's share of the display's frames, whatever the game could render, and the interval alone only ever asked
+// for more (a run at 144 Hz went from 2x to 3x and stayed, the game drawing 46 frames a second where it could draw 69).
+// There the GPU's own time per rendered frame says what the game could do (vk_gpu_busy_all, timed while dynamic is
+// set), and only a lower multiplier is taken from it. A step down that the interval undoes within 3 s was wrong (the
+// processor, not the GPU, held the frame): no step down for 20 s after that, twice as long each time it happens again.
 static int ng_multiplier(int max) {
     const char *v = cfg_value("NX2NAVI_FG_MULT");
     int m;
-    if (!strcmp(v, "dynamic")) {
+    const int dynamic = !strcmp(v, "dynamic");
+    perf_gpu_timing_want_fg(dynamic);
+    if (dynamic) {
         static int cur = 2, cand, held;
+        static uint64_t busy_last, t_down, no_down_until, no_down_ns = 20000000000ull;
+        static double gpu_ns;
         double hz = gfx_window_refresh_hz(), ms = (double)ng.interval / 1e6;
+        uint64_t busy = vk_gpu_busy_all(), d = busy - busy_last, now = plat_now_ns();
+        if (busy_last && d && d < 1000000000ull) gpu_ns = gpu_ns > 0 ? gpu_ns * 0.9 + (double)d * 0.1 : (double)d;
+        busy_last = busy;
         int fit = hz > 0 && ms > 0 ? (int)(hz * ms / 1000.0 + 0.1) : 2;   // shown frames per rendered one that fit
+        const int paced = hz > 0 && ms > 0 && hz * ms / 1000.0 > cur - 0.25;   // the screen gets its refresh rate
+        if (paced) {
+            int could = gpu_ns > 0 ? (int)(hz * gpu_ns / 1e9 + 0.1) : cur;   // what the GPU's time per frame needs
+            fit = could < cur && now >= no_down_until ? could : cur;
+        }
         if (fit < 2) fit = 2;
         if (fit > max + 1) fit = max + 1;
         if (fit != cur) {
             held = fit == cand ? held + 1 : 0, cand = fit;
-            if (held >= 30) cur = fit, held = 0;
+            if (held >= 30) {
+                if (fit > cur && t_down && now - t_down < 3000000000ull) {   // the last step down did not hold
+                    no_down_until = now + no_down_ns;
+                    if (no_down_ns < 300000000000ull) no_down_ns *= 2;
+                }
+                t_down = fit < cur ? now : 0;
+                static int said;
+                if (said++ < 20)
+                    rt_log("ngxfg: dynamic multiplier %dx -> %dx (%.2f ms between rendered frames, GPU %.2f ms a frame, %.0f Hz)",
+                           cur, fit, ms, gpu_ns / 1e6, hz);
+                cur = fit, held = 0;
+            }
         } else held = 0;
         m = cur;
     } else {
