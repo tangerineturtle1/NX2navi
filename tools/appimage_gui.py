@@ -5,9 +5,9 @@ command line keeps working as before.
 It runs AppRun itself with --events, which does what the command line does (the package check, zbic, make_game.py,
 NVIDIA's DLSS, play.sh) and prints make_game.py's "@@" progress lines (tools/make_game.py, --events) plus its own for
 the steps around it. The last dump and folder are remembered in ~/.config/nx2navi/appimage.json, the last run's output
-in ~/.cache/nx2navi/build.log (Details opens it).
+in ~/.cache/nx2navi/build.log (Details displays it without needing an external editor).
 
-The window is one Tk canvas. The Tk that comes with python-build-standalone has no Xft, so its only font is X11's
+The main window is one Tk canvas. The Tk that comes with python-build-standalone has no Xft, so its only font is X11's
 bitmap "fixed", unreadable on a high-DPI screen: text is drawn with Pillow in the desktop's own font (fc-match
 sans-serif) as PNG images, everything is sized by the screen's DPI (Tk's winfo_fpixels, which follows Xft.dpi), and the
 file choosers are the desktop's (kdialog or zenity, else Tk's). Without fc-match or Pillow, text falls back to Tk's.
@@ -20,11 +20,14 @@ import io
 import json
 import locale
 import os
+import platform
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
 from pathlib import Path
 
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'nx2navi' / 'appimage.json'
@@ -50,6 +53,10 @@ TEXT = {
         'finished': 'Finished. Press Play.', 'stopped': 'Stopped:', 'cancelled': 'Cancelled. Run it again to go on.',
         'nodump': 'Choose your .nup dump first.', 'busy': 'A build is running: Cancel it first, or press close again.',
         'missing': 'Packages are missing. Install them (see Details), then press the button again.',
+        'missing_items': 'Missing dependencies: {items}',
+        'copy': 'Copy', 'open_editor': 'Open in editor', 'close': 'Close',
+        'open_error': 'Could not open the log in an editor: {error}',
+        'read_error': 'Could not read the log: {error}',
     },
     'fr': {
         'title': 'Ocarina of Time pour Linux',
@@ -66,6 +73,10 @@ TEXT = {
         'cancelled': 'Annulé. Relancez-le pour continuer.', 'nodump': 'Choisissez d\'abord votre dump .nup.',
         'busy': 'Un build est en cours : annulez-le d\'abord, ou fermez encore une fois.',
         'missing': 'Des paquets manquent. Installez-les (voir Détails), puis appuyez de nouveau sur le bouton.',
+        'missing_items': 'Dépendances manquantes : {items}',
+        'copy': 'Copier', 'open_editor': 'Ouvrir dans un éditeur', 'close': 'Fermer',
+        'open_error': 'Impossible d’ouvrir le journal dans un éditeur : {error}',
+        'read_error': 'Impossible de lire le journal : {error}',
     },
 }
 
@@ -196,6 +207,109 @@ def exec_quote(path):
     return '"' + out.replace('\\', '\\\\').replace('%', '%%') + '"'
 
 
+def dependency_message(items):
+    """Name the failed checks and the packages that satisfy them on the detected distribution."""
+    message = T['missing_items'].format(items=items)
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        return message + '\n' + T['missing']
+    distros = {release.get('ID', ''), *release.get('ID_LIKE', '').split()}
+    # Each column follows AppRun's package advice for Arch, Fedora and Debian respectively.
+    packages = {
+        'clang': ('clang', 'clang', 'clang'), 'clang++': ('clang', 'clang', 'clang'),
+        'ld.lld': ('lld', 'lld', 'lld'), 'SDL3/SDL.h': ('sdl3', 'SDL3-devel', 'libsdl3-dev'),
+        'opus/opus.h': ('opus', 'opus-devel', 'libopus-dev'),
+        'vpx/vpx_decoder.h': ('libvpx', 'libvpx-devel', 'libvpx-dev'),
+        'dav1d/dav1d.h': ('dav1d', 'libdav1d-devel', 'libdav1d-dev'),
+        'zstd.h': ('zstd', 'libzstd-devel', 'libzstd-dev'),
+    }
+    for family, column, command in (('arch', 0, 'sudo pacman -S --needed'),
+                                    ('fedora', 1, 'sudo dnf install'),
+                                    ('debian', 2, 'sudo apt install')):
+        if family in distros:
+            names = list(dict.fromkeys(packages[item][column] for item in items.split() if item in packages))
+            if names:
+                return message + '\n' + command + ' ' + ' '.join(names)
+    return message + '\n' + T['missing']
+
+
+class LogWindow(tk.Toplevel):
+    """An in-process log viewer; an external editor is optional and its failures stay visible here."""
+    def __init__(self, parent, path, content):
+        super().__init__(parent)
+        self.path, self.proc, self.stderr, self.poll_id = path, None, None, None
+        self.title('NX2navi – ' + T['details'])
+        self.geometry('800x500')
+        self.minsize(480, 300)
+        self.configure(bg=COLORS['bg'])
+        self.text = ScrolledText(self, wrap='word', bg=COLORS['panel'], fg=COLORS['text'],
+                                 insertbackground=COLORS['text'], font=('TkFixedFont', 12))
+        self.text.pack(fill='both', expand=True, padx=12, pady=12)
+        self.error = tk.StringVar(self)
+        tk.Label(self, textvariable=self.error, fg=COLORS['bad'], bg=COLORS['bg'],
+                 wraplength=700, justify='left').pack(fill='x', padx=12)
+        buttons = tk.Frame(self, bg=COLORS['bg'])
+        buttons.pack(fill='x', padx=12, pady=12)
+        for label, action in (('copy', self.copy), ('open_editor', self.open_editor), ('close', self.destroy)):
+            tk.Button(buttons, text=T[label], command=action).pack(side='left', padx=(0, 8))
+        self.set_content(content)
+
+    def set_content(self, content):
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        self.text.insert('1.0', content)
+        self.text.configure(state='disabled')
+        self.text.see('end')
+
+    def copy(self):
+        self.master.clipboard_clear()
+        self.master.clipboard_append(self.text.get('1.0', 'end-1c'))
+
+    def open_editor(self):
+        if self.proc is not None:
+            return
+        self.error.set('')
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(self.text.get('1.0', 'end-1c'), encoding='utf-8')
+            # A file captures diagnostics without blocking the UI or filling a pipe while the editor is open.
+            self.stderr = tempfile.TemporaryFile(mode='w+b')
+            self.proc = subprocess.Popen(['xdg-open', str(self.path)], start_new_session=True,
+                                         stdout=subprocess.DEVNULL, stderr=self.stderr)
+        except OSError as exc:
+            self.error.set(T['open_error'].format(error=exc))
+            if self.stderr:
+                self.stderr.close()
+                self.stderr = None
+            return
+        self.poll_editor()
+
+    def poll_editor(self):
+        self.poll_id = None
+        code = self.proc.poll()
+        if code is None:
+            self.poll_id = self.after(100, self.poll_editor)
+            return
+        if code:
+            self.stderr.seek(0)
+            detail = self.stderr.read(8192).decode('utf-8', errors='replace').strip()
+            self.error.set(T['open_error'].format(error=detail or f'xdg-open exited with code {code}'))
+        self.stderr.close()
+        self.stderr, self.proc = None, None
+
+    def destroy(self):
+        if self.poll_id is not None:
+            self.after_cancel(self.poll_id)
+        if self.stderr:
+            self.stderr.close()
+        # The editor is independent: closing Details must not close the user's editor.
+        if self.proc is not None:
+            threading.Thread(target=self.proc.wait, daemon=True).start()
+            self.proc = None
+        super().destroy()
+
+
 class App:
     W, H = 760, 640   # logical pixels (96 dpi); everything is drawn at scale
 
@@ -208,6 +322,7 @@ class App:
         self.out = cfg.get('out', str(DEFAULT_OUT))
         self.shortcut = cfg.get('shortcut', True)
         self.proc, self.events, self.log = None, queue.Queue(), []
+        self.details_window = None
         self.rows = {s: [0.0, ''] for s in STEPS}   # fraction, state
         self.status, self.status_color = T['ready'], 'dim'
         self.confirm = self.close_armed = False
@@ -424,9 +539,8 @@ class App:
     def line(self, text):
         if not text.startswith('@@'):
             self.log.append(text)
-            del self.log[:-5000]
             if text.startswith('Missing:'):
-                self.missing = True
+                self.missing = text.partition(':')[2].strip()
             return
         try:
             ev = json.loads(text[2:])
@@ -469,7 +583,7 @@ class App:
             if self.shortcut:
                 self.add_shortcut()
         elif self.missing:
-            self.status, self.status_color = T['missing'], 'bad'
+            self.status, self.status_color = dependency_message(self.missing), 'bad'
         else:
             last = self.failed or next((l for l in reversed(self.log) if l.strip()), str(code))
             self.status, self.status_color = f"{T['stopped']} {last}", 'bad'
@@ -477,15 +591,24 @@ class App:
 
     def details(self):
         log = CACHE / 'build.log'
-        if self.log:   # the run in progress, as far as it went
+        if self.log:
+            content = '\n'.join(self.log) + '\n'
             try:
                 CACHE.mkdir(parents=True, exist_ok=True)
-                log.write_text('\n'.join(self.log) + '\n', encoding='utf-8')
+                log.write_text(content, encoding='utf-8')
             except OSError:
-                pass
-        if log.is_file():
-            subprocess.Popen(['xdg-open', str(log)], start_new_session=True, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+                pass   # The current log remains readable even when it cannot be saved.
+        else:
+            try:
+                content = log.read_text(encoding='utf-8', errors='replace')
+            except OSError as exc:
+                content = T['read_error'].format(error=exc)
+        if self.details_window is None or not self.details_window.winfo_exists():
+            self.details_window = LogWindow(self.root, log, content)
+        else:
+            self.details_window.set_content(content)
+            self.details_window.deiconify()
+            self.details_window.lift()
 
     # ---- play and the menu entry
     def play(self):
