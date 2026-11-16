@@ -159,6 +159,11 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    `vk_pipeline.c` `pin_subgroup32` pin stages to 32 lanes with `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`
    where `subgroupSizeControl` allows it, and otherwise tell the translator the GPU's own size
    (`NX2NAVI_VK_SUBGROUP_PIN=0` forces that). **Fixed.**
+   Task stages must request the size independently of their mesh stage. Their payload compaction also needs full
+   subgroups where the local width is a multiple of that size: legacy SPIR-V may otherwise run with only part of
+   each subgroup active. Missing task requirements produced alternating strips of fog and missing terrain on Intel
+   Arc A770M/ANV. `pin_task_subgroup32` applies both requirements to whole pipelines and stage libraries when
+   supported; `--selftest` checks their gates.
 7. **Images aliased onto GPU-only pool memory.** `vk_texture.c` `bind_pool_memory` binds each `VkImage` into its pool
    allocation; textures are keyed by address plus descriptor, and each new image starts `UNDEFINED` (`init_image`). Two descriptors over the
    same storage, or bytes written through a buffer, do not see each other's data on AMD. Check: count distinct keys per
