@@ -1,0 +1,191 @@
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/GotoElimination.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/GotoElimination.cs
+@@ -16,6 +16,7 @@
+         public static void Eliminate(GotoStatement[] gotos, Func<AggregateType, AstOperand> newTemp)
+         {
+             _newTemp = newTemp;
++            gotos = ForwardGotosToBreaks(gotos);
+             for (int index = gotos.Length - 1; index >= 0; index--)
+             {
+                 GotoStatement stmt = gotos[index];
+@@ -94,6 +95,180 @@
+             }
+         }
+ 
++        // NX2NAVI: a forward goto out of nested ifs to a label later in an enclosing block (the cases of a switch that
++        // all jump to one join, the light loops of the lighting shaders) becomes a break out of a loop that runs once,
++        // put around the statements from the first such goto to the label: do { ... if (c) break; ... } while (false).
++        // Moving the goto outward instead guards everything after it with a flag, and an unconditional goto out of an
++        // if puts the rest in an else, which can take another goto's label in and make a do-while loop on a flag
++        // (Lift). The driver then sees paths around those loops that never run, and every value on them stays live:
++        // the light loop of 9aa2c5d7 (input 29d0c523) spilled 62 KB per thread on an Intel Arc 140V, and 0 bytes
++        // with 4x fewer instructions written as an if/else chain. Only gotos with no loop between them and the label's
++        // block are taken (a break would leave that loop instead); the others are left to the algorithm below.
++        private static GotoStatement[] ForwardGotosToBreaks(GotoStatement[] gotos)
++        {
++            Dictionary<IAstNode, int> order = [];
++
++            if (gotos.Length != 0)
++            {
++                AstBlock root = ParentBlock(gotos[0].Goto);
++
++                while (root.Parent != null)
++                {
++                    root = root.Parent;
++                }
++
++                Number(root, order);
++            }
++
++            // The gotos to each label, the labels from the last to the first: an outer region (a later label) is made
++            // first, and a region made inside it later routes any break of the outer one it takes in (RouteOuterExits).
++            List<AstAssignment> labels = [];
++            Dictionary<AstAssignment, List<GotoStatement>> byLabel = [];
++
++            foreach (GotoStatement stmt in gotos)
++            {
++                if (stmt.IsLoop || !order.ContainsKey(stmt.Label) || !order.ContainsKey(stmt.Goto))
++                {
++                    continue;
++                }
++
++                if (!byLabel.TryGetValue(stmt.Label, out List<GotoStatement> list))
++                {
++                    byLabel.Add(stmt.Label, list = []);
++                    labels.Add(stmt.Label);
++                }
++
++                list.Add(stmt);
++            }
++
++            labels.Sort((l, r) => order[r].CompareTo(order[l]));
++
++            HashSet<GotoStatement> done = [];
++
++            foreach (AstAssignment label in labels)
++            {
++                AstBlock lBlock = ParentBlock(label);
++                IAstNode first = null;
++                List<GotoStatement> taken = [];
++
++                foreach (GotoStatement stmt in byLabel[label])
++                {
++                    IAstNode stmtInL = StatementIn(lBlock, stmt.Goto, out bool crossesLoop);
++
++                    // Not inside lBlock, directly in it (a plain if does), behind the label, or a loop in between.
++                    if (stmtInL == null || stmtInL == stmt.Goto || crossesLoop || !Before(lBlock, stmtInL, label))
++                    {
++                        continue;
++                    }
++
++                    if (first == null || Before(lBlock, stmtInL, first))
++                    {
++                        first = stmtInL;
++                    }
++
++                    taken.Add(stmt);
++                }
++
++                if (taken.Count == 0)
++                {
++                    continue;
++                }
++
++                // The breaks of the gotos to this label are made first: the region RouteOuterExits looks through holds
++                // breaks of enclosing loops only.
++                AstBlock region = new(AstBlockType.DoWhile, Const(IrConsts.False));
++
++                lBlock.AddBefore(first, region);
++
++                for (IAstNode node = first; node != label;)
++                {
++                    IAstNode next = Next(node);
++
++                    lBlock.Remove(node);
++                    region.Add(node);
++
++                    node = next;
++                }
++
++                RouteOuterExits(region);
++
++                foreach (GotoStatement stmt in taken)
++                {
++                    EncloseSingleInst(stmt, Instruction.LoopBreak);
++
++                    ParentBlock(stmt.Goto).Remove(stmt.Goto);
++
++                    done.Add(stmt);
++                }
++            }
++
++            return done.Count == 0 ? gotos : Array.FindAll(gotos, g => !done.Contains(g));
++        }
++
++        // Program order of every node under block.
++        private static void Number(AstBlock block, Dictionary<IAstNode, int> order)
++        {
++            foreach (IAstNode node in block)
++            {
++                order[node] = order.Count;
++
++                if (node is AstBlock child)
++                {
++                    Number(child, order);
++                }
++            }
++        }
++
++        // The statement of block that holds node (node itself when it is in block), null when block does not hold it;
++        // crossesLoop: a loop lies between them.
++        private static IAstNode StatementIn(AstBlock block, IAstNode node, out bool crossesLoop)
++        {
++            crossesLoop = false;
++
++            while (node != null)
++            {
++                AstBlock parent = node is AstBlock b ? b.Parent : ParentBlock(node);
++
++                if (parent == block)
++                {
++                    return node;
++                }
++
++                if (parent == null)
++                {
++                    return null;
++                }
++
++                if (parent.Type == AstBlockType.DoWhile)
++                {
++                    crossesLoop = true;
++                }
++
++                node = parent;
++            }
++
++            return null;
++        }
++
++        // Whether node a comes before node b, both statements of block.
++        private static bool Before(AstBlock block, IAstNode a, IAstNode b)
++        {
++            foreach (IAstNode node in block)
++            {
++                if (node == a)
++                {
++                    return node != b;
++                }
++
++                if (node == b)
++                {
++                    return false;
++                }
++            }
++
++            return false;
++        }
++
+         private static bool IndirectlyRelated(AstBlock lBlock, AstBlock rBlock, int lLevel, int rlevel)
+         {
+             return !(lBlock == rBlock || DirectlyRelated(lBlock, rBlock, lLevel, rlevel));
