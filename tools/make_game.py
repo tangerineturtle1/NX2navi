@@ -25,7 +25,7 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
               then, and the driver cache is per executable and is lost when the driver clears it
   7. prompts  only with button art in the kit (<kit>/prompt-art, tools/make_launcher.py and make_kit.py
               --prompt-art): tools/pad_prompts.py draws the Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts
-              from it into <out>/romfs-patches-* (the Controls menu's Button prompts loads them), the keys as the
+              from it into <out>/romfs-patches-* (the Controls menu's Button prompts loads them), with buttons and keys as the
               bind_ lines of <out>/nx2navi.ini give them. Its key names everything it reads (the RomFS, the art, the
               tools, those lines), so it runs again only when one of them changed or a folder is gone, and running
               it makes no other step run again. A failure here leaves the game and its shaders complete.
@@ -132,9 +132,9 @@ SCAN_TOOL = '55ea0c150aaf9dac93a2e6fd3b4ca11e1c572b5eee8b6bd74960535964384634'
 # The same for the tools that draw the button prompts (tools/pad_prompts.py, prompt_art.py, button_icons.py) in the
 # prompts step's key, which held the digest of the three scripts' bytes: two of four releases changed a script, and
 # each time every install drew its prompts again, a minute. Changed by hand when a change to the scripts can change
-# what they write. Its value is their digest in 0.7.0 and 0.7.1, so the key of an install made by those stays what it
-# is. tests/launcher_test.py test_the_prompt_tools_logic_is_the_recorded_one asks the question when the logic changes.
-PROMPT_TOOLS = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'
+# what they write. tests/launcher_test.py test_the_prompt_tools_logic_is_the_recorded_one asks the question when the
+# logic changes.
+PROMPT_TOOLS = '3ab852a3d366b631515642da77bf782319cef9e8da2bd1946b5804ee3850907f'
 
 # Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
 LIFT_FIXES = [
@@ -2439,15 +2439,14 @@ def prompt_art_dir():
     return art if art.is_dir() else None
 
 
-def bind_lines(out):
-    """The bind_ lines of the game folder's nx2navi.ini, comments cut off: the keys the keyboard and mouse prompts
-    show (tools/pad_prompts.py pc_keys reads the same lines)."""
+def bind_lines(out: Path) -> list[str]:
+    """The bind_ lines of nx2navi.ini, which tools/pad_prompts.py binding_lines reads for pad and keyboard art."""
     try:
-        text = (out / 'nx2navi.ini').read_text(encoding='utf-8', errors='replace')
-    except OSError:
+        text = (out / 'nx2navi.ini').read_text(encoding='utf-8-sig', errors='replace')
+    except FileNotFoundError:
         return []
     lines = (ln.split('#')[0].split(';')[0].strip() for ln in text.splitlines())
-    return [ln for ln in lines if ln.lower().startswith('bind_')]
+    return [ln for ln in lines if ln.lower().removeprefix('nx2navi_').startswith('bind_')]
 
 
 def step_prompts(out):

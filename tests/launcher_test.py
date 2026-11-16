@@ -3601,8 +3601,8 @@ class FileCheckTest(Tmp):
 # PromptToolsTest.test_the_prompt_tools_logic_is_the_recorded_one. If the change can alter what the tools write, give
 # PROMPT_TOOLS a new value (every install then draws its prompts again) and record both here; if it cannot, record
 # only the new digests.
-PROMPT_LOGIC = ('ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249',
-                {'pad_prompts.py': '780c246b5fde7a0e9dbf3f59ad16372e1737592add6f2f2d9825bee6df4e296f',
+PROMPT_LOGIC = ('3ab852a3d366b631515642da77bf782319cef9e8da2bd1946b5804ee3850907f',
+                {'pad_prompts.py': 'ed99bf6cbbc96afdfd24e1832863e0f2fac28c0e4076c78087c12ea8e38e5915',
                  'prompt_art.py': '87edacabcddb4952f5862373815d7d46a05c67f350e0734025ae4d2f83b12038',
                  'button_icons.py': '3804e371a030965bc9eb4226f333b611651f25efaa67ee523b404edc3257818a'})
 
@@ -3643,6 +3643,29 @@ class PromptToolsTest(Tmp):
             self.pp = load_pad_prompts()
         except ImportError as e:
             self.skipTest(f'needs zstandard and Pillow: {e}')
+
+    def test_pad_prompt_pictures_follow_physical_bindings(self):
+        pp = self.pp
+        ini = ('bind_X = pad:south, key:enter\n'
+               'BIND_b = PAD:NORTH ; swap with X\n'
+               'bind_A = pad:ZL, pad:east\n'
+               'bind_Y = pad:south, pad:default\n'
+               'bind_L = pad:rpaddle1, pad:south\n'
+               'bind_R = key:q\n'
+               'bind_UP = pad:lstick\n'
+               'bind_LCLICK = pad:dpad_up\n'
+               'bind_PLUS = pad:back\n')
+        for name, style in pp.STYLES.items():
+            for layout in pp.FACE:
+                with self.subTest(style=name, layout=layout):
+                    base_glyph, base_note = pp.pad_pictures(name, layout)
+                    glyph, note = pp.pad_pictures(name, layout, pp.pad_binds(ini))
+                    self.assertEqual(glyph, {**base_glyph, 'X': style['glyph']['south'],
+                                             'B': style['glyph']['north'], 'A': style['glyph']['ZL'],
+                                             'DPAD_UP': style['glyph']['LSTICK_PRESS'],
+                                             'LSTICK_PRESS': style['glyph']['DPAD_UP'], 'PLUS': style['glyph']['MINUS']})
+                    self.assertEqual(note, {**base_note, 'X': style['note']['south'], 'B': style['note']['north']})
+        self.assertEqual(pp.pc_keys(ini), {**pp.PC_KEYS, 'X': 'enter', 'R': 'q'})
 
     def test_a_file_unpacks_to_the_same_bytes_in_pieces(self):
         import random
@@ -3693,12 +3716,17 @@ class PromptToolsTest(Tmp):
         out = self.tmp / 'game'
         out.mkdir()
         ident = 'nup C:\\dumps\\game.nup 28000000000 1760000000'
-        released = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'   # the scripts of 0.7.1
+        revision = PROMPT_LOGIC[0]
         with mock.patch.object(make_game, 'KIT', kit):
             pictures = make_game.tree_digest(kit / 'prompt-art', ('**/*.png',))
             binds = make_game.sha256_bytes(b'[]')
             self.assertEqual(make_game.step_key('prompts', ident, out),
-                             f'prompts-1|{ident}|{pictures}|{released}|{binds}|missing')
+                             f'prompts-1|{ident}|{pictures}|{revision}|{binds}|missing')
+            line = 'NX2NAVI_BIND_X = pad:south'
+            (out / 'nx2navi.ini').write_text(f'{line} # jump\n', encoding='utf-8-sig')
+            binds = make_game.sha256_bytes(json.dumps([line]).encode())
+            self.assertEqual(make_game.step_key('prompts', ident, out),
+                             f'prompts-1|{ident}|{pictures}|{revision}|{binds}|missing')
 
     def test_the_prompt_tools_logic_is_the_recorded_one(self):
         import make_game
