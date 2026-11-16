@@ -60,7 +60,8 @@ def quiet_exit(root, argv, age):
     exit code (rollback_target), and that version's home screen says which version did not start. Not when Steam
     started this version without the stub (--play, launcher/steam.py PLAY_TEXT), and not once the stub has stopped
     waiting (age, process_age): nobody acts on the exit code then, and without the box nothing would be seen."""
-    return bool(rollback_target(root)) and '--play' not in argv and age < STUB_WAITS
+    return (bool(rollback_target(root)) and age < STUB_WAITS
+            and not any(arg in ('--play', '--launch') or arg.startswith('--launch=') for arg in argv))
 
 
 def crash(text, box=True):

@@ -7,8 +7,9 @@
       app\previous.txt names another complete release, current.txt goes back to it and it starts with
       --rolled-back <version>.
 
-   Its own commands, for the launcher and the setup: --desktop-shortcut on|off, --shortcuts on|off (Desktop and Start
-   menu). No console window (-mwindows). */
+   --launch TARGET keeps the caller's working folder and returns the game's exit code without updating the current
+   release on failure. Its own commands: --desktop-shortcut on|off and --shortcuts on|off (Desktop and Start menu).
+   No console window (-mwindows). */
 #include "common.h"
 
 #define STARTUP_FAILED 86
@@ -37,8 +38,8 @@ static void swap_python(const wchar_t *root)
     if (!MoveFileExW(next, cur, 0)) MoveFileExW(old, cur, 0);
 }
 
-/* Start the release; returns its exit code if it ended within QUICK_MS, else -1 (still running). */
-static long start_release(const wchar_t *root, const wchar_t *ver, const wchar_t *args, const wchar_t *extra)
+/* Start the release. Ordinary starts return -1 if still running after QUICK_MS. */
+static long start_release(const wchar_t *root, const wchar_t *ver, const wchar_t *args, const wchar_t *extra, int direct)
 {
     static wchar_t cmd[32768];
     wchar_t python[PATHN];
@@ -51,14 +52,14 @@ static long start_release(const wchar_t *root, const wchar_t *ver, const wchar_t
     SetEnvironmentVariableW(L"NX2NAVI_LAUNCHER_ROOT", root);
     STARTUPINFOW si = {.cb = sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(python, cmd, NULL, NULL, FALSE, 0, NULL, root, &si, &pi)) {
+    if (!CreateProcessW(python, cmd, NULL, NULL, FALSE, 0, NULL, direct ? NULL : root, &si, &pi)) {
         message(L"The launcher could not be started. Run NX2navi-Setup.exe again to repair the installation.");
         return 1;
     }
     CloseHandle(pi.hThread);
     DWORD code = 0;
     long result = -1;
-    if (WaitForSingleObject(pi.hProcess, QUICK_MS) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &code))
+    if (WaitForSingleObject(pi.hProcess, direct ? INFINITE : QUICK_MS) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &code))
         result = (long)code;
     CloseHandle(pi.hProcess);
     return result;
@@ -83,10 +84,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     (void)instance; (void)previous; (void)show;
     exe_dir(root, PATHN);
     if (!root[0]) return 1;
-    int argc = 0;
+    int argc = 0, direct = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
         int r = shortcut_command(root, argc, argv);
+        for (int i = 1; i < argc && wcscmp(argv[i], L"--"); i++)
+            if (!wcscmp(argv[i], L"--launch") || !wcsncmp(argv[i], L"--launch=", 9)) direct = 1;
         LocalFree(argv);
         if (r >= 0) return r;
     }
@@ -99,7 +102,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
             return 1;
         }
     }
-    long code = start_release(root, ver, args ? args : L"", L"");
+    long code = start_release(root, ver, args ? args : L"", L"", direct);
+    if (direct) return (int)code;
     if (code == -1 || code == 0) return 0;
     swprintf(file, PATHN, L"%ls\\app\\previous.txt", root);
     if ((code == STARTUP_FAILED || code > 0) && read_line(file, prev, 128) && wcscmp(prev, ver) &&
@@ -109,7 +113,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
         swprintf(file, PATHN, L"%ls\\app\\previous.txt", root);
         DeleteFileW(file);
         swprintf(extra, 160, L"--rolled-back %ls", ver);
-        start_release(root, prev, args ? args : L"", extra);
+        start_release(root, prev, args ? args : L"", extra, 0);
         return 0;
     }
     if (code == STARTUP_FAILED) message(L"NX2navi could not start. data\\logs\\crash.log in its folder says why.");
