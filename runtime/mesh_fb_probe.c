@@ -412,6 +412,8 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
 int probe_meshfb(void) {
     const char *dir = cfg_get("NX2NAVI_PROBE_MESHFB_DIR");
     if (dir && *dir) return modules_part(dir);
+    // Synthetic draws have no loaded game actors for the motion ownership scan.
+    CHECK(cfg_setenv("NX2NAVI_SELECTIVE_MOTION", "0"), "cannot disable actor ownership for synthetic draws");
     vk_hdr_off();
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;

@@ -957,6 +957,8 @@ pictures; on a device without mesh shaders only the fallback draws. A change to 
 `runtime/vk_mesh_fb.c` or the fallback's part of `runtime/vk_exec_draw.c` passes it. With
 `NX2NAVI_PROBE_MESHFB_DIR=<folder>` it converts the game's own task and mesh translations instead, for `spirv-val`
 (the top of `runtime/mesh_fb_probe.c` says what the folder holds).
+`python tests/mesh_fb_spirv_check.py <runtime-exe>` validates converted synthetic task, mesh and vertex modules with
+`spirv-val`, including mesh inputs with and without an explicit Shader capability; it needs no game files or GPU.
 A change to the texture detail (`runtime/vk_texture.c` "texture detail": `detail_skip`, `upload`, `astc_bl_regions`)
 passes it three times, with `NX2NAVI_TEXTURE_DETAIL` set to `full`, `reduced` and `low`: each time ASTC textures are
 uploaded and rewritten, and every level and layer of their images must hold the game's level it stands for.
