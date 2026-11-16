@@ -111,6 +111,9 @@ int main(int argc, char **argv) {
     assert(frame(0, WALK, link) == 0 && dashing());
     assert(frame(0, JUMP, link) == 0 && dashing());     // on through a jump
     assert(frame(0, SLIDE, link) == 0 && dashing());
+    assert(frame(0, ROLL, link) == 0 && dashing());     // on through a roll
+    assert(frame(0, ROLL, link) == 0 && dashing());
+    assert(frame(0, WALK, link) == 0 && dashing());     // and still on after it
     frame(L3, WALK, link);                               // the next press ends it
     assert(!dashing());
     frame(0, WALK, link);
@@ -134,9 +137,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 90; i++) frame(0, WAIT_ID, link);
     assert(!dashing());
 
-    // toggle: an attack, a roll, targeting or a cutscene ends it at once
-    const int32_t enders[] = {ATTACK, ROLL, CUTSCENE};
-    for (int k = 0; k < 3; k++) {
+    // toggle: an attack, targeting or a cutscene ends it at once
+    const int32_t enders[] = {ATTACK, CUTSCENE};
+    for (int k = 0; k < 2; k++) {
         frame(L3, WALK, link), frame(0, WALK, link);
         assert(dashing());
         frame(0, enders[k], link);

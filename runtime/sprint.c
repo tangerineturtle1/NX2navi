@@ -56,6 +56,7 @@ static const struct { int32_t id; uint8_t kind; } states[] = {
     {253, KEEP},   // StepOn
     {35, KEEP},    // Slide
     {36, KEEP},    // SlideLand
+    {99, KEEP},    // Rolling: a roll keeps a toggled sprint, which goes on when it ends
     {40, WAIT},    // Wait
 };
 
