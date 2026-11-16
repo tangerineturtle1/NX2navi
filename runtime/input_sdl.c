@@ -23,8 +23,8 @@ static volatile int32_t esc_held, f8_held, insert_held, focused;
 static volatile int32_t mouse_dx, mouse_dy;   // relative motion since the last ikb_mouse_take, whole counts
 static float rem_x, rem_y;                    // window thread: the fractions SDL reported beyond them
 static volatile int32_t captured;             // relative mouse mode is on
-enum { CUR_REL = 1, CUR_ESC = 2 };            // as input_win.c: released by Esc or a click elsewhere; by Esc
-static volatile int32_t cur_rel, cur_suspend, cur_pending;
+enum { CUR_REL = 1, CUR_ESC = 2 };            // as input_win.c: free until a click in the window; set by Esc
+static volatile int32_t cur_rel = CUR_REL, cur_suspend, cur_pending;
 static uint32_t wake_event;                   // SDL_RegisterEvents: wakes the window thread for a cursor change
 
 // SDL scancode of a key id, 0 for an id without a key (the mouse buttons).
@@ -206,7 +206,7 @@ void input_sdl_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         plat_xchg32(&focused, 0);
-        plat_xchg32(&cur_rel, 0);   // coming back (Alt+Tab) captures again
+        plat_xchg32(&cur_rel, CUR_REL);   // coming back leaves the cursor free until a click in the window
         memset((void *)key_held, 0, sizeof key_held);   // the key-ups go elsewhere
         plat_xchg32(&esc_held, 0);
         plat_xchg32(&f8_held, 0);

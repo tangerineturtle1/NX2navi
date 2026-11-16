@@ -88,16 +88,18 @@ static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sa
 static volatile LONG mouse_travel;          // raw counts moved in total, captured or not (ikb_mouse_travel)
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
-// Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
-// by Esc (not when it was already set): closing the menu gives the capture back. One word, changed by one CAS.
+// Bits: CUR_REL, the cursor is free until a click in the client area: at start, after the application lost activation
+// and after Esc. Becoming active again (Alt+Tab, a title bar click, another window closing) does not capture. CUR_ESC,
+// set with CUR_REL by Esc (not when it was already set): closing the menu gives back the capture a click had given.
+// One word, changed by one CAS.
 enum { CUR_REL = 1, CUR_ESC = 2 };
-static volatile LONG cur_rel;
+static volatile LONG cur_rel = CUR_REL;
 static void cur_rel_update(LONG (*f)(LONG)) {
     LONG o, n;
     do { o = cur_rel; n = f(o); } while (n != o && InterlockedCompareExchange(&cur_rel, n, o) != o);
 }
 static LONG rel_esc(LONG o) { return o & CUR_REL ? o : CUR_REL | CUR_ESC; }
-static LONG rel_title(LONG o) { (void)o; return CUR_REL; }
+static LONG rel_away(LONG o) { (void)o; return CUR_REL; }
 static LONG rel_clear(LONG o) { (void)o; return 0; }
 static LONG rel_menu_closed(LONG o) { return o & CUR_ESC ? 0 : o; }
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
@@ -163,11 +165,11 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
         if (cur_rel & CUR_REL) { cur_rel_update(rel_clear); cursor_update(h); }
         break;
-    case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
-        if (LOWORD(l) != HTCLIENT) cur_rel_update(rel_title);
+    case WM_MOUSEACTIVATE:   // a title bar or border click frees the cursor; a client click captures (WM_LBUTTONDOWN)
+        if (LOWORD(l) != HTCLIENT) cur_rel_update(rel_away);
         break;
     case WM_ACTIVATEAPP:
-        if (!w) cur_rel_update(rel_clear);   // Alt+Tab back in captures again
+        if (!w) cur_rel_update(rel_away);   // coming back leaves the cursor free until a click in the window
         InterlockedExchange(&cur_active, w != 0);
         cursor_update(h);
         break;

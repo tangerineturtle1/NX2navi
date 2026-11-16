@@ -158,8 +158,9 @@ int probe_window(void) {
     }
     printf("probe-window: focus off/on pushed 2 messages (15)\n");
 
-    // Cursor release: Esc releases, a client click recaptures, a title bar activation releases (where the window system
-    // reports one). The probe window may not be the foreground window, so this checks the release flag, not the capture.
+    // Cursor release: Esc releases, a client click recaptures, a title bar activation and losing activation release
+    // (where the window system reports them), and becoming active again does not capture. The probe window may not be
+    // the foreground window, so this checks the release flag, not the capture.
     wsys_probe_escape();
     int esc = input_cursor_released();
     wsys_probe_click(0);
@@ -171,11 +172,11 @@ int probe_window(void) {
     wsys_probe_focus(1);
     int back = input_cursor_released();
     if (menu_is_open()) menu_toggle();   // Esc opened the menu: the presents below compare the bare game image
-    if (!esc || click || client || !caption || back) {
+    if (!esc || click || client || !caption || !back) {
         printf("probe-window: released esc=%d click=%d client=%d caption=%d reactivated=%d\n", esc, click, client, caption, back);
         return fail("cursor release");
     }
-    printf("probe-window: cursor released by Esc and title bar activation, recaptured by a click\n");
+    printf("probe-window: cursor released by Esc, title bar activation and losing activation, recaptured by a click\n");
 
     // Resize: the client area changes, the swapchain follows, presenting still reads back exact.
     gfx_window_resize(1280, 720);
