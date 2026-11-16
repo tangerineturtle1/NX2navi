@@ -49,6 +49,7 @@
 
 #include "debug_tools.h"
 #include "cfg.h"
+#include "driver_frame_limit.h"
 #include "floor_watch.h"
 #include "gfx.h"
 #include "host.h"
@@ -267,10 +268,27 @@ static int generated_factor(void) { return vk_fg_generating() ? 2 : vk_dlssg_mul
 // of the multiplier took drawn frames away (60 at 4x drew 15) and the generated ones had less to work from and more
 // delay. Only "display" is a rate on the screen, the monitor's: there the game draws that rate over the factor, since a
 // frame past the monitor's refresh is never seen. The result is game frames a second, before the ceiling of the step.
+// With frame generation a limit above the refresh rate over the factor is held to that, as "display" is: the game drawing
+// past it only made the frames on screen fall short of the refresh rate unevenly (generated pairs at 66 game frames a
+// second on a 144 Hz display: 132 pictures for 144 refreshes, a repeated one every few refreshes, seen as a hitch while
+// the camera turns). NX2NAVI_FG_CAP=0 leaves the limit as set.
 static double limit_game_hz(int limit, int gen) {
-    if (limit) return shown_hz(limit);
     double hz = shown_hz(gfx_window_refresh_hz());
-    return gen > 1 ? hz / gen : hz;
+    // The rate on the screen: the monitor's, or the driver's frame limit under it (NVIDIA's Max Frame Rate, set for a
+    // variable refresh rate a few frames under the monitor's). Generated frames past the driver's limit made each
+    // present wait in the driver: at 72 game frames a second with 2x under a limit of 140, 140 pictures a second came
+    // unevenly, and the waits held the game too.
+    const int drv = driver_frame_limit();
+    if (drv > 0 && drv < hz) hz = drv;
+    if (!limit) return gen > 1 ? hz / gen : hz;
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = cfg_get("NX2NAVI_FG_CAP");
+        cap = !(e && !strcmp(e, "0"));
+    }
+    double lim = shown_hz(limit);
+    if (cap && gen > 1 && gfx_window_refresh_hz() > 0 && lim > hz / gen) lim = hz / gen;
+    return lim;
 }
 
 // The rate the game renders at under the limit (mouse_direct.c, whose camera input follows the game's own frame time);
