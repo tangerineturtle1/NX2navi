@@ -574,6 +574,53 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     return true;
 }
 
+// A whole-number slider from lo to hi that goes on into named stops past hi (the frame limit's monitor rate and
+// unlimited). Positions are lo..hi and then hi + 1 + k for stop k. Left and right step one; held for a second over a
+// long range they step ten through the numbers, and stop at hi before the first named stop, so a quick sweep up does
+// not run past the last number. A / a click steps one and goes round to lo after the last stop. cur: the value in
+// effect (NULL: cfg_value(key)); a value that is neither a stop nor a number shows the default's position.
+bool opt_slider_stops(const char *key, UiTextId label, int lo, int hi, UiTextId desc, const char *fmt,
+                      const char *const *stop_values, const char *const *stop_names, int stops, const char *cur,
+                      const char *note) {
+    auto pos_of = [&](const char *v, int fallback) {
+        if (!v || !*v) return fallback;
+        for (int k = 0; k < stops; k++)
+            if (!strcmp(v, stop_values[k])) return hi + 1 + k;
+        char *end;
+        long n = strtol(v, &end, 10);
+        if (*end || end == v) return fallback;
+        return n < lo ? lo : n > hi ? hi : (int)n;
+    };
+    const char *d = cfg_default(key);
+    int def = pos_of(d, lo), pos = pos_of(cur ? cur : cfg_value(key), def);
+    char shown[48], ends[48];
+    if (pos > hi) snprintf(shown, sizeof shown, "%s", stop_names[pos - hi - 1]);
+    else snprintf(shown, sizeof shown, fmt, pos);
+    snprintf(ends, sizeof ends, fmt, hi);
+    const char *widest[2 + 8] = {shown, ends};
+    int nw = 2;
+    for (int k = 0; k < stops && nw < 10; k++) widest[nw++] = stop_names[k];
+    int top = hi + stops;
+    RowView rv = {shown, pos == def, true, note, value_width(widest, nw), pos <= lo, pos >= top};
+    int s = row(key, label, desc, rv);
+    if (!s) return false;
+    int n;
+    if (s == 2) n = pos >= top ? lo : pos + 1;   // A / click: one up, round to the first after the last
+    else {
+        // ten at a time among the numbers only: from hi, right goes one into the named stops (never past the first)
+        int steps = g_held && hi - lo > 40 && (s < 0 ? pos <= hi : pos < hi) ? 10 : 1;
+        n = pos + s * steps;
+        if (pos < hi && n > hi) n = hi;   // a fast sweep stops on the last number before the named stops
+        n = n < lo ? lo : n > top ? top : n;
+    }
+    if (n == pos) return false;
+    char out[32];
+    if (n > hi) snprintf(out, sizeof out, "%s", stop_values[n - hi - 1]);
+    else snprintf(out, sizeof out, "%d", n);
+    apply(key, out);
+    return true;
+}
+
 // ---- binding rows (the remapping rows of the Controls tab): a label and three cells, each its own nav item
 
 // Text centred (left-aligned when centred is false) in [x0, x1] on a row from y to y + h, at the font size or smaller so

@@ -77,6 +77,12 @@ void opt_text_str(const char *text, bool warn = false);
 // the "default" mark from the fallback's default, and a step onto the fallback's value unsets key again.
 bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId desc, float step = 1,
                 const char *fmt = "%g", const char *note = nullptr, const char *fallback = nullptr);
+// Whole numbers lo..hi that go on into named stops past hi (stop_values[k] written, stop_names[k] shown): left and
+// right step one, held they step ten through the numbers and stop at hi before the stops; A goes round. fmt formats a
+// number ("%d FPS"). cur: the value in effect when it differs from cfg_value(key) (NULL: cfg_value). note: as above.
+bool opt_slider_stops(const char *key, UiTextId label, int lo, int hi, UiTextId desc, const char *fmt,
+                      const char *const *stop_values, const char *const *stop_names, int stops,
+                      const char *cur = nullptr, const char *note = nullptr);
 
 // Binding rows (remapping on the Controls tab): a label and three cells, each selectable on its own (left / right move between them).
 // opt_bind_header: the column titles above them. opt_bind_row: key is the setting's name without NX2NAVI_ (BIND_A; the
