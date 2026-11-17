@@ -34,6 +34,7 @@
 #include "vk_fg.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
+#include "vk_xr.h"
 #include "vk_up_defer.h"
 #include "dlaa_mv_spv.h"
 #include "dlaa_sharpen_spv.h"
@@ -556,6 +557,7 @@ static struct {
     uint64_t seconds;            // present intervals with a second scene after DLSS ran
     int on;                      // the dlaa setting, read at each present (the menu switches it live)
     int fgo;                     // frame generation runs and no upscaler does: inputs alone (fg_only_frame), read at each present
+    int vro;                     // ... and only for VR's depth stereo: no motion passes (vr_only_frame)
     int preset, preset_dirty;    // the DLSS model features are created with (preset_value); a change pending
     VkExecTarget ids;            // this frame's G-buffer target 0 (object classes in green), valid with ids_ok
     int ids_ok;
@@ -636,6 +638,16 @@ int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImage
     return 1;
 }
 
+int vk_dlaa_vr_planes(float planes[2]) {
+    if (!D.fg_cam_ok || D.failed || !fg_current(D.fg_at)) return 0;
+    // d = a + b / distance through the stored 0 and 1 (proj_planes): (n, f) as (0, 1), or as (1, 0) inverted
+    const double n = D.fg_cam.znear, f = D.fg_cam.zfar;
+    if (D.fg_cam.infinite) planes[0] = D.fg_cam.inverted ? 0.0f : 1.0f, planes[1] = (float)(D.fg_cam.inverted ? n : -n);
+    else if (D.fg_cam.inverted) planes[0] = (float)(-n / (f - n)), planes[1] = (float)(n * f / (f - n));
+    else planes[0] = (float)(f / (f - n)), planes[1] = (float)(-n * f / (f - n));
+    return 1;
+}
+
 int vk_dlaa_fg_camera(VkDlaaCamera *c) {
     if (!D.fg_cam_ok) return 0;
     *c = D.fg_cam;
@@ -676,6 +688,7 @@ int vk_dlaa_active(void) { return dl_active(); }
 // takes the scene's inputs without one (D.fgo, fg_only_frame).
 static int inputs_on(void) { return dl_active() || D.fgo; }
 int vk_dlaa_fg_only(void) { return D.fgo; }
+int vk_dlaa_fg_motion(void) { return D.fgo && !D.vro; }
 // The upscaler this frame runs with, as vk_dlaa_frame read it. The menu can set NX2NAVI_TAA to dlss between that and
 // evaluate; read again there while NGX is not up (DLSS starts only after a restart), it sent evaluate to DLSS's path
 // with NGX's functions not loaded, a call to address 0 (issue #325).
@@ -2663,6 +2676,10 @@ evaluated:
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
     // for frame generation at this frame's present (vk_dlaa_fg_inputs)
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
+    if (vk_xr_depth_wanted()) {   // VR's own copy of the depth: its shader's bindings, so the next draw binds all again
+        vk_xr_keep_depth(cb, zv, w, h);
+        vk_exec_draw_new_cb();
+    }
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
     D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
@@ -3364,7 +3381,9 @@ static void idle_release(void) {
 
 // Frame generation that takes this frame's inputs: NVIDIA's through Streamline (vk_dlssg.c, set up with the device),
 // AMD's swapchain in place (vk_fg.cpp, either library) or NVIDIA's through NGX, set now (vk_ngxfg_on).
-static int fg_runs(void) { return vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on(); }
+// VR's depth stereo (vk_xr_depth_wanted) takes the scene's depth (vk_xr_keep_depth) and its planes (vk_dlaa_vr_planes)
+// from the same frames.
+static int fg_runs(void) { return vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on() || vk_xr_depth_wanted(); }
 
 // One line at the first present and one at each change: whether frame generation runs, and where its inputs come from.
 static void fg_state_line(int on, int fgo) {
@@ -3374,6 +3393,8 @@ static void fg_state_line(int on, int fgo) {
     last = st;
     if (st == 0) rt_log("dlaa: frame generation does not run: no inputs are made for it");
     else if (st == 1) rt_log("dlaa: frame generation runs with its inputs from the upscaler (%s)", use_fsr() ? "FSR" : "DLSS");
+    else if (st == 2 && !(vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on()))
+        rt_log("dlaa: VR's depth stereo takes the scene's depth and camera without an upscaler, no jitter");
     else if (st == 2)
         rt_log("dlaa: frame generation runs without an upscaler: the scene's depth, motion vectors and camera, no "
                "jitter, and the picture without the HUD from the game's own scaling");
@@ -3398,7 +3419,41 @@ static int blit_from(VkFormat f) {
     return r;
 }
 
+// VR's depth stereo alone (D.vro: no frame generation takes inputs): the scene's depth for VR (vk_xr_keep_depth) and
+// its projection's planes (vk_dlaa_vr_planes), from the projection rows the scene draws read (vk_dlaa_draw), without
+// the motion vectors and per-object motion frame generation needs.
+static void vr_only_frame(VkExec *ex) {
+    const VkExecTarget *z = &D.depth;
+    D.up = 0;   // the game's scaling draw makes the picture (vk_dlaa_skip_draw)
+    vk_exec_barrier(ex);
+    const float *cr = NULL;
+    for (int i = 0; D.cam_size == OCAM_BLOCK && D.cam_addr && i < D.nviews; i++)
+        if (D.views[i].addr == D.cam_addr && D.views[i].got) cr = D.views[i].cam;
+    if (!cr && D.cam_size == OCAM_BLOCK && D.cam_addr) cr = (const float *)vk_usnap_bytes(D.cam_addr, OCAM_BYTES);
+    if (cr) {
+        double P[16];
+        for (int i = 0; i < 16; i++) P[i] = cr[28 + i];   // rows 7-10 (ocam_vp, fg_camera)
+        if (!(D.fg_cam.znear > 0)) D.fg_cam.znear = 0.1f, D.fg_cam.zfar = VK_DLAA_FAR_INFINITE, D.fg_cam.infinite = 1;
+        proj_planes(P, &D.fg_cam);
+        D.fg_cam_ok = 1;
+    }
+    VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
+                                         z->base_layer, 1, 0);
+    vk_xr_keep_depth(ex->cb, zv, D.color.width, D.color.height);
+    if (cr) vk_xr_scene_camera(cr);   // (rows 0-2: the view the scene was drawn with)
+    vk_exec_draw_new_cb();   // VR's copy bound a pipeline and descriptors of its own: the next draw binds all again
+    D.jdepth = z->image, D.jw = z->width, D.jh = z->height;   // the scene depth the camera's draws go to (vk_dlaa_draw)
+    D.fg_at = D.presents, D.jit_ok = 0;
+    D.evals++;
+    static uint64_t frames;
+    if (!frames++) rt_log("dlaa: VR's depth stereo alone: the scene's depth and planes without motion vectors");
+}
+
 static void fg_only_frame(VkExec *ex, const VkExecTarget *dst) {
+    if (D.vro) {
+        vr_only_frame(ex);
+        return;
+    }
     const VkExecTarget *t = &D.color, *z = &D.depth;
     const uint32_t w = t->width, h = t->height;
     D.up = 0;   // the game's scaling draw makes the picture (vk_dlaa_skip_draw)
@@ -3438,6 +3493,10 @@ static void fg_only_frame(VkExec *ex, const VkExecTarget *dst) {
     vk_exec_draw_new_cb();   // the motion pass bound a pipeline and descriptors of its own: the next draw binds all again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;   // the scene depth the camera's draws go to (vk_dlaa_draw)
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
+    if (vk_xr_depth_wanted()) {   // VR's own copy of the depth: its shader's bindings, so the next draw binds all again
+        vk_xr_keep_depth(cb, zv, w, h);
+        vk_exec_draw_new_cb();
+    }
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
     D.fg_jx = D.fg_jy = 0.0f, D.fg_at = D.presents, D.fg_fresh = 1;
@@ -3479,6 +3538,10 @@ void vk_dlaa_frame(void) {
     // Frame generation without an upscaler takes this frame's inputs alone (fg_only_frame); switching in either
     // direction starts anew as switching the upscaler does below, and the frame before gets nothing to frame generation.
     int fgo = !on && !D.failed && fg_runs();
+    // frame generation's inputs for VR's depth stereo alone: no motion (vr_only_frame)
+    const int vro = fgo && !(vk_dlssg_active() || vk_fg_active() || vk_ngxfg_on());
+    if (vro != D.vro) D.reset = 1, D.cam_prev_ok = 0;
+    D.vro = vro;
     fg_state_line(on, fgo);
     if (fgo != D.fgo) {
         D.fgo = fgo;

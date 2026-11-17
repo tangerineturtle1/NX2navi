@@ -1,5 +1,6 @@
 // The debug menu's access to the game (debug_tools.c). Everything but dbg_tick is for the menu's thread.
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef __cplusplus
@@ -8,6 +9,7 @@ void dbg_tick(Cpu *c);                 // the game's thread, at its pad read (ov
 // ... and the pad's state before the game gets it: the free camera takes the sticks and four buttons while it flies
 void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 void dbg_freecam_host(Cpu *c);         // the free camera's patch site (recomp/patches-v111.txt, set freecam)
+void dbg_enum_set(Cpu *c, const char *name, const char *value);   // the game's thread: an enum of the game data
 #endif
 
 #ifdef __cplusplus
@@ -20,7 +22,11 @@ int dbg_player_rot(float m[9]);        // Link's rotation, a 3x3 matrix by rows;
 int dbg_area(char out[64]);            // the area the game is in, by its name in the game's files; 0 unknown
 // Every 64-character text of the game data (the area among them) with the hash of its name; returns their number.
 int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx);
+int dbg_text_get(const char *name, char out[64]);   // a 64-character text of the game data by name; 0 none
 uint32_t dbg_name_hash(const char *name);   // the hash the game knows a flag or a text by
+int dbg_flag_get(const char *name, int *on);   // an on/off flag of the game data now; 0 when there is no such flag
+uint64_t dbg_player_actor(void);       // Link's actor; 0 while there is no player
+int dbg_poke(uint64_t addr, const void *from, size_t n);   // a write into the game's read-write memory; 0 elsewhere
 float dbg_speed_factor(void);          // the game's speed: 1 normal, 0.05 to 8 (frame_rate.c multiplies the game's step)
 void dbg_speed_set(float factor);
 
@@ -88,6 +94,9 @@ int dbg_freeze(uint64_t addr, uint64_t value, int size, int on);   // written ev
 int dbg_frozen(uint64_t addr);
 int dbg_frozen_count(void);
 void dbg_unfreeze_all(void);
+// The game data's ints and enums by name (any thread reads; dbg_enum_set the game's thread): 0 when there is none
+int dbg_int_get(const char *name, int32_t *v);
+int dbg_enum_get(const char *name, uint32_t *value_hash);
 #ifdef __cplusplus
 }
 #endif

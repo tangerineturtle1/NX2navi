@@ -323,6 +323,22 @@ typedef enum {
     // frame generation with any Upscaling choice, an upscaler or none (vk_dlaa.c fg_only_frame); through NGX (every
     // build but the Windows one) NVIDIA's needs DLSS upscaling on at the start, its note and description there
     UI_MENU_FRAMEGEN_DESC_ANY, UI_MENU_FRAMEGEN_DESC_NGX, UI_MENU_FRAMEGEN_NOTE_NGX,
+    // the VR tab (vk_xr.cpp, vr_game.c)
+    UI_MENU_TAB_VR, UI_MENU_VR, UI_MENU_VR_DESC, UI_MENU_VR_VIEW, UI_MENU_VR_VIEW_DESC, UI_MENU_VR_VIEW_SCREEN,
+    UI_MENU_VR_VIEW_HEAD, UI_MENU_VR_CAMERA, UI_MENU_VR_CAMERA_DESC, UI_MENU_VR_CAMERA_FIRST, UI_MENU_VR_CAMERA_THIRD,
+    UI_MENU_VR_EYE_UP, UI_MENU_VR_EYE_UP_DESC, UI_MENU_VR_EYE_SIDE,
+    UI_MENU_VR_EYE_SIDE_DESC, UI_MENU_VR_EYE_FORWARD, UI_MENU_VR_EYE_FORWARD_DESC, UI_MENU_VR_HUD, UI_MENU_VR_HUD_DESC,
+    UI_MENU_VR_HUD_PANEL, UI_MENU_VR_HUD_PICTURE, UI_MENU_VR_HUD_SIZE, UI_MENU_VR_HUD_SIZE_DESC, UI_MENU_VR_SCALE,
+    UI_MENU_VR_SCALE_DESC, UI_MENU_VR_DEPTH, UI_MENU_VR_DEPTH_DESC, UI_MENU_VR_SCREEN_SIZE, UI_MENU_VR_SCREEN_SIZE_DESC,
+    UI_MENU_VR_SCREEN_CURVE, UI_MENU_VR_SCREEN_CURVE_DESC, UI_MENU_VR_GROUP_VIEW, UI_MENU_VR_GROUP_EYES, UI_MENU_VR_GROUP_HUD,
+    UI_MENU_VR_GROUP_CONTROLS, UI_MENU_VR_CONTROLS, UI_MENU_VR_CONTROLS_PAD, UI_MENU_VR_CONTROLS_META,
+    UI_MENU_VR_CONTROLS_PAD_DESC, UI_MENU_VR_CONTROLS_META_DESC, UI_MENU_VR_SWING_SPEED, UI_MENU_VR_SWING_SPEED_DESC,
+    UI_MENU_VR_CHARGE_REACH, UI_MENU_VR_CHARGE_REACH_DESC, UI_MENU_VR_HANDEDNESS, UI_MENU_VR_HANDEDNESS_DESC,
+    UI_MENU_VR_HANDEDNESS_RIGHT, UI_MENU_VR_HANDEDNESS_LEFT, UI_MENU_VR_EVENT_UP, UI_MENU_VR_EVENT_UP_DESC,
+    UI_MENU_VR_RUN_ZONE, UI_MENU_VR_RUN_ZONE_DESC,
+    UI_MENU_VR_PLAY, UI_MENU_VR_PLAY_DESC, UI_MENU_VR_PLAY_STATIONARY, UI_MENU_VR_PLAY_MOTION, UI_MENU_VR_AIM_TILT,
+    UI_MENU_VR_AIM_TILT_DESC, UI_MENU_VR_STEREO, UI_MENU_VR_STEREO_DESC, UI_MENU_VR_STEREO_PERFORMANT,
+    UI_MENU_VR_STEREO_BALANCED, UI_MENU_VR_STEREO_ACCURATE,
     UI_TEXT_COUNT
 } UiTextId;
 
@@ -353,6 +369,8 @@ int ui_text_game_langs(int game_version, UiGameLang *out, int max);
 // regions holds the four-letter prefix of each Mals/<region>.Product... file ("USen", "EUpl"); the version gates are
 // not used. Returns the count.
 int ui_text_game_langs_in(const char *const *regions, int nregions, UiGameLang *out, int max);
+// The Mals region a game language reads ("en-US" -> "USen"), NULL for a code not in the list
+const char *ui_text_game_mals(const char *switch_code);
 
 // Menu text: ui_text_in(menu language, id). The menu language is NX2NAVI_MENU_LANG ("en", "ru", "pt-BR", "zh-Hans");
 // unset, the system UI language when the catalog has menu text for it (English, Russian, Brazilian Portuguese,

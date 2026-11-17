@@ -10,7 +10,7 @@
 //   format (+0x1c), width and height (+0x24, +0x28), the block height of the block-linear layout as log2 of GOBs
 //   (+0x34), the level size (+0x50), the name (+0x60, a u16-length string) and the level offsets (+0x70). The levels
 //   are block linear in the Switch 2 GOB layout (tex_deswizzle.c tex_bl_copy). BC4 masks become white with the mask as
-//   alpha (the menu tints them), ASTC 4x4 goes through the runtime's decoder.
+//   alpha (the menu tints them), BC1 gives its colours, ASTC (any block size) goes through the runtime's decoder.
 #include <stdlib.h>
 #include <string.h>
 
@@ -177,6 +177,35 @@ static void bc4_decode(const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t
         }
 }
 
+// BC1: two RGB565 ends and 2-bit indices per 4x4 block; four colours, or three and a clear one when the first end is
+// not the greater
+static void bc1_decode(const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t w, uint32_t h, uint8_t *rgba) {
+    for (uint32_t by = 0; by < hb; by++)
+        for (uint32_t bx = 0; bx < wb; bx++) {
+            const uint8_t *b = blocks + 8ull * (by * wb + bx);
+            const uint16_t e0 = le16(b), e1 = le16(b + 2);
+            const uint32_t bits = le32(b + 4);
+            uint8_t pal[4][4];
+            for (int k = 0; k < 2; k++) {
+                const uint16_t e = k ? e1 : e0;
+                pal[k][0] = (uint8_t)((e >> 11 & 31) * 255 / 31), pal[k][1] = (uint8_t)((e >> 5 & 63) * 255 / 63);
+                pal[k][2] = (uint8_t)((e & 31) * 255 / 31), pal[k][3] = 255;
+            }
+            for (int c = 0; c < 3; c++) {
+                if (e0 > e1) {
+                    pal[2][c] = (uint8_t)((2 * pal[0][c] + pal[1][c]) / 3), pal[3][c] = (uint8_t)((pal[0][c] + 2 * pal[1][c]) / 3);
+                } else {
+                    pal[2][c] = (uint8_t)((pal[0][c] + pal[1][c]) / 2), pal[3][c] = 0;
+                }
+            }
+            pal[2][3] = 255, pal[3][3] = e0 > e1 ? 255 : 0;
+            for (int i = 0; i < 16; i++) {
+                const uint32_t x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x < w && y < h) memcpy(rgba + 4ull * (y * w + x), pal[bits >> (2 * i) & 3], 4);
+            }
+        }
+}
+
 int menu_asset_texture(const uint8_t *bntx, size_t n, const char *name, uint8_t **rgba_out, uint32_t *w_out, uint32_t *h_out) {
     // the platform block at 0x20 is "NX  " on Switch, "Ounc" in Switch 2 archives; its layout is the same
     if (!bntx || n < 0x40 || memcmp(bntx, "BNTX", 4)) return 0;
@@ -199,7 +228,12 @@ int menu_asset_texture(const uint8_t *bntx, size_t n, const char *name, uint8_t 
         if (data + size > n) return 0;
         uint32_t kind = fmt >> 8, bpb, bw = 4, bh = 4;
         if (kind == 0x1d) bpb = 8;                       // BC4
-        else if (kind == 0x2d) bpb = 16;                 // ASTC 4x4
+        else if (kind == 0x1a) bpb = 8;                  // BC1 (VR's hands' models)
+        else if (kind >= 0x2d && kind <= 0x3a) {        // ASTC, 4x4 to 12x12
+            static const uint8_t dims[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6},
+                                                {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
+            bpb = 16, bw = dims[kind - 0x2d][0], bh = dims[kind - 0x2d][1];
+        }
         else if (kind == 0x0b) bpb = 4, bw = bh = 1;     // R8G8B8A8
         else {
             rt_log("menu: interface texture %s has format %#x, not read", name, fmt);
@@ -214,7 +248,8 @@ int menu_asset_texture(const uint8_t *bntx, size_t n, const char *name, uint8_t 
         memcpy(bl, bntx + data, size);
         tex_bl_copy(bl, lin, row, row, hb, 1, th, 0, 1);
         if (kind == 0x1d) bc4_decode(lin, wb, hb, w, h, rgba);
-        else if (kind == 0x2d) astc_decode_ldr(lin, w, h, 4, 4, (fmt & 0xff) == 6, rgba);
+        else if (kind == 0x1a) bc1_decode(lin, wb, hb, w, h, rgba);
+        else if (kind >= 0x2d && kind <= 0x3a) astc_decode_ldr(lin, w, h, bw, bh, (fmt & 0xff) == 6, rgba);
         else memcpy(rgba, lin, (size_t)w * h * 4);
         free(bl), free(lin);
         *rgba_out = rgba, *w_out = w, *h_out = h;

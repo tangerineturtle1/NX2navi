@@ -184,7 +184,7 @@ void picture(const PerfPanel *p) {
 
 }  // namespace
 
-void perf_panel_draw(const PerfPanel *p, float width, float scale) {
+void perf_panel_draw(const PerfPanel *p, float width, float scale, float rect[4]) {
     const float m = 12 * scale;
     ImGui::SetNextWindowPos(ImVec2(width - m, m), ImGuiCond_Always, ImVec2(1, 0));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));   // the panel below is the background
@@ -219,6 +219,7 @@ void perf_panel_draw(const PerfPanel *p, float width, float scale) {
     dl->ChannelsSetCurrent(0);
     ImVec2 a = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
     skin_panel(dl, a, ImVec2(a.x + sz.x, a.y + sz.y), scale * 0.8f, 0.94f);
+    rect[0] = a.x, rect[1] = a.y, rect[2] = sz.x, rect[3] = sz.y;
     dl->ChannelsMerge();
     ImGui::End();
 }

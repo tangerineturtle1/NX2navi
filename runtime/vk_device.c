@@ -20,6 +20,7 @@
 #include "vk_dlssg.h"
 #include "vk_dlssg_device.h"
 #include "vk_lowlat.h"
+#include "vk_xr.h"
 #include "vk_mesh_path.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
@@ -176,8 +177,9 @@ void vk_driver_cache_env(void) {
 static int create_instance(void) {
     vk_driver_cache_env();
     vk_dlssg_early();   // DLSS Frame Generation: Streamline before any Vulkan call of the process (its slInit asks so)
-    const char *ext[12];
+    const char *ext[24];
     uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
+    vk_xr_instance_exts(ext, &n_ext, 18);   // VR (vk_xr.cpp, NX2NAVI_VR): the headset's runtime and what it needs
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = cfg_bool("NX2NAVI_VK_VALIDATION");
     if (validate && !layer_present(layers[0])) {
@@ -190,7 +192,7 @@ static int create_instance(void) {
     // armed, not wanted: the menu switches HDR on during the run (vk_hdr.c), and the extensions are fixed here
     if (vk_hdr_armed() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
-    vk_dlaa_instance_exts(ext, &n_ext, 12);
+    vk_dlaa_instance_exts(ext, &n_ext, 24);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "NX2navi",
                              .pEngineName = "NX2navi", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -260,6 +262,7 @@ static int pick_device(void) {
     const char *name = cfg_get("NX2NAVI_GPU_NAME");
     int best = -1, best_score = -1, listed = 0;
     uint32_t best_driver = 0;   // the driver version of the best one so far
+    const VkPhysicalDevice xr_pd = vk_xr_device(g_vk.instance);   // VR: the headset's runtime's GPU, first unless one is chosen
 retry:
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
@@ -287,7 +290,7 @@ retry:
         uint32_t fam = find_gfx_family(pd[i], qp, nq);
         free(qp);
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
-        int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
+        int score = (int)i == want ? 100 : pd[i] == xr_pd && !(name && *name) ? 50 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
         if (score > best_score) { best_score = score; best = (int)i; best_driver = p.driverVersion; continue; }
         // The same GPU listed again by another installed driver (a laptop with the vendor's processor graphics and its
@@ -337,6 +340,7 @@ retry:
         }
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    vk_xr_device_picked(g_vk.phys);
     vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
     {   // and by whether the device imports dma-bufs (vk_memory.c "dma-buf imports")
         uint32_t ne = 0;
@@ -579,6 +583,7 @@ static int create_device(void) {
             CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
         }
     }
+    vk_xr_device_exts(ep, ne, ext, &n_ext, 62);   // VR: what the headset's runtime needs (vk_xr.cpp), ahead of the two below
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -700,10 +705,13 @@ static int create_device(void) {
             if (fg_af == UINT32_MAX) fg_af = fg_pf, fg_ai = fg_pi;
         }
     }
+    // VR (vk_xr.cpp): one more queue of the graphics family, after those, for the headset's copies
+    const uint32_t xr_queue = vk_xr_queue(g_gfx_queues, nq_gfx);
     VkDeviceQueueCreateInfo qi[QFAM_MAX];
     uint32_t nqi = 0;
     qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                          .queueFamilyIndex = g_vk.gfx_family, .queueCount = nq_gfx, .pQueuePriorities = prio};
+                                          .queueFamilyIndex = g_vk.gfx_family,
+                                          .queueCount = nq_gfx + (xr_queue != UINT32_MAX), .pQueuePriorities = prio};
     for (uint32_t f = 0; f < g_nqfam; f++)
         if (f != g_vk.gfx_family && used[f])
             qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -736,6 +744,7 @@ static int create_device(void) {
     }
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
+    vk_xr_device_ready(g_vk.instance, g_vk.phys, g_vk.device, g_vk.gfx_family);
 
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};

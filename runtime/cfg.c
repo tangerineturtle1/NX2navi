@@ -94,6 +94,9 @@ static const char *const known[] = {
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
+    "VR", "VR_SCREEN_SIZE", "VR_SCREEN_CURVE", "VR_VIEW", "VR_CAMERA", "VR_EYE_UP", "VR_EYE_SIDE", "VR_EYE_FORWARD", "VR_HUD", "VR_HUD_SIZE", "VR_VIEW_SCALE",
+    "VR_DEPTH", "VR_CONTROLS", "VR_SWING_SPEED", "VR_CHARGE_REACH", "VR_HANDEDNESS", "VR_EVENT_UP", "VR_RUN_ZONE", "VR_PLAY", "VR_AIM_TILT", "VR_STEREO",
+    "PATCH_VR_LENS",   // VR through OpenXR (vk_xr.cpp, vr_game.c)
     // developer switches read with cfg_get, rt_knob or vk_caps.c env_u32, without a menu row (tests/cfg_rows_check.py)
     "AUDIO_DUMP", "DEFER_STAMP", "DEPTH_TWIN", "DLAA_ZFIT", "DUMP_SKIP_RUNS", "DUMP_TEX", "DUMP_UBO", "EVENT_ORDER",
     "GATHER_BIAS", "PIN_SWEEP", "REC_CHECK", "REC_DELAY_US", "REG_ORDER", "SHADOW", "ZERO_LOCALS",
@@ -194,6 +197,9 @@ static const struct { const char *key, *section; } sections[] = {
     {"COPY_RETIRE", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
+    {"VR", "vr"}, {"VR_SCREEN_SIZE", "vr"}, {"VR_SCREEN_CURVE", "vr"}, {"VR_VIEW", "vr"}, {"VR_CAMERA", "vr"}, {"VR_EYE_UP", "vr"}, {"VR_EYE_SIDE", "vr"},
+    {"VR_EYE_FORWARD", "vr"}, {"VR_HUD", "vr"}, {"VR_HUD_SIZE", "vr"}, {"VR_VIEW_SCALE", "vr"}, {"VR_DEPTH", "vr"},
+    {"VR_CONTROLS", "vr"}, {"VR_SWING_SPEED", "vr"}, {"VR_CHARGE_REACH", "vr"}, {"VR_HANDEDNESS", "vr"}, {"VR_EVENT_UP", "vr"}, {"VR_RUN_ZONE", "vr"}, {"VR_PLAY", "vr"}, {"VR_AIM_TILT", "vr"}, {"VR_STEREO", "vr"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -217,6 +223,36 @@ static const CfgMeta metas[] = {
     {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
     // vk_lowlat.c level_now: the driver's low latency without frame generation (0 off, 1 on, 2 on with boost)
     {"LOW_LATENCY", "0", "0|1|2", LIVE},
+    // vk_xr.cpp: VR through OpenXR, the screen's width and distance in metres, and the view: the game's camera following
+    // the headset (head) or the picture on the screen (screen)
+    {"VR", "0", "0|1", RESTART}, {"VR_SCREEN_SIZE", "65", "45..125", LIVE},
+    {"VR_SCREEN_CURVE", "1", "0|1", LIVE}, {"VR_VIEW", "head", "screen|head", LIVE},
+    // vr_game.c: the head's view from Link's eyes (first) or the game's camera (third), and the eyes' offsets in cm
+    // vk_xr.cpp: what the game is played with: the gamepad (and keys) alone, or the Touch controllers too
+    {"VR_CONTROLS", "gamepad", "gamepad|meta", LIVE},
+    // vk_xr.cpp: the sword hand (its swing slashes; the other holds the shield)
+    {"VR_HANDEDNESS", "left", "left|right", LIVE},
+    // vk_xr.cpp: Stationary (the game's own gear and aim) or Motion (the gear drawn in the hands)
+    {"VR_PLAY", "stationary", "stationary|motion", LIVE},
+    // vr_game.c: Motion's pointed aim, the controller's pointing ray tilted down this many degrees
+    {"VR_AIM_TILT", "35", "0..60", LIVE},
+    // vk_xr.cpp: the hand's speed in cm a second a swing (Y) needs, and how far out from the head in cm a swing leaves it
+    // to hold the charge
+    {"VR_SWING_SPEED", "230", "100..500", LIVE}, {"VR_CHARGE_REACH", "45", "25..70", LIVE},
+    {"VR_CAMERA", "first", "first|third", LIVE}, {"VR_EYE_UP", "0", "-30..30", LIVE}, {"VR_EYE_SIDE", "0", "-30..30", LIVE},
+    {"VR_EYE_FORWARD", "0", "-30..30", LIVE},
+    // vr_game.c: an event's camera raised by Link's height for his age and this many cm more in the head's view;
+    // running forward in first person goes straight while the head is within this many degrees of its rest
+    {"VR_EVENT_UP", "0", "-50..50", LIVE}, {"VR_RUN_ZONE", "5", "0..20", LIVE},
+    // vk_xr.cpp: the HUD on a panel in front of the head (panel) or left in the picture, and the panel's width in cm
+    {"VR_HUD", "panel", "panel|picture", LIVE}, {"VR_HUD_SIZE", "100", "40..200", LIVE},
+    // vk_xr.cpp: the game's view this many percent of the headset's lens, shown in the lens (more: the world smaller)
+    {"VR_VIEW_SCALE", "100", "50..200", LIVE},
+    // vk_xr.cpp: depth stereo, each eye this many percent of half the eyes' distance to its side (0: both eyes one picture)
+    {"VR_DEPTH", "100", "0..200", LIVE},
+    // vk_xr.cpp: stereo by depth (performant: one picture, each eye made from it and its depth) or by eyes in turn
+    // (balanced: each frame drawn from one eye, true geometry, each eye at half the rate)
+    {"VR_STEREO", "performant", "performant|balanced|accurate", LIVE},
     {"MONITOR", "auto", NULL, RESTART},   // auto|primary|<1-based index>|<part of a monitor name> (gfx_window_win.c, gfx_window_sdl.c chosen_monitor)
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},

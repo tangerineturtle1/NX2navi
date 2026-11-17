@@ -42,6 +42,88 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TITLE] = "Settings",
     [UI_MENU_TAB_SCREEN] = "Screen", [UI_MENU_TAB_GAME] = "Game", [UI_MENU_TAB_MODS] = "Mods", [UI_MENU_TAB_SOUND] = "Sound",
     [UI_MENU_TAB_CONTROLS] = "Controls", [UI_MENU_TAB_AMIIBO] = "Amiibo", [UI_MENU_TAB_MENU] = "Menu", [UI_MENU_TAB_ADVANCED] = "Advanced",
+    [UI_MENU_TAB_VR] = "VR",
+    [UI_MENU_VR] = "VR", [UI_MENU_VR_DESC] = "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, with "
+        "the headset connected before the game starts). Applies after a restart.",
+    [UI_MENU_VR_GROUP_VIEW] = "View", [UI_MENU_VR_GROUP_EYES] = "Eye position", [UI_MENU_VR_GROUP_HUD] = "HUD",
+    [UI_MENU_VR_VIEW] = "VR mode", [UI_MENU_VR_VIEW_SCREEN] = "Theater", [UI_MENU_VR_VIEW_HEAD] = "Immersive",
+    [UI_MENU_VR_VIEW_DESC] = "Immersive: the world surrounds you in play and in cutscenes, and the game's camera follows "
+        "your head. Theater: the game on a large screen floating in front of you. This menu always shows on the screen.",
+    [UI_MENU_VR_CAMERA] = "Camera", [UI_MENU_VR_CAMERA_FIRST] = "First person", [UI_MENU_VR_CAMERA_THIRD] = "Third person",
+    [UI_MENU_VR_CAMERA_DESC] = "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
+        "look while he stands. "
+        "Third person: the game's own camera, turned by your head.",
+    [UI_MENU_VR_EYE_UP] = "Height", [UI_MENU_VR_EYE_UP_DESC] = "Moves your eyes up or down from the height of Link's eyes, in "
+        "centimetres.",
+    [UI_MENU_VR_EYE_SIDE] = "Left and right", [UI_MENU_VR_EYE_SIDE_DESC] = "Moves your eyes to Link's right (more) or left "
+        "(less), in centimetres.",
+    [UI_MENU_VR_EYE_FORWARD] = "Forward", [UI_MENU_VR_EYE_FORWARD_DESC] = "Moves your eyes forward or back from Link's face, "
+        "in centimetres.",
+    [UI_MENU_VR_HUD] = "HUD", [UI_MENU_VR_HUD_PANEL] = "Panel in front of you", [UI_MENU_VR_HUD_PICTURE] = "In the picture",
+    [UI_MENU_VR_HUD_DESC] = "Panel in front of you: the hearts, buttons and map float on a panel that moves with your head, "
+        "and the world is shown without them. In the picture: the HUD stays drawn over the world.",
+    [UI_MENU_VR_HUD_SIZE] = "HUD size", [UI_MENU_VR_HUD_SIZE_DESC] = "The width of the HUD's panel, a metre in front of you.",
+    [UI_MENU_VR_DEPTH] = "Depth",
+    [UI_MENU_VR_DEPTH_DESC] = "How strongly each eye sees the world from its own side, made from the game's one picture and its "
+                              "depth. 100% matches your eyes' own distance; 0% shows both eyes the same flat picture.",
+    [UI_MENU_VR_SCREEN_SIZE] = "Screen size",
+    [UI_MENU_VR_SCREEN_SIZE_DESC] = "How much of your view the floating screen fills, in degrees across: Theater mode, this "
+                                    "menu and the title.",
+    [UI_MENU_VR_SCREEN_CURVE] = "Curved screen",
+    [UI_MENU_VR_SCREEN_CURVE_DESC] = "Curves the floating screen around you, like a cinema's, so its edges stay as near as "
+                                     "its middle. Off: a flat screen.",
+    [UI_MENU_VR_GROUP_CONTROLS] = "Controls", [UI_MENU_VR_CONTROLS] = "Control scheme",
+    [UI_MENU_VR_CONTROLS_PAD] = "GamePad", [UI_MENU_VR_CONTROLS_META] = "Meta/Oculus",
+    [UI_MENU_VR_CONTROLS_PAD_DESC] = "Play with a normal controller (or the keyboard and mouse), as without VR.",
+    [UI_MENU_VR_CONTROLS_META_DESC] = "Play with the headset's Touch controllers (a gamepad still works alongside). "
+        "A/B: the game's own A/B. X/Y: mirror A/B. L3 and R3: X (jump). "
+        "Grips: ZL/ZR. L trigger (held): the D-pad wheel. R trigger (held): the item wheel; the game waits meanwhile. "
+        "Hold that hand's stick toward a slot and release the trigger to use it; flick the stick toward a slot and let go "
+        "to swap what it holds (bombs or bombchus, the arrows, the seed or beans). Menu pressed: + (primary menu). "
+        "Menu held: - (secondary menu). "
+        "Swinging the sword hand: Y (sword). Both hands together behind your head: draw the sword and shield, or put "
+        "them away. Shield facing ahead, held before the eye on its side: Z (target). "
+        "D-pad: both arms shaken upward: down (boots); both hands together before your face: left (ocarina); both "
+        "hands beside your head: right (Navi); a hand shaken sideways above your head: up (mask). "
+        "Playing the ocarina: the right stick's left, up, right and down play Y, X, A and R, the A button L.",
+    [UI_MENU_VR_HANDEDNESS] = "Handedness", [UI_MENU_VR_HANDEDNESS_RIGHT] = "Right-handed",
+    [UI_MENU_VR_HANDEDNESS_LEFT] = "Left-handed",
+    [UI_MENU_VR_HANDEDNESS_DESC] = "Which hand holds the sword (Meta/Oculus): its swing slashes and charges. The other "
+        "hand holds the shield.",
+    [UI_MENU_VR_SWING_SPEED] = "Swing speed",
+    [UI_MENU_VR_SWING_SPEED_DESC] = "How fast your hand must move for a swing to count as a sword slash (Meta/Oculus). "
+        "Lower: gentler swings slash. Higher: only strong swings do.",
+    [UI_MENU_VR_CHARGE_REACH] = "Charge reach",
+    [UI_MENU_VR_CHARGE_REACH_DESC] = "How far out from your body a swing must leave your hand to keep charging the sword "
+        "(Meta/Oculus); bringing the hand back in releases it. Lower suits shorter arms.",
+    [UI_MENU_VR_EVENT_UP] = "Cutscene height",
+    [UI_MENU_VR_EVENT_UP_DESC] = "Moves your eyes up or down in cutscenes and conversations, in centimetres. They stand "
+        "Link's height (a child's or an adult's) above the game's camera.",
+    [UI_MENU_VR_RUN_ZONE] = "Straight-ahead zone",
+    [UI_MENU_VR_RUN_ZONE_DESC] = "Running forward in first person, Link runs dead straight while your head is within this "
+        "many degrees of looking straight ahead; turn it further and he follows your head. 0: he always follows your "
+        "head. Standing still, strafing and backing up are never affected.",
+    [UI_MENU_VR_PLAY] = "Play style", [UI_MENU_VR_PLAY_STATIONARY] = "Stationary", [UI_MENU_VR_PLAY_MOTION] = "Motion",
+    [UI_MENU_VR_PLAY_DESC] = "Stationary: Link's own gear and aiming, as on a pad. Motion (Meta/Oculus): what Link holds "
+        "is in your hands, his own gear hidden, his own hand shown on a hand that holds nothing, and the slingshot, bow, hookshot and boomerang aim where your sword hand "
+        "points (the game's motion controls on).",
+    [UI_MENU_VR_STEREO] = "Stereo", [UI_MENU_VR_STEREO_PERFORMANT] = "Performant",
+    [UI_MENU_VR_STEREO_BALANCED] = "Balanced", [UI_MENU_VR_STEREO_ACCURATE] = "Accurate",
+    [UI_MENU_VR_STEREO_DESC] = "Performant: the game draws one picture and each eye's is made from it and its depth "
+        "at the game's full rate; edges beside near things can smear. Balanced: each "
+        "frame is drawn from one eye in turn, true depth everywhere with no smearing, but each eye updates at half the "
+        "game's rate, so moving can judder a little: best for slow moving and looking around, Performant for action. "
+        "Accurate: as Balanced, but the game's time stands still for the second eye, so both eyes see the same moment "
+        "and nothing judders; the world moves at half the game's rate, and below about 28 frames a second the game runs "
+        "slower than real time. The desktop window shows the left eye in "
+        "Balanced and Accurate. The Depth row sets how far apart the eyes are in all three.",
+    [UI_MENU_VR_AIM_TILT] = "Pointing angle",
+    [UI_MENU_VR_AIM_TILT_DESC] = "Motion: how far below the controller's own pointing line your aim goes, in degrees. "
+        "Raise it if the aim sits above where you point, lower it if below.",
+    [UI_MENU_VR_SCALE] = "Field of view",
+    [UI_MENU_VR_SCALE_DESC] = "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. "
+        "Higher fits more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, "
+        "the world seems to swim as you turn your head.",
     [UI_MENU_CONTINUE] = "Continue", [UI_MENU_QUIT] = "Quit game",
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
@@ -2629,6 +2711,12 @@ int ui_text_game_langs(int game_version, UiGameLang *out, int max) {
     for (size_t i = 0; i < sizeof all_langs / sizeof *all_langs && n < max; i++)
         if (game_version >= all_langs[i].since) out[n++] = (UiGameLang){all_langs[i].code, all_langs[i].name};
     return n;
+}
+
+const char *ui_text_game_mals(const char *code) {
+    for (size_t i = 0; code && i < sizeof all_langs / sizeof *all_langs; i++)
+        if (!strcmp(code, all_langs[i].code)) return all_langs[i].mals;
+    return NULL;
 }
 
 int ui_text_game_langs_in(const char *const *regions, int nregions, UiGameLang *out, int max) {

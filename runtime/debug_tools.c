@@ -40,6 +40,7 @@
 #include <zstd.h>
 
 #include "bugcap.h"
+#include "vr_game.h"
 #include "cfg.h"
 #include "cpu.h"
 #include "debug_tools.h"
@@ -550,6 +551,36 @@ int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx)
     return n;
 }
 uint32_t dbg_name_hash(const char *name) { return hash_of(name); }
+int dbg_text_get(const char *name, char out[64]) { return dbg_supported() && text_get(name, out); }
+
+// An int (kind 2, entries of 0x28 bytes) or an enum (kind 6, 0x38 bytes, the value's name's hash) of the game data, its
+// value now at +0x1c. 0 when the game has no such entry.
+static void enum_set(Cpu *c, const char *name, const char *value);
+int dbg_int_get(const char *name, int32_t *v) {
+    uint64_t e = dbg_supported() ? gmd_entry(2, 0x28, hash_of(name)) : 0;
+    return e && rd(e + 0x1c, v, 4);
+}
+int dbg_enum_get(const char *name, uint32_t *value_hash) {
+    uint64_t e = dbg_supported() ? gmd_entry(6, 0x38, hash_of(name)) : 0;
+    return e && rd(e + 0x1c, value_hash, 4);
+}
+void dbg_enum_set(Cpu *c, const char *name, const char *value) {
+    if (dbg_supported() && gmd()) enum_set(c, name, value);
+}
+
+// One on/off flag of the game data by its name, as the game holds it now (kind 0: entries of 0x18 bytes, the value's
+// bit at +0x16, as dbg_flags_refresh reads them). 0 when the game has no such flag yet.
+int dbg_flag_get(const char *name, int *on) {
+    uint64_t e = dbg_supported() ? gmd_entry(0, 0x18, hash_of(name)) : 0;
+    uint8_t b;
+    if (!e || !rd(e + 0x16, &b, 1)) return 0;
+    *on = b & 1;
+    return 1;
+}
+
+// Link's actor (0 while there is none), and a write into memory the game reads and writes (0: not such memory)
+uint64_t dbg_player_actor(void) { return dbg_supported() ? player() : 0; }
+int dbg_poke(uint64_t addr, const void *from, size_t n) { return wr(addr, from, n); }
 
 // The area the game is in: its text Sequence_CurrentBanc. 0 while the game has none.
 int dbg_area(char out[64]) { return dbg_supported() && text_get("Sequence_CurrentBanc", out) && out[0]; }
@@ -934,6 +965,7 @@ void dbg_freecam_host(Cpu *c) {
         cam_seen[scene - 1].n++;
         plat_mutex_unlock(&cam_lock);
     }
+    if (!fc.on && scene) vr_camera_update(c, scene);   // VR's head view (vr_game.c); the free camera goes over it
     if (fc.on && scene) {
         if (fc.capture) {   // start where the game's camera is, looking where it looks
             double d[3] = {reg_d(c, 3) - reg_d(c, 0), reg_d(c, 4) - reg_d(c, 1), reg_d(c, 5) - reg_d(c, 2)};

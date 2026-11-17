@@ -1,0 +1,63 @@
+#version 450
+// VR's aiming reticle (runtime/vk_xr.cpp vk_xr_capture), drawn into the scene the HUD's shader left before depth stereo
+// makes the eyes from it, so it stands at the depth of what it lies on. The aim is the game's own camera's ray (from
+// over Link's shoulder), given in the head's view: its points from near to far are put in the picture and the first one
+// behind the scene's depth there is where it lands (the sky's far end when none is).
+layout(local_size_x = 64) in;
+layout(binding = 0) uniform sampler2D depth;   // the scene's depth (R32F, as stored)
+layout(binding = 1, rgba8) uniform image2D scene;
+layout(push_constant) uniform Push {
+    float w, h;              // the scene's picture, pixels
+    float ox, oy, oz;        // the ray's start in the head's view (x right, y up, z back), metres
+    float dx, dy, dz;        // its direction
+    float tan_x, tan_y;      // the lens: x_ndc = x / (-z tan_x)
+    float plane_a, plane_b;  // the stored depth d is plane_a + plane_b / distance
+} p;
+
+const int STEPS = 512;
+const float NEAR = 0.3, FAR = 200.0;
+shared uint first;
+
+vec3 at_step(int i) {
+    const float t = NEAR * pow(FAR / NEAR, float(i) / float(STEPS - 1));
+    return vec3(p.ox, p.oy, p.oz) + vec3(p.dx, p.dy, p.dz) * t;
+}
+
+vec2 to_uv(vec3 v) { return vec2(0.5 + 0.5 * v.x / (-v.z * p.tan_x), 0.5 - 0.5 * v.y / (-v.z * p.tan_y)); }
+
+void main() {
+    const uint id = gl_LocalInvocationID.x;
+    if (id == 0) first = uint(STEPS);
+    barrier();
+    const ivec2 dsize = textureSize(depth, 0);
+    for (int i = int(id); i < STEPS; i += 64) {
+        const vec3 v = at_step(i);
+        if (v.z > -1.0) continue;   // behind the eyes, or what is held right at them
+        const vec2 uv = to_uv(v);
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) continue;
+        const ivec2 t = clamp(ivec2(uv * vec2(dsize)), ivec2(0), dsize - 1);
+        const float surface = (texelFetch(depth, t, 0).r - p.plane_a) / p.plane_b;   // 1 / its distance
+        if (1.0 / -v.z <= surface) atomicMin(first, uint(i));
+    }
+    barrier();
+    const vec3 v = at_step(first < uint(STEPS) ? int(first) : STEPS - 1);
+    if (v.z > -0.05) return;
+    const vec2 c = to_uv(v) * vec2(p.w, p.h);
+    const float r = 0.012 * p.h, line = max(1.5, 0.003 * p.h), edge = max(1.0, 0.0015 * p.h);
+    const int half_side = int(r + line + edge + 2.0), side = 2 * half_side + 1;
+    for (int k = int(id); k < side * side; k += 64) {
+        const ivec2 px = ivec2(c) + ivec2(k % side - half_side, k / side - half_side);
+        if (px.x < 0 || px.y < 0 || px.x >= int(p.w) || px.y >= int(p.h)) continue;
+        const float d = length(vec2(px) + 0.5 - c);
+        const float ring = abs(d - r), dot_d = d;
+        const float white = max(1.0 - smoothstep(line * 0.5 - 0.5, line * 0.5 + 0.5, ring),
+                                1.0 - smoothstep(line * 0.6, line * 0.6 + 1.0, dot_d));
+        const float dark = max(1.0 - smoothstep(line * 0.5 + edge - 0.5, line * 0.5 + edge + 0.5, ring),
+                               1.0 - smoothstep(line * 0.6 + edge, line * 0.6 + edge + 1.0, dot_d));
+        if (dark <= 0.0) continue;
+        vec4 s = imageLoad(scene, px);
+        s.rgb = mix(s.rgb, vec3(0.0), dark * 0.6);
+        s.rgb = mix(s.rgb, vec3(1.0), white);
+        imageStore(scene, px, s);
+    }
+}

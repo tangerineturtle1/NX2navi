@@ -1,0 +1,68 @@
+#version 450
+// VR's depth stereo (runtime/vk_xr.cpp vk_xr_capture): an eye's picture made from the one the game drew from between
+// the eyes. A point at view distance z seen from an eye `shift` to the side moves by shift * P00 / z in clip space, half
+// that in the picture's [0, 1]: the scene texel at u lands at u - move(u). Each output pixel scans its row's texels that
+// can land on it (a move is at most `most`, to one side) and takes, of the neighbouring pairs that land around it on one
+// surface, the nearest, as a depth test does. Where only pairs across a depth step land around it (the gap beside a near
+// thing that this eye sees and the middle did not), the background beside the step fills it, a few of its texels
+// averaged away from the edge so the fill is soft rather than one edge texel drawn out, never a copy of the near thing.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D color;   // the scene, sRGB-encoded bytes (RGBA8 UNORM)
+layout(binding = 1) uniform sampler2D depth;   // the scene's depth (R32F, as stored), at the scene's own size
+layout(binding = 2, rgba8) uniform writeonly image2D eye;
+layout(binding = 3, std430) readonly buffer Rows { uint r[]; } rows;   // each depth row's least, then greatest, depth
+layout(push_constant) uniform Push {
+    vec2 size;        // the eye's picture, pixels
+    float shift;      // the eye's offset (view units, right positive) times P00
+    float plane_a;    // the stored depth d is plane_a + plane_b / distance
+    float plane_b;
+    float most;       // the largest move, in the picture's [0, 1]
+    float nearest;    // 1 / the nearest distance used, so a point at the camera does not move without end
+} p;
+
+float inv_distance(ivec2 t) { return clamp((texelFetch(depth, t, 0).r - p.plane_a) / p.plane_b, 0.0, p.nearest); }
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= int(p.size.x) || at.y >= int(p.size.y)) return;
+    const vec2 uv = (vec2(at) + 0.5) / p.size;
+    const ivec2 dsize = textureSize(depth, 0);
+    const float w = float(dsize.x);
+    const int row = clamp(int(uv.y * float(dsize.y)), 0, dsize.y - 1);
+    // the texels that can land here: u - move(u) = uv.x with move between 0 and the row's largest on the shift's side,
+    // that of the row's nearest depth (a row of far things needs a few texels, a row with a near one many)
+    const float ra = (uintBitsToFloat(rows.r[row]) - p.plane_a) / p.plane_b;
+    const float rb = (uintBitsToFloat(rows.r[dsize.y + row]) - p.plane_a) / p.plane_b;
+    const float row_most = min(p.most, 0.5 * abs(p.shift) * clamp(max(ra, rb), 0.0, p.nearest) + 2.0 / w);
+    const float lo = p.shift < 0.0 ? uv.x - row_most : uv.x, hi = p.shift > 0.0 ? uv.x + row_most : uv.x;
+    const int k0 = clamp(int(floor(lo * w)) - 1, 0, dsize.x - 1), k1 = clamp(int(ceil(hi * w)) + 1, 0, dsize.x - 1);
+    float best = -1.0, best_u = uv.x;   // the nearest surface found landing here, and where it is in the scene
+    float hole = 1e9, hole_u = uv.x;    // else the farther side of the nearest depth step landing around here
+    float hole_dir = 0.0;               // and which way the background goes on from it
+    float ia = inv_distance(ivec2(k0, row));
+    float ua = (float(k0) + 0.5) / w;
+    float la = ua - clamp(0.5 * p.shift * ia, -p.most, p.most);
+    for (int k = k0 + 1; k <= k1; k++) {
+        const float ib = inv_distance(ivec2(k, row));
+        const float ub = (float(k) + 0.5) / w;
+        const float lb = ub - clamp(0.5 * p.shift * ib, -p.most, p.most);
+        if ((la - uv.x) * (lb - uv.x) <= 0.0 && la != lb) {
+            const float t = clamp((uv.x - la) / (lb - la), 0.0, 1.0);
+            if (abs(ia - ib) <= 0.1 * max(ia, ib) + 1e-4) {   // one surface: the point between them lands here
+                const float i = mix(ia, ib, t);
+                if (i > best) best = i, best_u = mix(ua, ub, t);
+            } else {   // a depth step: what is behind it shows here unless a surface does
+                const float far_i = min(ia, ib);
+                if (far_i < hole) hole = far_i, hole_u = ia < ib ? ua : ub, hole_dir = ia < ib ? -1.0 : 1.0;
+            }
+        }
+        ia = ib, ua = ub, la = lb;
+    }
+    if (best < 0.0 && hole < 1e9) {
+        vec4 sum = vec4(0.0);
+        for (int j = 0; j < 6; j++) sum += texture(color, vec2(hole_u + hole_dir * float(j) * 1.5 / w, uv.y));
+        imageStore(eye, at, sum / 6.0);
+        return;
+    }
+    imageStore(eye, at, texture(color, vec2(best >= 0.0 ? best_u : uv.x, uv.y)));
+}

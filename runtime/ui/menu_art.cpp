@@ -5,6 +5,7 @@
 // it, and registers it with Dear ImGui's Vulkan back end. Without the files the menu draws its plain shapes.
 #include <atomic>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,7 +28,7 @@ static const char *const kNames[MENU_ART_COUNT] = {
     "LocationDeco_00", "CtrlGuideBG_00", "MessageWindowCommonBase_00",
     "BtnThinBase_01", "BtnThinBase_00", "BtnThinBase_05", "BtnThinBase_04", "BtnThinBase_02",
     "OptionBtnThinCursorGlow_00", "OptionBtnThinCursorLine_00", "SystemCaptionBg_00",
-    "OptionSeparateMark_00", "SystemLine_03", "MenuHeaderSelect_00",
+    "OptionSeparateMark_00", "SystemLine_03", "MenuHeaderSelect_00", "HUDNaviIcon_Body_00",
 };
 // Levels uploaded for each art: the buttons draw it at about half size and smaller, where a line one or two texels wide
 // would break up if sampled from the full image alone.
@@ -222,6 +223,60 @@ extern "C" int menu_art(MenuArt id, ImTextureID *tex, float *w, float *h) {
     return 1;
 }
 
+// VR's wheels' icons (menu_icon): each decoded once on a worker, its pixels kept, uploaded at its first draw
+enum { ICONS_MAX = 64 };
+static struct Icon {
+    char file[96], tex[64];
+    std::atomic<int> state;   // 0 waiting for the worker, 1 decoded, 2 not in the files, 3 being written
+    Art art;
+} g_icons[ICONS_MAX];
+static int g_icon_n;   // the window thread alone adds
+static std::atomic<int> g_icon_worker;   // 1 while the worker runs
+
+static void decode_icons(void *) {
+    for (;;) {
+        Icon *todo = nullptr;
+        for (int i = 0; i < ICONS_MAX && !todo; i++)
+            if (g_icons[i].file[0] && g_icons[i].state.load(std::memory_order_acquire) == 0) todo = &g_icons[i];
+        if (!todo) break;
+        size_t n = 0;
+        uint8_t *bntx = menu_asset_load(todo->file, &n);
+        Art &a = todo->art;
+        const int ok = bntx && menu_asset_texture(bntx, n, todo->tex, &a.rgba, &a.w, &a.h);
+        free(bntx);
+        if (!ok) rt_log("menu: icon %s of %s not decoded", todo->tex, todo->file);
+        todo->state.store(ok ? 1 : 2, std::memory_order_release);
+    }
+    g_icon_worker.store(0, std::memory_order_release);
+}
+
+extern "C" int menu_icon(const char *file, const char *tex, ImTextureID *out) {
+    Icon *ic = nullptr;
+    for (int i = 0; i < g_icon_n && !ic; i++)
+        if (!strcmp(g_icons[i].file, file) && !strcmp(g_icons[i].tex, tex)) ic = &g_icons[i];
+    if (!ic) {
+        if (g_icon_n >= ICONS_MAX) return 0;
+        ic = &g_icons[g_icon_n++];
+        ic->state.store(3);   // being written: the worker passes it by
+        snprintf(ic->tex, sizeof ic->tex, "%s", tex);
+        snprintf(ic->file, sizeof ic->file, "%s", file);
+        ic->state.store(0, std::memory_order_release);
+    }
+    const int st = ic->state.load(std::memory_order_acquire);
+    if (st == 0) {
+        int idle = 0;
+        if (g_icon_worker.compare_exchange_strong(idle, 1) && !plat_thread_spawn(decode_icons, nullptr, "menu-icons", 0))
+            decode_icons(nullptr);
+        return 0;
+    }
+    if (st != 1) return 0;
+    Art &a = ic->art;
+    if (!a.ds && !a.failed && !upload(a)) a.failed = 1;
+    if (!a.ds) return 0;
+    *out = (ImTextureID)a.ds;
+    return 1;
+}
+
 extern "C" void menu_art_release(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
@@ -229,6 +284,7 @@ extern "C" void menu_art_release(void) {
         art_free(a);
         a.failed = 0;   // uploaded again at the next use
     }
+    for (int i = 0; i < g_icon_n; i++) art_free(g_icons[i].art), g_icons[i].art.failed = 0;
     art_free(g_font);   // the menu makes its atlas again after the back end starts again (fonts_up)
     ImGui::GetIO().Fonts->SetTexID(0);
     if (g_sampler) vkDestroySampler(c->device, g_sampler, nullptr), g_sampler = VK_NULL_HANDLE;

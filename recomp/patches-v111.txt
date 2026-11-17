@@ -308,6 +308,14 @@ site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
 # own work.
 site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70
 
+# VR's lens (runtime/vr_game.c vr_lens_host; switched on at start with the head's view, NX2NAVI_VR_VIEW=head). Further on
+# in the same camera update, main+0x4c52f8 loads the camera's vertical view angle (+0x13c of the camera, x19), from which
+# the next instructions write the angle and its half-angle's sine, cosine and tangent into sead's perspective
+# projection: rendering and the CPU's culling both follow the angle loaded here. The load goes to the host function on
+# the patch page (+0xf90), which does it and puts the headset's angle in its place for the camera the head is on.
+set vrlens NX2NAVI_PATCH_VR_LENS 0
+site vrlens main 4c52f8 bd413e60 95276f26   # ldr s0, [x19, #0x13c] -> bl page+0xf90
+
 # Occlusion queries off, an experiment (patch_occlusion_off = 1; off by default). main+0x11ac790 copies the values of a
 # parameter object (x20) into a list of options (x21): an option is found by the CRC-32 of its name (vtable +0x38) and
 # keeps its value at +0x18. Two of the parameters are CreateZPrePassOcclusionQuery (the byte main+0xf5acc0 returns:

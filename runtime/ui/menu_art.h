@@ -18,6 +18,7 @@ typedef enum {
     MENU_ART_DIVIDER,       // the options menu's divider ornament
     MENU_ART_DIVIDER_LINE,  // the line beside the ornament, ending in a dot
     MENU_ART_TAB_SELECT,    // the plate of the selected category in the game's menu header
+    MENU_ART_NAVI_ICON,     // Navi on the HUD (VR's D-pad wheel)
     MENU_ART_COUNT
 } MenuArt;
 
@@ -26,6 +27,9 @@ extern "C" void menu_art_start(void);    // decodes the textures on a worker, on
 // Window thread: the first call for an art uploads it.
 extern "C" int menu_art(MenuArt id, ImTextureID *tex, float *w, float *h);
 extern "C" void menu_art_release(void);  // before ImGui's Vulkan back end shuts down; the font atlas goes too
+// A texture of another BNTX archive of the RomFS (file) by its name (tex), for VR's wheels: decoded on a worker the first
+// time it is asked for, then uploaded here (window thread) and kept; 0 until it is there or when it is not in the files.
+extern "C" int menu_icon(const char *file, const char *tex, ImTextureID *out);
 // The font atlas's pixels (w x h, RGBA) as a texture for the draw lists in *tex; 0 when it could not be made, the previous
 // atlas then kept. The previous one is freed once the queue has finished with it.
 extern "C" int menu_font_upload(const unsigned char *rgba, int w, int h, ImTextureID *tex);

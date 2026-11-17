@@ -33,6 +33,7 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_lowlat.h"
+#include "vk_xr.h"
 
 #define FRAMES 2
 #define MAX_IMAGES 16
@@ -1815,6 +1816,17 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     }
+    // VR (vk_xr.cpp): the window's image, the menu over the game, copied for the headset; the submit signals it
+    VkSemaphoreSubmitInfo xr_sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    if (vk_xr_wants_capture(g_sc_hdr)) {
+        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        last_write = 0;
+        vk_xr_capture(cb, dst, g_sc_ext, g_sc_fmt, src,
+                      general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rect, &xr_sig);
+    }
     if (cap) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1872,11 +1884,14 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         si.waitSemaphoreInfoCount = ng_n > 2 ? 1u : 0u;
         if (ng_n > 2) ng_wait_signaled(ng_n - 2);
     }
+    const VkSemaphoreSubmitInfo sigs[2] = {sig, xr_sig};
+    if (xr_sig.semaphore) si.signalSemaphoreInfoCount = 2, si.pSignalSemaphoreInfos = sigs;
     vk_queue_lock();
     pts_sub[slot] = plat_now_ns();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
     if (r != VK_SUCCESS) pts_on[slot] = 0;
+    if (r == VK_SUCCESS) vk_xr_captured(&xr_sig);
     if (r == VK_SUCCESS && via_ng) {   // the presenter shows the generated frames, then this one
         ng.n = ng_n;
         ng_hand(idx, ng_count, ng_set, ng_n);

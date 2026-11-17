@@ -25,6 +25,7 @@
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
+#include "vk_xr.h"
 #include "platform/platform.h"
 
 enum { STICK_MAX = 32767, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
@@ -1274,6 +1275,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             if (travel - travel_seen >= MOUSE_USED) kbm_used = 1;
             travel_seen = travel;
         }
+        pad_used |= vk_xr_pad(&b, sl, sr);   // VR's hand controllers, as the pad
         // A press or a full-way stick on the pad wins over keys held in the same poll: the player picked it up
         if (pad_used) __atomic_store_n(&g_kbm_last, 0, __ATOMIC_RELAXED);
         else if (kbm_used) __atomic_store_n(&g_kbm_last, 1, __ATOMIC_RELAXED);

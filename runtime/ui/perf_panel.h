@@ -19,4 +19,5 @@ typedef struct {
 } PerfPanel;
 
 // The panel at the top right corner of a width-pixel-wide frame.
-void perf_panel_draw(const PerfPanel *p, float width, float scale);
+// rect: where it was drawn (x, y, width, height in the target's pixels)
+void perf_panel_draw(const PerfPanel *p, float width, float scale, float rect[4]);

@@ -61,6 +61,8 @@ extern "C" {
 #include "ui_text.h"
 #include "vk_dlssg.h"
 #include "vk_lowlat.h"
+#include "vk_xr.h"
+#include "vr_wheel.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -367,7 +369,7 @@ static int vk_up(const MenuTarget *t) {
     ii.Device = t->device;
     ii.QueueFamily = t->queue_family;
     ii.Queue = t->queue;
-    ii.DescriptorPoolSize = 32;   // the art's sets, and two font atlases while one replaces the other
+    ii.DescriptorPoolSize = 128;   // the art's sets, two font atlases while one replaces the other, VR's wheels' icons (64)
     ii.CheckVkResultFn = menu_vk_check;
     ii.MinImageCount = 2;
     ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than gfx_present.c's 2 frames in flight
@@ -581,7 +583,7 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
 // (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 // Ocarina of Time: the options this port has
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_VR, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16, TEST_OPENS = 8 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -1741,8 +1743,57 @@ static void tab_controls(float scale) {
     binds_after_page();
 }
 
+// VR (vk_xr.cpp, vr_game.c): the headset at the next start, then how the view, the eyes and the HUD are placed
+static void tab_vr(float scale) {
+    opt_begin("##vr", scale);
+    opt_toggle("NX2NAVI_VR", UI_MENU_VR, UI_MENU_VR_DESC);
+    opt_group(UI_MENU_VR_GROUP_VIEW);
+    static const UiTextId views[] = {UI_MENU_VR_VIEW_SCREEN, UI_MENU_VR_VIEW_HEAD};
+    opt_choice("NX2NAVI_VR_VIEW", UI_MENU_VR_VIEW, views, 2, UI_MENU_VR_VIEW_DESC);
+    opt_slider("NX2NAVI_VR_SCREEN_SIZE", UI_MENU_VR_SCREEN_SIZE, 45, 125, UI_MENU_VR_SCREEN_SIZE_DESC, 5, "%.0f degrees");
+    opt_toggle("NX2NAVI_VR_SCREEN_CURVE", UI_MENU_VR_SCREEN_CURVE, UI_MENU_VR_SCREEN_CURVE_DESC);
+    static const UiTextId cameras[] = {UI_MENU_VR_CAMERA_FIRST, UI_MENU_VR_CAMERA_THIRD};
+    opt_choice("NX2NAVI_VR_CAMERA", UI_MENU_VR_CAMERA, cameras, 2, UI_MENU_VR_CAMERA_DESC);
+    opt_slider("NX2NAVI_VR_VIEW_SCALE", UI_MENU_VR_SCALE, 50, 200, UI_MENU_VR_SCALE_DESC, 5, "%.0f %%");
+    {
+        static const UiTextId stereos[] = {UI_MENU_VR_STEREO_PERFORMANT, UI_MENU_VR_STEREO_BALANCED,
+                                           UI_MENU_VR_STEREO_ACCURATE};
+        opt_choice("NX2NAVI_VR_STEREO", UI_MENU_VR_STEREO, stereos, 3, UI_MENU_VR_STEREO_DESC);
+    }
+    opt_slider("NX2NAVI_VR_DEPTH", UI_MENU_VR_DEPTH, 0, 200, UI_MENU_VR_DEPTH_DESC, 5, "%.0f %%");
+    opt_group(UI_MENU_VR_GROUP_EYES);
+    opt_slider("NX2NAVI_VR_EYE_UP", UI_MENU_VR_EYE_UP, -30, 30, UI_MENU_VR_EYE_UP_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EYE_SIDE", UI_MENU_VR_EYE_SIDE, -30, 30, UI_MENU_VR_EYE_SIDE_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EYE_FORWARD", UI_MENU_VR_EYE_FORWARD, -30, 30, UI_MENU_VR_EYE_FORWARD_DESC, 1, "%+.0f cm");
+    opt_slider("NX2NAVI_VR_EVENT_UP", UI_MENU_VR_EVENT_UP, -50, 50, UI_MENU_VR_EVENT_UP_DESC, 1, "%+.0f cm");
+    opt_group(UI_MENU_VR_GROUP_CONTROLS);
+    {   // the description of the scheme chosen: its buttons
+        static const UiTextId schemes[] = {UI_MENU_VR_CONTROLS_PAD, UI_MENU_VR_CONTROLS_META};
+        const bool meta = strcmp(cfg_value("NX2NAVI_VR_CONTROLS"), "meta") == 0;
+        opt_choice("NX2NAVI_VR_CONTROLS", UI_MENU_VR_CONTROLS, schemes, 2,
+                   meta ? UI_MENU_VR_CONTROLS_META_DESC : UI_MENU_VR_CONTROLS_PAD_DESC);
+    }
+    {
+        static const UiTextId hands[] = {UI_MENU_VR_HANDEDNESS_LEFT, UI_MENU_VR_HANDEDNESS_RIGHT};
+        opt_choice("NX2NAVI_VR_HANDEDNESS", UI_MENU_VR_HANDEDNESS, hands, 2, UI_MENU_VR_HANDEDNESS_DESC);
+    }
+    {
+        static const UiTextId plays[] = {UI_MENU_VR_PLAY_STATIONARY, UI_MENU_VR_PLAY_MOTION};
+        opt_choice("NX2NAVI_VR_PLAY", UI_MENU_VR_PLAY, plays, 2, UI_MENU_VR_PLAY_DESC);
+    }
+    opt_slider("NX2NAVI_VR_AIM_TILT", UI_MENU_VR_AIM_TILT, 0, 60, UI_MENU_VR_AIM_TILT_DESC, 1, "%.0f degrees");
+    opt_slider("NX2NAVI_VR_SWING_SPEED", UI_MENU_VR_SWING_SPEED, 100, 500, UI_MENU_VR_SWING_SPEED_DESC, 10, "%.0f cm/s");
+    opt_slider("NX2NAVI_VR_CHARGE_REACH", UI_MENU_VR_CHARGE_REACH, 25, 70, UI_MENU_VR_CHARGE_REACH_DESC, 1, "%.0f cm");
+    opt_slider("NX2NAVI_VR_RUN_ZONE", UI_MENU_VR_RUN_ZONE, 0, 20, UI_MENU_VR_RUN_ZONE_DESC, 1, "%.0f degrees");
+    opt_group(UI_MENU_VR_GROUP_HUD);
+    static const UiTextId huds[] = {UI_MENU_VR_HUD_PANEL, UI_MENU_VR_HUD_PICTURE};
+    opt_choice("NX2NAVI_VR_HUD", UI_MENU_VR_HUD, huds, 2, UI_MENU_VR_HUD_DESC);
+    opt_slider("NX2NAVI_VR_HUD_SIZE", UI_MENU_VR_HUD_SIZE, 40, 200, UI_MENU_VR_HUD_SIZE_DESC, 5, "%.0f cm");
+    opt_end();
+}
+
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_VR};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -1863,6 +1914,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_GAME: tab_game(scale); break;
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_VR: tab_vr(scale); break;
             }
             ImGui::EndTabItem();
         }
@@ -2055,6 +2107,7 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
 }
 
 // The full panel (ui/perf_panel.cpp draws it in the menu's look): the numbers of this frame.
+static float g_perf_rect[4];   // where the overlay was drawn this frame (menu_perf_rect); width 0: nowhere
 static void perf_full_draw(const MenuTarget *t, float scale) {
     static PerfPanel p;
     perfmon_snapshot(&p.s);
@@ -2071,10 +2124,11 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     perf_picture(t, &p);
     p.fg_fps = gfx_output_fps() > 0 ? (float)gfx_output_fps() : 0;
     p.under_menu = g_open.load(std::memory_order_relaxed) != 0;
-    perf_panel_draw(&p, (float)t->width, scale);
+    perf_panel_draw(&p, (float)t->width, scale, g_perf_rect);
 }
 
 static void perf_draw(const MenuTarget *t, float scale) {
+    g_perf_rect[2] = 0;
     if (g_perf_mode == 2) return perf_full_draw(t, scale);
     float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
@@ -2086,6 +2140,131 @@ static void perf_draw(const MenuTarget *t, float scale) {
     // a small panel in the menu's look (ui/menu_skin.cpp), its frame scaled to the line
     skin_panel(dl, p, ImVec2(p.x + sz.x + padx * 2, p.y + sz.y + pady * 2), scale * 0.6f, 0.9f);
     dl->AddText(ImVec2(p.x + padx, p.y + pady), SKIN_TEXT, g_perf_text);
+    g_perf_rect[0] = p.x, g_perf_rect[1] = p.y, g_perf_rect[2] = sz.x + padx * 2, g_perf_rect[3] = sz.y + pady * 2;
+}
+
+int menu_perf_rect(int r[4]) {
+    if (!(g_perf_rect[2] > 0) || !(g_perf_rect[3] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_perf_rect[i]) : ceilf(g_perf_rect[i]));
+    return 1;
+}
+
+// VR's wheels (vk_xr.cpp vk_xr_wheel: a Touch trigger held) around the middle of the window, slot 0 up and clockwise
+// (vr_wheel.c: kind 1 the D-pad's four actions, 2 the items): each slot the game's icon of what it holds, empty when
+// the save does not own it; the slot the stick is held toward lit, its icon large in the middle. vk_xr.cpp copies the
+// disc onto the middle of the HUD.
+static float g_wheel_rect[4];   // the disc's square this frame (menu_wheel_rect); width 0: not drawn
+static float g_wheel_label[4];  // the hovered item's name under it (menu_wheel_label); width 0: none
+static bool icon_tex(const VrIcon &ic, ImTextureID *tex) {
+    if (!strcmp(ic.tex, "HUDNaviIcon_Body_00")) return menu_art(MENU_ART_NAVI_ICON, tex, nullptr, nullptr) != 0;
+    return menu_icon(ic.file, ic.tex, tex) != 0;
+}
+// a count, size high, centred on c or (corner) with its bottom right at c, outlined so it reads over any icon: green
+// full (max known), yellow at a quarter of the max or less, red none, white otherwise
+static void count_draw(ImDrawList *dl, int n, int max, ImVec2 c, float size, bool corner) {
+    if (n < 0) return;
+    char text[16];
+    snprintf(text, sizeof text, "%d", n);
+    ImFont *font = ImGui::GetFont();
+    const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, text);
+    const ImVec2 at = corner ? ImVec2(c.x - ts.x, c.y - ts.y + size * 0.1f)
+                             : ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f);
+    const float o = size * 0.07f > 1 ? size * 0.07f : 1;
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++)
+            if (dx || dy) dl->AddText(font, size, ImVec2(at.x + dx * o, at.y + dy * o), IM_COL32(0, 0, 0, 230), text);
+    const ImU32 col = n <= 0                  ? IM_COL32(255, 110, 90, 255)
+                      : max > 0 && n >= max   ? IM_COL32(120, 255, 120, 255)
+                      : max > 0 && n * 4 <= max ? IM_COL32(255, 225, 80, 255)
+                                              : IM_COL32(255, 255, 255, 255);
+    dl->AddText(font, size, at, col, text);
+}
+// a small icon centred on p, m wide, its count at its bottom right
+static void mini_draw(ImDrawList *dl, const VrIcon &ic, int count, int max, ImVec2 p, float m) {
+    ImTextureID tex;
+    const ImVec2 a(p.x - m * 0.5f, p.y - m * 0.5f), b(p.x + m * 0.5f, p.y + m * 0.5f);
+    if (icon_tex(ic, &tex)) dl->AddImage(tex, a, b);
+    count_draw(dl, count, max, b, m * 0.36f, true);
+}
+// a slot's icon centred on p, size wide, and the adult's arrows in a row along its bottom (the one in use framed); the
+// slot's own count and the swaps' small icons are drawn around it by wheel_draw
+static void slot_draw(ImDrawList *dl, const VrSlot &s, ImVec2 p, float size) {
+    ImTextureID tex;
+    const float h = size * 0.5f;
+    if (icon_tex(s.main, &tex)) dl->AddImage(tex, ImVec2(p.x - h, p.y - h), ImVec2(p.x + h, p.y + h));
+    if (!s.minis || s.mini_selected < 0) return;
+    const float m = size * (s.mini_selected >= 0 ? 0.3f : 0.42f), gap = m * 0.08f;
+    const float row = s.minis * m + (s.minis - 1) * gap;
+    float x = p.x - row * 0.5f;
+    const float y = p.y + h - m * 0.75f;
+    for (int i = 0; i < s.minis; i++, x += m + gap) {
+        if (icon_tex(s.mini[i], &tex)) dl->AddImage(tex, ImVec2(x, y), ImVec2(x + m, y + m));
+        count_draw(dl, s.mini_count[i], s.mini_max[i], ImVec2(x + m, y + m), m * 0.36f, true);
+        if (i == s.mini_selected)
+            dl->AddRect(ImVec2(x - 1, y - 1), ImVec2(x + m + 1, y + m + 1), IM_COL32(255, 255, 255, 255), 0, 0, 2.0f);
+    }
+}
+static void wheel_draw(const MenuTarget *t, float scale, int kind, int picked) {
+    const int n = vr_wheel_slots(kind);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    const float w = (float)t->width, h = (float)t->height;
+    const ImVec2 c(w * 0.5f, h * 0.5f);
+    const float R = 0.36f * (w < h ? w : h), r = 0.34f * R, pi = 3.14159265f, step = 2 * pi / n;
+    dl->AddCircleFilled(c, R, IM_COL32(24, 18, 12, 235), 96);
+    const auto at = [&](float a, float rad) { return ImVec2(c.x + sinf(a) * rad, c.y - cosf(a) * rad); };
+    // each slot's icon as large as fits between its lines and the rings
+    const float mid = 0.5f * (R + r), chord = 2 * mid * sinf(step * 0.5f);
+    const float icon = 0.92f * (chord < R - r ? chord : R - r);
+    VrSlot s;
+    for (int i = 0; i < n; i++) {
+        const float a0 = (i - 0.5f) * step, a1 = (i + 0.5f) * step;
+        if (i == picked)
+            for (int k = 0; k < 12; k++) {
+                const float b0 = a0 + (a1 - a0) * k / 12, b1 = a0 + (a1 - a0) * (k + 1) / 12;
+                dl->AddQuadFilled(at(b0, r), at(b0, R - 2), at(b1, R - 2), at(b1, r), IM_COL32(150, 112, 50, 235));
+            }
+        dl->AddLine(at(a0, r), at(a0, R), SKIN_GOLD, 2.0f);
+        if (vr_wheel_slot(kind, i, &s)) {   // its count between the icon and the inner ring, its swaps by the outer one
+            slot_draw(dl, s, at(i * step, mid), icon);
+            count_draw(dl, s.count, s.max, at(i * step, 0.5f * (r + mid - icon * 0.5f)), icon * 0.28f, false);
+            if (s.minis && s.mini_selected < 0) {
+                const float m = icon * 0.42f, out = 0.5f * (mid + icon * 0.5f + R), spread = m * 1.1f / out;
+                for (int k = 0; k < s.minis; k++)
+                    mini_draw(dl, s.mini[k], s.mini_count[k], s.mini_max[k],
+                              at(i * step + (k - 0.5f * (s.minis - 1)) * spread, out), m);
+            }
+        }
+    }
+    dl->AddCircle(c, R - 1, SKIN_GOLD, 96, 3.0f);
+    dl->AddCircle(c, r, SKIN_GOLD, 64, 2.0f);
+    g_wheel_rect[0] = c.x - R, g_wheel_rect[1] = c.y - R, g_wheel_rect[2] = g_wheel_rect[3] = 2 * R;
+    g_wheel_label[2] = 0;
+    if (picked < 0 || !vr_wheel_slot(kind, picked, &s)) return;
+    {   // the middle: only what the release equips
+        VrSlot only = {};
+        only.main = s.now, only.count = -1;
+        slot_draw(dl, only, c, 1.35f * r);
+    }
+    if (!s.label) return;
+    // the name on a small panel under the disc, as the game names the item under its own bar
+    const ImVec2 ts = ImGui::CalcTextSize(s.label);
+    const float padx = 14 * scale, pady = 7 * scale;
+    const ImVec2 a(c.x - ts.x * 0.5f - padx, c.y + R + 8 * scale), b(c.x + ts.x * 0.5f + padx, a.y + ts.y + 2 * pady);
+    skin_panel(dl, a, b, scale * 0.6f, 0.9f);
+    dl->AddText(ImVec2(a.x + padx, a.y + pady), SKIN_TEXT, s.label);
+    g_wheel_label[0] = a.x, g_wheel_label[1] = a.y, g_wheel_label[2] = b.x - a.x, g_wheel_label[3] = b.y - a.y;
+}
+
+int menu_wheel_rect(int r[4]) {
+    if (!(g_wheel_rect[2] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_wheel_rect[i]) : ceilf(g_wheel_rect[i]));
+    return 1;
+}
+
+int menu_wheel_label(int r[4]) {
+    if (!(g_wheel_rect[2] > 0) || !(g_wheel_label[2] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? floorf(g_wheel_label[i]) : ceilf(g_wheel_label[i]));
+    return 1;
 }
 
 // The note after F8 (bugcap.c): the capture's number and its folder's name for a few seconds, top centre, in the
@@ -2124,6 +2303,9 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     int cap_number, cap_ok;
     char cap_name[64];
     const bool capture_shows = bugcap_note(&cap_number, &cap_ok, cap_name) != 0;   // the note after F8
+    g_wheel_rect[2] = 0;
+    int wheel_slot = -1;
+    const int wheel = g_open.load(std::memory_order_relaxed) ? 0 : vk_xr_wheel(&wheel_slot);   // VR's wheels
     if (g_booting.load(std::memory_order_relaxed)) g_booting.store(0, std::memory_order_release);   // the game runs
     bool open = g_open.load(std::memory_order_relaxed);
     // the frame the menu is first laid out after opening: also when its g_reset went to an earlier frame of the overlay
@@ -2141,7 +2323,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
             if (g_debug.load()) debug_menu_tab(0);
             set_open(1);
             open = true;
-        } else if (!g_perf_mode && !capture_shows) {
+        } else if (!g_perf_mode && !capture_shows && !wheel) {
             return 0;
         }
     }
@@ -2206,6 +2388,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
         layout_menu(t->width, t->height, scale);
     }
     perf_draw(t, scale);
+    if (wheel && !open) wheel_draw(t, scale, wheel, wheel_slot);
     capture_note(t, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);

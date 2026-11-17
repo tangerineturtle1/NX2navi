@@ -30,6 +30,9 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
 // fg_only_frame): the motion passes run as for the upscaler (vk_usnap.c, vk_exec_draw.c, vk_mvprev.c), nothing is
 // jittered. Read at each present.
 int vk_dlaa_fg_only(void);
+// ... and something takes motion from it: frame generation does, VR's depth stereo alone does not (vk_mvprev.c,
+// vk_exec_draw.c's per-object motion skip their work then)
+int vk_dlaa_fg_motion(void);
 // ... their views, and this frame's camera for DLSS Frame Generation (vk_dlssg.c): matrices for row vectors (v * M, the
 // rows stored in order), as Streamline takes them; 0 without a camera that frame.
 // znear and zfar: the view distances the depth buffer holds as 0 and 1 (1 and 0 when inverted), from the frame's own
@@ -49,6 +52,9 @@ int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
 // upscaler's picture or, without an upscaler, from the game's own scaled picture; 1 once per evaluation.
 extern int vk_dlaa_hudless_wanted;
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt);
+// VR's depth stereo (vk_xr.cpp vk_xr_capture), at the present: the stored depth d of a view distance z in the frame's
+// scene depth (the one vk_xr_keep_depth copied) as planes[0] + planes[1] / z; 0 without a recent frame
+int vk_dlaa_vr_planes(float planes[2]);
 int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is AMD FSR 3.1 (NX2NAVI_TAA = fsr3) instead of DLSS
 int vk_dlaa_ffx_camera(VkFfxCamera *c);     // the same camera as FSR takes it (vk_ffx.h); 0 without one that frame
 // vk_device.c: NGX's instance and device extensions join the lists (room for max names); vk_dlaa_init after the

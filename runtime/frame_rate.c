@@ -59,6 +59,7 @@
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
+#include "vk_xr.h"
 
 #define STEP_SAMPLES 5
 #define STEP_MAX_S (1.0 / 15.0)    // longest step; a longer frame slows the game down
@@ -425,6 +426,8 @@ static double ocarina_step_s(void) {
     return base * speed / 60.0;
 }
 
+double frame_step_update_s(void) { return ocarina_step_s(); }
+
 static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight, frame_step_presents)
 
 // The game's presents so far, one per update of the game at any frame rate (input.c shake_stick counts its updates).
@@ -765,6 +768,13 @@ static void ocarina_step_write(double dt) {
     }
     if (!on || dt <= 0) return;
     if (ostep_page) {   // the set ostep: the game makes its whole nominal frame from this, the interface's included
+        static int held;
+        static double owed;
+        if (vk_xr_holds_time()) {   // VR's Stereo Accurate: one update steps two frames' time (at most the longest step),
+            if (held) owed = dt - STEP_MIN_S, dt = STEP_MIN_S;   // the next the shortest, so both eyes see one moment
+            else dt += owed, owed = 0;
+            held ^= 1;
+        } else held = 0, owed = 0;
         if (dt < 1.0 / 1000) dt = 1.0 / 1000;
         if (dt > STEP_MAX_S) dt = STEP_MAX_S;
         float f = (float)(dt * 60.0);

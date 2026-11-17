@@ -1,0 +1,33 @@
+#version 450
+// VR's hands (runtime/vk_xr.cpp make_hands): the models drawn for the hands put into a picture (an eye's, the scene the
+// HUD's shader left without depth stereo, or the desktop's overlay, cleared to clear) where they are nearer than the
+// scene's kept depth: their colour, sRGB-encoded, alpha 1
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D color;   // the models' colour (an sRGB target, read as linear), alpha 0 where none
+layout(binding = 1) uniform sampler2D dist;    // their distance along the view, metres (16-bit float)
+layout(binding = 2, rgba8) uniform writeonly image2D scene;   // sRGB-encoded bytes
+layout(binding = 3, r32f) uniform readonly image2D depth;    // as stored: plane_a + plane_b / distance
+layout(binding = 4, std430) buffer Rows { uint r[]; } rows;
+layout(push_constant) uniform Push {
+    ivec2 size;    // the scene's
+    ivec2 dsize;   // the depth's
+    float plane_a, plane_b;
+} p;
+
+vec3 encode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, p.size))) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(p.size);   // (the models are drawn smaller than the scene)
+    const vec4 c = texture(color, uv);
+    if (c.a < 0.5) return;
+    const float d = texture(dist, uv).r;   // (nearest)
+    const ivec2 t = clamp(ivec2((vec2(at) + 0.5) / vec2(p.size) * vec2(p.dsize)), ivec2(0), p.dsize - 1);
+    const float surface = (imageLoad(depth, t).r - p.plane_a) / p.plane_b;   // 1 / the scene's distance
+    if (!(d > 0.0) || 1.0 / d <= surface) return;   // behind the scene
+    imageStore(scene, at, vec4(encode(c.rgb / c.a), 1.0));
+}

@@ -1,0 +1,32 @@
+#version 450
+// VR's HUD panel (runtime/vk_xr.cpp vk_xr_capture). The game upscales its scene into a float target and draws the HUD
+// over it there; vk_exec_draw.c keeps that target as the upscaler left it (scene), and at the present it holds the HUD
+// too (hud). Both linear. Out, sRGB-encoded as the window's texture holds the game's picture: the scene without the HUD
+// for the head's view, and the panel, what the HUD changed, premultiplied, transparent where nothing changed. keep_hud
+// (the HUD left in the picture, depth stereo on): the scene out is the picture with its HUD.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D hud;
+layout(binding = 1) uniform sampler2D scene;
+layout(binding = 2, rgba8) uniform writeonly image2D scene_out;
+layout(binding = 3, rgba8) uniform writeonly image2D panel_out;
+layout(push_constant) uniform Push {
+    ivec2 size;
+    int keep_hud;
+    int cut;   // the panel left clear within this many pixels of its middle (the game's reticle while Link aims), 0 none
+} p;
+
+vec3 encode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, p.size))) return;
+    const vec3 h = encode(texelFetch(hud, at, 0).rgb), s = encode(texelFetch(scene, at, 0).rgb);
+    const vec3 d = abs(h - s);
+    float a = smoothstep(0.01, 0.06, max(d.r, max(d.g, d.b)));
+    if (p.cut > 0 && length(vec2(at) + 0.5 - vec2(p.size) * 0.5) < float(p.cut)) a = 0.0;
+    imageStore(scene_out, at, vec4(p.keep_hud != 0 ? h : s, 1.0));
+    imageStore(panel_out, at, vec4(h * a, a));
+}

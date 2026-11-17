@@ -1,0 +1,22 @@
+#version 450
+// VR's depth stereo (runtime/vk_xr.cpp vk_xr_keep_depth): the scene's depth, as it is once the scene is drawn, into an
+// image of VR's own, which the game's later passes do not draw over, and each row's least and greatest stored depth
+// (rows: h least then h greatest, as the bits of positive floats, which order as the floats do; cleared to +inf and 0
+// before), from which the eyes' shader bounds its search along the row
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth;
+layout(binding = 1, r32f) uniform writeonly image2D kept;
+layout(binding = 2, std430) buffer Rows { uint r[]; } rows;
+layout(push_constant) uniform Push {
+    ivec2 size;
+} p;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, p.size))) return;
+    const float d = texelFetch(depth, at, 0).r;
+    imageStore(kept, at, vec4(d));
+    const uint bits = floatBitsToUint(max(d, 0.0));
+    atomicMin(rows.r[at.y], bits);
+    atomicMax(rows.r[p.size.y + at.y], bits);
+}

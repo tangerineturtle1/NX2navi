@@ -43,6 +43,11 @@ __attribute__((constructor)) static void day_register(void) {
     rt_register_host(RT_PATCH_PAGE + 0xf10, frame_rate_sound_gate_host);
     rt_register_host(RT_PATCH_PAGE + 0xf00, frame_rate_sound_step_host);
 }
+// VR's lens (vr_game.c vr_lens_host): the site of the set vrlens (patches-v111.txt) calls the page's +0xf90.
+#include "vr_game.h"
+__attribute__((constructor)) static void vr_register(void) {
+    if (RT_V111) rt_register_host(RT_PATCH_PAGE + 0xf90, vr_lens_host);
+}
 #endif
 
 #if RT_PATCH_COUNT
