@@ -48,6 +48,7 @@
 #include "host.h"
 #include "boot_warm.h"
 #include "mem_need.h"
+#include "lod.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "prp_file.h"
@@ -2737,8 +2738,184 @@ static int spirv_mark_list_test(const char *list) {
     return bad;
 }
 
+static VkShaderModule make_module_in(const uint32_t *w, uint64_t words, int early_ok);
+
+// The tree gather shader with its test of the foliage block's flag 2 gone, in a run that starts with the low trees'
+// shadow distance changed (lod.c lod_tree_shadow_split). The shader is the compute shader that reads the block's
+// row 32 .w (the low trees' shadow distance); the test is the flag word (row 6 .x, as an integer) and 2, which
+// becomes the word and 0. A malloc'd copy, or NULL when w is not that shader.
+static uint32_t *spirv_tree_shadow(const uint32_t *w, uint64_t n) {
+    if (!lod_tree_shadow_split() || n < 5) return NULL;
+    uint32_t bound = w[3], zero = 0, *o = NULL;
+    enum { C0 = 1, C2, C3, C6, C32, CHAIN, LOADED, CAST };
+    uint8_t *tag = calloc(bound ? bound : 1, 1), *is_int = calloc(bound ? bound : 1, 1);
+    uint64_t at[8];
+    int n_at = 0, reads_dist = 0;
+    for (uint64_t i = 5; tag && is_int && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 21 && len == 4 && w[i + 1] < bound) is_int[w[i + 1]] = w[i + 2] == 32 && w[i + 3];       // OpTypeInt, signed
+        else if (op == 43 && len == 4 && w[i + 1] < bound && w[i + 2] < bound && is_int[w[i + 1]]) {     // OpConstant
+            uint32_t v = w[i + 3];
+            tag[w[i + 2]] = v == 0 ? C0 : v == 2 ? C2 : v == 3 ? C3 : v == 6 ? C6 : v == 32 ? C32 : 0;
+            if (!v) zero = w[i + 2];
+        } else if (op == 65 && len == 7 && w[i + 2] < bound && w[i + 4] < bound && w[i + 5] < bound && w[i + 6] < bound &&
+                   tag[w[i + 4]] == C0) {                                                                // OpAccessChain
+            if (tag[w[i + 5]] == C6 && tag[w[i + 6]] == C0) tag[w[i + 2]] = CHAIN;
+            reads_dist |= tag[w[i + 5]] == C32 && tag[w[i + 6]] == C3;
+        } else if (op == 61 && len >= 4 && w[i + 2] < bound && w[i + 3] < bound && tag[w[i + 3]] == CHAIN) tag[w[i + 2]] = LOADED;
+        else if (op == 124 && len == 4 && w[i + 2] < bound && w[i + 3] < bound && tag[w[i + 3]] == LOADED) tag[w[i + 2]] = CAST;
+        else if (op == 199 && len == 5 && w[i + 3] < bound && w[i + 4] < bound && tag[w[i + 3]] == CAST && tag[w[i + 4]] == C2 &&
+                 n_at < 8)
+            at[n_at++] = i + 4;
+        i += len;
+    }
+    if (tag && is_int && reads_dist && n_at && zero && (o = malloc(n * 4))) {
+        memcpy(o, w, n * 4);
+        for (int k = 0; k < n_at; k++) o[at[k]] = zero;
+    }
+    free(tag), free(is_int);
+    return o;
+}
+
+// A foliage shader with its list capacities scaled by lod_foliage_capacity (lod.c): the capacities, and the offsets
+// of the arrays that follow an array of that many entries in the lists' buffers. Only a foliage list shader is
+// changed: one with one of those offsets, or one that holds a capacity together with the other constants of its list
+// (225280, 20480, and 2048 or 24640 with the numbers beside them). 18 of the game's list shaders hold a capacity
+// without any of the offsets; left as they were while the lists were scaled, they dropped entries past their old
+// capacity and the trees flickered. The capacities are common numbers, and 40960 is also the texture pool's length in
+// every translation since the translator's pool grew to 40960 slots, so a rewrite keyed on 40960 or 16384 alone scaled
+// the pool in other shaders and their textures went missing. The shaders that fill or read a list also drop an entry
+// whose index is above the capacity less one (an unsigned greater-than against 2047 or 20479, the constant's only use):
+// those limits are scaled too, 20479 in any shader (the leaves' mesh shaders hold it and nothing else of the lists),
+// 2047 in the list shaders that index the tree list's array at 16448. Unscaled, they kept the trees past 2,048 and the
+// leaves past 20,480 out of the picture at every capacity. In a
+// foliage shader the pool's array type may name the same constant as a capacity: it gets a constant of its own with
+// the old value, added right after that one, so the pool keeps its length. A malloc'd copy and its length in *n, or
+// NULL when nothing is scaled or the shader holds none of them.
+static uint32_t *spirv_foliage_lists(const uint32_t *w, uint64_t *n_io) {
+    uint32_t k = lod_foliage_capacity();
+    uint64_t n = *n_io;
+    if (k <= 1 || n < 5) return NULL;
+    uint32_t bound = w[3], *o = NULL;
+    uint8_t *ty = calloc(bound ? bound : 1, 1);       // 1 unsigned, 2 signed 32-bit integer type
+    uint8_t *arr_len = calloc(bound ? bound : 1, 1);  // the length of an OpTypeArray
+    if (!ty || !arr_len) return free(ty), free(arr_len), NULL;
+    int u288 = 0, u25600 = 0, u40960 = 0, i24640 = 0, i16448 = 0, offs = 0, u225280 = 0, u20480 = 0, u2048 = 0;
+    for (uint64_t i = 5; i < n;) {   // what the shader holds
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n || op == 54) break;   // OpFunction: the types and constants are all before it
+        if (op == 21 && len == 4 && w[i + 1] < bound && w[i + 2] == 32) ty[w[i + 1]] = w[i + 3] ? 2 : 1;
+        if (op == 28 && len == 4 && w[i + 3] < bound) arr_len[w[i + 3]] = 1;   // OpTypeArray
+        if (op == 43 && len == 4 && w[i + 1] < bound && ty[w[i + 1]]) {   // OpConstant
+            uint32_t v = w[i + 3];
+            int u = ty[w[i + 1]] == 1;
+            u288 |= u && v == 288, u25600 |= u && v == 25600, u40960 |= u && v == 40960;
+            i24640 |= !u && v == 24640, i16448 |= !u && v == 16448;
+            offs |= v == 81984 || v == 163904 || v == 327744;
+            u225280 |= u && v == 225280, u20480 |= u && v == 20480, u2048 |= u && v == 2048;
+        }
+        i += len;
+    }
+    int lists = offs || u225280 || u20480 || (u2048 && u288 && i24640 && i16448) || (i24640 && (u288 || u25600));
+    // the overflow tests: the ids of the constants 2047 and 20479 whose every use is OpUGreaterThan
+    uint8_t *gt = calloc(bound ? bound : 1, 1);   // 1 a 2047 or 20479 constant, 2 used elsewhere than in OpUGreaterThan
+    if (!gt) return free(ty), free(arr_len), NULL;
+    int cands = 0, gt_any = 0;
+    uint64_t body = n;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 54) { body = i; break; }
+        if (op == 43 && len == 4 && w[i + 1] < bound && ty[w[i + 1]] == 1 && w[i + 2] < bound &&
+            ((w[i + 3] == 2047 && lists && offs && i16448) || w[i + 3] == 20479))
+            gt[w[i + 2]] = 1, cands++;
+        i += len;
+    }
+    for (uint64_t i = body; cands && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        for (uint32_t a = 1; a < len; a++)
+            if (w[i + a] < bound && gt[w[i + a]]) gt[w[i + a]] = op == 172 && gt[w[i + a]] == 1 ? 1 : 2;   // OpUGreaterThan
+        i += len;
+    }
+    for (uint32_t id = 0; cands && id < bound; id++) gt_any |= gt[id] == 1;
+    if (!lists && !gt_any) return free(ty), free(arr_len), free(gt), NULL;   // not a foliage list shader
+    // the new value of each scaled constant, by the word that holds it; and the constants an array type keeps
+    uint64_t extra = 0;
+    uint32_t *nv_at = calloc(n, sizeof *nv_at);
+    if (!nv_at) return free(ty), free(arr_len), free(gt), NULL;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n || op == 54) break;
+        if (op == 43 && len == 4 && w[i + 1] < bound && ty[w[i + 1]]) {
+            uint32_t v = w[i + 3], nv = 0;
+            int u = ty[w[i + 1]] == 1;
+            if ((v == 2047 || v == 20479) && w[i + 2] < bound && gt[w[i + 2]] == 1) nv = (v + 1) * k - 1;
+            else if (!lists) nv = 0;   // a shader with only the overflow test: nothing else of it is a list's
+            else if ((v == 20480 || v == 40960) && (u || offs)) nv = v * k;
+            else if (v == 81984 || v == 163904 || v == 327744) nv = 64 + (v - 64) * k;
+            else if (v == 225280 && u) nv = v * k;
+            else if (v == 16384 && u && u40960) nv = v * k;
+            else if (v == 2048 && u && u288 && i24640 && i16448) nv = v * k;
+            else if (v == 24640 && !u && (u288 || u25600)) nv = 16448 + 8192 * k;
+            if (nv) {
+                nv_at[i + 3] = nv;
+                if (w[i + 2] < bound && arr_len[w[i + 2]]) extra += 4;
+            }
+        }
+        i += len;
+    }
+    uint64_t on = n + extra, j = 0;
+    o = malloc(on * 4);
+    if (o) {
+        uint32_t next = bound, *map = extra ? calloc(bound, sizeof *map) : NULL;   // old constant -> the array's copy
+        int scaled = 0;
+        if (extra && !map) free(o), o = NULL;
+        for (uint64_t i = 0; o && i < n;) {
+            uint32_t op = i < 5 ? 0 : w[i] & 0xffff, len = i < 5 ? 5 : w[i] >> 16;
+            if (!len || i + len > n) len = (uint32_t)(n - i);
+            memcpy(o + j, w + i, len * 4ull);
+            if (op == 28 && len == 4 && map && w[i + 3] < bound && map[w[i + 3]]) o[j + 3] = map[w[i + 3]];
+            if (op == 43 && len == 4 && nv_at[i + 3]) {
+                o[j + 3] = nv_at[i + 3], scaled = 1;
+                if (map && w[i + 2] < bound && arr_len[w[i + 2]]) {   // the array's own copy, with the old value
+                    o[j + 4] = w[i], o[j + 5] = w[i + 1], o[j + 6] = map[w[i + 2]] = next++, o[j + 7] = w[i + 3];
+                    j += 4;
+                }
+            }
+            j += len, i += len;
+        }
+        if (o && scaled) {
+            o[3] = next, *n_io = j;
+            static int told[3];   // a count of the list shaders changed: with the offsets, without, the overflow test only
+            int kind = !lists ? 2 : !offs, t = __atomic_add_fetch(&told[kind], 1, __ATOMIC_RELAXED);   // several threads
+            if (t <= 64 && !(t & (t - 1)))
+                rt_log("lod: foliage list capacities scaled in %d shaders %s", t,
+                       kind == 0 ? "with the array offsets" : kind == 1 ? "without the array offsets" : "with only an overflow test");
+        } else free(o), o = NULL;
+        free(map);
+    }
+    free(nv_at), free(ty), free(arr_len), free(gt);
+    return o;
+}
+
 // early_ok: a fragment shader whose pipeline has no alpha to coverage (spirv_pool_mark)
 static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_ok) {
+    uint64_t lists_n = words;
+    uint32_t *lists = spirv_foliage_lists(w, &lists_n);   // may add words: its length is lists_n
+    if (lists) words = lists_n;
+    uint32_t *tree = spirv_tree_shadow(lists ? lists : w, words);
+    if (tree) free(lists), lists = tree;
+    if (lists) {   // the rest works on the changed copy
+        VkShaderModule lm = make_module_in(lists, words, early_ok);
+        free(lists);
+        return lm;
+    }
+    return make_module_in(w, words, early_ok);
+}
+
+static VkShaderModule make_module_in(const uint32_t *w, uint64_t words, int early_ok) {
     const uint32_t *orig_w = w;   // for the log of a module the marks cannot take
     uint64_t orig_words = words, fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);

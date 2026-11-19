@@ -28,6 +28,7 @@
 #include "gfx.h"
 #include "motion_owner.h"
 #include "host.h"
+#include "lod.h"
 #include "nvn_api.h"
 #include "perfmon.h"
 #include "vk.h"
@@ -317,6 +318,7 @@ static void frame_end(uint64_t frame, const tex_t *t) {   // t: the presented te
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_exec_barrier_log(frame);
     vk_dlaa_frame();
+    lod_frame();               // the LoD distances changed in the menu: the game's parameters take them
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_gpu_passes_frame(frame);
