@@ -34,6 +34,12 @@ class Context:
             self._file = None
         self.log(f'--- NX2Saria launcher {self.version} ({"checkout" if self.layout.dev else "release"}) in '
                  f'{self.layout.root}; platform {sys.platform}; {describe()}')
+        if sys.platform.startswith('linux'):
+            from .platform.linux import udmabuf_log_line, udmabuf_status
+            self.udmabuf = udmabuf_status()
+            self.log(udmabuf_log_line(self.udmabuf))
+        else:
+            self.udmabuf = None
         from .toolchain import zstd_missing
         self.zstd_missing = zstd_missing(self.layout)
         if self.zstd_missing:

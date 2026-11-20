@@ -25,6 +25,16 @@ until the player selects Updates. Saves and settings are never touched.
 
 **Existing NX2navi installs.** NX2Saria does not move or rename a folder that NX2navi made: its game files, saves, profiles and mods stay where they are. New installs use the NX2Saria folder names. [Names and compatibility](branding.md) lists the older names that still work.
 
+### Linux guest memory
+
+On Linux, the launcher checks whether `/dev/udmabuf` is readable and writable and whether the module's
+`size_limit_mb` is at least 1024. When the module is present and either check needs attention, Settings offers an
+optional fix. Choosing it shows the exact change before asking PolicyKit (`pkexec`) for administrator approval. The
+fix adds a udev `uaccess` rule and sets the module limit to 1024 MB now and on later boots; Settings can remove those
+two configuration files again. Nothing runs with elevated privileges unless the player confirms. SteamOS and systems
+without `pkexec` do not offer the change. The launcher records the detected access, limit and result in
+`data/logs/launcher.log`.
+
 ## Look
 
 The window follows the game's options menu, with colours sampled from it: a wooden band across the whole top with

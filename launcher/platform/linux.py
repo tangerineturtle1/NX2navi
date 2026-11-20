@@ -7,6 +7,74 @@ import subprocess
 from pathlib import Path
 
 
+UDMABUF_MINIMUM_MB = 1024
+
+
+def udmabuf_status(device='/dev/udmabuf', parameter='/sys/module/udmabuf/parameters/size_limit_mb',
+                  which=shutil.which, read_text=None, accessible=None, os_release='/etc/os-release'):
+    """Describe udmabuf without privilege; injectable paths and probes keep the check isolated in tests."""
+    device, parameter = Path(device), Path(parameter)
+    read_text = read_text or (lambda path: path.read_text(encoding='utf-8').strip())
+    accessible = accessible or (lambda path: os.access(path, os.R_OK | os.W_OK))
+    try:
+        limit = int(read_text(parameter))
+    except (OSError, ValueError):
+        return None
+    device_accessible = bool(accessible(device))
+    steamos = False
+    try:
+        steamos = any(line.strip() == 'ID=steamos' for line in Path(os_release).read_text(encoding='utf-8').splitlines())
+    except OSError:
+        pass
+    needs_fix = not device_accessible or limit < UDMABUF_MINIMUM_MB
+    reason = ('module writable only on SteamOS' if steamos else 'pkexec not installed') if needs_fix and (
+        steamos or not which('pkexec')) else ''
+    offered = bool(needs_fix and not reason)
+    return {'accessible': device_accessible, 'limit_mb': limit, 'needs_fix': needs_fix,
+            'offered': offered, 'reason': reason, 'steamos': steamos}
+
+
+def run_udmabuf_fix(script, action, run=subprocess.run):
+    """Ask PolicyKit to run the single packaged script after the player confirms the requested action."""
+    if action not in ('apply', 'remove'):
+        raise ValueError('unknown udmabuf action')
+    try:
+        result = run(['pkexec', str(script), action], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)[:240]
+    if result.returncode:
+        if result.returncode in (126, 127):
+            return False, 'authorization refused or cancelled'
+        detail = (result.stderr or result.stdout or f'exit status {result.returncode}').strip()
+        return False, detail[:240]
+    return True, (result.stdout or 'completed').strip()[:240]
+
+
+def udmabuf_log_line(status):
+    """One bounded diagnostic line for the launcher log at startup."""
+    if status is None:
+        return 'udmabuf: module absent; offer=none'
+    accessible = 'yes' if status['accessible'] else 'no'
+    offered = 'yes' if status['offered'] else 'no'
+    reason = f" ({status['reason']})" if status['reason'] else ''
+    return (f"udmabuf: accessible={accessible}; size_limit_mb={status['limit_mb']}; "
+            f"offer={'offered' if offered == 'yes' else 'none'}{reason}")[:240]
+
+
+def udmabuf_fix_installed(rules='/etc/udev/rules.d/70-udmabuf-uaccess.rules',
+                           tmpfiles='/etc/tmpfiles.d/udmabuf.conf'):
+    return Path(rules).is_file() or Path(tmpfiles).is_file()
+
+
+def udmabuf_change_available(which=shutil.which, os_release='/etc/os-release'):
+    try:
+        steamos = any(line.strip() == 'ID=steamos'
+                      for line in Path(os_release).read_text(encoding='utf-8').splitlines())
+    except OSError:
+        steamos = False
+    return not steamos and bool(which('pkexec'))
+
+
 def _sdl_library():
     """Load the kit's SDL3 first, then the system copy; return a short source label for the log."""
     bundled = next((root / 'toolchain' / 'sdl3' / 'lib' / 'libSDL3.so.0'

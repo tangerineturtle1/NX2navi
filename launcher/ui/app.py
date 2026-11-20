@@ -56,7 +56,7 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2, 'mods': 1, 'mod_order': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2, 'udmabuf': 2}
 MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
 ORDER_PAGE = 10   # ... of the Load Order screen
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
@@ -788,13 +788,16 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order',
+                           'udmabuf'):
             self.sounds.play('back')
         if self.screen == 'color':
             self.pick_done()
         elif self.screen == 'settings':
             self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
+            self.show('settings')
+        elif self.screen == 'udmabuf':
             self.show('settings')
         elif self.screen == 'saves':
             self.show('home', self.home_row('Saves'))
@@ -1036,8 +1039,9 @@ class App:
                 desc=dump_desc),
             Row('value', 'Install Folder', gd, big=True, on=self.choose_folder, desc=folder_desc),
             Row('divider'),
-            self.toggle('Desktop Shortcut', 'desktop_shortcut',
-                        'Put an NX2Saria shortcut on the desktop. The Start menu always has one.'),
+            *([self.toggle('Desktop Shortcut', 'desktop_shortcut',
+                           'Put an NX2Saria shortcut on the desktop. The Start menu always has one.')]
+              if os.name == 'nt' else []),
             self.toggle('Check for Updates at Start', 'auto_check',
                         'Look for a new version of NX2Saria when the launcher opens, and every hour while it stays '
                         'open. A new version downloads in the background and installs when you are not playing; '
@@ -2171,6 +2175,19 @@ class App:
     def rows_settings(self):
         gd = self.settings.get('game_dir')
         dump = self.settings.get('dump')
+        udmabuf_row = []
+        if sys.platform.startswith('linux'):
+            from ..platform import linux
+            if self.ctx.udmabuf and self.ctx.udmabuf['offered']:
+                udmabuf_row = [Row('value', 'udmabuf Memory Access', 'Fix Recommended', 'orange_arrow',
+                                   on=lambda: self.show('udmabuf'),
+                                   desc=('Allow the game to use Linux udmabuf for faster guest memory copies. '
+                                         'The change needs administrator approval.',))]
+            elif (self.ctx.udmabuf is not None and linux.udmabuf_fix_installed()
+                  and linux.udmabuf_change_available()):
+                udmabuf_row = [Row('value', 'Remove udmabuf Fix', 'Administrator Approval', 'arrow',
+                                   on=lambda: self.show('udmabuf'),
+                                   desc=('Remove the udev rule and boot-time memory limit installed for udmabuf.',))]
         return [
             self.toggle('Check for Updates at Start', 'auto_check',
                         'Look for a new version of NX2Saria when the launcher opens, and every hour while it stays '
@@ -2181,12 +2198,14 @@ class App:
                         'background either way.'),
             self.toggle('Hide Launcher While Playing', 'hide_while_playing',
                         'Hide this window while the game runs; it comes back when you quit the game.'),
-            self.toggle('Warn About Low Commit', 'warn_low_commit',
-                        'Before Play, warn when Windows has too little commit left and the page file is disabled or '
-                        'fixed-size. Turn this off to stop these prompts; the game still logs the memory figures.'),
+            *([self.toggle('Warn About Low Commit', 'warn_low_commit',
+                           'Before Play, warn when Windows has too little commit left and the page file is disabled or '
+                           'fixed-size. Turn this off to stop these prompts; the game still logs the memory figures.')]
+              if os.name == 'nt' else []),
             self.toggle('Keep Build Cache', 'keep_cache',
                         'Keep the translated code and compiled files (about 1.5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
+            *udmabuf_row,
             self.channel_row(),
             *([self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
             Row('divider'),
@@ -2205,6 +2224,41 @@ class App:
                       'game goes too.',)),
             Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
         ]
+
+    def rows_udmabuf(self):
+        if not sys.platform.startswith('linux'):
+            return [Row('action', 'Back', on=lambda: self.show('settings'), height=40)]
+        from ..platform import linux
+        remove = linux.udmabuf_fix_installed()
+        action = 'remove' if remove else 'apply'
+        title = 'Remove the udmabuf Fix' if remove else 'Apply the udmabuf Fix'
+        detail = ('This removes the udev permission rule and boot-time 1024 MB setting.' if remove else
+                  'This installs a udev permission rule and sets udmabuf size_limit_mb to 1024 MB now and at boot.')
+        return [
+            Row('value', title, 'pkexec will ask for approval', 'normal', desc=(detail,
+                'The launcher does not request administrator access until you select the button below.',)),
+            Row('divider'),
+            Row('pair', actions=[('Continue', lambda: self.apply_udmabuf(action)),
+                                 ('Not Now', lambda: self.udmabuf_refused(action))]),
+        ]
+
+    def apply_udmabuf(self, action):
+        from ..platform import linux
+        self.ctx.log(f'udmabuf: offer accepted; action={action}')
+        script = Path(linux.__file__).with_name('udmabuf_fix.sh')
+        ok, detail = linux.run_udmabuf_fix(script, action)
+        if not ok and detail.startswith('authorization refused'):
+            self.ctx.log('udmabuf: offer refused; PolicyKit authorization cancelled')
+        self.ctx.log(f'udmabuf: fix {"succeeded" if ok else "failed"}: {detail}')
+        self.message = ('The udmabuf setting was updated. Log out and back in if device access does not change.'
+                        if ok and action == 'apply' else 'The udmabuf fix was removed.' if ok else
+                        f'Could not change udmabuf: {detail}.')
+        self.show('settings')
+
+    def udmabuf_refused(self, action):
+        self.ctx.log(f'udmabuf: offer refused; action={action}')
+        self.message = 'No system changes were made.'
+        self.show('settings')
 
     # ---- uninstall
 
@@ -2766,7 +2820,7 @@ class App:
                 return
         if isinstance(d, tuple):
             d = {'text': [t for t in d if t]}
-        elif self.message and self.screen in ('first_run', 'settings', 'uninstall'):
+        elif self.message and self.screen in ('first_run', 'settings', 'uninstall', 'udmabuf'):
             d = dict(d)
             d['text'] = [self.message] + list(d.get('text', []))
         c, X = self.canvas, self.X

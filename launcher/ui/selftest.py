@@ -172,6 +172,9 @@ def states(app):
     def settings():
         app.show('settings', 0)
 
+    def udmabuf():
+        app.show('udmabuf', 0)
+
     def failed():
         j = jobs.InstallJob(ctx, s['dump'], s['game_dir'])
         for sid, val in (('tools', 'Done · 0:48'), ('check', 'Version 1.1.1'), ('exefs', 'Done · 0:04'),
@@ -274,14 +277,18 @@ def states(app):
         s['game_dir'] = was_game
         app.show('home', 0)
 
-    return [('1-first-run', first_run), ('2-installing', installing), ('3-home', home),
+    result = [('1-first-run', first_run), ('2-installing', installing), ('3-home', home),
             ('4a-whats-new-before', whats_new_before), ('4-update-ready', update_ready),
             ('4b-whats-new-end', whats_new_end), ('5-updating', updating), ('6-settings', settings),
-            ('7-build-failed', failed), ('8-uninstall', uninstall), ('9-import-saves', import_saves),
+            ('7-build-failed', failed), ('8-uninstall', uninstall),
+            ('10-import-saves', import_saves),
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
             ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-custom-picker', custom_picker),
             ('16-first-scheme', restore_scheme), ('17-mods', mods_screen), ('18-mod-order', mod_order),
             ('19-home-again', restore_game)]
+    if sys.platform.startswith('linux'):
+        result.insert(9, ('9-udmabuf', udmabuf))
+    return result
 
 
 def run(app, shots):

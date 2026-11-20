@@ -12,6 +12,7 @@ from unittest import mock
 
 from launcher.platform import linux
 from launcher import winsys
+from launcher.paths import Layout
 
 
 class LinuxPlatformTest(unittest.TestCase):
@@ -120,6 +121,75 @@ class LinuxPlatformTest(unittest.TestCase):
         process.stdin.close.assert_called_once_with()
         process.wait.assert_called_once_with(timeout=2)
         self.assertEqual(log, ['keep awake: systemd-inhibit held', 'keep awake: systemd-inhibit released'])
+
+    def test_udmabuf_detection_is_injectable_and_offers_only_when_needed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            device = base / 'udmabuf'
+            parameter = base / 'size_limit_mb'
+            os_release = base / 'os-release'
+            device.touch()
+            parameter.write_text('64\n')
+            os_release.write_text('ID=ubuntu\n')
+            status = linux.udmabuf_status(device, parameter, which=lambda name: '/usr/bin/pkexec',
+                                          accessible=lambda path: False, os_release=os_release)
+            self.assertEqual(status, {'accessible': False, 'limit_mb': 64, 'needs_fix': True,
+                                      'offered': True, 'reason': '', 'steamos': False})
+            parameter.write_text('1024\n')
+            status = linux.udmabuf_status(device, parameter, which=lambda name: '/usr/bin/pkexec',
+                                          accessible=lambda path: True, os_release=os_release)
+            self.assertFalse(status['needs_fix'])
+            self.assertFalse(status['offered'])
+
+    def test_udmabuf_missing_module_and_restricted_platforms_are_not_offered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            missing = linux.udmabuf_status(base / 'device', base / 'missing',
+                                           which=lambda name: '/usr/bin/pkexec', os_release=base / 'os-release')
+            self.assertIsNone(missing)
+            parameter, release = base / 'size', base / 'os-release'
+            parameter.write_text('64')
+            release.write_text('ID=steamos\n')
+            steam = linux.udmabuf_status(base / 'device', parameter, which=lambda name: '/usr/bin/pkexec',
+                                         accessible=lambda path: False, os_release=release)
+            self.assertFalse(steam['offered'])
+            self.assertIn('SteamOS', steam['reason'])
+            release.write_text('ID=ubuntu\n')
+            no_pkexec = linux.udmabuf_status(base / 'device', parameter, which=lambda name: None,
+                                             accessible=lambda path: False, os_release=release)
+            self.assertFalse(no_pkexec['offered'])
+            self.assertEqual(no_pkexec['reason'], 'pkexec not installed')
+
+    def test_udmabuf_confirmation_runs_only_the_privileged_script(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout='complete', stderr='')
+
+        script = Path(linux.__file__).with_name('udmabuf_fix.sh')
+        ok, detail = linux.run_udmabuf_fix(script, 'apply', run=run)
+        self.assertTrue(ok)
+        self.assertEqual(detail, 'complete')
+        self.assertEqual(calls[0][0], ['pkexec', str(script), 'apply'])
+        self.assertEqual(calls[0][1]['timeout'], 60)
+        self.assertTrue(os.access(script, os.X_OK))
+        syntax = subprocess.run(['sh', '-n', str(script)], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_udmabuf_startup_state_is_logged_once(self):
+        from launcher.context import Context
+        status = {'accessible': False, 'limit_mb': 64, 'needs_fix': True, 'offered': True,
+                  'reason': '', 'steamos': False}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(linux, 'udmabuf_status', return_value=status):
+            ctx = Context(Layout(root=Path(tmp)))
+            try:
+                ctx._file.flush()
+                log = (Path(tmp) / 'data' / 'logs' / 'launcher.log').read_text()
+                self.assertIn('udmabuf: accessible=no; size_limit_mb=64; offer=offered', log)
+            finally:
+                ctx._file.close()
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'the parent-death pipe test needs Linux /proc')
     def test_parent_death_closes_inhibitor_pipe_and_child_exits(self):
